@@ -1,3 +1,5 @@
+import { getSelectedPostgresDatabase, getSelectedPersistenceIdentity } from "./controlPlaneContext";
+import { createPostgresSessionRepository } from "./postgres/sessionRepository";
 /**
  * Durable second tier for the CCR block store (#9061).
  *
@@ -135,4 +137,75 @@ export function countCcrBlocks(principalId?: string): number {
       : db.prepare(`SELECT COUNT(*) AS n FROM ccr_blocks WHERE principal_id = ?`).get(principalId)
   ) as { n: number } | undefined;
   return row?.n ?? 0;
+}
+
+export async function persistCcrBlockAsync(
+  ...args: Parameters<typeof persistCcrBlock>
+): Promise<ReturnType<typeof persistCcrBlock>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresSessionRepository(database).persistCcrBlock(...args)
+    : persistCcrBlock(...args);
+}
+
+export async function loadCcrBlockAsync(
+  ...args: Parameters<typeof loadCcrBlock>
+): Promise<ReturnType<typeof loadCcrBlock>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresSessionRepository(database).loadCcrBlock(...args)
+    : loadCcrBlock(...args);
+}
+
+export async function touchCcrBlockAsync(
+  ...args: Parameters<typeof touchCcrBlock>
+): Promise<ReturnType<typeof touchCcrBlock>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresSessionRepository(database).touchCcrBlock(...args)
+    : touchCcrBlock(...args);
+}
+
+export async function deleteCcrBlockRowAsync(
+  ...args: Parameters<typeof deleteCcrBlockRow>
+): Promise<ReturnType<typeof deleteCcrBlockRow>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresSessionRepository(database).deleteCcrBlockRow(...args)
+    : deleteCcrBlockRow(...args);
+}
+
+export async function deleteAllCcrBlocksAsync(
+  ...args: Parameters<typeof deleteAllCcrBlocks>
+): Promise<ReturnType<typeof deleteAllCcrBlocks>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresSessionRepository(database).deleteAllCcrBlocks(...args)
+    : deleteAllCcrBlocks(...args);
+}
+
+export async function pruneExpiredCcrBlocksAsync(
+  ...args: Parameters<typeof pruneExpiredCcrBlocks>
+): Promise<ReturnType<typeof pruneExpiredCcrBlocks>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresSessionRepository(database).pruneExpiredCcrBlocks(...args)
+    : pruneExpiredCcrBlocks(...args);
+}
+
+export async function countCcrBlocksAsync(
+  ...args: Parameters<typeof countCcrBlocks>
+): Promise<ReturnType<typeof countCcrBlocks>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresSessionRepository(database).countCcrBlocks(...args)
+    : countCcrBlocks(...args);
+}
+
+/** Opaque authority fences the process cache when another database is selected. */
+export function ccrPersistenceAuthority(): object | undefined {
+  return getSelectedPersistenceIdentity();
+}
+export function isPostgresCcrStoreSelected(): boolean {
+  return getSelectedPostgresDatabase() !== undefined;
 }

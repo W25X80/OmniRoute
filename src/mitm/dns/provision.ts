@@ -6,9 +6,12 @@
 import { addDNSEntry, addDNSEntries, isSudoAvailable } from "./dnsConfig.ts";
 import { isRoot } from "../systemCommands.ts";
 import { ALL_TARGETS } from "../targets/index.ts";
-import { getAllAgentBridgeStates } from "@/lib/db/agentBridgeState.ts";
-import { listCustomHosts } from "@/lib/db/inspectorCustomHosts.ts";
-import { getGheCopilotHosts } from "@/lib/db/providers.ts";
+import {
+  getAllAgentBridgeStates,
+  getAllAgentBridgeStatesAsync,
+} from "@/lib/db/agentBridgeState.ts";
+import { listCustomHosts, listCustomHostsAsync } from "@/lib/db/inspectorCustomHosts.ts";
+import {} from "@/lib/db/providers.ts";
 import { createLogger } from "@/shared/utils/logger.ts";
 
 const defaultLog = createLogger("mitm-dns-provision");
@@ -23,8 +26,11 @@ interface DnsProvisionLogger {
 export interface DnsProvisionDeps {
   addDefaultDns?: (sudoPassword: string) => Promise<void>;
   addHostsDns?: (hosts: string[], sudoPassword: string) => Promise<void>;
-  getAgentStates?: () => ReturnType<typeof getAllAgentBridgeStates>;
-  listEnabledCustomHosts?: () => ReturnType<typeof listCustomHosts>;
+  getAgentStates?: () =>
+    | ReturnType<typeof getAllAgentBridgeStates>
+    | Promise<ReturnType<typeof getAllAgentBridgeStates>>;
+  listEnabledCustomHosts?: () =>
+    ReturnType<typeof listCustomHosts> | Promise<ReturnType<typeof listCustomHosts>>;
   /** Return true if privileged host-file writes are possible (sudo or root). */
   canElevate?: () => boolean;
   logger?: DnsProvisionLogger;
@@ -34,8 +40,11 @@ export interface DnsProvisionDeps {
 type ResolvedDnsProvisionDeps = {
   addDefaultDns: (sudoPassword: string) => Promise<void>;
   addHostsDns: (hosts: string[], sudoPassword: string) => Promise<void>;
-  getAgentStates: () => ReturnType<typeof getAllAgentBridgeStates>;
-  listEnabledCustomHosts: () => ReturnType<typeof listCustomHosts>;
+  getAgentStates: () =>
+    | ReturnType<typeof getAllAgentBridgeStates>
+    | Promise<ReturnType<typeof getAllAgentBridgeStates>>;
+  listEnabledCustomHosts: () =>
+    ReturnType<typeof listCustomHosts> | Promise<ReturnType<typeof listCustomHosts>>;
   logger: DnsProvisionLogger;
 };
 
@@ -57,7 +66,7 @@ async function provisionAgentDns(
   deps: ResolvedDnsProvisionDeps
 ): Promise<void> {
   try {
-    const agentStates = deps.getAgentStates();
+    const agentStates = await deps.getAgentStates();
     const agentHostsToAdd: string[] = [];
     for (const state of agentStates) {
       if (!state.dns_enabled) continue;
@@ -81,7 +90,7 @@ async function provisionCustomHostsDns(
   deps: ResolvedDnsProvisionDeps
 ): Promise<void> {
   try {
-    const customHosts = deps.listEnabledCustomHosts();
+    const customHosts = await deps.listEnabledCustomHosts();
     const customHostNames = customHosts.map((h) => h.host);
     if (customHostNames.length > 0) {
       deps.logger.info({ count: customHostNames.length }, "Adding DNS for custom host(s)...");
@@ -133,9 +142,9 @@ export async function provisionDnsEntries(
   const resolvedDeps: ResolvedDnsProvisionDeps = {
     addDefaultDns: deps.addDefaultDns ?? addDNSEntry,
     addHostsDns: deps.addHostsDns ?? addDNSEntries,
-    getAgentStates: deps.getAgentStates ?? getAllAgentBridgeStates,
+    getAgentStates: deps.getAgentStates ?? getAllAgentBridgeStatesAsync,
     listEnabledCustomHosts:
-      deps.listEnabledCustomHosts ?? (() => listCustomHosts({ enabledOnly: true })),
+      deps.listEnabledCustomHosts ?? (() => listCustomHostsAsync({ enabledOnly: true })),
     logger,
   };
 

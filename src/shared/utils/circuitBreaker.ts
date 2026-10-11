@@ -24,6 +24,13 @@ import {
   deleteAllCircuitBreakerStates,
 } from "../../lib/db/domainState";
 import type { FailureKind } from "./classify429";
+import {
+  getSelectedPostgresDatabase,
+  getSelectedPersistenceIdentity,
+} from "@/lib/db/controlPlaneContext";
+import { PostgresDomainStateRepository } from "@/lib/db/postgres/domainStateRepository";
+import type { PostgresDatabase } from "@/lib/db/postgres/database";
+import { runPersistenceBackgroundWork } from "@/lib/db/persistenceRuntime";
 
 /**
  * #4602 — Detect a LOCAL stream-lifecycle error that must NOT count as a
@@ -277,12 +284,25 @@ export class CircuitBreaker {
     this.transitionHistory = [];
     this.maxTransitionHistory = 20;
 
+    if (
+      getSelectedPostgresDatabase() &&
+      !postgresRuntime.has(getSelectedPersistenceIdentity() ?? getSelectedPostgresDatabase()!)
+    )
+      throw new Error(
+        "PostgreSQL circuit-breaker state must be initialized before serving requests"
+      );
     this._restoreFromDb();
   }
 
   _restoreFromDb() {
     try {
-      const saved = loadCircuitBreakerState(this.name);
+      const database = getSelectedPostgresDatabase();
+      const runtime = database
+        ? postgresRuntime.get(getSelectedPersistenceIdentity() ?? database)
+        : undefined;
+      if (database && !runtime)
+        throw new Error("PostgreSQL breaker state has not been initialized");
+      const saved = database ? runtime!.saved.get(this.name) : loadCircuitBreakerState(this.name);
       if (saved) {
         if (
           saved.state === STATE.CLOSED ||
@@ -303,7 +323,9 @@ export class CircuitBreaker {
           this.lastFailureKind = savedKind;
         }
         this.openCycleCount = (saved.options?.openCycleCount as number) ?? 0;
-        this.kindFailureCounts = (saved.options?.kindFailureCounts as Record<string, number>) ?? {};
+        this.kindFailureCounts = {
+          ...((saved.options?.kindFailureCounts as Record<string, number>) ?? {}),
+        };
 
         if (this.state === STATE.HALF_OPEN) {
           this.halfOpenAllowed = this.halfOpenRequests;
@@ -315,22 +337,25 @@ export class CircuitBreaker {
   }
 
   _persistToDb() {
+    const snapshot = {
+      state: this.state,
+      failureCount: this.failureCount,
+      lastFailureTime: this.lastFailureTime,
+      options: {
+        failureThreshold: this.failureThreshold,
+        resetTimeout: this.resetTimeout,
+        halfOpenRequests: this.halfOpenRequests,
+        lastFailureKind: this.lastFailureKind,
+        openCycleCount: this.openCycleCount,
+        kindFailureCounts: { ...this.kindFailureCounts },
+      },
+    };
     try {
-      saveCircuitBreakerState(this.name, {
-        state: this.state,
-        failureCount: this.failureCount,
-        lastFailureTime: this.lastFailureTime,
-        options: {
-          failureThreshold: this.failureThreshold,
-          resetTimeout: this.resetTimeout,
-          halfOpenRequests: this.halfOpenRequests,
-          lastFailureKind: this.lastFailureKind,
-          openCycleCount: this.openCycleCount,
-          kindFailureCounts: this.kindFailureCounts,
-        },
-      });
+      const database = getSelectedPostgresDatabase();
+      if (database) persistPostgresBreaker(database, this.name, snapshot);
+      else saveCircuitBreakerState(this.name, snapshot);
     } catch {
-      // Non-critical
+      /* The source breaker continues enforcing its in-memory state. */
     }
   }
 
@@ -649,6 +674,7 @@ export class CircuitBreakerOpenError extends Error {
   constructor(message: string, circuitName: string, retryAfterMs: number) {
     super(message);
     this.name = "CircuitBreakerOpenError";
+    Object.defineProperty(this, Symbol.for("omniroute.circuitBreaker.openError"), { value: true });
     this.circuitName = circuitName;
     this.retryAfterMs = retryAfterMs;
   }
@@ -657,28 +683,130 @@ export class CircuitBreakerOpenError extends Error {
 // ─── Registry ─────────────────────────────────────
 
 const MAX_REGISTRY_SIZE = 500;
-const registry = new Map<string, CircuitBreaker>();
+const sqliteRegistry = new Map<string, CircuitBreaker>();
+type BreakerSnapshot = NonNullable<ReturnType<typeof loadCircuitBreakerState>>;
+interface PostgresBreakerRuntime {
+  identity: object;
+  saved: Map<string, BreakerSnapshot>;
+  registry: Map<string, CircuitBreaker>;
+  pending: Map<string, BreakerSnapshot | null>;
+  resetPending: boolean;
+  running?: Promise<void>;
+}
+const POSTGRES_BREAKER_RUNTIME = Symbol.for("omniroute.postgres.circuitBreakers");
+const sharedBreakerState = globalThis as typeof globalThis & {
+  [POSTGRES_BREAKER_RUNTIME]?: WeakMap<object, PostgresBreakerRuntime>;
+};
+const postgresRuntime = (sharedBreakerState[POSTGRES_BREAKER_RUNTIME] ??= new WeakMap<
+  object,
+  PostgresBreakerRuntime
+>());
+
+function getRegistry(): Map<string, CircuitBreaker> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return sqliteRegistry;
+  const runtime = postgresRuntime.get(getSelectedPersistenceIdentity() ?? database);
+  if (!runtime)
+    throw new Error("PostgreSQL circuit-breaker state must be initialized before serving requests");
+  return runtime.registry;
+}
+
+export async function initializeCircuitBreakerPersistence(
+  database: PostgresDatabase
+): Promise<void> {
+  if (postgresRuntime.has(getSelectedPersistenceIdentity() ?? database)) return;
+  const rows = await new PostgresDomainStateRepository(database).loadAllCircuitBreakerSnapshots();
+  postgresRuntime.set(getSelectedPersistenceIdentity() ?? database, {
+    identity: getSelectedPersistenceIdentity() ?? database,
+    saved: new Map(rows.map((row) => [row.name, row])),
+    registry: new Map(),
+    pending: new Map(),
+    resetPending: false,
+  });
+}
+
+/** One writer and one latest pending state per breaker; reset is an ordered barrier. */
+function startPostgresBreakerWriter(runtime: PostgresBreakerRuntime): void {
+  if (runtime.running) return;
+  const identity = runtime.identity;
+  runtime.running = (async () => {
+    while (runtime.resetPending || runtime.pending.size) {
+      if (runtime.resetPending) {
+        runtime.resetPending = false;
+        try {
+          await runPersistenceBackgroundWork(async () => {
+            const current = getSelectedPostgresDatabase();
+            if (!current || getSelectedPersistenceIdentity() !== identity)
+              throw new Error("Circuit-breaker persistence changed during background work");
+            await new PostgresDomainStateRepository(current).deleteAllCircuitBreakerStates();
+          });
+        } catch (error) {
+          console.error("[CircuitBreaker] State reset failed", error);
+        }
+        continue;
+      }
+      const [name, snapshot] = runtime.pending.entries().next().value!;
+      runtime.pending.delete(name);
+      try {
+        await runPersistenceBackgroundWork(async () => {
+          const current = getSelectedPostgresDatabase();
+          if (!current || getSelectedPersistenceIdentity() !== identity)
+            throw new Error("Circuit-breaker persistence changed during background work");
+          const owner = new PostgresDomainStateRepository(current);
+          if (snapshot) await owner.saveCircuitBreakerState(name, snapshot);
+          else await owner.deleteCircuitBreakerState(name);
+        });
+      } catch (error) {
+        console.error("[CircuitBreaker] State persistence failed", error);
+      }
+    }
+  })().finally(() => {
+    runtime.running = undefined;
+    // A microtask producer can enqueue after the loop's last read but before finally.
+    if (runtime.resetPending || runtime.pending.size) startPostgresBreakerWriter(runtime);
+  });
+}
+
+function persistPostgresBreaker(
+  database: PostgresDatabase,
+  name: string,
+  snapshot: BreakerSnapshot
+): void {
+  const runtime = postgresRuntime.get(getSelectedPersistenceIdentity() ?? database);
+  if (!runtime) throw new Error("PostgreSQL circuit-breaker state has not been initialized");
+  runtime.saved.set(name, snapshot);
+  runtime.pending.set(name, snapshot);
+  startPostgresBreakerWriter(runtime);
+}
+
+export async function flushCircuitBreakerPersistence(database: PostgresDatabase): Promise<void> {
+  const runtime = postgresRuntime.get(getSelectedPersistenceIdentity() ?? database);
+  if (!runtime) return;
+  while (runtime.running) await runtime.running;
+}
 
 /** Test-only: current number of registered circuit breakers. */
 export function __getCircuitRegistrySizeForTests(): number {
-  return registry.size;
+  return getRegistry().size;
 }
 
 const _registrySweep = setInterval(() => {
-  const now = Date.now();
-  for (const [name, breaker] of registry) {
-    const status = breaker.getStatus();
-    if (
-      status.state === STATE.CLOSED &&
-      status.failureCount === 0 &&
-      (!status.lastFailureTime || now - status.lastFailureTime > 30 * 60 * 1000)
-    ) {
-      registry.delete(name);
-      try {
-        deleteCircuitBreakerState(name);
-      } catch {}
+  void runPersistenceBackgroundWork(async () => {
+    const now = Date.now();
+    for (const [name, breaker] of getRegistry()) {
+      const status = breaker.getStatus();
+      if (
+        status.state === STATE.CLOSED &&
+        status.failureCount === 0 &&
+        (!status.lastFailureTime || now - status.lastFailureTime > 30 * 60 * 1000)
+      ) {
+        getRegistry().delete(name);
+        try {
+          deleteSelectedBreakerState(name);
+        } catch {}
+      }
     }
-  }
+  }).catch((error) => console.error("[CircuitBreaker] Registry sweep failed", error));
 }, 5 * 60_000);
 if (typeof _registrySweep === "object" && "unref" in _registrySweep) {
   (_registrySweep as { unref?: () => void }).unref?.();
@@ -694,30 +822,30 @@ if (typeof _registrySweep === "object" && "unref" in _registrySweep) {
  * evicting and lazily recreating it later changes nothing.
  */
 function evictColdBreakersIfNeeded(): void {
-  if (registry.size < MAX_REGISTRY_SIZE) return;
+  if (getRegistry().size < MAX_REGISTRY_SIZE) return;
   const candidates: { name: string; lastFailureTime: number }[] = [];
-  for (const [name, breaker] of registry) {
+  for (const [name, breaker] of getRegistry()) {
     const status = breaker.getStatus();
     if (status.state === STATE.CLOSED && status.failureCount === 0) {
       candidates.push({ name, lastFailureTime: status.lastFailureTime || 0 });
     }
   }
   candidates.sort((a, b) => a.lastFailureTime - b.lastFailureTime);
-  const target = registry.size - MAX_REGISTRY_SIZE + 1;
+  const target = getRegistry().size - MAX_REGISTRY_SIZE + 1;
   for (let i = 0; i < candidates.length && i < target; i++) {
-    registry.delete(candidates[i].name);
+    getRegistry().delete(candidates[i].name);
     try {
-      deleteCircuitBreakerState(candidates[i].name);
+      deleteSelectedBreakerState(candidates[i].name);
     } catch {}
   }
 }
 
 export function getCircuitBreaker(name: string, options?: CircuitBreakerOptions): CircuitBreaker {
-  if (!registry.has(name)) {
+  if (!getRegistry().has(name)) {
     evictColdBreakersIfNeeded();
-    registry.set(name, new CircuitBreaker(name, options));
+    getRegistry().set(name, new CircuitBreaker(name, options));
   }
-  const breaker = registry.get(name)!;
+  const breaker = getRegistry().get(name)!;
   if (options) {
     if (typeof options.failureThreshold === "number") {
       breaker.failureThreshold = options.failureThreshold;
@@ -768,26 +896,77 @@ export function getCircuitBreaker(name: string, options?: CircuitBreakerOptions)
 
 export function getAllCircuitBreakerStatuses() {
   try {
-    const persisted = loadAllCircuitBreakerStates();
+    const database = getSelectedPostgresDatabase();
+    const persisted = database
+      ? [
+          ...(postgresRuntime.get(getSelectedPersistenceIdentity() ?? database)?.saved.entries() ??
+            []),
+        ].map(([name, state]) => ({ name, ...state }))
+      : loadAllCircuitBreakerStates();
     for (const cb of persisted) {
-      if (!registry.has(cb.name)) {
+      if (!getRegistry().has(cb.name)) {
         getCircuitBreaker(cb.name);
       }
     }
   } catch {
     // Use registry only
   }
-  return Array.from(registry.values()).map((cb) => cb.getStatus());
+  return Array.from(getRegistry().values()).map((cb) => cb.getStatus());
 }
 
 export function resetAllCircuitBreakers() {
-  for (const cb of registry.values()) {
+  for (const cb of getRegistry().values()) {
     cb.reset();
   }
-  registry.clear();
+  getRegistry().clear();
   try {
-    deleteAllCircuitBreakerStates();
+    deleteAllSelectedBreakerStates();
   } catch {
     // Non-critical
   }
+}
+
+function deleteSelectedBreakerState(name: string): void {
+  const database = getSelectedPostgresDatabase();
+  if (!database) {
+    deleteCircuitBreakerState(name);
+    return;
+  }
+  const runtime = postgresRuntime.get(getSelectedPersistenceIdentity() ?? database);
+  if (!runtime) return;
+  runtime.saved.delete(name);
+  runtime.pending.set(name, null);
+  startPostgresBreakerWriter(runtime);
+}
+
+function deleteAllSelectedBreakerStates(): void {
+  const database = getSelectedPostgresDatabase();
+  if (!database) {
+    deleteAllCircuitBreakerStates();
+    return;
+  }
+  const runtime = postgresRuntime.get(getSelectedPersistenceIdentity() ?? database);
+  if (!runtime) return;
+  runtime.saved.clear();
+  runtime.pending.clear();
+  runtime.resetPending = true;
+  startPostgresBreakerWriter(runtime);
+}
+
+export async function resetAllCircuitBreakersAsync(): Promise<void> {
+  resetAllCircuitBreakers();
+  const database = getSelectedPostgresDatabase();
+  if (database) await flushCircuitBreakerPersistence(database);
+}
+
+/** A breaker restored in another Next bundle retains the same rejection classification. */
+export function isCircuitBreakerOpenError(error: unknown): error is CircuitBreakerOpenError {
+  if (!error || typeof error !== "object") return false;
+  const value = error as { [key: symbol]: unknown; circuitName?: unknown; retryAfterMs?: unknown };
+  return (
+    value[Symbol.for("omniroute.circuitBreaker.openError")] === true &&
+    typeof value.circuitName === "string" &&
+    typeof value.retryAfterMs === "number" &&
+    Number.isFinite(value.retryAfterMs)
+  );
 }

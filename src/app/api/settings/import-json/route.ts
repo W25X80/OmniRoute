@@ -1,3 +1,7 @@
+import {
+  requireSqliteMaintenance,
+  persistenceCapabilityResponse,
+} from "@/lib/db/persistenceCapabilities";
 import { NextResponse } from "next/server";
 import { getDbInstance } from "@/lib/db/core";
 import { backupDbFile } from "@/lib/db/backup";
@@ -27,6 +31,7 @@ export async function POST(request: Request) {
   }
 
   try {
+    requireSqliteMaintenance("legacy-json-import");
     let rawText: string | null = null;
     const contentType = request.headers.get("content-type") ?? "";
 
@@ -92,6 +97,8 @@ export async function POST(request: Request) {
       ...counts,
     });
   } catch (err) {
+    const unavailable = persistenceCapabilityResponse(err);
+    if (unavailable) return NextResponse.json(unavailable, { status: 501 });
     console.error("[API] Error importing JSON backup:", err);
     return NextResponse.json(
       { error: sanitizeErrorMessage(err instanceof Error ? err.message : String(err)) },

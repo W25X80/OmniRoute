@@ -7,6 +7,17 @@
  */
 
 import { getDbInstance } from "./core";
+import { getSelectedPostgresDatabase } from "./controlPlaneContext";
+import { getPostgresKeyValue } from "./postgres/keyValueRepository";
+import {
+  hasPostgresCatalogSnapshot,
+  catalogEnvironmentValue,
+  readPostgresCatalogNamespace,
+  mutatePostgresCatalog,
+  putCatalogValue,
+  deleteCatalogValue,
+  afterPostgresCatalogCommit,
+} from "./postgres/catalogSnapshot";
 import { invalidateDbCache } from "./readCache";
 
 const NAMESPACE = "settings";
@@ -64,7 +75,7 @@ function parseSetting(key: ChatAdmissionSettingKey, raw: string): number {
 }
 
 function isEnvProvided(key: ChatAdmissionSettingKey): boolean {
-  const raw = process.env[ENV_KEYS[key]];
+  const raw = admissionEnvironmentValue(ENV_KEYS[key]);
   return raw !== undefined && raw.trim() !== "";
 }
 
@@ -72,7 +83,7 @@ function isEnvProvided(key: ChatAdmissionSettingKey): boolean {
 function readEnvValue(key: ChatAdmissionSettingKey): number {
   const fallback = DEFAULT_CHAT_ADMISSION_SETTINGS[key];
   if (!isEnvProvided(key)) return fallback;
-  const parsed = parseSetting(key, process.env[ENV_KEYS[key]] as string);
+  const parsed = parseSetting(key, admissionEnvironmentValue(ENV_KEYS[key]) as string);
   return isValid(key, parsed) ? parsed : fallback;
 }
 
@@ -90,10 +101,12 @@ function pickSetting(source: Record<string, unknown>, key: ChatAdmissionSettingK
  * provenance reporting does not have to guess.
  */
 function readStoredSettings(): Record<string, unknown> | null {
-  const db = getDbInstance();
-  const row = db
-    .prepare("SELECT value FROM key_value WHERE namespace = ? AND key = ?")
-    .get(NAMESPACE, SETTINGS_KEY) as { value?: string } | undefined;
+  const selectedRows = readPostgresCatalogNamespace(NAMESPACE);
+  const row = selectedRows
+    ? selectedRows.find((entry) => entry.key === SETTINGS_KEY)
+    : (getDbInstance()
+        .prepare("SELECT value FROM key_value WHERE namespace = ? AND key = ?")
+        .get(NAMESPACE, SETTINGS_KEY) as { value?: string } | undefined);
 
   if (!row?.value) return null;
 
@@ -188,6 +201,18 @@ export function getChatAdmissionSettingsSource(): Record<
 export async function updateChatAdmissionSettings(
   next: ChatAdmissionSettings
 ): Promise<ChatAdmissionSettings> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    await mutatePostgresCatalog(postgres, async () => {
+      await putCatalogValue(
+        NAMESPACE,
+        SETTINGS_KEY,
+        JSON.stringify(normalizeChatAdmissionSettings(next))
+      );
+      afterPostgresCatalogCommit(() => invalidateDbCache("settings"));
+    });
+    return getEffectiveChatAdmissionSettingsAsync();
+  }
   const db = getDbInstance();
 
   db.prepare("INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES (?, ?, ?)").run(
@@ -202,10 +227,76 @@ export async function updateChatAdmissionSettings(
 
 /** Drop the stored override; effective settings fall back to env/defaults. */
 export async function resetChatAdmissionSettings(): Promise<ChatAdmissionSettings> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    await mutatePostgresCatalog(postgres, async () => {
+      await deleteCatalogValue(NAMESPACE, SETTINGS_KEY);
+      afterPostgresCatalogCommit(() => invalidateDbCache("settings"));
+    });
+    return getEffectiveChatAdmissionSettingsAsync();
+  }
   const db = getDbInstance();
 
   db.prepare("DELETE FROM key_value WHERE namespace = ? AND key = ?").run(NAMESPACE, SETTINGS_KEY);
 
   invalidateDbCache("settings");
   return getEffectiveChatAdmissionSettings();
+}
+
+async function readStoredSettingsAsync(): Promise<Record<string, unknown> | null> {
+  const postgres = getSelectedPostgresDatabase();
+  if (!postgres || hasPostgresCatalogSnapshot(postgres)) return readStoredSettings();
+  const value = await getPostgresKeyValue(postgres, NAMESPACE, SETTINGS_KEY);
+  if (!value) return null;
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return parsed !== null && typeof parsed === "object"
+      ? (parsed as Record<string, unknown>)
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function readChatAdmissionSettingsFromDbAsync(): Promise<ChatAdmissionSettings> {
+  const stored = await readStoredSettingsAsync();
+  return stored === null ? DEFAULT_CHAT_ADMISSION_SETTINGS : normalizeChatAdmissionSettings(stored);
+}
+
+export async function getEffectiveChatAdmissionSettingsAsync(): Promise<ChatAdmissionSettings> {
+  const db = await readChatAdmissionSettingsFromDbAsync();
+  return {
+    chatMaxHeavyInFlight: isEnvProvided("chatMaxHeavyInFlight")
+      ? readEnvValue("chatMaxHeavyInFlight")
+      : db.chatMaxHeavyInFlight,
+    chatAdmissionHeapShedRatio: isEnvProvided("chatAdmissionHeapShedRatio")
+      ? readEnvValue("chatAdmissionHeapShedRatio")
+      : db.chatAdmissionHeapShedRatio,
+    chatAdmissionHealthyHeadroom: isEnvProvided("chatAdmissionHealthyHeadroom")
+      ? readEnvValue("chatAdmissionHealthyHeadroom")
+      : db.chatAdmissionHealthyHeadroom,
+  };
+}
+
+export async function getChatAdmissionSettingsSourceAsync(): Promise<
+  ReturnType<typeof getChatAdmissionSettingsSource>
+> {
+  const stored = await readStoredSettingsAsync();
+  const source = (key: ChatAdmissionSettingKey): ChatAdmissionSettingSource => {
+    if (isEnvProvided(key)) return "env";
+    const value = stored?.[key];
+    return typeof value === "number" && isValid(key, value) ? "db" : "default";
+  };
+  return {
+    chatMaxHeavyInFlight: source("chatMaxHeavyInFlight"),
+    chatAdmissionHeapShedRatio: source("chatAdmissionHeapShedRatio"),
+    chatAdmissionHealthyHeadroom: source("chatAdmissionHealthyHeadroom"),
+  };
+}
+
+function admissionEnvironmentValue(name: string): string | undefined {
+  const database = getSelectedPostgresDatabase();
+  return database && hasPostgresCatalogSnapshot(database)
+    ? catalogEnvironmentValue(name)
+    : process.env[name];
 }

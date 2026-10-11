@@ -1,5 +1,5 @@
 import { CORS_HEADERS, handleCorsOptions } from "@/shared/utils/cors";
-import { getBatch, updateBatch } from "@/lib/db/batches";
+import { getBatchAsync, updateBatchAsync } from "@/lib/db/batches";
 import { NextResponse } from "next/server";
 import {
   getApiKeyRequestScope,
@@ -44,7 +44,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
   if (policy.rejection) return policy.rejection;
 
   const { id } = await params;
-  const batch = getBatch(id);
+  const batch = await getBatchAsync(id);
 
   // A key resolved only via the ungated x-api-key/x-goog-api-key transport
   // never sets scope.apiKeyId — fall back to the id enforceApiKeyPolicy()
@@ -76,12 +76,12 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
     return NextResponse.json(formatBatchResponse(batch), { headers: CORS_HEADERS });
   }
 
-  updateBatch(id, {
+  await updateBatchAsync(id, {
     status: "cancelling",
     cancellingAt: Math.floor(Date.now() / 1000),
   });
 
-  const updatedBatch = getBatch(id);
+  const updatedBatch = await getBatchAsync(id);
 
   return NextResponse.json(formatBatchResponse(updatedBatch), { headers: CORS_HEADERS });
 }

@@ -1,6 +1,6 @@
+import { getSelectedProxySubscriptionStore } from "../db/proxySubscriptionStore";
 import type { getDbInstance } from "../db/core";
 import { deleteProxyById } from "../db/proxies";
-
 type DbHandle = ReturnType<typeof getDbInstance>;
 
 /**
@@ -10,10 +10,18 @@ type DbHandle = ReturnType<typeof getDbInstance>;
  * feed omits stay in place until the subscription is enabled again.
  */
 export async function removeStaleSubscriptionNodes(
-  db: DbHandle,
+  db: DbHandle | null,
   id: string,
   keptIds: string[]
 ): Promise<void> {
+  const store = getSelectedProxySubscriptionStore();
+  if (store) {
+    for (const row of await store.proxyIds(id, false, keptIds)) {
+      await deleteProxyById(row.id, { force: true });
+    }
+    return;
+  }
+  if (!db) throw new Error("SQLite stale-node cleanup requires a database handle");
   if (keptIds.length > 0) {
     const placeholders = keptIds.map(() => "?").join(",");
     const stale = db

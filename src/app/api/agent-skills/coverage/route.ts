@@ -6,15 +6,17 @@
  * Response: SkillCoverage
  */
 import { NextResponse } from "next/server";
+import { parseDatabaseBackend } from "@/lib/db/backendSelection";
 
 import { buildErrorBody } from "@omniroute/open-sse/utils/error.ts";
-import { computeCoverage } from "@/lib/agentSkills/catalog";
+import { computeCoverage, computeCoverageAsync } from "@/lib/agentSkills/catalog";
 
 export const dynamic = "force-dynamic";
 
 export async function GET() {
   try {
-    const coverage = computeCoverage();
+    const coverage =
+      parseDatabaseBackend() === "postgres" ? await computeCoverageAsync() : computeCoverage();
     return NextResponse.json(coverage);
   } catch (error) {
     console.error("[API] GET /api/agent-skills/coverage error:", error);

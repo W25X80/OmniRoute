@@ -1027,3 +1027,47 @@ test("upstream error code/type survive into the error outcome", async () => {
     assert.equal(outcome.result.status, 422);
   }
 });
+
+test("Codex rotation awaits affinity cleanup before selecting and using a replacement", async () => {
+  const { runProviderExecutionPipeline } =
+    await import("../../open-sse/handlers/chatCore/providerExecutionPipeline.ts");
+  let release!: () => void;
+  let cleanupStarted!: () => void;
+  const pendingCleanup = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const started = new Promise<void>((resolve) => {
+    cleanupStarted = resolve;
+  });
+  const events: string[] = [];
+  let sends = 0;
+  const input = makeInput({
+    policy: { allowAccountRotation: true, allowModelFallback: true },
+    provider: "codex",
+    send: async () => {
+      events.push("send");
+      sends++;
+      return sends === 1
+        ? makeAttempt({ error: { message: "rate limited", type: "rate_limit_error" } }, 429)
+        : makeAttempt({ choices: [{ message: { role: "assistant", content: "ok" } }] }, 200);
+    },
+    getProviderCredentials: (async () => {
+      events.push("select");
+      return { connectionId: "conn-b", allRateLimited: false };
+    }) as PipelineConnectionContext["getProviderCredentials"],
+    state: {
+      onClearSessionAffinity: async () => {
+        cleanupStarted();
+        await pendingCleanup;
+        events.push("cleared");
+      },
+    },
+  });
+  const execution = runProviderExecutionPipeline(input);
+  await started;
+  assert.deepEqual(events, ["send"]);
+  release();
+  const outcome = await execution;
+  assert.equal(outcome.kind, "response");
+  assert.deepEqual(events, ["send", "cleared", "select", "send"]);
+});

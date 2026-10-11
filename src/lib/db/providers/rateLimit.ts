@@ -1,3 +1,5 @@
+import { getSelectedPostgresDatabase } from "../controlPlaneContext";
+import { afterProviderRuntimeWrite, writeProviderRuntime } from "../postgres/providerRuntime";
 /**
  * db/providers/rateLimit.ts — Rate-limit/quota runtime helpers for provider_connections.
  */
@@ -6,7 +8,10 @@ import { getDbInstance } from "../core";
 import { invalidateDbCache } from "../readCache";
 import { backupDbFile } from "../backup";
 import { bumpProxyConfigGeneration } from "../settings";
-import { stripCodexChildCooldownsFromConnection } from "./codexAccountState";
+import {
+  stripCodexChildCooldownsFromConnection,
+  stripCodexChildCooldownsFromConnectionAsync,
+} from "./codexAccountState";
 
 interface StatementLike<TRow = unknown> {
   all: (...params: unknown[]) => TRow[];
@@ -266,6 +271,56 @@ export async function clearConnectionErrorIfUnchanged(
     rateLimitedUntil: string | null | undefined;
   }
 ): Promise<boolean> {
+  const database = getSelectedPostgresDatabase();
+  if (database) {
+    const applied = await writeProviderRuntime(database, async (transaction) => {
+      const { rows } = await transaction.query<Record<string, unknown>>(
+        `SELECT provider,provider_specific_data FROM omniroute.provider_connections
+         WHERE id=$1 AND COALESCE(test_status,'')=$2 AND COALESCE(last_error_at,'')=$3
+           AND COALESCE(rate_limited_until,'')=$4 FOR UPDATE`,
+        [id, expected.testStatus ?? "", expected.lastErrorAt ?? "", expected.rateLimitedUntil ?? ""]
+      );
+      if (!rows[0]) return false;
+      const row = rows[0];
+      let providerData = row.provider_specific_data;
+      if (row.provider === "codex" && typeof providerData === "string") {
+        try {
+          const parsed: unknown = JSON.parse(providerData);
+          // json_remove has no matching object paths for scalars/arrays.
+          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+            const data = { ...(parsed as Record<string, unknown>) };
+            delete data.codexScopeRateLimitedUntil;
+            delete data.codexScopeRateLimitSource;
+            providerData = JSON.stringify(data);
+          }
+        } catch {
+          /* Preserve source behavior for invalid JSON. */
+        }
+      }
+      const result = await transaction.query(
+        `UPDATE omniroute.provider_connections SET test_status='active',last_error=NULL,
+         last_error_at=NULL,last_error_type=NULL,last_error_source=NULL,error_code=NULL,
+         rate_limited_until=NULL,backoff_level=0,provider_specific_data=$1,updated_at=$2
+         WHERE id=$3 AND COALESCE(test_status,'')=$4 AND COALESCE(last_error_at,'')=$5
+           AND COALESCE(rate_limited_until,'')=$6`,
+        [
+          providerData,
+          new Date().toISOString(),
+          id,
+          expected.testStatus ?? "",
+          expected.lastErrorAt ?? "",
+          expected.rateLimitedUntil ?? "",
+        ]
+      );
+      return (result.rowCount ?? 0) > 0;
+    });
+    if (applied)
+      await afterProviderRuntimeWrite("conditional_error_clear", async () => {
+        invalidateDbCache("connections", id, { skipModelCatalog: true });
+        await bumpProxyConfigGeneration();
+      });
+    return applied;
+  }
   const db = getDbInstance() as unknown as DbLike;
   backupDbFile("pre-write");
   const result = db
@@ -319,3 +374,116 @@ export async function clearConnectionErrorIfUnchanged(
 // server-only DB module (better-sqlite3/ioredis) into the browser bundle.
 // Re-exported here for existing server-side callers and the db/providers barrel.
 export { formatResetCountdown } from "@/shared/utils/formatting";
+
+/** Native async setter; the legacy sync setter remains a SQLite-only compatibility API. */
+export async function setConnectionRateLimitUntilAsync(
+  connectionId: string,
+  until: number | null
+): Promise<void> {
+  if (until !== null && (!Number.isFinite(until) || until <= Date.now())) return;
+  const database = getSelectedPostgresDatabase();
+  if (!database) return setConnectionRateLimitUntil(connectionId, until);
+  if (until == null) {
+    await stripCodexChildCooldownsFromConnectionAsync(connectionId, { alsoClearTopLevel: true });
+    return;
+  }
+  await writeProviderRuntime(database, async (transaction) => {
+    await transaction.query(
+      "UPDATE omniroute.provider_connections SET rate_limited_until=$1,updated_at=$2 WHERE id=$3",
+      [String(until), new Date().toISOString(), connectionId]
+    );
+  });
+  await afterProviderRuntimeWrite("connection_cooldown", () =>
+    invalidateDbCache("connections", connectionId, { skipModelCatalog: true })
+  );
+}
+
+export async function markConnectionRateLimitedUntilAsync(
+  connectionId: string,
+  retryAfterMs: number
+): Promise<void> {
+  if (typeof connectionId !== "string" || connectionId.length === 0) return;
+  if (!Number.isFinite(retryAfterMs) || retryAfterMs <= 0) return;
+  try {
+    await setConnectionRateLimitUntilAsync(connectionId, Date.now() + retryAfterMs);
+  } catch {
+    /* Source best effort: persistence failure cannot crash chat. */
+  }
+}
+
+export async function clearConnectionRateLimitAsync(connectionId: string): Promise<void> {
+  if (typeof connectionId !== "string" || connectionId.length === 0) return;
+  try {
+    await setConnectionRateLimitUntilAsync(connectionId, null);
+  } catch {
+    /* Source best effort. */
+  }
+}
+
+export async function isConnectionRateLimitedAsync(connectionId: string): Promise<boolean> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return isConnectionRateLimited(connectionId);
+  return database.transaction(async (transaction) => {
+    const { rows } = await transaction.query<{ rate_limited_until: string | null }>(
+      "SELECT rate_limited_until FROM omniroute.provider_connections WHERE id=$1",
+      [connectionId]
+    );
+    if (!rows[0]?.rate_limited_until) return false;
+    // Preserve this legacy helper's numeric-coercion contract; other auth paths parse ISO.
+    return Date.now() < Number(rows[0].rate_limited_until);
+  });
+}
+
+export async function getRateLimitedConnectionsAsync(
+  provider: string
+): Promise<Array<{ id: string; rateLimitedUntil: number }>> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return getRateLimitedConnections(provider);
+  return database.transaction(async (transaction) => {
+    const { rows } = await transaction.query<{ id: string; rate_limited_until: number }>(
+      `SELECT id,rate_limited_until FROM omniroute.provider_connections
+       WHERE provider=$1 AND rate_limited_until COLLATE "C" > $2::text COLLATE "C"
+       ORDER BY insertion_order`,
+      [provider, String(Date.now())]
+    );
+    // TEXT affinity in SQLite already exposes these values as strings despite the legacy type.
+    return rows.map((row) => ({ id: row.id, rateLimitedUntil: row.rate_limited_until }));
+  });
+}
+
+export async function clearStaleCrashCooldownsAsync(): Promise<{ cleared: number }> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return clearStaleCrashCooldowns();
+  const result = await writeProviderRuntime(database, async (transaction) => {
+    const now = new Date().toISOString(),
+      nowMs = Date.now();
+    const terminal = new Set(["banned", "expired", "credits_exhausted"]);
+    const { rows } = await transaction.query<{
+      id: string;
+      test_status: string | null;
+      rate_limited_until: string | null;
+    }>(
+      `SELECT id,test_status,rate_limited_until FROM omniroute.provider_connections
+       WHERE rate_limited_until IS NOT NULL ORDER BY insertion_order FOR UPDATE`
+    );
+    let cleared = 0;
+    for (const row of rows) {
+      if (terminal.has((row.test_status || "").trim().toLowerCase())) continue;
+      const until = parseCooldownUntilMs(row.rate_limited_until);
+      if (until !== null && until > nowMs) continue;
+      const result = await transaction.query(
+        `UPDATE omniroute.provider_connections SET rate_limited_until=NULL,test_status='active',
+         backoff_level=0,last_error=NULL,last_error_at=NULL,last_error_type=NULL,last_error_source=NULL,
+         error_code=NULL,updated_at=$1 WHERE id=$2`,
+        [now, row.id]
+      );
+      cleared += result.rowCount ?? 0;
+    }
+    return { cleared };
+  });
+  if (result.cleared > 0)
+    await afterProviderRuntimeWrite("startup_cooldowns", () =>
+      invalidateDbCache("connections", undefined, { skipModelCatalog: true })
+    );
+  return result;
+}

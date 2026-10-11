@@ -1,3 +1,6 @@
+import fsPromises from "node:fs/promises";
+import { parseDatabaseBackend } from "../../../src/lib/db/backendSelection";
+import { getServerLifecyclePhase } from "../../../src/lib/serverLifecycle";
 import { existsSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { Worker } from "node:worker_threads";
@@ -85,6 +88,47 @@ export function resolveWorkerFile(): string {
   return join(process.cwd(), WORKER_JS_REL);
 }
 
+async function fileExistsAsync(filePath: string): Promise<boolean> {
+  try {
+    await fsPromises.access(filePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function firstAncestorWithAsync(
+  anchors: string[],
+  relPath: string
+): Promise<string | null> {
+  for (const anchor of anchors) {
+    if (!anchor) continue;
+    let dir = resolve(anchor);
+    for (let i = 0; i <= MAX_WALK_UP; i++) {
+      if (await fileExistsAsync(join(dir, relPath))) return dir;
+      const parent = dirname(dir);
+      if (parent === dir) break;
+      dir = parent;
+    }
+  }
+  return null;
+}
+
+export async function resolveWorkerFileAsync(): Promise<string> {
+  const anchors = runtimeAnchors();
+  const cwd = process.cwd();
+  const jsRoot = await firstAncestorWithAsync(anchors, WORKER_JS_REL);
+  if (
+    jsRoot &&
+    (!(await fileExistsAsync(join(jsRoot, WORKER_TS_REL))) ||
+      (await fileExistsAsync(join(dirname(join(jsRoot, WORKER_JS_REL)), "package.json"))))
+  ) {
+    return join(jsRoot, WORKER_JS_REL);
+  }
+  const tsRoot = await firstAncestorWithAsync(anchors, WORKER_TS_REL);
+  return tsRoot ? join(tsRoot, WORKER_TS_REL) : join(cwd, WORKER_JS_REL);
+}
+
 function unchanged(body: Record<string, unknown>): CompressionResult {
   return { body, compressed: false, stats: null };
 }
@@ -155,7 +199,12 @@ export class CompressionWorkerPool {
   private readonly timeoutMs: number;
   private readonly idleMs: number;
   private readonly maxOldGenerationSizeMb: number;
-  private readonly spawnWorker: () => Worker;
+  private readonly spawnWorker: () => Worker | Promise<Worker>;
+  private readonly nativeMetadata = parseDatabaseBackend() === "postgres";
+  private spawnPending = false;
+  private pendingSpawn: Promise<void> | undefined;
+  private generation = 0;
+  private closing = false;
   /**
    * Set when spawn() throws synchronously (e.g. Turbopack's moduleContext
    * MODULE_NOT_FOUND in the standalone build). A pool that cannot create a
@@ -177,7 +226,7 @@ export class CompressionWorkerPool {
     idleMs?: number;
     maxOldGenerationSizeMb?: number;
     /** Test seam: replaces `new Worker(resolveWorkerFile(), { resourceLimits })`. */
-    workerFactory?: () => Worker;
+    workerFactory?: () => Worker | Promise<Worker>;
   } = {}) {
     this.size = Math.max(1, Math.floor(size));
     this.timeoutMs = Math.max(1, Math.floor(timeoutMs));
@@ -185,12 +234,17 @@ export class CompressionWorkerPool {
     this.maxOldGenerationSizeMb = Math.max(128, Math.floor(maxOldGenerationSizeMb));
     this.spawnWorker =
       workerFactory ??
-      (() =>
-        new Worker(resolveWorkerFile(), {
-          resourceLimits: {
-            maxOldGenerationSizeMb: this.maxOldGenerationSizeMb,
-          },
-        }));
+      (() => {
+        const options = { resourceLimits: { maxOldGenerationSizeMb: this.maxOldGenerationSizeMb } };
+        if (!this.nativeMetadata) return new Worker(resolveWorkerFile(), options);
+        const generation = this.generation;
+        return resolveWorkerFileAsync().then((workerFile) => {
+          if (this.closing || generation !== this.generation) {
+            throw new Error("Compression worker preparation was cancelled");
+          }
+          return new Worker(workerFile, options);
+        });
+      });
   }
 
   run(
@@ -199,6 +253,7 @@ export class CompressionWorkerPool {
     options?: CompressionWorkerOptions,
     onEngineStep?: (step: StackedCompressionStep) => void
   ): Promise<CompressionResult> {
+    if (this.nativeMetadata && this.closing) return Promise.resolve(unchanged(body));
     if (this.broken) {
       // Without this the pool fails open silently forever after the one startup
       // warn — exactly the invisibility that let issue #2 leak for hours.
@@ -221,17 +276,21 @@ export class CompressionWorkerPool {
     });
   }
   async close(): Promise<void> {
+    if (this.nativeMetadata) this.closing = true;
+    this.generation++;
     for (const job of this.queue.splice(0)) job.resolve(unchanged(job.originalBody));
     for (const slot of this.workers) {
       const job = slot.job;
       if (job) job.resolve(unchanged(job.originalBody));
       slot.job = null;
     }
+    // Metadata preparation cannot publish or construct a native worker after close.
+    await this.pendingSpawn;
     await Promise.all([...this.workers].map((slot) => this.remove(slot)));
   }
-  private spawn(): PoolWorker {
+  private attachWorker(created: Worker): PoolWorker {
     const slot: PoolWorker = {
-      worker: this.spawnWorker(),
+      worker: created,
       job: null,
       timeout: null,
       idle: null,
@@ -240,7 +299,8 @@ export class CompressionWorkerPool {
     slot.worker.on("message", (message: CompressionWorkerMessage) =>
       this.handleMessage(slot, message)
     );
-    slot.worker.on("error", (error) =>
+    slot.worker.on("error", (error) => {
+      if (this.nativeMetadata && !this.workers.has(slot)) return;
       this.fail(
         slot,
         `worker error: ${errorText(error)}`,
@@ -248,46 +308,84 @@ export class CompressionWorkerPool {
         // unsafe to retry on the gateway's main isolate. Fail open instead of
         // recreating the same host-OOM condition in-process.
         !isWorkerOutOfMemory(error)
-      )
-    );
+      );
+    });
     slot.worker.on("exit", (code) => {
       if (this.workers.has(slot)) this.fail(slot, `worker exit code ${code}`);
     });
     return slot;
   }
-  private spawnOrFailOpen(): PoolWorker | null {
-    try {
-      return this.spawn();
-    } catch (error) {
-      // A synchronous spawn failure (bundler module-context miss, bad worker
-      // path, …) must never leave the queue stranded: nothing else would ever
-      // call dispatch() again, so the jobs — and their full request bodies —
-      // would be retained for the lifetime of the process.
-      const structural = isStructuralSpawnFailure(error);
-      // A structural failure is only pool-wide when no worker was ever created.
-      // Existing workers remain usable even if an attempt to add capacity fails.
-      const stranded = this.workers.size === 0;
-      this.broken = structural && stranded;
-      const reason = `worker spawn failed — pool failing open${this.broken ? " permanently" : " for this wave"}: ${errorText(error)}`;
-      notifyCompressionFailOpen(reason);
-      // Only a queue with no worker left to drain it is stranded. While any worker
-      // survives it is busy by construction (dispatch() only spawns once no idle
-      // slot exists), and its finish()/abort() re-enters dispatch() — so failing
-      // the backlog open here would needlessly drop compression for jobs a healthy
-      // worker is about to pick up. A spawn throw is a fast, pre-dispatch fault, so
-      // reject as retryable and let the caller preserve compression in-process.
-      if (stranded) {
-        for (const job of this.queue.splice(0)) {
-          job.reject(new CompressionWorkerError(reason, true));
-        }
+  private handleSpawnFailure(error: unknown): void {
+    // A synchronous spawn failure (bundler module-context miss, bad worker
+    // path, …) must never leave the queue stranded: nothing else would ever
+    // call dispatch() again, so the jobs — and their full request bodies —
+    // would be retained for the lifetime of the process.
+    const structural = isStructuralSpawnFailure(error);
+    // A structural failure is only pool-wide when no worker was ever created.
+    // Existing workers remain usable even if an attempt to add capacity fails.
+    const stranded = this.workers.size === 0;
+    this.broken = structural && stranded;
+    const reason = `worker spawn failed — pool failing open${this.broken ? " permanently" : " for this wave"}: ${errorText(error)}`;
+    notifyCompressionFailOpen(reason);
+    // Only a queue with no worker left to drain it is stranded. While any worker
+    // survives it is busy by construction (dispatch() only spawns once no idle
+    // slot exists), and its finish()/abort() re-enters dispatch() — so failing
+    // the backlog open here would needlessly drop compression for jobs a healthy
+    // worker is about to pick up. A spawn throw is a fast, pre-dispatch fault, so
+    // reject as retryable and let the caller preserve compression in-process.
+    if (stranded) {
+      for (const job of this.queue.splice(0)) {
+        job.reject(new CompressionWorkerError(reason, true));
       }
+    }
+  }
+  private spawnOrFailOpen(): PoolWorker | null {
+    if (this.spawnPending) return null;
+    const generation = this.generation;
+    // Reserve before invoking the factory, including a reentrant test factory.
+    this.spawnPending = true;
+    let created: Worker | Promise<Worker>;
+    try {
+      created = this.spawnWorker();
+    } catch (error) {
+      this.spawnPending = false;
+      this.handleSpawnFailure(error);
       return null;
     }
+    if (!(created instanceof Promise)) {
+      this.spawnPending = false;
+      return this.attachWorker(created);
+    }
+    let succeeded = false;
+    const pending = created
+      .then(async (ready) => {
+        if (generation !== this.generation || this.closing) {
+          await ready.terminate().catch(() => undefined);
+          return;
+        }
+        this.attachWorker(ready);
+        succeeded = true;
+      })
+      .catch((error: unknown) => {
+        if (generation === this.generation && !this.closing) this.handleSpawnFailure(error);
+      });
+    this.pendingSpawn = pending;
+    void pending.finally(() => {
+      if (this.pendingSpawn === pending) {
+        this.pendingSpawn = undefined;
+        this.spawnPending = false;
+      }
+      // A failed spawn does not retry itself: a surviving worker's progress triggers dispatch.
+      if (succeeded && generation === this.generation && !this.closing) this.dispatch();
+    });
+    return null;
   }
   private dispatch(): void {
     while (this.queue.length) {
       let slot = [...this.workers].find((candidate) => !candidate.job);
-      if (!slot && this.workers.size < this.size) slot = this.spawnOrFailOpen() ?? undefined;
+      if (!slot && this.workers.size < this.size && !this.spawnPending) {
+        slot = this.spawnOrFailOpen() ?? undefined;
+      }
       if (!slot) return;
       if (slot.idle) clearTimeout(slot.idle);
       const job = this.queue.shift();
@@ -387,26 +485,43 @@ export class CompressionWorkerPool {
 }
 
 let pool: CompressionWorkerPool | null = null;
-let workerFactoryOverride: (() => Worker) | undefined;
+let workerFactoryOverride: (() => Worker | Promise<Worker>) | undefined;
+const NATIVE_COMPRESSION_POOL = Symbol.for("omniroute.nativeCompressionWorkerPool");
+const compressionGlobals = globalThis as typeof globalThis & {
+  [NATIVE_COMPRESSION_POOL]?: CompressionWorkerPool;
+};
 export function runCompressionInWorker(
   body: Record<string, unknown>,
   mode: CompressionWorkerJob["mode"],
   options?: CompressionWorkerOptions,
   onEngineStep?: (step: StackedCompressionStep) => void
 ): Promise<CompressionResult> {
+  if (parseDatabaseBackend() === "postgres") {
+    if (getServerLifecyclePhase() === "stopping") return Promise.resolve(unchanged(body));
+    const nativePool = (compressionGlobals[NATIVE_COMPRESSION_POOL] ??= new CompressionWorkerPool({
+      workerFactory: workerFactoryOverride,
+    }));
+    return nativePool.run(body, mode, options, onEngineStep);
+  }
   pool ??= new CompressionWorkerPool({ workerFactory: workerFactoryOverride });
   return pool.run(body, mode, options, onEngineStep);
+}
+/** Shutdown does not instantiate a native pool that was never used. */
+export function closeNativeCompressionWorkerPool(): Promise<void> {
+  return compressionGlobals[NATIVE_COMPRESSION_POOL]?.close() ?? Promise.resolve();
 }
 /** Test seam: force the lazily created shared pool to use a factory that throws
  *  synchronously (Turbopack moduleContext MODULE_NOT_FOUND) or serves fake workers. */
 export async function __setCompressionWorkerFactoryForTests(
-  factory: (() => Worker) | null
+  factory: (() => Worker | Promise<Worker>) | null
 ): Promise<void> {
   await closeCompressionWorkerPoolForTests();
   workerFactoryOverride = factory ?? undefined;
 }
 export async function closeCompressionWorkerPoolForTests(): Promise<void> {
+  const nativePool = compressionGlobals[NATIVE_COMPRESSION_POOL];
+  delete compressionGlobals[NATIVE_COMPRESSION_POOL];
   const active = pool;
   pool = null;
-  await active?.close();
+  await Promise.all([active?.close(), nativePool?.close()]);
 }

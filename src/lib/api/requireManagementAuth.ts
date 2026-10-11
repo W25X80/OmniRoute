@@ -3,8 +3,8 @@ import { createErrorResponse } from "@/lib/api/errorResponse";
 import { extractApiKey, isValidApiKey } from "@/sse/services/auth";
 import { getApiKeyMetadata } from "@/lib/db/apiKeys";
 import { isCliTokenAuthValid } from "@/lib/middleware/cliTokenAuth";
-import { evaluateAccessTokenAuth } from "@/server/authz/accessTokenAuth";
-import { isTrustedLoopbackInternalServiceRequest } from "@/lib/api/internalServiceAuth";
+import { evaluateAccessTokenAuthAsync } from "@/server/authz/accessTokenAuth";
+import { isTrustedLoopbackInternalServiceRequestAsync } from "@/lib/api/internalServiceAuth";
 import { AUTHZ_HEADER_AUTH_KIND, AUTHZ_HEADER_AUTH_LABEL } from "@/server/authz/headers";
 import {
   MANAGE_SCOPE,
@@ -64,7 +64,7 @@ export async function requireManagementAuth(
     return null;
   }
 
-  if (isTrustedLoopbackInternalServiceRequest(request)) {
+  if (await isTrustedLoopbackInternalServiceRequestAsync(request)) {
     return null;
   }
 
@@ -88,7 +88,7 @@ export async function requireManagementAuth(
   // and would otherwise be rejected by isValidApiKey. Same shared evaluation the
   // central managementPolicy uses (no drift). Dashboard JWT, the loopback CLI
   // token, and manage-scope API keys remain full-access above/below.
-  const accessVerdict = evaluateAccessTokenAuth(request);
+  const accessVerdict = await evaluateAccessTokenAuthAsync(request);
   switch (accessVerdict.kind) {
     case "ok":
       return null;

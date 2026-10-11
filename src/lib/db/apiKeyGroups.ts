@@ -10,6 +10,13 @@
 import { getDbInstance } from "@/lib/db/core";
 import { randomUUID } from "crypto";
 import { invalidateModelCatalogCache } from "./readCache";
+import { getSelectedControlPlane } from "./controlPlaneContext";
+import {
+  evaluateKeyGroupAccess,
+  hydrateKeyGroup as rowToGroup,
+  hydrateGroupPermission as rowToPermission,
+  hydrateKeyGroupMember as rowToMember,
+} from "./apiKeys/groupSemantics";
 
 // ── Types ────────────────────────────────────────────────────────────────
 
@@ -265,95 +272,111 @@ export function checkKeyModelAccess(
 
   const permissions = rules.map(rowToPermission);
 
-  // Check deny rules first (they take precedence)
-  const denyRules = permissions.filter(
-    (p) =>
-      p.accessType === "deny" &&
-      matchesModelPattern(p.modelPattern, model) &&
-      (!p.provider || p.provider === provider)
-  );
-
-  if (denyRules.length > 0) {
-    return { allowed: false, matchedRules: permissions, deniedBy: denyRules[0] };
-  }
-
-  // Check allow rules
-  const allowRules = permissions.filter(
-    (p) =>
-      p.accessType === "allow" &&
-      matchesModelPattern(p.modelPattern, model) &&
-      (!p.provider || p.provider === provider)
-  );
-
-  if (allowRules.length > 0) {
-    return { allowed: true, matchedRules: permissions, deniedBy: null };
-  }
-
-  // No matching rules = restricted by group membership but no explicit allow
-  return { allowed: false, matchedRules: permissions, deniedBy: null };
+  return evaluateKeyGroupAccess(true, permissions, model, provider);
 }
 
-/**
- * Compile a group model pattern.
- *
- * `*` is the only wildcard this syntax has, so every other regex
- * metacharacter must be escaped before the pattern is compiled. Interpolating
- * it raw made an operator's pattern behave as a regex in two ways:
- *
- *   - `gpt-4.1*` matched `gpt-4o1-preview`, because `.` is "any character".
- *     On a deny rule that blocks unrelated models; on an allow rule it grants
- *     models the pattern was never meant to cover.
- *   - `gpt-4(*`, `claude-3[*` and `*+*` threw `SyntaxError` (unterminated
- *     group / unterminated character class / nothing to repeat) out of
- *     `checkKeyModelAccess()`, which runs on the completion and /v1/models
- *     paths — one malformed pattern broke every request for keys in that
- *     group.
- *
- * Escaping keeps the semantics this function already had (case-sensitive,
- * `*`-only) and matches how the rest of the repo compiles operator patterns
- * (`globToRegex`, `matchesWildcardPattern`).
- */
-function modelPatternToRegex(pattern: string): RegExp {
-  const escaped = pattern.replace(/[.+^${}()|[\]\\?]/g, "\\$&").replace(/\*/g, ".*");
-  return new RegExp(`^${escaped}$`);
+// Async domain facades preserve the synchronous SQLite API for existing embedded callers.
+
+export async function getAllKeyGroupsAsync(
+  ...args: Parameters<typeof getAllKeyGroups>
+): Promise<ReturnType<typeof getAllKeyGroups>> {
+  const selected = getSelectedControlPlane();
+  return selected ? selected.keyGroups.getAllKeyGroups(...args) : getAllKeyGroups(...args);
 }
 
-function matchesModelPattern(pattern: string, model: string): boolean {
-  if (pattern === "*") return true;
-  if (pattern.includes("*")) {
-    return modelPatternToRegex(pattern).test(model);
-  }
-  return pattern === model;
+export async function getKeyGroupAsync(
+  ...args: Parameters<typeof getKeyGroup>
+): Promise<ReturnType<typeof getKeyGroup>> {
+  const selected = getSelectedControlPlane();
+  return selected ? selected.keyGroups.getKeyGroup(...args) : getKeyGroup(...args);
 }
 
-// ── Row Mappers ──────────────────────────────────────────────────────────
-
-function rowToGroup(row: any): KeyGroup {
-  return {
-    id: row.id,
-    name: row.name,
-    description: row.description || "",
-    isActive: row.is_active === 1,
-    createdAt: row.created_at,
-    updatedAt: row.updated_at,
-  };
+export async function getKeyGroupWithPermissionsAsync(
+  ...args: Parameters<typeof getKeyGroupWithPermissions>
+): Promise<ReturnType<typeof getKeyGroupWithPermissions>> {
+  const selected = getSelectedControlPlane();
+  return selected
+    ? selected.keyGroups.getKeyGroupWithPermissions(...args)
+    : getKeyGroupWithPermissions(...args);
 }
 
-function rowToPermission(row: any): GroupModelPermission {
-  return {
-    id: row.id,
-    groupId: row.group_id,
-    modelPattern: row.model_pattern,
-    provider: row.provider || null,
-    accessType: row.access_type,
-    createdAt: row.created_at,
-  };
+export async function createKeyGroupAsync(
+  ...args: Parameters<typeof createKeyGroup>
+): Promise<ReturnType<typeof createKeyGroup>> {
+  const selected = getSelectedControlPlane();
+  return selected ? selected.keyGroups.createKeyGroup(...args) : createKeyGroup(...args);
 }
 
-function rowToMember(row: any): KeyGroupMember {
-  return {
-    keyId: row.key_id,
-    groupId: row.group_id,
-    createdAt: row.created_at,
-  };
+export async function updateKeyGroupAsync(
+  ...args: Parameters<typeof updateKeyGroup>
+): Promise<ReturnType<typeof updateKeyGroup>> {
+  const selected = getSelectedControlPlane();
+  return selected ? selected.keyGroups.updateKeyGroup(...args) : updateKeyGroup(...args);
+}
+
+export async function deleteKeyGroupAsync(
+  ...args: Parameters<typeof deleteKeyGroup>
+): Promise<ReturnType<typeof deleteKeyGroup>> {
+  const selected = getSelectedControlPlane();
+  return selected ? selected.keyGroups.deleteKeyGroup(...args) : deleteKeyGroup(...args);
+}
+
+export async function getGroupPermissionsAsync(
+  ...args: Parameters<typeof getGroupPermissions>
+): Promise<ReturnType<typeof getGroupPermissions>> {
+  const selected = getSelectedControlPlane();
+  return selected ? selected.keyGroups.getGroupPermissions(...args) : getGroupPermissions(...args);
+}
+
+export async function addGroupPermissionAsync(
+  ...args: Parameters<typeof addGroupPermission>
+): Promise<ReturnType<typeof addGroupPermission>> {
+  const selected = getSelectedControlPlane();
+  return selected ? selected.keyGroups.addGroupPermission(...args) : addGroupPermission(...args);
+}
+
+export async function removeGroupPermissionAsync(
+  ...args: Parameters<typeof removeGroupPermission>
+): Promise<ReturnType<typeof removeGroupPermission>> {
+  const selected = getSelectedControlPlane();
+  return selected
+    ? selected.keyGroups.removeGroupPermission(...args)
+    : removeGroupPermission(...args);
+}
+
+export async function getGroupMembersAsync(
+  ...args: Parameters<typeof getGroupMembers>
+): Promise<ReturnType<typeof getGroupMembers>> {
+  const selected = getSelectedControlPlane();
+  return selected ? selected.keyGroups.getGroupMembers(...args) : getGroupMembers(...args);
+}
+
+export async function getKeyGroupsForApiKeyAsync(
+  ...args: Parameters<typeof getKeyGroupsForApiKey>
+): Promise<ReturnType<typeof getKeyGroupsForApiKey>> {
+  const selected = getSelectedControlPlane();
+  return selected
+    ? selected.keyGroups.getKeyGroupsForApiKey(...args)
+    : getKeyGroupsForApiKey(...args);
+}
+
+export async function addKeyToGroupAsync(
+  ...args: Parameters<typeof addKeyToGroup>
+): Promise<ReturnType<typeof addKeyToGroup>> {
+  const selected = getSelectedControlPlane();
+  return selected ? selected.keyGroups.addKeyToGroup(...args) : addKeyToGroup(...args);
+}
+
+export async function removeKeyFromGroupAsync(
+  ...args: Parameters<typeof removeKeyFromGroup>
+): Promise<ReturnType<typeof removeKeyFromGroup>> {
+  const selected = getSelectedControlPlane();
+  return selected ? selected.keyGroups.removeKeyFromGroup(...args) : removeKeyFromGroup(...args);
+}
+
+export async function checkKeyModelAccessAsync(
+  ...args: Parameters<typeof checkKeyModelAccess>
+): Promise<ReturnType<typeof checkKeyModelAccess>> {
+  const selected = getSelectedControlPlane();
+  return selected ? selected.keyGroups.checkKeyModelAccess(...args) : checkKeyModelAccess(...args);
 }

@@ -1,5 +1,5 @@
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
-import { consumeCommandCodeAuthSecret } from "@/lib/db/commandCodeAuth";
+import { consumeCommandCodeAuthSecretAsync } from "@/lib/db/commandCodeAuth";
 import { createProviderConnection, updateProviderConnection } from "@/lib/db/providers";
 import { getCachedProviderConnectionById } from "@/lib/db/readCache";
 import { sanitizeProviderSpecificDataForResponse } from "@/lib/providers/requestDefaults";
@@ -48,7 +48,7 @@ export async function POST(request: Request) {
     }
   }
 
-  const consumed = consumeCommandCodeAuthSecret(stateHashFromState(parsed.data.state));
+  const consumed = await consumeCommandCodeAuthSecretAsync(stateHashFromState(parsed.data.state));
   if (!consumed) {
     return noStoreJson(
       { error: "No received Command Code API key for this state" },
@@ -94,5 +94,8 @@ export async function POST(request: Request) {
     })) as Record<string, unknown> | null;
   }
 
-  return noStoreJson({ connection: safeConnection(connection), status: "applied" });
+  return noStoreJson({
+    connection: safeConnection(connection),
+    status: "applied",
+  });
 }

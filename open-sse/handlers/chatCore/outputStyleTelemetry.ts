@@ -1,3 +1,4 @@
+import { runPersistenceBackgroundWork } from "@/lib/db/persistenceRuntime";
 /**
  * chatCore output-style run-telemetry hook (Quality Gate v2 / Fase 9 — chatCore god-file
  * decomposition, #3501).
@@ -25,12 +26,12 @@ export function emitOutputStyleTelemetry(args: {
   const result = args.outputStyleResult;
   if (!result) return;
 
-  void (async () => {
+  void runPersistenceBackgroundWork(async () => {
     try {
-      const { buildOutputStyleTelemetry } = await import(
-        "../../services/compression/outputStyles/telemetry.ts"
-      );
-      const { insertCompressionRunTelemetryRow } = await import("@/lib/db/compressionRunTelemetry");
+      const { buildOutputStyleTelemetry } =
+        await import("../../services/compression/outputStyles/telemetry.ts");
+      const { insertCompressionRunTelemetryRowAsync } =
+        await import("@/lib/db/compressionRunTelemetry");
       const record = buildOutputStyleTelemetry({
         requestId: args.skillRequestId ?? args.traceId ?? "",
         model: args.effectiveModel ?? "",
@@ -42,12 +43,12 @@ export function emitOutputStyleTelemetry(args: {
         appliedStyles: result.appliedStyles,
         skippedReason: result.skippedReason,
       });
-      insertCompressionRunTelemetryRow(record);
+      await insertCompressionRunTelemetryRowAsync(record);
     } catch (err) {
       args.log?.debug?.(
         "COMPRESSION",
         "Run-telemetry emit skipped: " + (err instanceof Error ? err.message : String(err))
       );
     }
-  })();
+  }).catch(() => {});
 }

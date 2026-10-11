@@ -16,9 +16,12 @@ import { z } from "zod";
 import { buildErrorBody } from "@omniroute/open-sse/utils/error";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 import { CORS_HEADERS, handleCorsOptions } from "@/shared/utils/cors";
-import { getQuotaAnalyticsSummary } from "@/lib/quota/quotaAnalytics";
-import { getActiveQuotaResetItems, resetExpiredQuotaWindows } from "@/lib/quota/quotaResetTimers";
-import { clearProviderQuota } from "@/lib/quota/providerQuotaState";
+import { getQuotaAnalyticsSummaryAsync } from "@/lib/quota/quotaAnalytics";
+import {
+  getActiveQuotaResetItemsAsync,
+  resetExpiredQuotaWindowsAsync,
+} from "@/lib/quota/quotaResetTimers";
+import { clearProviderQuotaAsync } from "@/lib/quota/providerQuotaState";
 
 const QuotaStateActionSchema = z.discriminatedUnion("action", [
   z.object({ action: z.literal("reset_expired") }),
@@ -40,8 +43,8 @@ export async function GET(request: Request) {
   if (authError) return authError;
 
   try {
-    const analytics = getQuotaAnalyticsSummary();
-    const resetTimers = getActiveQuotaResetItems();
+    const analytics = await getQuotaAnalyticsSummaryAsync();
+    const resetTimers = await getActiveQuotaResetItemsAsync();
 
     return NextResponse.json(
       {
@@ -78,7 +81,7 @@ export async function POST(request: Request) {
     const { action } = parsed.data;
 
     if (action === "reset_expired") {
-      const resetCount = resetExpiredQuotaWindows();
+      const resetCount = await resetExpiredQuotaWindowsAsync();
       return NextResponse.json(
         { success: true, resetCount, message: `Reset ${resetCount} expired quota windows.` },
         { headers: CORS_HEADERS }
@@ -87,7 +90,7 @@ export async function POST(request: Request) {
 
     // action === "clear_connection"
     const { connectionId, model } = parsed.data;
-    clearProviderQuota(connectionId);
+    await clearProviderQuotaAsync(connectionId);
     return NextResponse.json(
       { success: true, message: `Cleared quota state for connection ${connectionId} (${model}).` },
       { headers: CORS_HEADERS }

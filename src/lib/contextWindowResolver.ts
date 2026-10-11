@@ -1,10 +1,14 @@
+import { parseDatabaseBackend } from "@/lib/db/backendSelection";
+import { getSelectedPersistenceIdentity } from "@/lib/db/controlPlaneContext";
+import { runPersistenceBackgroundWork } from "@/lib/db/persistenceRuntime";
+import { createPersistencePoller, type PersistencePoller } from "@/lib/config/persistencePoller";
+import { setModelContextOverrideAsync } from "./db/modelContextOverrides";
+import { removeModelContextOverrideAsync } from "./db/modelContextOverrides";
+import { getSelectedPostgresDatabase } from "./db/controlPlaneContext";
+import { isPostgresCatalogMutation, mutatePostgresCatalog } from "./db/postgres/catalogSnapshot";
 import { getAllSyncedAvailableModels } from "./db/models";
 import { getResolvedModelCapabilities } from "./modelCapabilities";
-import {
-  getModelContextOverrideRecord,
-  setModelContextOverride,
-  removeModelContextOverride,
-} from "./db/modelContextOverrides";
+import { getModelContextOverrideRecord } from "./db/modelContextOverrides";
 
 /**
  * Feature 5004 — self-correcting context-window reconciler.
@@ -48,7 +52,12 @@ export function reconcileContextWindows(
   discovered: DiscoveredWindow[],
   deps: ReconcileDeps
 ): ReconcileResult {
-  const result: ReconcileResult = { scanned: 0, written: 0, removed: 0, skippedManual: 0 };
+  const result: ReconcileResult = {
+    scanned: 0,
+    written: 0,
+    removed: 0,
+    skippedManual: 0,
+  };
   for (const { provider, modelId, window } of discovered) {
     result.scanned++;
     if (!provider || !modelId) continue;
@@ -103,24 +112,42 @@ function toDiscoveredWindows(
 
 /** Run the reconcile against the live DB (discovery → overrides). */
 export async function runContextWindowReconcile(): Promise<ReconcileResult> {
+  const database = getSelectedPostgresDatabase();
+  if (database && !isPostgresCatalogMutation(database))
+    return mutatePostgresCatalog(database, runContextWindowReconcile);
   const byProvider = await getAllSyncedAvailableModels();
   const discovered = toDiscoveredWindows(byProvider);
-  return reconcileContextWindows(discovered, {
-    // Compare against the override-free catalog view. A persisted override must
-    // never feed back into the comparison that (re)writes it, or the reconciler
-    // oscillates (write → equal → remove → differ → write ...).
-    getCatalogWindow: (provider, modelId) =>
-      getResolvedModelCapabilities({ provider, model: modelId }, { persistedOverrides: false })
-        .contextWindow,
-    getExistingSource: (provider, modelId) =>
-      getModelContextOverrideRecord(provider, modelId)?.source ?? null,
-    writeAuto: (provider, modelId, window) => {
-      setModelContextOverride(provider, modelId, window, "auto:discovery");
-    },
-    removeOverride: (provider, modelId) => {
-      removeModelContextOverride(provider, modelId);
-    },
-  });
+  const total: ReconcileResult = {
+    scanned: 0,
+    written: 0,
+    removed: 0,
+    skippedManual: 0,
+  };
+  for (const entry of discovered) {
+    const actions: Array<() => Promise<unknown>> = [];
+    const current = reconcileContextWindows([entry], {
+      getCatalogWindow: (provider, modelId) =>
+        getResolvedModelCapabilities({ provider, model: modelId }, { persistedOverrides: false })
+          .contextWindow,
+      getExistingSource: (provider, modelId) =>
+        getModelContextOverrideRecord(provider, modelId)?.source ?? null,
+      writeAuto: (provider, modelId, window) => {
+        actions.push(
+          async () =>
+            await setModelContextOverrideAsync(provider, modelId, window, "auto:discovery")
+        );
+      },
+      removeOverride: (provider, modelId) => {
+        actions.push(async () => await removeModelContextOverrideAsync(provider, modelId));
+      },
+    });
+    for (const action of actions) await action();
+    total.scanned += current.scanned;
+    total.written += current.written;
+    total.removed += current.removed;
+    total.skippedManual += current.skippedManual;
+  }
+  return total;
 }
 
 // --- Periodic job (mirrors modelsDevSync.startPeriodicSync) ---
@@ -141,15 +168,62 @@ function resolveIntervalMs(): number {
  * `CONTEXT_WINDOW_RECONCILE_INTERVAL=0`. Best-effort: failures are swallowed (the
  * static catalog remains the source of truth).
  */
+interface NativeSchedulerOwner {
+  readonly identity: object;
+  readonly poller: PersistencePoller;
+  stopping?: Promise<void>;
+}
+const NATIVE_SCHEDULER = Symbol.for("omniroute.contextWindowReconcile.postgresScheduler");
+const nativeGlobals = globalThis as typeof globalThis & {
+  [NATIVE_SCHEDULER]?: NativeSchedulerOwner;
+};
+
+function stopNativePoller(): Promise<void> {
+  const owner = nativeGlobals[NATIVE_SCHEDULER];
+  if (!owner) return Promise.resolve();
+
+  owner.stopping ??= owner.poller.stop().finally(() => {
+    if (nativeGlobals[NATIVE_SCHEDULER] === owner) nativeGlobals[NATIVE_SCHEDULER] = undefined;
+  });
+  return owner.stopping;
+}
+
 export function startContextWindowReconcile(intervalMs?: number): void {
+  if (parseDatabaseBackend() === "postgres") {
+    const identity = getSelectedPersistenceIdentity();
+    if (!identity) throw new Error("Native scheduler requires selected PostgreSQL persistence");
+    const existing = nativeGlobals[NATIVE_SCHEDULER];
+    if (existing) {
+      if (existing.identity !== identity || existing.stopping)
+        throw new Error("Native scheduler authority changed or is draining");
+      return;
+    }
+    const interval = intervalMs ?? resolveIntervalMs();
+    if (!interval || interval <= 0) return;
+    const poller = createPersistencePoller({
+      intervalMs: interval,
+      initialDelayMs: 0,
+      check: async () => {
+        await runPersistenceBackgroundWork(async () => {
+          if (getSelectedPersistenceIdentity() !== identity)
+            throw new Error("Native scheduler persistence identity changed");
+          await runContextWindowReconcile();
+        });
+      },
+      onFailure: () => {},
+    });
+    nativeGlobals[NATIVE_SCHEDULER] = { identity, poller };
+    poller.start();
+    return;
+  }
   if (reconcileTimer) return;
   const interval = intervalMs ?? resolveIntervalMs();
   if (!interval || interval <= 0) return;
 
-  const tick = () => {
-    void runContextWindowReconcile().catch(() => {
+  const tick = async () => {
+    void (await runContextWindowReconcile().catch(() => {
       // Swallow — reconcile is advisory; the catalog still resolves windows.
-    });
+    }));
   };
 
   // Initial non-blocking pass, then on the interval.
@@ -159,8 +233,18 @@ export function startContextWindowReconcile(intervalMs?: number): void {
 }
 
 export function stopContextWindowReconcile(): void {
+  if (parseDatabaseBackend() === "postgres") {
+    void stopNativePoller().catch(() => {});
+    return;
+  }
   if (reconcileTimer) {
     clearInterval(reconcileTimer);
     reconcileTimer = null;
   }
+}
+
+/** Stop admission and wait for every accepted native tick. */
+export async function stopContextWindowReconcileAsync(): Promise<void> {
+  if (parseDatabaseBackend() !== "postgres") return stopContextWindowReconcile();
+  await stopNativePoller();
 }

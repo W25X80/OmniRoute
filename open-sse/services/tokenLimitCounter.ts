@@ -21,6 +21,8 @@ import {
   logTokenLimitReset,
   type TokenLimit,
 } from "@/lib/db/tokenLimits";
+import { getSelectedPostgresDatabase } from "@/lib/db/controlPlaneContext";
+import { PostgresTokenLimitRepository } from "@/lib/db/postgres/tokenLimitRepository";
 
 interface CacheEntry {
   windowStart: string;
@@ -272,7 +274,11 @@ export function recordTokenUsage(
       if (!limits || limits.length === 0) return;
 
       const db = getDbInstance();
-      const applied: Array<{ limitId: string; windowStart: string; total: number }> = [];
+      const applied: Array<{
+        limitId: string;
+        windowStart: string;
+        total: number;
+      }> = [];
 
       const tx = db.transaction(() => {
         for (const limit of limits) {
@@ -338,4 +344,114 @@ export function recordTokenUsage(
     .catch(() => {
       // Microtask scheduling/setup failure — non-fatal, never blocks the stream.
     });
+}
+
+export async function seedWindowUsageFromHistoryAsync(
+  limit: TokenLimit,
+  now = Date.now()
+): Promise<number> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? new PostgresTokenLimitRepository(database).seedFromHistory(limit, now)
+    : seedWindowUsageFromHistory(limit, now);
+}
+
+export async function getCurrentWindowUsageAsync(
+  limit: TokenLimit,
+  now = Date.now(),
+  forceFresh = false
+): Promise<number> {
+  const database = getSelectedPostgresDatabase();
+  // PostgreSQL never consumes the process-local SQLite counter cache.
+  return database
+    ? new PostgresTokenLimitRepository(database).currentUsage(limit, now)
+    : getCurrentWindowUsage(limit, now, forceFresh);
+}
+
+export async function addWindowTokensAsync(
+  limit: TokenLimit,
+  tokens: number,
+  now = Date.now()
+): Promise<number> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? new PostgresTokenLimitRepository(database).increment(
+        limit.id,
+        resetWindowIfElapsed(limit, now).windowStart,
+        tokens
+      )
+    : addWindowTokens(limit, tokens, now);
+}
+
+export async function checkTokenLimitsAsync(
+  apiKeyId: string,
+  provider = "",
+  model = "",
+  now = Date.now()
+): Promise<TokenLimitBreach | null> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return checkTokenLimits(apiKeyId, provider, model, now);
+  if (!apiKeyId) return null;
+  const owner = new PostgresTokenLimitRepository(database);
+  let worst: TokenLimitBreach | null = null;
+  for (const { limit, tokensUsed } of await owner.readRequestUsage(
+    apiKeyId,
+    provider,
+    model,
+    now
+  )) {
+    if (!Number.isFinite(limit.tokenLimit) || limit.tokenLimit <= 0) continue;
+    if (tokensUsed < limit.tokenLimit) continue;
+    const { windowStart, nextResetAt } = resetWindowIfElapsed(limit, now);
+    const breach: TokenLimitBreach = {
+      limitId: limit.id,
+      scopeType: limit.scopeType,
+      scopeValue: limit.scopeValue,
+      limitValue: limit.tokenLimit,
+      tokensUsed,
+      remaining: Math.max(0, limit.tokenLimit - tokensUsed),
+      windowStart,
+      nextResetAt,
+    };
+    if (
+      !worst ||
+      breach.remaining < worst.remaining ||
+      (breach.remaining === worst.remaining && breach.limitValue < worst.limitValue)
+    )
+      worst = breach;
+  }
+  return worst;
+}
+
+/** Best-effort post-response accounting retains the upstream non-fatal contract. */
+export async function recordTokenUsageAsync(
+  apiKeyId: string,
+  provider: string,
+  model: string,
+  tokens: number,
+  usageHistoryId?: number,
+  nowMs?: number
+): Promise<void> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) {
+    recordTokenUsage(apiKeyId, provider, model, tokens);
+    return;
+  }
+  if (
+    nowMs !== undefined &&
+    (!Number.isSafeInteger(nowMs) || nowMs < 0 || nowMs > 8_640_000_000_000_000)
+  )
+    throw new RangeError("Invalid native token completion time");
+  try {
+    await new PostgresTokenLimitRepository(database).recordUsage(
+      apiKeyId,
+      provider,
+      model,
+      tokens,
+      nowMs === undefined ? Date.now() : nowMs,
+      usageHistoryId
+    );
+  } catch (error) {
+    console.error("[TokenLimits] Failed to persist token usage", error);
+  }
 }

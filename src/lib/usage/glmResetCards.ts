@@ -1,8 +1,8 @@
 import { randomBytes } from "node:crypto";
 
 import {
-  acquireExclusiveConnectionLease,
-  releaseExclusiveConnectionLease,
+  acquireExclusiveConnectionLeaseAsync,
+  releaseExclusiveConnectionLeaseAsync,
 } from "@/lib/db/exclusiveConnectionLeases";
 import { getProviderConnectionById } from "@/lib/db/providers";
 import { resolveProxyForConnection } from "@/lib/db/settings";
@@ -83,7 +83,7 @@ async function withOperationLease<T>(
   operation: () => Promise<T>
 ): Promise<T> {
   const leaseOwnerId = OPERATION_LEASE_OWNER_PREFIX + randomBytes(32).toString("base64url");
-  const acquired = acquireExclusiveConnectionLease({
+  const acquired = await acquireExclusiveConnectionLeaseAsync({
     leaseOwnerId,
     apiKeyId: OPERATION_LEASE_API_KEY_ID,
     provider: connection.provider,
@@ -100,7 +100,7 @@ async function withOperationLease<T>(
   try {
     return await operation();
   } finally {
-    releaseExclusiveConnectionLease({
+    await releaseExclusiveConnectionLeaseAsync({
       leaseOwnerId,
       generation: acquired.lease.generation,
       apiKeyId: OPERATION_LEASE_API_KEY_ID,

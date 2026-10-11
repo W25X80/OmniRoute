@@ -14,7 +14,7 @@ import { NextResponse } from "next/server";
 import { CORS_HEADERS, handleCorsOptions } from "@/shared/utils/cors";
 import { isFeatureFlagEnabled } from "@/shared/utils/featureFlags";
 import { isAuthenticated } from "@/shared/utils/apiAuth";
-import { getRadarCatalog } from "@/lib/radar";
+import { getRadarCatalogAsync } from "@/lib/radar";
 import { buildErrorBody } from "@omniroute/open-sse/utils/error";
 
 export const dynamic = "force-dynamic";
@@ -41,7 +41,7 @@ export async function GET(request: Request) {
   }
 
   try {
-    const result = getRadarCatalog();
+    const result = await getRadarCatalogAsync();
     return NextResponse.json(
       { entries: result.entries, meta: result.meta },
       { headers: { ...CORS_HEADERS, "Cache-Control": "no-store" } }

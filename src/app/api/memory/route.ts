@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
-import { listMemories, createMemory, getMemoryTokensUsed } from "@/lib/memory/store";
+import { getMemoryTokensUsedAsync } from "@/lib/memory/store";
 import { memoryManager } from "@/lib/memory";
 import { memoryCache } from "@/lib/memory/cache";
 import { MemoryType } from "@/lib/memory/types";
@@ -54,7 +54,7 @@ export async function GET(request: Request) {
 
     // Total tokens across all memories (computed in SQL inside the domain module
     // to avoid loading every memory's content into process memory).
-    const tokensUsed = getMemoryTokensUsed(apiKeyId);
+    const tokensUsed = await getMemoryTokensUsedAsync(apiKeyId);
 
     // Compute hit rate from memory cache
     const cacheStats = memoryCache.stats();

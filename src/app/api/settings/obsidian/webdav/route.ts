@@ -17,7 +17,9 @@ const enableSchema = z
 
 export async function GET(request: NextRequest) {
   if (!(await isAuthenticated(request))) {
-    return NextResponse.json(buildErrorBody(401, "Authentication required"), { status: 401 });
+    return NextResponse.json(buildErrorBody(401, "Authentication required"), {
+      status: 401,
+    });
   }
 
   try {
@@ -32,8 +34,7 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({
       webdavEnabled: status.webdavEnabled,
       webdavUsername: status.webdavEnabled ? status.webdavUsername : null,
-      webdavPassword:
-        status.webdavEnabled && hasManagement ? status.webdavPassword : null,
+      webdavPassword: status.webdavEnabled && hasManagement ? status.webdavPassword : null,
       webdavPasswordSet: status.webdavEnabled && Boolean(status.webdavPassword),
       vaultPath: status.vaultPath,
     });
@@ -45,27 +46,30 @@ export async function GET(request: NextRequest) {
 
 export async function POST(request: NextRequest) {
   if (!(await isAuthenticated(request))) {
-    return NextResponse.json(buildErrorBody(401, "Authentication required"), { status: 401 });
+    return NextResponse.json(buildErrorBody(401, "Authentication required"), {
+      status: 401,
+    });
   }
 
   let rawBody: unknown;
   try {
     rawBody = await request.json();
   } catch {
-    return NextResponse.json(buildErrorBody(400, "Invalid JSON body"), { status: 400 });
+    return NextResponse.json(buildErrorBody(400, "Invalid JSON body"), {
+      status: 400,
+    });
   }
 
   const parsed = enableSchema.safeParse(rawBody);
   if (!parsed.success) {
-    return NextResponse.json(
-      buildErrorBody(400, "Missing or invalid vaultPath"),
-      { status: 400 }
-    );
+    return NextResponse.json(buildErrorBody(400, "Missing or invalid vaultPath"), { status: 400 });
   }
 
   const result = await enableObsidianVaultSync(parsed.data.vaultPath);
   if (!result.success) {
-    return NextResponse.json(buildErrorBody(400, result.error), { status: 400 });
+    return NextResponse.json(buildErrorBody(400, result.error), {
+      status: 400,
+    });
   }
 
   return NextResponse.json({
@@ -77,7 +81,9 @@ export async function POST(request: NextRequest) {
 
 export async function DELETE(request: NextRequest) {
   if (!(await isAuthenticated(request))) {
-    return NextResponse.json(buildErrorBody(401, "Authentication required"), { status: 401 });
+    return NextResponse.json(buildErrorBody(401, "Authentication required"), {
+      status: 401,
+    });
   }
 
   const result = await disableObsidianVaultSync();

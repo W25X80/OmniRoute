@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 import { isAuthenticated } from "@/shared/utils/apiAuth";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
-import { setAccountKeyLimit, getAccountKeyLimit } from "@/lib/db/registeredKeys";
+import { setAccountKeyLimitAsync, getAccountKeyLimitAsync } from "@/lib/db/registeredKeys";
 
 const limitsSchema = z.object({
   maxActiveKeys: z.number().int().positive().nullable().optional(),
@@ -20,7 +20,7 @@ export async function GET(request: Request, { params }: { params: Promise<{ id: 
   }
 
   const resolvedParams = await params;
-  const limits = getAccountKeyLimit(resolvedParams.id);
+  const limits = await getAccountKeyLimitAsync(resolvedParams.id);
   return NextResponse.json({ accountId: resolvedParams.id, limits: limits ?? null });
 }
 
@@ -46,7 +46,7 @@ export async function PUT(request: Request, { params }: { params: Promise<{ id: 
   }
 
   const resolvedParams = await params;
-  setAccountKeyLimit(resolvedParams.id, validation.data);
-  const updated = getAccountKeyLimit(resolvedParams.id);
+  await setAccountKeyLimitAsync(resolvedParams.id, validation.data);
+  const updated = await getAccountKeyLimitAsync(resolvedParams.id);
   return NextResponse.json({ accountId: resolvedParams.id, limits: updated });
 }

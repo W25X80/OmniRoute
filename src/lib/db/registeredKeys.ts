@@ -1,3 +1,5 @@
+export { RegisteredKeyQuotaError } from "./registeredKeys/errors";
+import { getSelectedPostgresDatabase } from "./controlPlaneContext";
 /**
  * db/registeredKeys.ts — Registered Keys Provisioning (#464)
  *
@@ -532,4 +534,131 @@ interface AccountKeyLimitRow {
   last_reset_day: string;
   last_reset_hour: string;
   updated_at: string;
+}
+
+export async function checkQuotaAsync(
+  ...args: Parameters<typeof checkQuota>
+): Promise<ReturnType<typeof checkQuota>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceRegisteredKeys");
+    return postgres.transaction((transaction) => native.checkQuota(transaction, ...args));
+  }
+  return checkQuota(...args);
+}
+
+export async function issueRegisteredKeyAsync(
+  ...args: Parameters<typeof issueRegisteredKey>
+): Promise<ReturnType<typeof issueRegisteredKey>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceRegisteredKeys");
+    return postgres.transaction((transaction) => native.issueRegisteredKey(transaction, ...args));
+  }
+  const quota = checkQuota(args[0].provider ?? "", args[0].accountId ?? "");
+  if (!quota.allowed) throw new RegisteredKeyQuotaError(quota);
+  return issueRegisteredKey(...args);
+}
+
+export async function getRegisteredKeyAsync(
+  ...args: Parameters<typeof getRegisteredKey>
+): Promise<ReturnType<typeof getRegisteredKey>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceRegisteredKeys");
+    return postgres.transaction((transaction) => native.getRegisteredKey(transaction, ...args));
+  }
+  return getRegisteredKey(...args);
+}
+
+export async function listRegisteredKeysAsync(
+  ...args: Parameters<typeof listRegisteredKeys>
+): Promise<ReturnType<typeof listRegisteredKeys>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceRegisteredKeys");
+    return postgres.transaction((transaction) => native.listRegisteredKeys(transaction, ...args));
+  }
+  return listRegisteredKeys(...args);
+}
+
+export async function revokeRegisteredKeyAsync(
+  ...args: Parameters<typeof revokeRegisteredKey>
+): Promise<ReturnType<typeof revokeRegisteredKey>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceRegisteredKeys");
+    return postgres.transaction((transaction) => native.revokeRegisteredKey(transaction, ...args));
+  }
+  return revokeRegisteredKey(...args);
+}
+
+export async function validateRegisteredKeyAsync(
+  ...args: Parameters<typeof validateRegisteredKey>
+): Promise<ReturnType<typeof validateRegisteredKey>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceRegisteredKeys");
+    return postgres.transaction((transaction) =>
+      native.validateRegisteredKey(transaction, ...args)
+    );
+  }
+  return validateRegisteredKey(...args);
+}
+
+export async function incrementRegisteredKeyUsageAsync(
+  ...args: Parameters<typeof incrementRegisteredKeyUsage>
+): Promise<ReturnType<typeof incrementRegisteredKeyUsage>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceRegisteredKeys");
+    return postgres.transaction((transaction) =>
+      native.incrementRegisteredKeyUsage(transaction, ...args)
+    );
+  }
+  return incrementRegisteredKeyUsage(...args);
+}
+
+export async function setProviderKeyLimitAsync(
+  ...args: Parameters<typeof setProviderKeyLimit>
+): Promise<ReturnType<typeof setProviderKeyLimit>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceRegisteredKeys");
+    return postgres.transaction((transaction) => native.setProviderKeyLimit(transaction, ...args));
+  }
+  return setProviderKeyLimit(...args);
+}
+
+export async function setAccountKeyLimitAsync(
+  ...args: Parameters<typeof setAccountKeyLimit>
+): Promise<ReturnType<typeof setAccountKeyLimit>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceRegisteredKeys");
+    return postgres.transaction((transaction) => native.setAccountKeyLimit(transaction, ...args));
+  }
+  return setAccountKeyLimit(...args);
+}
+
+export async function getProviderKeyLimitAsync(
+  ...args: Parameters<typeof getProviderKeyLimit>
+): Promise<ReturnType<typeof getProviderKeyLimit>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceRegisteredKeys");
+    return postgres.transaction((transaction) => native.getProviderKeyLimit(transaction, ...args));
+  }
+  return getProviderKeyLimit(...args);
+}
+
+export async function getAccountKeyLimitAsync(
+  ...args: Parameters<typeof getAccountKeyLimit>
+): Promise<ReturnType<typeof getAccountKeyLimit>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceRegisteredKeys");
+    return postgres.transaction((transaction) => native.getAccountKeyLimit(transaction, ...args));
+  }
+  return getAccountKeyLimit(...args);
 }

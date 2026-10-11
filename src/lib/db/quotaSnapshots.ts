@@ -5,6 +5,7 @@ import {
   liftCodexScopeCooldownOnHeadroom,
 } from "./providers/codexAccountState";
 import { isCodexSparkQuotaKey } from "@omniroute/open-sse/config/codexQuotaScopes";
+import { getSelectedPostgresDatabase, getSelectedPersistenceIdentity } from "./controlPlaneContext";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -274,4 +275,207 @@ export function cleanupOldSnapshots(retentionDays = 90): number {
     }
     throw err;
   }
+}
+
+function nativeSnapshot(row: Record<string, unknown>): QuotaSnapshotRow {
+  // Match the public facade's historical rowToCamel output, including bigint conversion.
+  const values = {
+    ...row,
+    id: Number(row.id),
+    is_exhausted: Number(row.is_exhausted),
+    remaining_percentage:
+      row.remaining_percentage === null ? null : Number(row.remaining_percentage),
+    window_duration_ms: row.window_duration_ms === null ? null : Number(row.window_duration_ms),
+  };
+  return rowToCamel(values) as unknown as QuotaSnapshotRow;
+}
+
+export async function saveQuotaSnapshotAsync(
+  snapshot: Omit<QuotaSnapshotRow, "id" | "created_at">
+): Promise<void> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return saveQuotaSnapshot(snapshot);
+  await database.transaction(async (tx) => {
+    await tx.query(
+      `INSERT INTO omniroute.quota_snapshots
+    (provider,connection_id,window_key,remaining_percentage,is_exhausted,next_reset_at,window_duration_ms,raw_data,created_at)
+    VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+      [
+        snapshot.provider,
+        snapshot.connection_id,
+        snapshot.window_key,
+        snapshot.remaining_percentage,
+        snapshot.is_exhausted,
+        snapshot.next_reset_at,
+        snapshot.window_duration_ms,
+        snapshot.raw_data,
+        new Date().toISOString(),
+      ]
+    );
+  });
+  await maybeLiftCodexCooldownOnHeadroomAsync(snapshot);
+}
+
+async function maybeLiftCodexCooldownOnHeadroomAsync(
+  snapshot: Omit<QuotaSnapshotRow, "id" | "created_at">
+): Promise<void> {
+  if (
+    snapshot.provider?.toLowerCase() !== "codex" ||
+    !snapshot.connection_id ||
+    (snapshot.remaining_percentage ?? 0) <= 0 ||
+    snapshot.is_exhausted === 1
+  )
+    return;
+  try {
+    const scope = isCodexSparkQuotaKey(snapshot.window_key) ? "spark" : "codex";
+    const codex = await import("./providers/codexAccountState");
+    if (!(await codex.hasCodexScopeCooldownAsync(snapshot.connection_id, scope))) return;
+    const windows = (
+      await getLatestQuotaSnapshotsForConnectionAsync(snapshot.connection_id)
+    ).filter((s: SnapshotShape) => {
+      const key = s.windowKey ?? s.window_key;
+      return scope === "spark" ? isCodexSparkQuotaKey(key) : !isCodexSparkQuotaKey(key);
+    });
+    if (windows.length && windows.every(snapshotHasHeadroom))
+      await codex.liftCodexScopeCooldownOnHeadroomAsync(snapshot.connection_id, scope);
+  } catch (error) {
+    console.debug("[QuotaSnapshots] Headroom evaluation skipped:", error);
+  }
+}
+
+export async function getQuotaSnapshotsAsync(
+  opts: Parameters<typeof getQuotaSnapshots>[0]
+): Promise<QuotaSnapshotRow[]> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return getQuotaSnapshots(opts);
+  const params: unknown[] = [opts.since],
+    where = ["created_at >= $1"];
+  if (opts.provider) {
+    params.push(opts.provider);
+    where.push(`provider=$${params.length}`);
+  }
+  if (opts.connectionId) {
+    params.push(opts.connectionId);
+    where.push(`connection_id=$${params.length}`);
+  }
+  if (opts.until) {
+    params.push(opts.until);
+    where.push(`created_at <= $${params.length}`);
+  }
+  return database.transaction(async (tx) =>
+    (
+      await tx.query(
+        `SELECT * FROM omniroute.quota_snapshots WHERE ${where.join(" AND ")}
+    ORDER BY created_at ASC,id ASC`,
+        params
+      )
+    ).rows.map(nativeSnapshot)
+  );
+}
+
+export async function getLatestQuotaSnapshotsForConnectionAsync(
+  id: string
+): Promise<QuotaSnapshotRow[]> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return getLatestQuotaSnapshotsForConnection(id);
+  return database.transaction(async (tx) =>
+    (
+      await tx.query(
+        `SELECT * FROM (
+    SELECT *,ROW_NUMBER() OVER(PARTITION BY window_key ORDER BY created_at DESC,id DESC) AS rn
+    FROM omniroute.quota_snapshots WHERE connection_id=$1) snapshots WHERE rn=1`,
+        [id]
+      )
+    ).rows.map(nativeSnapshot)
+  );
+}
+
+export async function getAggregatedSnapshotsAsync(
+  opts: Parameters<typeof getAggregatedSnapshots>[0]
+): Promise<ProviderUtilizationPoint[]> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return getAggregatedSnapshots(opts);
+  const seconds = Number(opts.bucketMinutes) * 60;
+  if (!Number.isFinite(seconds) || seconds <= 0) throw new Error("Invalid bucket size");
+  const params: unknown[] = [seconds, opts.since],
+    where = ["created_at >= $2"];
+  if (opts.provider) {
+    params.push(opts.provider);
+    where.push(`provider=$${params.length}`);
+  }
+  if (opts.until) {
+    params.push(opts.until);
+    where.push(`created_at <= $${params.length}`);
+  }
+  const connection = opts.aggregateBy === "connection";
+  return database.transaction(async (tx) => {
+    const rows = (
+      await tx.query(
+        `SELECT to_char(to_timestamp(FLOOR(EXTRACT(EPOCH FROM created_at::timestamptz)/$1)*$1)
+      AT TIME ZONE 'UTC','YYYY-MM-DD HH24:MI:SS') AS bucket,
+      ${connection ? "provider || ':' || connection_id" : "provider"} AS provider,
+      AVG(remaining_percentage) AS remaining_pct,MAX(is_exhausted) AS exhausted,window_key
+      FROM omniroute.quota_snapshots WHERE ${where.join(" AND ")}
+      GROUP BY bucket,${connection ? "provider,connection_id" : "provider"},window_key ORDER BY bucket ASC`,
+        params
+      )
+    ).rows;
+    return rows.map((r) => ({
+      timestamp: String(r.bucket),
+      provider: String(r.provider),
+      remainingPct: Number(r.remaining_pct ?? 0),
+      isExhausted: Number(r.exhausted) === 1,
+      windowKey: String(r.window_key),
+    }));
+  });
+}
+
+const nativeSnapshotCleanup = new WeakMap<object, { last: number; running?: Promise<number> }>();
+export async function cleanupOldSnapshotsAsync(retentionDays = 90): Promise<number> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return cleanupOldSnapshots(retentionDays);
+  const identity = getSelectedPersistenceIdentity()!;
+  let state = nativeSnapshotCleanup.get(identity);
+  if (!state) {
+    state = { last: 0 };
+    nativeSnapshotCleanup.set(identity, state);
+  }
+  const now = Date.now();
+  if (now - state.last < 6 * 60 * 60 * 1000) return 0;
+  if (state.running) return state.running;
+  const current = state;
+  const cutoff = new Date(now - retentionDays * 86_400_000).toISOString();
+  current.running = database
+    .transaction(
+      async (tx) =>
+        (await tx.query("DELETE FROM omniroute.quota_snapshots WHERE created_at < $1", [cutoff]))
+          .rowCount || 0
+    )
+    .then((count) => {
+      current.last = now;
+      return count;
+    })
+    .finally(() => {
+      current.running = undefined;
+    });
+  return current.running;
+}
+
+export async function getAllLatestQuotaSnapshotsAsync(): Promise<QuotaSnapshotRow[]> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) {
+    const rows = getDbInstance()
+      .prepare(
+        `SELECT * FROM(SELECT *,ROW_NUMBER() OVER(PARTITION BY connection_id,window_key ORDER BY created_at DESC,id DESC) rn FROM quota_snapshots) WHERE rn=1`
+      )
+      .all();
+    return rows.map((row) => rowToCamel(row) as unknown as QuotaSnapshotRow);
+  }
+  return database.transaction(async (tx) =>
+    (
+      await tx.query(`SELECT * FROM(SELECT *,ROW_NUMBER() OVER(
+    PARTITION BY connection_id,window_key ORDER BY created_at DESC,id DESC) AS rn FROM omniroute.quota_snapshots)
+    snapshots WHERE rn=1`)
+    ).rows.map(nativeSnapshot)
+  );
 }

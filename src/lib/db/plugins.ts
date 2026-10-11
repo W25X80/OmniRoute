@@ -1,3 +1,5 @@
+import { getSelectedPostgresDatabase } from "./controlPlaneContext";
+import { createPostgresAgentMetadataRepository } from "./postgres/agentMetadataRepository";
 /**
  * Plugin DB module — CRUD operations for the plugins table.
  *
@@ -303,4 +305,118 @@ export function getPluginAnalyticsSummary(pluginName: string): PluginAnalyticsSu
     failureCount: row?.failures ?? 0,
     avgDurationMs: row?.avg_duration ?? 0,
   };
+}
+
+export async function insertPluginAsync(
+  ...args: Parameters<typeof insertPlugin>
+): Promise<Awaited<ReturnType<typeof insertPlugin>>> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return insertPlugin(...args);
+  const result = await createPostgresAgentMetadataRepository(database).insertPlugin(...args);
+  log.info("plugin.inserted", { id: args[0].id, name: args[0].name });
+  return result;
+}
+
+export async function getPluginByIdAsync(
+  ...args: Parameters<typeof getPluginById>
+): Promise<Awaited<ReturnType<typeof getPluginById>>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresAgentMetadataRepository(database).getPluginById(...args)
+    : getPluginById(...args);
+}
+
+export async function getPluginByNameAsync(
+  ...args: Parameters<typeof getPluginByName>
+): Promise<Awaited<ReturnType<typeof getPluginByName>>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresAgentMetadataRepository(database).getPluginByName(...args)
+    : getPluginByName(...args);
+}
+
+export async function listPluginsAsync(
+  ...args: Parameters<typeof listPlugins>
+): Promise<Awaited<ReturnType<typeof listPlugins>>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresAgentMetadataRepository(database).listPlugins(...args)
+    : listPlugins(...args);
+}
+
+export async function updatePluginStatusAsync(
+  ...args: Parameters<typeof updatePluginStatus>
+): Promise<Awaited<ReturnType<typeof updatePluginStatus>>> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return updatePluginStatus(...args);
+  const result = await createPostgresAgentMetadataRepository(database).updatePluginStatus(...args);
+  if (result) log.info("plugin.status_updated", { name: args[0], status: args[1] });
+  return result;
+}
+
+export async function updatePluginManifestAsync(
+  ...args: Parameters<typeof updatePluginManifest>
+): Promise<Awaited<ReturnType<typeof updatePluginManifest>>> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return updatePluginManifest(...args);
+  const result = await createPostgresAgentMetadataRepository(database).updatePluginManifest(
+    ...args
+  );
+  if (result) log.info("plugin.manifest_updated", { name: args[0] });
+  return result;
+}
+
+export async function updatePluginConfigAsync(
+  ...args: Parameters<typeof updatePluginConfig>
+): Promise<Awaited<ReturnType<typeof updatePluginConfig>>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresAgentMetadataRepository(database).updatePluginConfig(...args)
+    : updatePluginConfig(...args);
+}
+
+export async function deletePluginAsync(
+  ...args: Parameters<typeof deletePlugin>
+): Promise<Awaited<ReturnType<typeof deletePlugin>>> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return deletePlugin(...args);
+  const result = await createPostgresAgentMetadataRepository(database).deletePlugin(...args);
+  if (result) log.info("plugin.deleted", { name: args[0] });
+  return result;
+}
+
+export async function pluginExistsAsync(
+  ...args: Parameters<typeof pluginExists>
+): Promise<Awaited<ReturnType<typeof pluginExists>>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresAgentMetadataRepository(database).pluginExists(...args)
+    : pluginExists(...args);
+}
+
+export async function recordPluginExecutionAsync(
+  ...args: Parameters<typeof recordPluginExecution>
+): Promise<Awaited<ReturnType<typeof recordPluginExecution>>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresAgentMetadataRepository(database).recordPluginExecution(...args)
+    : recordPluginExecution(...args);
+}
+
+export async function getPluginAnalyticsAsync(
+  ...args: Parameters<typeof getPluginAnalytics>
+): Promise<Awaited<ReturnType<typeof getPluginAnalytics>>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresAgentMetadataRepository(database).getPluginAnalytics(...args)
+    : getPluginAnalytics(...args);
+}
+
+export async function getPluginAnalyticsSummaryAsync(
+  ...args: Parameters<typeof getPluginAnalyticsSummary>
+): Promise<Awaited<ReturnType<typeof getPluginAnalyticsSummary>>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresAgentMetadataRepository(database).getPluginAnalyticsSummary(...args)
+    : getPluginAnalyticsSummary(...args);
 }

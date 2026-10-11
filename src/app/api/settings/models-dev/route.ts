@@ -8,7 +8,7 @@ import {
   getSyncedCapabilities,
   getSyncStatus,
   startPeriodicSync,
-  stopPeriodicSync,
+  stopPeriodicSyncAsync,
 } from "@/lib/modelsDevSync";
 
 const modelsDevActionSchema = z.object({
@@ -84,7 +84,7 @@ export async function POST(request: NextRequest) {
   }
 
   if (action === "stop") {
-    stopPeriodicSync();
+    await stopPeriodicSyncAsync();
     return NextResponse.json({ success: true, message: "Periodic sync stopped" });
   }
 

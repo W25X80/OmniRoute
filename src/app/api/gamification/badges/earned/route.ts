@@ -7,7 +7,10 @@
 import { NextRequest, NextResponse } from "next/server";
 
 import { CORS_HEADERS, handleCorsOptions } from "@/shared/utils/cors";
-import { getBadges, getAllEarnedBadges } from "@/lib/db/gamification";
+import {
+  getBadgesAsync as getBadges,
+  getAllEarnedBadgesAsync as getAllEarnedBadges,
+} from "@/lib/db/gamification";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 
 export async function OPTIONS() {
@@ -19,6 +22,6 @@ export async function GET(request: NextRequest) {
   if (authError) return authError;
 
   const apiKeyId = new URL(request.url).searchParams.get("apiKeyId");
-  const badges = apiKeyId ? getBadges(apiKeyId) : getAllEarnedBadges();
+  const badges = apiKeyId ? await getBadges(apiKeyId) : await getAllEarnedBadges();
   return NextResponse.json({ badges }, { headers: CORS_HEADERS });
 }

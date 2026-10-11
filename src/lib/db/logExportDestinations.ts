@@ -1,3 +1,4 @@
+import { getSelectedPostgresDatabase } from "./controlPlaneContext";
 /**
  * Log-export destination persistence (migration 170).
  *
@@ -203,4 +204,122 @@ export function recordLogExportRun(
         SET last_run_at = @now, last_status = @status, last_error = @error, updated_at = @now
       WHERE id = @id`
   ).run({ id, status, error, now: new Date().toISOString() });
+}
+
+export async function getLogExportDestinationsAsync(
+  ...args: Parameters<typeof getLogExportDestinations>
+): Promise<ReturnType<typeof getLogExportDestinations>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceOperations");
+    return postgres.transaction((transaction) =>
+      native.getLogExportDestinations(transaction, ...args)
+    );
+  }
+  return getLogExportDestinations(...args);
+}
+
+export async function getEnabledLogExportDestinationsAsync(
+  ...args: Parameters<typeof getEnabledLogExportDestinations>
+): Promise<ReturnType<typeof getEnabledLogExportDestinations>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceOperations");
+    return postgres.transaction((transaction) =>
+      native.getEnabledLogExportDestinations(transaction, ...args)
+    );
+  }
+  return getEnabledLogExportDestinations(...args);
+}
+
+export async function getLogExportDestinationAsync(
+  ...args: Parameters<typeof getLogExportDestination>
+): Promise<ReturnType<typeof getLogExportDestination>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceOperations");
+    return postgres.transaction((transaction) =>
+      native.getLogExportDestination(transaction, ...args)
+    );
+  }
+  return getLogExportDestination(...args);
+}
+
+export async function createLogExportDestinationAsync(
+  ...args: Parameters<typeof createLogExportDestination>
+): Promise<ReturnType<typeof createLogExportDestination>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceOperations");
+    return postgres.transaction((transaction) =>
+      native.createLogExportDestination(transaction, ...args)
+    );
+  }
+  return createLogExportDestination(...args);
+}
+
+export async function updateLogExportDestinationAsync(
+  ...args: Parameters<typeof updateLogExportDestination>
+): Promise<ReturnType<typeof updateLogExportDestination>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceOperations");
+    return postgres.transaction((transaction) =>
+      native.updateLogExportDestination(transaction, ...args)
+    );
+  }
+  return updateLogExportDestination(...args);
+}
+
+export async function deleteLogExportDestinationAsync(
+  ...args: Parameters<typeof deleteLogExportDestination>
+): Promise<ReturnType<typeof deleteLogExportDestination>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceOperations");
+    return postgres.transaction((transaction) =>
+      native.deleteLogExportDestination(transaction, ...args)
+    );
+  }
+  return deleteLogExportDestination(...args);
+}
+
+export async function advanceLogExportCursorAsync(
+  ...args: Parameters<typeof advanceLogExportCursor>
+): Promise<ReturnType<typeof advanceLogExportCursor>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceOperations");
+    return postgres.transaction((transaction) =>
+      native.advanceLogExportCursor(transaction, ...args)
+    );
+  }
+  return advanceLogExportCursor(...args);
+}
+
+export async function resetLogExportCursorAsync(
+  ...args: Parameters<typeof resetLogExportCursor>
+): Promise<ReturnType<typeof resetLogExportCursor>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceOperations");
+    return postgres.transaction((transaction) => native.resetLogExportCursor(transaction, ...args));
+  }
+  return resetLogExportCursor(...args);
+}
+
+export async function recordLogExportRunAsync(
+  ...args: Parameters<typeof recordLogExportRun>
+): Promise<ReturnType<typeof recordLogExportRun>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceOperations");
+    return postgres.transaction((transaction) => native.recordLogExportRun(transaction, ...args));
+  }
+  return recordLogExportRun(...args);
+}
+
+/** PostgreSQL export identities are not reused by retention deletes. */
+export function needsLogExportCursorReconciliation(): boolean {
+  return getSelectedPostgresDatabase() === undefined;
 }

@@ -21,7 +21,7 @@ import {
 } from "../../../src/shared/utils/circuitBreaker";
 import { connectionCircuitBreakerName } from "../connectionCircuitBreaker.ts";
 import { parseModel } from "../model.ts";
-import { canAffordRequest } from "../../../src/lib/quota/quotaScheduler.ts";
+import { canAffordRequestAsync as canAffordRequest } from "../../../src/lib/quota/quotaScheduler.ts";
 import { getCachedProviderConnectionById } from "../../../src/lib/db/readCache.ts";
 import { evaluateCliproxyPreflightGate } from "../../../src/lib/services/cliproxyManagementPreflight.ts";
 import { lookupPositiveCap } from "./concurrencyCaps.ts";
@@ -322,7 +322,7 @@ export async function evaluateExecuteTargetGates(opts: {
 
   // Lift-as-is: combo.ts reads the env flag inline, not via AttemptLoopDeps.
   if (process.env.OMNIROUTE_QUOTA_AWARE_ROUTING === "1" && provider && target.connectionId) {
-    const quotaDecision = canAffordRequest(
+    const quotaDecision = await canAffordRequest(
       target.connectionId,
       modelStr,
       deps.body as Record<string, unknown> | null | undefined

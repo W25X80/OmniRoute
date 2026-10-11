@@ -22,10 +22,28 @@ function databaseOptions(readonly = false) {
 const getOmpDir = () => path.join(os.homedir(), ".omp", "agent");
 const getOmpDbPath = () => path.join(getOmpDir(), "agent.db");
 
-export function getOmpCredentials(providerId: string) {
+/** OMP owns this native host artifact. It is never an application persistence fallback. */
+export interface OmpHostStorageCapability {
+  kind: "native-host-sqlite";
+  databasePath: string;
+  driverAvailable: boolean;
+}
+export function getOmpHostStorageCapability(): OmpHostStorageCapability {
+  return {
+    kind: "native-host-sqlite",
+    databasePath: getOmpDbPath(),
+    driverAvailable: getDatabaseClass() !== null,
+  };
+}
+
+export function getOmpCredentials(
+  providerId: string,
+  capability: OmpHostStorageCapability = getOmpHostStorageCapability()
+) {
   const Database = getDatabaseClass();
-  if (!Database) return { hasOmniRoute: false, baseUrl: null, apiKey: null };
-  const dbPath = getOmpDbPath();
+  if (!Database || !capability.driverAvailable)
+    return { hasOmniRoute: false, baseUrl: null, apiKey: null };
+  const dbPath = capability.databasePath;
   try {
     const db = new Database(dbPath, databaseOptions(true));
     const row = db
@@ -37,7 +55,11 @@ export function getOmpCredentials(providerId: string) {
 
     if (row?.data) {
       const parsed = JSON.parse(row.data);
-      return { hasOmniRoute: true, baseUrl: parsed.baseUrl || null, apiKey: parsed.apiKey || null };
+      return {
+        hasOmniRoute: true,
+        baseUrl: parsed.baseUrl || null,
+        apiKey: parsed.apiKey || null,
+      };
     }
     return { hasOmniRoute: false, baseUrl: null, apiKey: null };
   } catch {
@@ -45,10 +67,15 @@ export function getOmpCredentials(providerId: string) {
   }
 }
 
-export function saveOmpCredentials(providerId: string, apiKey: string, baseUrl: string) {
+export function saveOmpCredentials(
+  providerId: string,
+  apiKey: string,
+  baseUrl: string,
+  capability: OmpHostStorageCapability = getOmpHostStorageCapability()
+) {
   const Database = getDatabaseClass();
-  if (!Database) return;
-  const dbPath = getOmpDbPath();
+  if (!Database || !capability.driverAvailable) return;
+  const dbPath = capability.databasePath;
   const db = new Database(dbPath, databaseOptions());
 
   db.prepare("DELETE FROM auth_credentials WHERE provider = ?").run(providerId);
@@ -65,10 +92,13 @@ export function saveOmpCredentials(providerId: string, apiKey: string, baseUrl: 
   db.close();
 }
 
-export function deleteOmpCredentials(providerId: string) {
+export function deleteOmpCredentials(
+  providerId: string,
+  capability: OmpHostStorageCapability = getOmpHostStorageCapability()
+) {
   const Database = getDatabaseClass();
-  if (!Database) return;
-  const dbPath = getOmpDbPath();
+  if (!Database || !capability.driverAvailable) return;
+  const dbPath = capability.databasePath;
   const db = new Database(dbPath, databaseOptions());
   db.prepare("DELETE FROM auth_credentials WHERE provider = ?").run(providerId);
   db.close();

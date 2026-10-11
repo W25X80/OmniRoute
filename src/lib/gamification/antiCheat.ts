@@ -1,10 +1,13 @@
+import {
+  getHighXpKeysAsync,
+  getXpDistributionAsync,
+  getRecentXpAsync,
+} from "../db/gamificationRuntime";
 /**
  * Anti-cheat system — server-side validation and anomaly detection.
  *
  * @module lib/gamification/antiCheat
  */
-
-import { getDbInstance } from "../db/core";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -17,22 +20,6 @@ interface AnomalyFlag {
   apiKeyId: string;
   xpLastHour: number;
   zScore: number;
-}
-
-// ─── Statement / DB helpers (match gamification.ts pattern) ──────────────────
-
-interface StatementLike<TRow = unknown> {
-  all: (...params: unknown[]) => TRow[];
-  get: (...params: unknown[]) => TRow | undefined;
-  run: (...params: unknown[]) => { changes: number };
-}
-
-interface DbLike {
-  prepare: <TRow = unknown>(sql: string) => StatementLike<TRow>;
-}
-
-function db(): DbLike {
-  return getDbInstance() as unknown as DbLike;
 }
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -73,24 +60,13 @@ export async function validateScoreChange(
  * Get flagged anomalies for admin review.
  */
 export async function getAnomalies(): Promise<AnomalyFlag[]> {
-  const d = db();
-
-  const rows = d
-    .prepare(
-      `SELECT api_key_id, SUM(xp_earned) AS hourly_total
-       FROM xp_audit_log
-       WHERE created_at > datetime('now', '-1 hour')
-       GROUP BY api_key_id
-       HAVING hourly_total > 1000`
-    )
-    .all() as Array<{ api_key_id: string; hourly_total: number }>;
-
+  const rows = await getHighXpKeysAsync();
   const results: AnomalyFlag[] = [];
-  for (const r of rows) {
-    const z = await computeZScore(r.api_key_id);
+  for (const row of rows) {
+    const z = await computeZScore(row.api_key_id);
     results.push({
-      apiKeyId: r.api_key_id,
-      xpLastHour: r.hourly_total,
+      apiKeyId: row.api_key_id,
+      xpLastHour: row.hourly_total,
       zScore: z ?? 0,
     });
   }
@@ -104,55 +80,16 @@ export async function getAnomalies(): Promise<AnomalyFlag[]> {
  * Returns null if insufficient data.
  */
 async function computeZScore(apiKeyId: string): Promise<number | null> {
-  const d = db();
-
-  const userRow = d
-    .prepare(
-      `SELECT COALESCE(SUM(xp_earned), 0) AS total
-       FROM xp_audit_log
-       WHERE api_key_id = ? AND created_at > datetime('now', '-1 hour')`
-    )
-    .get(apiKeyId) as { total: number };
-
-  const statsRow = d
-    .prepare(
-      `SELECT AVG(hourly_total) AS mean,
-              CASE WHEN AVG(hourly_total) = 0 THEN 1
-                   ELSE AVG(hourly_total * hourly_total) - AVG(hourly_total) * AVG(hourly_total)
-              END AS variance
-       FROM (
-         SELECT api_key_id, SUM(xp_earned) AS hourly_total
-         FROM xp_audit_log
-         WHERE created_at > datetime('now', '-1 hour')
-         GROUP BY api_key_id
-       )`
-    )
-    .get() as { mean: number; variance: number } | undefined;
-
-  if (!statsRow || statsRow.variance <= 0) return null;
-
-  const stdDev = Math.sqrt(statsRow.variance);
-  return (userRow.total - statsRow.mean) / stdDev;
+  const stats = await getXpDistributionAsync(apiKeyId);
+  if (stats.mean === null || stats.variance === null || stats.variance <= 0) return null;
+  return (stats.total - stats.mean) / Math.sqrt(stats.variance);
 }
 
 /**
  * Get total XP earned in the last N milliseconds.
  */
 async function getRecentXp(apiKeyId: string, windowMs: number): Promise<number> {
-  const d = db();
-  // xp_audit_log.created_at is written by the table default datetime('now') as
-  // "YYYY-MM-DD HH:MM:SS", and TEXT compares are lexical. Computing the window start in
-  // SQLite keeps both sides in the same format (an ISO "T…Z" string from JS never matched
-  // same-day rows, so the window read as empty).
-  const windowStart = `-${Math.ceil(windowMs / 1000)} seconds`;
-
-  const row = d
-    .prepare(
-      "SELECT COALESCE(SUM(xp_earned), 0) AS total FROM xp_audit_log WHERE api_key_id = ? AND created_at > datetime('now', ?)"
-    )
-    .get(apiKeyId, windowStart) as { total: number };
-
-  return row.total;
+  return getRecentXpAsync(apiKeyId, windowMs);
 }
 
 /**

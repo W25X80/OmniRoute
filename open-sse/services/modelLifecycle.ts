@@ -12,6 +12,9 @@
  * is the same retired vendor id as `gpt-5.2-codex`.
  */
 import { readFileSync } from "node:fs";
+import fsPromises from "node:fs/promises";
+import { parseDatabaseBackend } from "../../src/lib/db/backendSelection";
+import { getServerLifecyclePhase } from "../../src/lib/serverLifecycle";
 
 export const OPENAI_MODEL_DEPRECATIONS_URL = "https://developers.openai.com/api/docs/deprecations";
 
@@ -148,11 +151,61 @@ type VendorRetiredEntry = {
 let _retiredIds: Set<string> | null = null;
 let _retiredEntries: Map<string, VendorRetiredEntry> | null = null;
 
+type RetiredSnapshot = { ids: Set<string>; entries: Map<string, VendorRetiredEntry> };
+const NATIVE_RETIRED_SNAPSHOT = Symbol.for("omniroute.nativeModelLifecycleSnapshot");
+interface NativeRetiredSnapshotState {
+  value?: RetiredSnapshot;
+  preparation?: Promise<void>;
+}
+const retiredSnapshotGlobals = globalThis as typeof globalThis & {
+  [NATIVE_RETIRED_SNAPSHOT]?: NativeRetiredSnapshotState;
+};
+function nativeRetiredSnapshotState(): NativeRetiredSnapshotState {
+  return (retiredSnapshotGlobals[NATIVE_RETIRED_SNAPSHOT] ??= {});
+}
+
+export function prepareNativeModelLifecycleSnapshot(): Promise<void> {
+  if (parseDatabaseBackend() !== "postgres") return Promise.resolve();
+  const state = nativeRetiredSnapshotState();
+  if (state.value) return Promise.resolve();
+  state.preparation ??= Promise.resolve().then(async () => {
+    const ids = new Set<string>();
+    const entries = new Map<string, VendorRetiredEntry>();
+    try {
+      const parsed = JSON.parse(await fsPromises.readFile(SNAPSHOT_URL, "utf8")) as {
+        retired?: Record<string, VendorRetiredEntry>;
+      };
+      for (const [id, entry] of Object.entries(parsed.retired ?? {})) {
+        if (entry?.status !== "retired") continue;
+        const key = id.toLowerCase();
+        ids.add(key);
+        entries.set(key, entry);
+      }
+    } catch {
+      // Match the legacy neutral missing/corrupt snapshot result.
+    }
+    state.value = { ids, entries };
+  });
+  return state.preparation;
+}
+
 function loadVendorRetiredSnapshot(): {
   ids: Set<string>;
   entries: Map<string, VendorRetiredEntry>;
 } {
-  if (_retiredIds && _retiredEntries) return { ids: _retiredIds, entries: _retiredEntries };
+  if (parseDatabaseBackend() === "postgres") {
+    const state = nativeRetiredSnapshotState();
+    if (state.value) return state.value;
+    if (state.preparation || getServerLifecyclePhase() === "ready") {
+      throw new Error("Native model lifecycle snapshot is not prepared");
+    }
+    // A bootstrap-only synchronous getter may initialize before the async barrier.
+  }
+  if (_retiredIds && _retiredEntries) {
+    const value = { ids: _retiredIds, entries: _retiredEntries };
+    if (parseDatabaseBackend() === "postgres") nativeRetiredSnapshotState().value = value;
+    return value;
+  }
   const ids = new Set<string>();
   const entries = new Map<string, VendorRetiredEntry>();
   try {
@@ -170,7 +223,9 @@ function loadVendorRetiredSnapshot(): {
   }
   _retiredIds = ids;
   _retiredEntries = entries;
-  return { ids, entries };
+  const value = { ids, entries };
+  if (parseDatabaseBackend() === "postgres") nativeRetiredSnapshotState().value = value;
+  return value;
 }
 
 /** True when `modelId` or its last `vendor/` path segment is `status: "retired"` in the snapshot. */
@@ -218,9 +273,7 @@ export function getModelLifecycleDecision(
         status: "shutdown",
         action: "reject",
         shutdownAt: typeof entry?.retiredOn === "string" ? entry.retiredOn : null,
-        replacement: replacementId
-          ? { provider: entry?.vendor ?? "", model: replacementId }
-          : null,
+        replacement: replacementId ? { provider: entry?.vendor ?? "", model: replacementId } : null,
         source: SNAPSHOT_SOURCE,
       };
     }
@@ -256,7 +309,9 @@ export function formatModelLifecycleMessage(decision: ModelLifecycleDecision): s
     ? ` Use "${decision.replacement.provider}/${decision.replacement.model}" instead.`
     : "";
   if (decision.status === "shutdown") {
-    const when = decision.shutdownAt ? ` was shut down on ${decision.shutdownAt}` : " has been retired by its vendor";
+    const when = decision.shutdownAt
+      ? ` was shut down on ${decision.shutdownAt}`
+      : " has been retired by its vendor";
     return `Model "${modelRef}"${when} and cannot be routed automatically.${replacement}`;
   }
   return `Model "${modelRef}" is deprecated and is scheduled to shut down on ${decision.shutdownAt}.${replacement}`;

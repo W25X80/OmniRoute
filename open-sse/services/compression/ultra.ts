@@ -4,7 +4,7 @@ import { DEFAULT_ULTRA_CONFIG } from "./types.ts";
 import type { UltraConfig, CompressionStats, CompressionMode } from "./types.ts";
 import { extractTextContent, mapTextContent, type ChatMessageLike } from "./messageContent.ts";
 import {
-  slmAvailable,
+  slmAvailableAsync,
   runLlmlinguaUltra,
   prewarmLlmlinguaUltra,
 } from "./engines/llmlingua/ultraEntry.ts";
@@ -126,7 +126,10 @@ async function slmOrHeuristic(prose: string, cfg: UltraConfig): Promise<ProseSlm
     });
     return { text, usedSlm: true };
   } catch {
-    return { text: pruneByScore(prose, cfg.compressionRate, cfg.minScoreThreshold), usedSlm: false };
+    return {
+      text: pruneByScore(prose, cfg.compressionRate, cfg.minScoreThreshold),
+      usedSlm: false,
+    };
   }
 }
 
@@ -222,7 +225,7 @@ export async function ultraCompress(
   messages: Message[],
   config: Partial<UltraConfig> & { ultraEngine?: "heuristic" | "slm" } = {}
 ): Promise<UltraCompressResult> {
-  if (config.ultraEngine !== "slm" || !slmAvailable()) {
+  if (config.ultraEngine !== "slm" || !(await slmAvailableAsync())) {
     return ultraCompressHeuristic(messages, config, "heuristic");
   }
 

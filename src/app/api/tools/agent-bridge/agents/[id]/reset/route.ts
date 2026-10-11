@@ -20,8 +20,14 @@
  */
 import { AgentBridgeResetBodySchema } from "@/shared/schemas/agentBridge";
 import { checkDNSEntryForAgent, flushWindowsDnsCache, removeDNSEntry } from "@/mitm/dns/dnsConfig";
-import { getAllAgentBridgeStates, upsertAgentBridgeState } from "@/lib/db/agentBridgeState";
-import { setMappings, syncAgentBridgeMappingsToMitmAlias } from "@/lib/db/agentBridgeMappings";
+import {
+  getAllAgentBridgeStatesAsync,
+  upsertAgentBridgeStateAsync,
+} from "@/lib/db/agentBridgeState";
+import {
+  setMappingsAsync,
+  syncAgentBridgeMappingsToMitmAliasAsync,
+} from "@/lib/db/agentBridgeMappings";
 import { getCachedPassword, setCachedPassword } from "@/mitm/manager";
 import {
   isMitmSudoPasswordRequired,
@@ -70,10 +76,10 @@ export async function POST(request: Request, { params }: Params): Promise<Respon
     await removeDNSEntry(sudoPassword, id);
     flushWindowsDnsCache();
 
-    setMappings(id, []);
-    syncAgentBridgeMappingsToMitmAlias(id);
+    await setMappingsAsync(id, []);
+    await syncAgentBridgeMappingsToMitmAliasAsync(id);
 
-    upsertAgentBridgeState({ agent_id: id, dns_enabled: false, setup_completed: false });
+    await upsertAgentBridgeStateAsync({ agent_id: id, dns_enabled: false, setup_completed: false });
 
     const suppliedPassword = normalizeMitmSudoPasswordInput(parsed.data.sudoPassword);
     if (process.platform !== "win32" && suppliedPassword) {
@@ -81,7 +87,7 @@ export async function POST(request: Request, { params }: Params): Promise<Respon
     }
 
     const verified = !checkDNSEntryForAgent(id);
-    const otherAgentsStillActive = getAllAgentBridgeStates().some(
+    const otherAgentsStillActive = (await getAllAgentBridgeStatesAsync()).some(
       (s) => s.agent_id !== id && s.dns_enabled
     );
 

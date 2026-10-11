@@ -1,3 +1,9 @@
+import {
+  getBadgeDetailsAsync,
+  getActionCountAsync,
+  awardXpOncePerDayAsync,
+  synchronizeLevelAsync,
+} from "../db/gamificationRuntime";
 /**
  * Gamification event emitter — called from chat pipeline.
  *
@@ -5,7 +11,8 @@
  */
 
 import { logger } from "../../../open-sse/utils/logger.ts";
-import { calculateLevel, XP_REWARDS } from "./xp";
+import { runPersistenceBackgroundWork } from "../db/persistenceRuntime";
+import { XP_REWARDS } from "./xp";
 
 const log = logger("GAMIFICATION");
 
@@ -16,7 +23,7 @@ const log = logger("GAMIFICATION");
  * This function is fire-and-forget — never blocks the request pipeline.
  * All errors are caught and logged, never thrown.
  */
-export async function emitGamificationEvent(params: {
+async function applyGamificationEvent(params: {
   apiKeyId: string;
   action:
     | "request"
@@ -51,12 +58,17 @@ export async function emitGamificationEvent(params: {
       const { validateScoreChange } = await import("./antiCheat");
       const verdict = await validateScoreChange(apiKeyId, action, xpAmount);
       if (!verdict.allowed) {
-        log.warn("events.award_rejected", { apiKeyId, action, xpAmount, reason: verdict.reason });
+        log.warn("events.award_rejected", {
+          apiKeyId,
+          action,
+          xpAmount,
+          reason: verdict.reason,
+        });
         return;
       }
 
-      const { addXp } = await import("../db/gamification");
-      addXp(apiKeyId, action, xpAmount, metadata ? JSON.stringify(metadata) : undefined);
+      const { addXpAsync: addXp } = await import("../db/gamification");
+      await addXp(apiKeyId, action, xpAmount, metadata ? JSON.stringify(metadata) : undefined);
 
       await syncLevel(apiKeyId);
     }
@@ -114,14 +126,8 @@ export async function emitGamificationEvent(params: {
  * Runs after every award so bonus XP (streaks, badges) also counts toward level-ups.
  */
 async function syncLevel(apiKeyId: string): Promise<void> {
-  const { getXp, updateLevel } = await import("../db/gamification");
-  const xp = getXp(apiKeyId);
-  if (!xp) return;
-  const newLevel = calculateLevel(xp.totalXp);
-  if (newLevel !== xp.currentLevel) {
-    updateLevel(apiKeyId, newLevel);
-    log.info("events.level_up", { apiKeyId, oldLevel: xp.currentLevel, newLevel });
-  }
+  const changed = await synchronizeLevelAsync(apiKeyId);
+  if (changed) log.info("events.level_up", { apiKeyId, ...changed });
 }
 
 /**
@@ -133,10 +139,11 @@ async function awardBonusXp(
   apiKeyId: string,
   action: "streak_bonus" | "badge_unlock",
   amount: number,
-  metadata: Record<string, unknown>
+  metadata: Record<string, unknown>,
+  persisted = false
 ): Promise<void> {
-  const { addXp } = await import("../db/gamification");
-  addXp(apiKeyId, action, amount, JSON.stringify(metadata));
+  const { addXpAsync: addXp } = await import("../db/gamification");
+  if (!persisted) await addXp(apiKeyId, action, amount, JSON.stringify(metadata));
   await syncLevel(apiKeyId);
 
   const { updateScore } = await import("./leaderboard");
@@ -152,9 +159,11 @@ async function awardBonusXp(
  * boundary cannot both pay.
  */
 async function awardStreakBonus(apiKeyId: string, streak: number): Promise<void> {
-  const { hasXpActionToday } = await import("../db/gamification");
-  if (hasXpActionToday(apiKeyId, "streak_bonus")) return;
-  await awardBonusXp(apiKeyId, "streak_bonus", XP_REWARDS.streak_bonus * streak, { streak });
+  const amount = XP_REWARDS.streak_bonus * streak;
+  const metadata = { streak };
+  if (!(await awardXpOncePerDayAsync(apiKeyId, "streak_bonus", amount, JSON.stringify(metadata))))
+    return;
+  await awardBonusXp(apiKeyId, "streak_bonus", amount, metadata, true);
 }
 
 /**
@@ -185,25 +194,25 @@ async function checkAndUnlockBadge(
   badgeId: string,
   rewardable = true
 ): Promise<void> {
-  const { unlockBadge, hasBadge } = await import("../db/gamification");
+  const { unlockBadgeAsync: unlockBadge, hasBadgeAsync: hasBadge } =
+    await import("../db/gamification");
   // #3472: dedup via user_badges directly. getBadges() INNER-JOINs badge_definitions, which is
   // empty until seeded, so it falsely reported "not earned" and re-emitted the unlock event on
   // every request.
-  if (!hasBadge(apiKeyId, badgeId)) {
+  if (!(await hasBadge(apiKeyId, badgeId))) {
     // unlockBadge is INSERT OR IGNORE on the (api_key_id, badge_id) primary key; only the call
     // that actually inserts the row pays, so concurrent unlocks cannot double-pay.
-    const inserted = unlockBadge(apiKeyId, badgeId);
+    const inserted = await unlockBadge(apiKeyId, badgeId);
+    if (!inserted) return;
     log.info("events.badge_unlocked", rewardable ? { apiKeyId, badgeId } : { badgeId });
     if (inserted && rewardable) {
-      await awardBonusXp(apiKeyId, "badge_unlock", XP_REWARDS.badge_unlock, { badgeId });
+      await awardBonusXp(apiKeyId, "badge_unlock", XP_REWARDS.badge_unlock, {
+        badgeId,
+      });
     }
 
     // Look up badge details from badge_definitions
-    const { getDbInstance } = await import("../db/core");
-    const badgeRow = getDbInstance()
-      .prepare("SELECT name, description, icon, rarity FROM badge_definitions WHERE id = ?")
-      .get(badgeId) as
-      { name: string; description: string | null; icon: string | null; rarity: string } | undefined;
+    const badgeRow = await getBadgeDetailsAsync(badgeId);
 
     // Record notification for SSE toast
     const { recordBadgeUnlock } = await import("./notifications");
@@ -222,21 +231,7 @@ async function checkAndUnlockBadge(
  * Check action count badges after an action.
  */
 async function checkActionCountBadges(apiKeyId: string, action: string): Promise<void> {
-  const { getDbInstance } = await import("../db/core");
-  const db = getDbInstance();
-
-  // Read the durable per-key/per-action counter (#12546), the same source
-  // getActionCount() (badges.ts) reads. Counting xp_audit_log directly here
-  // undercounted every "lifetime" milestone once the retention prune
-  // (cleanupXpAuditLog, default 30 days) aged the rows out. The counter is
-  // maintained in addXp() alongside the audit insert and survives the prune.
-  const row = db
-    .prepare(
-      "SELECT COALESCE(count, 0) AS count FROM xp_action_counts WHERE api_key_id = ? AND action = ?"
-    )
-    .get(apiKeyId, action) as { count: number } | undefined;
-
-  const count = row?.count ?? 0;
+  const count = await getActionCountAsync(apiKeyId, action);
 
   // Badge thresholds
   const thresholds: Record<string, Array<{ id: string; threshold: number }>> = {
@@ -261,5 +256,21 @@ async function checkActionCountBadges(apiKeyId: string, action: string): Promise
     if (count >= badge.threshold) {
       await checkAndUnlockBadge(apiKeyId, badge.id);
     }
+  }
+}
+
+/** Capture a fresh durable scope at enqueue time; the chat caller may discard this promise. */
+export async function emitGamificationEvent(
+  params: Parameters<typeof applyGamificationEvent>[0]
+): Promise<void> {
+  if (!params.apiKeyId) return;
+  try {
+    await runPersistenceBackgroundWork(() => applyGamificationEvent(params));
+  } catch (error) {
+    log.error("events.error", {
+      ...(params.action === "radar_supporter" ? {} : { apiKeyId: params.apiKeyId }),
+      action: params.action,
+      error: error instanceof Error ? error.message : String(error),
+    });
   }
 }

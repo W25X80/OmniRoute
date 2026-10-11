@@ -1,3 +1,4 @@
+import { getSelectedUsageReadRepository } from "../db/postgres/usageReadRepository";
 import { hasSelfAccountQuotaScope, hasSelfUsageScope } from "@/shared/constants/selfServiceScopes";
 import { supportsProviderQuota } from "@/shared/utils/providerQuotaVisibility";
 
@@ -31,7 +32,7 @@ interface CostSummaryLike {
   warningThreshold: number | null;
 }
 
-type GetCostSummaryFn = (apiKeyId: string) => CostSummaryLike;
+type GetCostSummaryFn = (apiKeyId: string) => CostSummaryLike | Promise<CostSummaryLike>;
 type CheckBudgetFn = (apiKeyId: string) => unknown;
 type GetDbInstanceFn = () => DbLike;
 type GetProviderConnectionByIdFn = (connectionId: string) => Promise<unknown>;
@@ -211,7 +212,7 @@ function normalizePlan(value: unknown): unknown {
 
 function isSupportedProvider(
   provider: string,
-  connection?: { provider?: string; providerSpecificData?: unknown },
+  connection?: { provider?: string; providerSpecificData?: unknown }
 ): boolean {
   return supportsProviderQuota(provider, connection);
 }
@@ -375,8 +376,8 @@ async function normalizeDeps(deps: ApiKeySelfServiceDeps): Promise<RequiredDeps>
 
   return {
     now: deps.now ?? Date.now,
-    getCostSummary: deps.getCostSummary ?? costRules!.getCostSummary,
-    checkBudget: deps.checkBudget ?? costRules!.checkBudget,
+    getCostSummary: deps.getCostSummary ?? costRules!.getCostSummaryAsync,
+    checkBudget: deps.checkBudget ?? costRules!.checkBudgetAsync,
     getDbInstance: deps.getDbInstance ?? dbCore!.getDbInstance,
     getProviderConnectionById: deps.getProviderConnectionById ?? localDb!.getProviderConnectionById,
     getProviderConnections: deps.getProviderConnections ?? localDb!.getProviderConnections,
@@ -394,16 +395,33 @@ export async function buildApiKeySelfServiceStatus(
   }
 
   const resolvedDeps = await normalizeDeps(deps);
-  const summary = resolvedDeps.getCostSummary(metadata.id);
-  resolvedDeps.checkBudget(metadata.id);
+  const summary = await resolvedDeps.getCostSummary(metadata.id);
+  await resolvedDeps.checkBudget(metadata.id);
 
   const cost = buildCostStatus(summary, resolvedDeps.now());
-  const tokens = aggregateTokens(
-    resolvedDeps.getDbInstance() as DbLike,
-    metadata.id,
+  const periodStartAt =
     cost.periodStartAt ??
-      new Date(getCurrentMonthWindow(resolvedDeps.now()).periodStartAt).toISOString()
-  );
+    new Date(getCurrentMonthWindow(resolvedDeps.now()).periodStartAt).toISOString();
+  const postgres = getSelectedUsageReadRepository();
+  const totals =
+    postgres && !deps.getDbInstance
+      ? await postgres.keyTokenTotals(metadata.id, periodStartAt)
+      : null;
+  const tokens = totals
+    ? {
+        inputTokens: toNumber(totals.inputTokens),
+        outputTokens: toNumber(totals.outputTokens),
+        cacheReadTokens: toNumber(totals.cacheReadTokens),
+        cacheCreationTokens: toNumber(totals.cacheCreationTokens),
+        reasoningTokens: toNumber(totals.reasoningTokens),
+        totalTokens:
+          toNumber(totals.inputTokens) +
+          toNumber(totals.outputTokens) +
+          toNumber(totals.cacheReadTokens) +
+          toNumber(totals.cacheCreationTokens) +
+          toNumber(totals.reasoningTokens),
+      }
+    : aggregateTokens(resolvedDeps.getDbInstance() as DbLike, metadata.id, periodStartAt);
   const accountQuotas = await resolveAccountQuotas(metadata, resolvedDeps);
   const accountQuota = accountQuotas && accountQuotas.length === 1 ? accountQuotas[0] : undefined;
 

@@ -1,11 +1,15 @@
 import { NextResponse } from "next/server";
-import { getAllFallbackChains, registerFallback, removeFallback } from "@/domain/fallbackPolicy";
+import {
+  getAllFallbackChainsAsync,
+  registerFallbackAsync,
+  removeFallbackAsync,
+} from "@/domain/fallbackPolicy";
 import { registerFallbackSchema, removeFallbackSchema } from "@/shared/validation/schemas";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
 
 export async function GET() {
   try {
-    const chains = getAllFallbackChains();
+    const chains = await getAllFallbackChainsAsync();
     return NextResponse.json(chains);
   } catch (error) {
     console.error("Error fetching fallback chains:", error);
@@ -36,7 +40,7 @@ export async function POST(request) {
     }
     const { model, chain } = validation.data;
 
-    registerFallback(model, chain);
+    await registerFallbackAsync(model, chain);
     return NextResponse.json({ success: true, model });
   } catch (error) {
     console.error("Error registering fallback chain:", error);
@@ -66,7 +70,7 @@ export async function DELETE(request) {
       return NextResponse.json({ error: validation.error }, { status: 400 });
     }
     const { model } = validation.data;
-    const removed = removeFallback(model);
+    const removed = await removeFallbackAsync(model);
     return NextResponse.json({ success: true, removed });
   } catch (error) {
     console.error("Error removing fallback chain:", error);

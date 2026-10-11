@@ -1,7 +1,7 @@
 import { z } from "zod";
 
 import {
-  getConfiguredLocalCorpusStatus,
+  getConfiguredLocalCorpusStatusAsync,
   readConfiguredLocalCorpus,
   searchConfiguredLocalCorpus,
 } from "../../../src/lib/localCorpus/configured.ts";
@@ -13,7 +13,7 @@ export const localCorpusTools = [
       "Show whether the read-only local corpus is configured and summarize its in-memory index without exposing the absolute root path.",
     scopes: ["read:local-corpus"],
     inputSchema: z.object({}).strict(),
-    handler: async () => getConfiguredLocalCorpusStatus(),
+    handler: async () => getConfiguredLocalCorpusStatusAsync(),
   },
   {
     name: "local_corpus_search",

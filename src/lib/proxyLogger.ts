@@ -1,3 +1,8 @@
+import { NativeProxyLogBuffer, type ProxyLogBufferStatus } from "./proxyLogBuffer";
+import { updateAttemptTimingAsync } from "./db/proxyLogs";
+import { parseDatabaseBackend } from "./db/backendSelection";
+import { runPersistenceBackgroundWork } from "./db/persistenceRuntime";
+import { getSelectedProxyLogStore } from "./db/postgres/proxyLogStore";
 /**
  * Proxy Logger — Hybrid in-memory + SQLite persistence
  *
@@ -30,7 +35,7 @@ interface ProxyInfo {
   name?: string;
 }
 
-interface ProxyLogEntry {
+export interface ProxyLogEntry {
   id: string;
   timestamp: string;
   status: string;
@@ -90,6 +95,7 @@ const proxyLogs: ProxyLogEntry[] = [];
 // ──────────────── Startup: hydrate from DB ────────────────
 
 function loadFromDb() {
+  if (parseDatabaseBackend() === "postgres") return;
   if (!shouldPersistToDisk) return;
   try {
     const db = getDbInstance();
@@ -101,41 +107,7 @@ function loadFromDb() {
       .all(MAX_IN_MEMORY_ENTRIES) as any[];
 
     for (const row of rows) {
-      proxyLogs.push({
-        id: row.id,
-        timestamp: row.timestamp,
-        status: row.status || "success",
-        proxy: row.proxy_host
-          ? {
-              type: row.proxy_type,
-              host: row.proxy_host,
-              port: row.proxy_port,
-              name: row.proxy_name || undefined,
-            }
-          : null,
-        level: row.level || "direct",
-        levelId: row.level_id || null,
-        provider: row.provider || null,
-        targetUrl: row.target_url || null,
-        clientIp: row.public_ip || null,
-        egressIp: row.egress_ip || null,
-        latencyMs: row.latency_ms || 0,
-        error: row.error || null,
-        connectionId: row.connection_id || null,
-        comboId: row.combo_id || null,
-        account: row.account || null,
-        rotationAccount: row.rotation_account || null,
-        correlationId: row.correlation_id || null,
-        tlsFingerprint: row.tls_fingerprint === 1,
-        upstreamStatus: typeof row.upstream_status === "number" ? row.upstream_status : null,
-        attemptNumber: typeof row.attempt_number === "number" ? row.attempt_number : null,
-        attemptIssue:
-          row.attempt_issue === "served" || row.attempt_issue === "abandoned"
-            ? row.attempt_issue
-            : null,
-        headersMs: sanitizeTimingMs(row.headers_ms),
-        firstChunkMs: sanitizeTimingMs(row.first_chunk_ms),
-      });
+      proxyLogs.push(mapProxyLogRow(row));
     }
 
     if (proxyLogs.length > 0) {
@@ -196,7 +168,100 @@ export function formatProxyEgressConsoleLine(params: {
 
 // ──────────────── Log a proxy event ────────────────
 
+function clipNativeProxyField(value: string, limit?: number): string;
+function clipNativeProxyField(value: string | undefined, limit?: number): string | undefined;
+function clipNativeProxyField(
+  value: string | null | undefined,
+  limit?: number
+): string | null | undefined;
+function clipNativeProxyField(
+  value: string | null | undefined,
+  limit = 512
+): string | null | undefined {
+  return typeof value === "string" ? value.slice(0, limit).replace(/\u0000/g, "") : value;
+}
+
+const NATIVE_PROXY_IDENTITY_CHAR_LIMIT = 4096;
+
+export function hasOversizedNativeProxyIdentity(entry: ProxyLogInput): boolean {
+  return [
+    entry.levelId,
+    entry.provider,
+    entry.connectionId,
+    entry.comboId,
+    entry.account,
+    entry.rotationAccount,
+    entry.correlationId,
+    entry.proxy?.host,
+  ].some((value) => typeof value === "string" && value.length > NATIVE_PROXY_IDENTITY_CHAR_LIMIT);
+}
+
+function nativeTiming(value: unknown): number | null {
+  const timing = sanitizeTimingMs(value);
+  return timing !== null && Number.isSafeInteger(timing) ? timing : null;
+}
+
+export function projectNativeProxyInput(entry: ProxyLogInput): ProxyLogInput {
+  const port =
+    typeof entry.proxy?.port === "string"
+      ? Number(entry.proxy.port.slice(0, 16))
+      : entry.proxy?.port;
+  return {
+    status: clipNativeProxyField(entry.status, 64),
+    proxy: entry.proxy
+      ? {
+          type: clipNativeProxyField(entry.proxy.type, 64),
+          host: clipNativeProxyField(entry.proxy.host, NATIVE_PROXY_IDENTITY_CHAR_LIMIT),
+          port:
+            typeof port === "number" && Number.isInteger(port) && port >= 1 && port <= 65535
+              ? port
+              : 0,
+          name: clipNativeProxyField(entry.proxy.name, 256),
+        }
+      : null,
+    level: clipNativeProxyField(entry.level, 64),
+    levelId: clipNativeProxyField(entry.levelId, NATIVE_PROXY_IDENTITY_CHAR_LIMIT),
+    provider: clipNativeProxyField(entry.provider, NATIVE_PROXY_IDENTITY_CHAR_LIMIT),
+    targetUrl: clipNativeProxyField(entry.targetUrl, 2048),
+    clientIp: clipNativeProxyField(entry.clientIp, 64),
+    publicIp: clipNativeProxyField(entry.publicIp, 64),
+    egressIp: clipNativeProxyField(entry.egressIp, 64),
+    error: clipNativeProxyField(entry.error, 1024),
+    connectionId: clipNativeProxyField(entry.connectionId, NATIVE_PROXY_IDENTITY_CHAR_LIMIT),
+    comboId: clipNativeProxyField(entry.comboId, NATIVE_PROXY_IDENTITY_CHAR_LIMIT),
+    account: clipNativeProxyField(entry.account, NATIVE_PROXY_IDENTITY_CHAR_LIMIT),
+    rotationAccount: clipNativeProxyField(entry.rotationAccount, NATIVE_PROXY_IDENTITY_CHAR_LIMIT),
+    correlationId: clipNativeProxyField(entry.correlationId, NATIVE_PROXY_IDENTITY_CHAR_LIMIT),
+    latencyMs:
+      typeof entry.latencyMs === "number" &&
+      Number.isFinite(entry.latencyMs) &&
+      Math.abs(entry.latencyMs) <= Number.MAX_SAFE_INTEGER
+        ? entry.latencyMs
+        : 0,
+    tlsFingerprint: entry.tlsFingerprint,
+    upstreamStatus:
+      typeof entry.upstreamStatus === "number" &&
+      Number.isInteger(entry.upstreamStatus) &&
+      entry.upstreamStatus >= 100 &&
+      entry.upstreamStatus <= 599
+        ? entry.upstreamStatus
+        : null,
+    attemptNumber:
+      typeof entry.attemptNumber === "number" &&
+      Number.isSafeInteger(entry.attemptNumber) &&
+      entry.attemptNumber >= 1
+        ? entry.attemptNumber
+        : null,
+    attemptIssue: entry.attemptIssue,
+    headersMs: nativeTiming(entry.headersMs),
+    firstChunkMs: nativeTiming(entry.firstChunkMs),
+  };
+}
+
 export function logProxyEvent(entry: ProxyLogInput) {
+  const nativePersistence = parseDatabaseBackend() === "postgres";
+  const oversizedIdentity = nativePersistence && hasOversizedNativeProxyIdentity(entry);
+  if (nativePersistence) entry = projectNativeProxyInput(entry);
   const safeError =
     entry.error === null || entry.error === undefined || entry.error === ""
       ? null
@@ -263,8 +328,8 @@ export function logProxyEvent(entry: ProxyLogInput) {
   }
 
   // 2. Queue for background batch persistence (SQLite / Redis)
-  if (shouldPersistToDisk) {
-    enqueueProxyLog(log);
+  if (shouldPersistToDisk || (nativePersistence && !isBuildPhase)) {
+    enqueueProxyLog(log, oversizedIdentity);
   }
 
   return log;
@@ -276,27 +341,68 @@ const BATCH_FLUSH_INTERVAL_MS = 1000;
 const BATCH_SIZE_THRESHOLD = 100;
 
 let pendingLogsQueue: ProxyLogEntry[] = [];
+const nativeProxyLogBuffer = new NativeProxyLogBuffer();
+
+/** Process-local diagnostics; unavailable on SQLite, and never a financial accounting counter. */
+export function getProxyLogBufferStatus(): ProxyLogBufferStatus | undefined {
+  return parseDatabaseBackend() === "postgres" ? nativeProxyLogBuffer.status() : undefined;
+}
 let batchTimer: NodeJS.Timeout | null = null;
+let nativeProxyFlushScheduled = false;
+
+function scheduleProxyLogFlush(): void {
+  if (parseDatabaseBackend() !== "postgres") {
+    void runPersistenceBackgroundWork(flushProxyLogsAsync).catch(reportProxyFlushFailure);
+    return;
+  }
+  if (nativeProxyFlushScheduled || !nativeProxyLogBuffer.canScheduleFlush(Date.now())) return;
+  nativeProxyFlushScheduled = true;
+  void runPersistenceBackgroundWork(flushProxyLogsAsync)
+    .catch(reportProxyFlushFailure)
+    .finally(() => {
+      nativeProxyFlushScheduled = false;
+    });
+}
 
 function ensureBatchTimer() {
   if (batchTimer) return;
-  batchTimer = setInterval(() => {
-    flushProxyLogsSync();
-  }, BATCH_FLUSH_INTERVAL_MS);
+  batchTimer = setInterval(scheduleProxyLogFlush, BATCH_FLUSH_INTERVAL_MS);
   if (typeof batchTimer.unref === "function") {
     batchTimer.unref();
   }
 }
 
-function enqueueProxyLog(log: ProxyLogEntry) {
+function enqueueProxyLog(log: ProxyLogEntry, oversizedIdentity = false) {
+  if (parseDatabaseBackend() === "postgres") {
+    // Projection above bounds serialization work; reservations include batches awaiting COMMIT.
+    const bytes = oversizedIdentity
+      ? nativeProxyLogBuffer.status().eventByteLimit + 1
+      : Buffer.byteLength(JSON.stringify(log), "utf8") + 32;
+    if (!nativeProxyLogBuffer.reserve(log.id, bytes)) {
+      if (nativeProxyLogBuffer.warningDue(Date.now())) {
+        const status = nativeProxyLogBuffer.status();
+        console.warn(
+          "[proxyLogger] Native telemetry capacity reached; newest diagnostic events were dropped",
+          {
+            bufferedRows: status.bufferedRows,
+            bufferedBytes: status.bufferedBytes,
+            droppedEvents: status.droppedEvents,
+            oversizedEvents: status.oversizedEvents,
+          }
+        );
+      }
+      return;
+    }
+  }
   pendingLogsQueue.push(log);
   ensureBatchTimer();
   if (pendingLogsQueue.length >= BATCH_SIZE_THRESHOLD) {
-    flushProxyLogsSync();
+    scheduleProxyLogFlush();
   }
 }
 
 export function flushProxyLogsSync() {
+  if (getSelectedProxyLogStore()) throw new Error("PostgreSQL proxy logs require an awaited flush");
   if (pendingLogsQueue.length === 0) return;
   const batch = pendingLogsQueue;
   pendingLogsQueue = [];
@@ -411,6 +517,7 @@ export function linkPendingFirstChunk(
   hasBody: boolean
 ): void {
   if (timingKnown || !hasBody) return;
+  if (parseDatabaseBackend() === "postgres" && !nativeProxyLogBuffer.has(id)) return;
   if (pendingFirstChunk.size >= TIMING_LINK_CAP) evictOldestTimingLink();
   pendingFirstChunk.set(id, entry);
 }
@@ -430,17 +537,34 @@ function dropPendingFirstChunk(id: string): void {
 export function settlePendingFirstChunk(
   id: string,
   firstChunkMs: number | null,
-  patchRow?: (id: string, patch: { firstChunkMs: number | null }) => boolean
+  patchRow?: (id: string, patch: { firstChunkMs: number | null }) => boolean | Promise<boolean>
 ): void {
   const entry = pendingFirstChunk.get(id);
   dropPendingFirstChunk(id);
   if (!entry) return;
-  const clean = sanitizeTimingMs(firstChunkMs);
+  const clean =
+    parseDatabaseBackend() === "postgres"
+      ? nativeTiming(firstChunkMs)
+      : sanitizeTimingMs(firstChunkMs);
   entry.firstChunkMs = clean;
-  if (!shouldPersistToDisk) return;
-  if (pendingLogsQueue.includes(entry)) return;
+  if (!shouldPersistToDisk && parseDatabaseBackend() !== "postgres") return;
+  if (pendingLogsQueue.includes(entry) || proxyFlushingEntries.has(entry)) return;
   try {
-    patchRow?.(id, { firstChunkMs: clean });
+    const result =
+      parseDatabaseBackend() === "postgres" && patchRow
+        ? runPersistenceBackgroundWork(async () => {
+            await patchRow(id, { firstChunkMs: clean });
+          })
+        : patchRow?.(id, { firstChunkMs: clean });
+    if (result && typeof result === "object")
+      void result.catch((error: unknown) => {
+        if (parseDatabaseBackend() === "postgres") {
+          console.debug(
+            "[proxyLogger] Deferred timing patch failed:",
+            error instanceof Error ? error.name : "Error"
+          );
+        }
+      });
   } catch {
     // Deferred visibility is best-effort; the in-memory copy above stays correct.
   }
@@ -453,7 +577,11 @@ export function settlePendingFirstChunk(
  * Reads from in-memory for speed (already hydrated from DB on startup).
  */
 export function getProxyLogs(filters: ProxyLogFilters = {}) {
-  let logs = [...proxyLogs];
+  return filterProxyLogs(proxyLogs, filters);
+}
+
+function filterProxyLogs(entries: ProxyLogEntry[], filters: ProxyLogFilters) {
+  let logs = [...entries];
 
   if (filters.status) {
     if (filters.status === "ok") {
@@ -512,4 +640,165 @@ export function clearProxyLogs() {
       );
     }
   }
+}
+
+function mapProxyLogRow(row: ProxyLogRow): ProxyLogEntry {
+  return {
+    id: row.id,
+    timestamp: row.timestamp,
+    status: row.status || "success",
+    proxy: row.proxy_host
+      ? {
+          type: row.proxy_type,
+          host: row.proxy_host,
+          port: row.proxy_port ?? 0,
+          name: row.proxy_name || undefined,
+        }
+      : null,
+    level: row.level || "direct",
+    levelId: row.level_id || null,
+    provider: row.provider || null,
+    targetUrl: row.target_url || null,
+    clientIp: row.public_ip || null,
+    egressIp: row.egress_ip || null,
+    latencyMs: row.latency_ms || 0,
+    error: row.error || null,
+    connectionId: row.connection_id || null,
+    comboId: row.combo_id || null,
+    account: row.account || null,
+    rotationAccount: row.rotation_account || null,
+    correlationId: row.correlation_id || null,
+    tlsFingerprint: row.tls_fingerprint === 1,
+    upstreamStatus: typeof row.upstream_status === "number" ? row.upstream_status : null,
+    attemptNumber: typeof row.attempt_number === "number" ? row.attempt_number : null,
+    attemptIssue:
+      row.attempt_issue === "served" || row.attempt_issue === "abandoned"
+        ? row.attempt_issue
+        : null,
+    headersMs: sanitizeTimingMs(row.headers_ms),
+    firstChunkMs: sanitizeTimingMs(row.first_chunk_ms),
+  };
+}
+
+let proxyFlushInFlight: Promise<void> | undefined;
+const proxyFlushingEntries = new Set<ProxyLogEntry>();
+function reportProxyFlushFailure(error: unknown): void {
+  console.warn(
+    "[proxyLogger] Proxy log flush failed:",
+    sanitizeErrorMessage(error) || "Proxy log persistence failed"
+  );
+}
+export async function flushProxyLogsAsync(): Promise<void> {
+  const store = getSelectedProxyLogStore();
+  if (!store) {
+    flushProxyLogsSync();
+    return;
+  }
+  if (proxyFlushInFlight) {
+    await proxyFlushInFlight;
+    return flushProxyLogsAsync();
+  }
+  if (pendingLogsQueue.length === 0) return;
+
+  // Drain the queue admitted by this call; later events belong to the next flush.
+  // The fence covers INSERT, COMMIT and the deferred timing patches together.
+  const admittedCount = pendingLogsQueue.length;
+  const work = (async () => {
+    let remaining = admittedCount;
+    while (remaining > 0) {
+      const batch = pendingLogsQueue.splice(0, Math.min(BATCH_SIZE_THRESHOLD, remaining));
+      if (batch.length === 0) break;
+      for (const entry of batch) proxyFlushingEntries.add(entry);
+      try {
+        await store.append(batch);
+        for (const entry of batch) proxyFlushingEntries.delete(entry);
+        // A first byte can arrive while INSERT/COMMIT is pending. Patch after commit
+        // from the current object so a zero-row early UPDATE cannot lose that byte.
+        for (const entry of batch) {
+          if (entry.firstChunkMs !== null) {
+            await updateAttemptTimingAsync(entry.id, {
+              firstChunkMs: entry.firstChunkMs,
+            });
+          }
+        }
+        for (const entry of batch) nativeProxyLogBuffer.release(entry.id);
+      } catch (error) {
+        // Stable row ids permit an explicit later flush without duplicate inserts.
+        // There is no transaction retry here, including an unknown COMMIT outcome.
+        pendingLogsQueue.unshift(...batch);
+        throw error;
+      } finally {
+        for (const entry of batch) proxyFlushingEntries.delete(entry);
+      }
+      remaining -= batch.length;
+    }
+  })();
+  proxyFlushInFlight = work;
+  try {
+    await work;
+    nativeProxyLogBuffer.noteFlushSuccess();
+  } catch (error) {
+    nativeProxyLogBuffer.noteFlushFailure(Date.now());
+    throw error;
+  } finally {
+    if (proxyFlushInFlight === work) proxyFlushInFlight = undefined;
+  }
+}
+export async function getProxyLogsAsync(filters: ProxyLogFilters = {}): Promise<ProxyLogEntry[]> {
+  const store = getSelectedProxyLogStore();
+  if (!store) return getProxyLogs(filters);
+  await flushProxyLogsAsync();
+  const rows = await store.list(MAX_IN_MEMORY_ENTRIES);
+  return filterProxyLogs(
+    rows.map((row) => mapProxyLogRow(row as ProxyLogRow)),
+    filters
+  );
+}
+export async function clearProxyLogsAsync(): Promise<void> {
+  const store = getSelectedProxyLogStore();
+  if (!store) {
+    clearProxyLogs();
+    return;
+  }
+  await flushProxyLogsAsync();
+  await store.clear();
+  proxyLogs.length = 0;
+  pendingFirstChunk.clear();
+}
+
+type ProxyLogRow = Record<string, unknown> & {
+  id: string;
+  timestamp: string;
+  status: ProxyLogEntry["status"];
+  proxy_host: string | null;
+  proxy_type: NonNullable<ProxyLogEntry["proxy"]>["type"];
+  proxy_port: number | null;
+  proxy_name: string | null;
+  level: ProxyLogEntry["level"];
+  level_id: string | null;
+  provider: string | null;
+  target_url: string | null;
+  public_ip: string | null;
+  egress_ip: string | null;
+  latency_ms: number | null;
+  error: string | null;
+  connection_id: string | null;
+  combo_id: string | null;
+  account: string | null;
+  rotation_account: string | null;
+  correlation_id: string | null;
+  tls_fingerprint: number | null;
+  upstream_status: number | null;
+  attempt_number: number | null;
+  attempt_issue: ProxyLogEntry["attemptIssue"];
+  headers_ms: number | null;
+  first_chunk_ms: number | null;
+};
+
+export async function closeProxyLogSavesAsync(): Promise<void> {
+  if (batchTimer) {
+    clearInterval(batchTimer);
+    batchTimer = null;
+  }
+  await flushProxyLogsAsync();
 }

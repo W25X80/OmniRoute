@@ -6,15 +6,24 @@
  */
 
 import { CronExpressionParser } from "cron-parser";
+import { parseDatabaseBackend } from "@/lib/db/backendSelection";
+import { runPersistenceBackgroundWork } from "@/lib/db/persistenceRuntime";
 import {
   getAllJobs,
   getJob,
-  recordRun,
-  pruneRuns,
-  cleanupOrphanedRuns,
   upsertJob,
   updateJobEnabled,
   getRuns as dbGetRuns,
+} from "../db/jobRegistryDb";
+import {
+  getAllJobsAsync,
+  getJobAsync,
+  recordRunAsync,
+  pruneRunsAsync,
+  cleanupOrphanedRunsAsync,
+  upsertJobAsync,
+  updateJobEnabledAsync,
+  getRunsAsync as dbGetRunsAsync,
 } from "../db/jobRegistryDb";
 import { isEnvEnabled } from "./core";
 import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error.ts";
@@ -25,6 +34,9 @@ function errMessage(err: unknown): string {
 }
 
 export class JobRegistry {
+  private closing = false;
+  private closePromise: Promise<void> | undefined;
+  private pending = new Set<Promise<unknown>>();
   private timers = new Map<string, ReturnType<typeof setTimeout>>();
   private running = new Set<string>();
   private handlers = new Map<string, () => Promise<HandlerResult>>();
@@ -34,6 +46,7 @@ export class JobRegistry {
   private static readonly MAX_CRON_PARSE_FAILURES = 5;
   private cronGetters = new Map<string, () => string>();
   register(def: JobDefinition): void {
+    this.assertOpen();
     // Never clobber enabled toggle or created_at on re-register.
     // the original created_at. Pass enabled=true for new jobs (seed default).
     upsertJob({
@@ -52,6 +65,7 @@ export class JobRegistry {
   }
 
   start(jobId: string): void {
+    this.assertOpen();
     if (this.timers.has(jobId)) return;
     const job = getJob(jobId);
     const handler = this.handlers.get(jobId);
@@ -87,23 +101,22 @@ export class JobRegistry {
   }
 
   async startAll(): Promise<void> {
+    this.assertOpen();
     if (this.handlers.size === 0) {
       throw new Error("[JobRegistry] No handlers registered. Call register() before startAll().");
     }
-    await cleanupOrphanedRuns();
-    const jobs = getAllJobs().filter((j) => j.enabled);
-    // start() is synchronous and can throw (getJob reads the DB), so each call
-    // needs its own try/catch. Collecting them with Promise.allSettled would not
-    // work: the callback returns void, every entry settles as fulfilled, and a
-    // synchronous throw escapes the map before allSettled is ever reached.
+    await cleanupOrphanedRunsAsync();
+    const jobs = (await getAllJobsAsync()).filter((j) => j.enabled);
+    // Start sequentially: each job may read configuration from the bounded pool.
     for (const job of jobs) {
       if (!this.handlers.has(job.id)) {
         console.warn(`[JobRegistry] Skip ${job.id}: no handler registered`);
         continue;
       }
       try {
-        this.start(job.id);
+        await this.startAsync(job.id);
       } catch (err) {
+        if (parseDatabaseBackend() === "postgres") throw err;
         console.error(`[JobRegistry] Failed to start ${job.id}:`, errMessage(err));
       }
     }
@@ -119,36 +132,79 @@ export class JobRegistry {
   }
 
   async runNow(jobId: string): Promise<{ started: boolean; reason?: string }> {
-    const job = getJob(jobId);
+    if (this.closing) return { started: false, reason: "closed" };
+    const job = await getJobAsync(jobId);
+    if (this.closing) return { started: false, reason: "closed" };
     if (!job) return { started: false, reason: "not_found" };
     if (!job.enabled) return { started: false, reason: "disabled" };
     const handler = this.handlers.get(jobId);
     if (!handler) return { started: false, reason: "no_handler" };
-
-    if (this.running.has(jobId)) {
-      if (this.queued.has(jobId)) return { started: false, reason: "already_queued" };
-      this.queued.add(jobId);
-      return new Promise<{ started: boolean; reason?: string }>((resolve) => {
-        const waiters = this.waiters.get(jobId) ?? [];
-        waiters.push(() => {
-          this.queued.delete(jobId);
-          resolve(this.runNow(jobId));
-        });
-        this.waiters.set(jobId, waiters);
-      });
-    }
-
     if (
       job.envFlag &&
       !isEnvEnabled(job.envFlag, job.config?.envDefault === false ? false : true)
     ) {
       return { started: false, reason: "env_disabled" };
     }
-    void this.safeRun(jobId, handler);
-    return { started: true };
+    if (this.queued.has(jobId)) return { started: false, reason: "already_queued" };
+    if (this.running.has(jobId)) {
+      this.queued.add(jobId);
+      let release!: () => void;
+      const previousFinished = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const waiters = this.waiters.get(jobId) ?? [];
+      waiters.push(release);
+      this.waiters.set(jobId, waiters);
+      let acknowledge!: (result: { started: boolean; reason?: string }) => void;
+      const acknowledgement = new Promise<{ started: boolean; reason?: string }>((resolve) => {
+        acknowledge = resolve;
+      });
+      const work = this.track(
+        runPersistenceBackgroundWork(async () => {
+          await previousFinished;
+          this.running.add(jobId);
+          this.queued.delete(jobId);
+          try {
+            const latest = await getJobAsync(jobId);
+            if (!latest || !latest.enabled) {
+              acknowledge({ started: false, reason: latest ? "disabled" : "not_found" });
+              return;
+            }
+            if (
+              latest.envFlag &&
+              !isEnvEnabled(latest.envFlag, latest.config?.envDefault === false ? false : true)
+            ) {
+              acknowledge({ started: false, reason: "env_disabled" });
+              return;
+            }
+            acknowledge({ started: true });
+            await this.executeRun(jobId, handler);
+          } finally {
+            this.releaseRun(jobId);
+          }
+        })
+      );
+      void work.catch((error) => {
+        this.queued.delete(jobId);
+        const remaining = this.waiters.get(jobId)?.filter((waiter) => waiter !== release) ?? [];
+        if (remaining.length) this.waiters.set(jobId, remaining);
+        else this.waiters.delete(jobId);
+        acknowledge({ started: false, reason: "unavailable" });
+        console.error(`[JobRegistry] Failed to execute queued ${jobId}:`, errMessage(error));
+      });
+      return acknowledgement;
+    }
+    return new Promise<{ started: boolean; reason?: string }>((resolve) => {
+      const work = this.safeRun(jobId, handler, () => resolve({ started: true }));
+      void work.then(
+        () => resolve({ started: false, reason: this.closing ? "closed" : "already_running" }),
+        () => resolve({ started: false, reason: "unavailable" })
+      );
+    });
   }
 
   setEnabled(jobId: string, enabled: boolean): void {
+    this.assertOpen();
     updateJobEnabled(jobId, enabled);
     if (enabled) {
       this.stop(jobId);
@@ -173,10 +229,51 @@ export class JobRegistry {
     return getJob(jobId)?.config ?? null;
   }
 
-  /** Core execution wrapper: re-entrancy guard + timing + recording + prune. */
-  private async safeRun(jobId: string, handler: () => Promise<HandlerResult>): Promise<void> {
-    if (this.running.has(jobId)) return;
+  private assertOpen(): void {
+    if (this.closing) throw new Error("Job registry is closing");
+  }
+
+  private track<T>(work: Promise<T>): Promise<T> {
+    this.pending.add(work);
+    void work.then(
+      () => this.pending.delete(work),
+      () => this.pending.delete(work)
+    );
+    return work;
+  }
+
+  private releaseRun(jobId: string): void {
+    this.running.delete(jobId);
+    const waiters = this.waiters.get(jobId);
+    if (waiters) {
+      this.waiters.delete(jobId);
+      for (const resolve of waiters) resolve();
+    }
+  }
+
+  /** Admission owns the complete handler, history write and retention work. */
+  private safeRun(
+    jobId: string,
+    handler: () => Promise<HandlerResult>,
+    started?: () => void,
+    canRun?: () => Promise<boolean>
+  ): Promise<void> {
+    if (this.closing || this.running.has(jobId) || this.queued.has(jobId)) return Promise.resolve();
     this.running.add(jobId);
+    const work = this.track(
+      runPersistenceBackgroundWork(async () => {
+        if (canRun && !(await canRun())) return;
+        started?.();
+        await this.executeRun(jobId, handler);
+      }).finally(() => this.releaseRun(jobId))
+    );
+    void work.catch((error) =>
+      console.error(`[JobRegistry] Failed to execute ${jobId}:`, errMessage(error))
+    );
+    return work;
+  }
+
+  private async executeRun(jobId: string, handler: () => Promise<HandlerResult>): Promise<void> {
     const startedAt = new Date().toISOString();
     const start = Date.now();
     try {
@@ -185,35 +282,39 @@ export class JobRegistry {
       try {
         result = await handler();
         errorMessage = result.error ? sanitizeErrorMessage(result.error) : undefined;
-      } catch (err) {
+      } catch (error) {
         result = { success: false };
-        errorMessage = sanitizeErrorMessage(errMessage(err));
+        errorMessage = sanitizeErrorMessage(errMessage(error));
       }
       try {
-        await recordRun(jobId, result.success ? "success" : "failure", {
+        await recordRunAsync(jobId, result.success ? "success" : "failure", {
           startedAt,
           durationMs: Date.now() - start,
           errorMessage,
           recordsAffected: result.recordsAffected,
         });
-      } catch (err) {
-        // History persistence must not turn a completed handler into a failed job.
-        console.error(`[JobRegistry] Failed to record run for ${jobId}:`, errMessage(err));
+      } catch (error) {
+        console.error(`[JobRegistry] Failed to record run for ${jobId}:`, errMessage(error));
       }
     } finally {
-      this.running.delete(jobId);
-      const ws = this.waiters.get(jobId);
-      if (ws) {
-        this.waiters.delete(jobId);
-        for (const resolve of ws) resolve();
-      }
       try {
-        await pruneRuns(jobId);
-      } catch (err) {
-        // Timer dispatch is fire-and-forget; pruning errors must not escape it.
-        console.error(`[JobRegistry] Failed to prune runs for ${jobId}:`, errMessage(err));
+        await pruneRunsAsync(jobId);
+      } catch (error) {
+        console.error(`[JobRegistry] Failed to prune runs for ${jobId}:`, errMessage(error));
       }
     }
+  }
+
+  /** Close admission before draining accepted jobs, including queued run-now work. */
+  close(): Promise<void> {
+    if (this.closePromise) return this.closePromise;
+    this.closing = true;
+    this.stopAll();
+    this.closePromise = (async () => {
+      while (this.pending.size) await Promise.allSettled([...this.pending]);
+      this.cronFailCount.clear();
+    })();
+    return this.closePromise;
   }
 
   private startInterval(
@@ -261,6 +362,7 @@ export class JobRegistry {
       delay = 60_000;
     }
     const timer = setTimeout(() => {
+      if (this.closing) return;
       let freshCron = cronExpr;
       const getter = this.cronGetters.get(jobId);
       if (getter) {
@@ -271,13 +373,91 @@ export class JobRegistry {
         }
       }
       this.scheduleNextCron(jobId, freshCron, tz, envFlag);
-      if (this.running.has(jobId)) return;
-      const jobConfig = this.getJobConfig(jobId);
-      if (envFlag && !isEnvEnabled(envFlag, jobConfig?.envDefault === false ? false : true)) return;
+      if (this.running.has(jobId) || this.queued.has(jobId)) return;
       const handler = this.handlers.get(jobId);
-      if (handler) void this.safeRun(jobId, handler);
+      if (handler) {
+        void this.safeRun(jobId, handler, undefined, async () => {
+          const jobConfig = await this.getJobConfigAsync(jobId);
+          return !envFlag || isEnvEnabled(envFlag, jobConfig?.envDefault === false ? false : true);
+        });
+      }
     }, delay);
     timer.unref?.();
     this.timers.set(jobId, timer);
+  }
+
+  async registerAsync(def: JobDefinition): Promise<void> {
+    this.assertOpen();
+    // Never clobber enabled toggle or created_at on re-register.
+    // the original created_at. Pass enabled=true for new jobs (seed default).
+    await upsertJobAsync({
+      id: def.id,
+      type: def.type,
+      cron: def.cron,
+      intervalMs: def.intervalMs,
+      enabled: (await getJobAsync(def.id))?.enabled ?? def.enabled ?? true,
+      envFlag: def.envFlag,
+      config: def.config,
+      createdAt: (await getJobAsync(def.id))?.createdAt ?? new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+    this.assertOpen();
+    this.handlers.set(def.id, def.handler);
+    if (def.cronGetter) this.cronGetters.set(def.id, def.cronGetter);
+  }
+
+  async startAsync(jobId: string): Promise<void> {
+    this.assertOpen();
+    if (this.timers.has(jobId)) return;
+    const job = await getJobAsync(jobId);
+    this.assertOpen();
+    if (this.timers.has(jobId)) return;
+    const handler = this.handlers.get(jobId);
+    if (!job || !handler) {
+      console.warn(`[JobRegistry] Skip ${jobId}: no ${job ? "handler" : "job"} registered`);
+      return;
+    }
+    if (job.type === "interval") {
+      this.startInterval(jobId, handler, job.intervalMs ?? 60_000);
+    } else {
+      const tz = (job.config?.timezone as string) || "UTC";
+      let cronExpr = job.cron ?? "* * * * *";
+      const getter = this.cronGetters.get(jobId);
+      if (getter) {
+        try {
+          cronExpr = getter();
+        } catch (err) {
+          console.error(`[JobRegistry] cronGetter for ${jobId} threw:`, errMessage(err));
+          cronExpr = job.cron ?? "* * * * *";
+        }
+      }
+      this.scheduleNextCron(jobId, cronExpr, tz, job.envFlag);
+    }
+  }
+
+  async setEnabledAsync(jobId: string, enabled: boolean): Promise<void> {
+    this.assertOpen();
+    await updateJobEnabledAsync(jobId, enabled);
+    if (enabled) {
+      this.stop(jobId);
+      await this.startAsync(jobId);
+    } else {
+      this.stop(jobId);
+    }
+  }
+
+  async getRunsAsync(jobId: string, limit = 20): Promise<JobRun[]> {
+    return await dbGetRunsAsync(jobId, limit);
+  }
+
+  async listJobsAsync(): Promise<JobDefinition[]> {
+    return (await getAllJobsAsync()).map((job) => ({
+      ...job,
+      handler: this.handlers.get(job.id) ?? (() => Promise.resolve({ success: true })),
+    }));
+  }
+
+  private async getJobConfigAsync(jobId: string): Promise<Record<string, unknown> | null> {
+    return (await getJobAsync(jobId))?.config ?? null;
   }
 }

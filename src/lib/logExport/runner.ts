@@ -1,3 +1,4 @@
+import { needsLogExportCursorReconciliation } from "@/lib/db/logExportDestinations";
 /**
  * Log-export runner — the destination-agnostic half of the pipeline.
  *
@@ -9,18 +10,18 @@
  */
 
 import {
-  advanceLogExportCursor,
-  getEnabledLogExportDestinations,
-  getLogExportDestination,
-  recordLogExportRun,
-  resetLogExportCursor,
+  advanceLogExportCursorAsync,
+  getEnabledLogExportDestinationsAsync,
+  getLogExportDestinationAsync,
+  recordLogExportRunAsync,
+  resetLogExportCursorAsync,
   type LogExportDestinationRow,
 } from "@/lib/db/logExportDestinations";
 import {
   attachExportBodies,
-  countCallLogsAfterRowId,
-  getCallLogsForExport,
-  getMaxCallLogRowId,
+  countCallLogsAfterRowIdAsync,
+  getCallLogsForExportAsync,
+  getMaxCallLogRowIdAsync,
 } from "@/lib/usage/callLogExportSource";
 import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
 import { getLogExportDestinationType } from "./registry";
@@ -71,10 +72,11 @@ export function createClientForDestination(destination: LogExportDestinationRow)
  * A cursor above the table's high-water mark means `call_logs` was purged and rowids
  * restarted; without this guard every future row would sit below the cursor forever.
  */
-function reconcileCursor(destination: LogExportDestinationRow): number {
-  const maxRowId = getMaxCallLogRowId();
+async function reconcileCursor(destination: LogExportDestinationRow): Promise<number> {
+  if (!needsLogExportCursorReconciliation()) return destination.cursorRowId;
+  const maxRowId = await getMaxCallLogRowIdAsync();
   if (destination.cursorRowId > maxRowId) {
-    resetLogExportCursor(destination.id, 0);
+    await resetLogExportCursorAsync(destination.id, 0);
     console.warn(
       `[LogExport] ${destination.name}: cursor ${destination.cursorRowId} is above max ` +
         `call_logs rowid ${maxRowId}; logs were purged, restarting from the beginning.`
@@ -110,14 +112,14 @@ export async function runDestinationExport(
 
   if (inFlight.has(destination.id)) {
     result.skipped = true;
-    result.pendingAfterRun = countCallLogsAfterRowId(destination.cursorRowId);
+    result.pendingAfterRun = await countCallLogsAfterRowIdAsync(destination.cursorRowId);
     return result;
   }
   inFlight.add(destination.id);
 
   try {
     const client = createClientForDestination(destination);
-    let cursor = reconcileCursor(destination);
+    let cursor = await reconcileCursor(destination);
     result.cursorRowId = cursor;
 
     const batchSize = Math.max(1, Math.min(destination.batchSize, 10_000));
@@ -126,7 +128,7 @@ export async function runDestinationExport(
 
     while (result.exported < maxRows) {
       const remaining = maxRows - result.exported;
-      const summaries = getCallLogsForExport(cursor, Math.min(batchSize, remaining));
+      const summaries = await getCallLogsForExportAsync(cursor, Math.min(batchSize, remaining));
       if (summaries.length === 0) break;
 
       // Payload hydration is per-row filesystem work, so it only runs when the
@@ -143,7 +145,7 @@ export async function runDestinationExport(
       await client.send(batch.map((row) => row.record));
 
       cursor = batch[batch.length - 1].rowId;
-      advanceLogExportCursor(destination.id, cursor, batch.length);
+      await advanceLogExportCursorAsync(destination.id, cursor, batch.length);
       result.exported += batch.length;
       result.batches += 1;
       result.cursorRowId = cursor;
@@ -151,13 +153,13 @@ export async function runDestinationExport(
       if (batch.length < batchSize) break;
     }
 
-    result.pendingAfterRun = countCallLogsAfterRowId(cursor);
-    recordLogExportRun(destination.id, "success", null);
+    result.pendingAfterRun = await countCallLogsAfterRowIdAsync(cursor);
+    await recordLogExportRunAsync(destination.id, "success", null);
   } catch (error) {
     result.success = false;
     result.error = errMessage(error);
-    result.pendingAfterRun = countCallLogsAfterRowId(result.cursorRowId);
-    recordLogExportRun(destination.id, "failure", result.error);
+    result.pendingAfterRun = await countCallLogsAfterRowIdAsync(result.cursorRowId);
+    await recordLogExportRunAsync(destination.id, "failure", result.error);
     console.error(`[LogExport] ${destination.name} failed: ${result.error}`);
   } finally {
     inFlight.delete(destination.id);
@@ -168,14 +170,14 @@ export async function runDestinationExport(
 
 /** Run one destination by id. Returns null when it does not exist. */
 export async function runSingleLogExport(id: string): Promise<DestinationRunResult | null> {
-  const destination = getLogExportDestination(id);
+  const destination = await getLogExportDestinationAsync(id);
   if (!destination) return null;
   return runDestinationExport(destination);
 }
 
 /** Run every enabled destination. This is what the hourly job calls. */
 export async function runAllLogExports(): Promise<LogExportRunSummary> {
-  const rows = getEnabledLogExportDestinations();
+  const rows = await getEnabledLogExportDestinationsAsync();
   const destinations: DestinationRunResult[] = [];
 
   // Sequential on purpose: destinations share the same SQLite read path and a slow

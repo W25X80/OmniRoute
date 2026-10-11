@@ -1,27 +1,14 @@
 import { parentPort } from "node:worker_threads";
+import { serializeArtifactForStorage } from "./callLogArtifactSerialization.ts";
+import { MAX_CALL_LOG_DECODE_BYTES } from "./callLogArtifactProtocol.ts";
+import type { CallLogArtifact } from "./callLogArtifacts.ts";
+import type {
+  CallLogArtifactEnvironment,
+  CallLogArtifactWorkerRequest,
+  CallLogArtifactWorkerReply,
+} from "./callLogArtifactProtocol.ts";
 
-import {
-  writeCallArtifact,
-  type CallLogArtifact,
-  type CallLogArtifactWriteResult,
-} from "./callLogArtifacts.ts";
-
-type WriteRequest = {
-  id: number;
-  artifact: CallLogArtifact;
-  environment: {
-    pipelineMaxSizeKb?: string;
-    chatDebugFile?: string;
-    appLogLevel?: string;
-  };
-};
-
-type WriteReply = {
-  id: number;
-  result: CallLogArtifactWriteResult | null;
-};
-
-function applyWriteEnvironment(environment: WriteRequest["environment"]): void {
+function applyWriteEnvironment(environment: CallLogArtifactEnvironment): void {
   const values = {
     CALL_LOG_PIPELINE_MAX_SIZE_KB: environment.pipelineMaxSizeKb,
     CHAT_DEBUG_FILE: environment.chatDebugFile,
@@ -33,25 +20,68 @@ function applyWriteEnvironment(environment: WriteRequest["environment"]): void {
   }
 }
 
-parentPort?.on("message", (request: WriteRequest) => {
-  const originalConsoleError = console.error;
-  let result: CallLogArtifactWriteResult | null = null;
-
+parentPort?.on("message", async (request: CallLogArtifactWorkerRequest) => {
+  let reply: CallLogArtifactWorkerReply =
+    request.kind === "deserialize"
+      ? { id: request.id, kind: "deserialize", result: null }
+      : request.kind === "serialize"
+        ? { id: request.id, kind: "serialize", bytes: null }
+        : { id: request.id, kind: "write", result: null };
   try {
-    // The writer reads these options lazily; mirror the caller's per-write environment snapshot.
-    applyWriteEnvironment(request.environment);
-    // writeCallArtifact's legacy error includes filesystem paths. Keep worker failures generic.
-    console.error = () => {};
-    result = writeCallArtifact(request.artifact);
+    if (request.kind === "deserialize") {
+      if (
+        request.bytes instanceof Uint8Array &&
+        request.bytes.byteLength <= MAX_CALL_LOG_DECODE_BYTES
+      ) {
+        try {
+          const artifact = JSON.parse(
+            Buffer.from(request.bytes).toString("utf8")
+          ) as CallLogArtifact;
+          reply = { id: request.id, kind: "deserialize", result: { artifact, state: "ready" } };
+        } catch {
+          reply = {
+            id: request.id,
+            kind: "deserialize",
+            result: { artifact: null, state: "corrupt" },
+          };
+        }
+      }
+    } else {
+      applyWriteEnvironment(request.environment);
+      if (request.kind === "serialize") {
+        reply = {
+          id: request.id,
+          kind: "serialize",
+          bytes: new TextEncoder().encode(serializeArtifactForStorage(request.artifact)),
+        };
+      } else {
+        // SQLite alone loads the filesystem owner. PostgreSQL jobs never resolve a data path.
+        const { writeCallArtifact } = await import("./callLogArtifactFiles.ts");
+        const originalConsoleError = console.error;
+        try {
+          console.error = () => {};
+          reply = { id: request.id, kind: "write", result: writeCallArtifact(request.artifact) };
+        } finally {
+          console.error = originalConsoleError;
+        }
+      }
+    }
   } catch {
-    result = null;
-  } finally {
-    console.error = originalConsoleError;
+    // Only a typed generic failure crosses the worker boundary, never paths or payloads.
   }
-
   try {
-    parentPort?.postMessage({ id: request.id, result } satisfies WriteReply);
+    const transfer =
+      reply.kind === "serialize" && reply.bytes?.buffer instanceof ArrayBuffer
+        ? [reply.bytes.buffer]
+        : [];
+    parentPort?.postMessage(reply, transfer);
   } catch {
-    parentPort?.postMessage({ id: request.id, result: null } satisfies WriteReply);
+    parentPort?.postMessage(
+      request.kind === "deserialize"
+        ? { id: request.id, kind: "deserialize", result: null }
+        : request.kind === "serialize"
+          ? { id: request.id, kind: "serialize", bytes: null }
+          : { id: request.id, kind: "write", result: null }
+    );
   }
 });

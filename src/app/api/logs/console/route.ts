@@ -11,7 +11,9 @@
  */
 
 import { NextRequest, NextResponse } from "next/server";
-import { readFileSync, existsSync } from "fs";
+import { readFileSync, existsSync, createReadStream } from "fs";
+import { setImmediate as yieldToEventLoop } from "node:timers/promises";
+import { parseDatabaseBackend } from "@/lib/db/backendSelection";
 import { getAppLogFilePath } from "@/lib/logEnv";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 import { matchesSearch } from "@/shared/utils/turkishText";
@@ -75,6 +77,10 @@ export async function GET(req: NextRequest) {
     const componentFilter = searchParams.get("component") || "";
 
     const logPath = getLogFilePath();
+
+    if (parseDatabaseBackend() === "postgres") {
+      return readConsoleLogsAsync(logPath, levelFilter, limit, componentFilter);
+    }
 
     if (!existsSync(logPath)) {
       return NextResponse.json([], { status: 200 });
@@ -145,4 +151,75 @@ export async function GET(req: NextRequest) {
       { status: 500 }
     );
   }
+}
+
+async function readConsoleLogsAsync(
+  logPath: string,
+  levelFilter: string,
+  limit: number,
+  componentFilter: string
+): Promise<NextResponse> {
+  const oneHourAgo = Date.now() - 60 * 60 * 1000;
+  const minLevel = LEVEL_ORDER[levelFilter] || 0;
+  const entries: Record<string, unknown>[] = [];
+  const stream = createReadStream(logPath, { encoding: "utf8" });
+  const lines = consoleLogLines(stream);
+  let visited = 0;
+  try {
+    for await (const line of lines) {
+      if (++visited % 128 === 0) await yieldToEventLoop();
+      if (!line.trim()) continue;
+      try {
+        const entry = JSON.parse(line);
+        const ts = entry.time || entry.timestamp;
+        if (ts && new Date(ts).getTime() < oneHourAgo) continue;
+        entry.level = parseLevel(entry.level);
+        entry.msg = stringifyLogValue(entry.msg ?? entry.message ?? "");
+        entry.message = stringifyLogValue(entry.message ?? entry.msg);
+        if (entry.component !== undefined) entry.component = stringifyLogValue(entry.component);
+        if (entry.module !== undefined) entry.module = stringifyLogValue(entry.module);
+        if (entry.correlationId !== undefined)
+          entry.correlationId = stringifyLogValue(entry.correlationId);
+        if (minLevel > 0 && (LEVEL_ORDER[entry.level] || 0) < minLevel) continue;
+        if (
+          componentFilter &&
+          !matchesSearch(entry.component || entry.module || "", componentFilter)
+        )
+          continue;
+        if (entry.time && !entry.timestamp) entry.timestamp = entry.time;
+        entries.push(entry);
+        if (entries.length > limit) entries.shift();
+      } catch {
+        // Preserve the viewer's skip-on-malformed-line behavior.
+      }
+    }
+    return NextResponse.json(entries, {
+      status: 200,
+      headers: { "Cache-Control": "no-store, no-cache, must-revalidate" },
+    });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT")
+      return NextResponse.json([], { status: 200 });
+    return NextResponse.json(
+      { error: sanitizeErrorMessage(error) || "Failed to read logs" },
+      { status: 500 }
+    );
+  } finally {
+    stream.destroy();
+  }
+}
+
+async function* consoleLogLines(
+  stream: ReturnType<typeof createReadStream>
+): AsyncGenerator<string> {
+  let pending = "";
+  for await (const chunk of stream) {
+    pending += String(chunk);
+    let newline: number;
+    while ((newline = pending.indexOf("\n")) !== -1) {
+      yield pending.slice(0, newline);
+      pending = pending.slice(newline + 1);
+    }
+  }
+  if (pending) yield pending;
 }

@@ -31,8 +31,6 @@
  * `control_url`, so it is excluded.
  */
 
-import { getDbInstance } from "../db/core";
-import { decrypt } from "../db/encryption";
 import { isProxySkipRecentlyFailedEnabled } from "@/shared/utils/featureFlags";
 import {
   isSelectorMemberAvoided,
@@ -41,11 +39,13 @@ import {
   snapshotProxySetAside,
   type ProxyRefusalKind,
 } from "@omniroute/open-sse/utils/proxyRefusalMemory.ts";
+import { getSelectedProxySubscriptionStore } from "../db/proxySubscriptionStore";
+import { getDbInstance } from "../db/core";
+import { decrypt } from "../db/encryption";
 import { parseSelectorTag } from "./selectorEndpoint";
 import { getGroupMembers, switchSelector, type SelectorSwitchReason } from "./selectorClient";
 import { isSelectorControlUrlAllowedAtFetchTime, resolveSelectorAllowlist } from "./selectorGuard";
 import { recordSelectorSwitchOutcome } from "./subscriptionService";
-
 export interface SelectorTriggerResult {
   switched: boolean;
   reason:
@@ -152,8 +152,10 @@ export function __setAnyControlUrlConfiguredForTesting(v: boolean | null): void 
   anyControlUrlConfigured = v;
 }
 
-function refreshControlUrlCache(): boolean {
+async function refreshControlUrlCache(): Promise<boolean> {
   try {
+    const store = getSelectedProxySubscriptionStore();
+    if (store) return store.controlUrlConfigured();
     const db = getDbInstance();
     const row = db
       .prepare("SELECT 1 AS hit FROM proxy_subscriptions WHERE control_url IS NOT NULL LIMIT 1")
@@ -173,11 +175,14 @@ interface ResolveHit {
   gapSeconds: number;
 }
 
-function resolvePairs(setAsideKey: string): ResolveHit[] {
-  const db = getDbInstance();
-  const rows = db
-    .prepare(
-      `SELECT p.id AS rid, p.type AS type, p.host AS host, p.port AS port, p.username AS username,
+async function resolvePairs(setAsideKey: string): Promise<ResolveHit[]> {
+  const store = getSelectedProxySubscriptionStore();
+  const db = store ? null : getDbInstance();
+  const rows = store
+    ? await store.selectorRows()
+    : (db!
+        .prepare(
+          `SELECT p.id AS rid, p.type AS type, p.host AS host, p.port AS port, p.username AS username,
               p.subscription_id AS subscription_id, p.updated_at AS updated_at,
               s.control_url AS control_url, s.control_secret_enc AS control_secret_enc,
               s.selector_min_gap_seconds AS selector_min_gap_seconds,
@@ -186,8 +191,8 @@ function resolvePairs(setAsideKey: string): ResolveHit[] {
          JOIN proxy_subscriptions s ON s.id = p.subscription_id
         WHERE p.subscription_id IS NOT NULL AND s.control_url IS NOT NULL
         ORDER BY datetime(p.updated_at) DESC, p.id ASC`
-    )
-    .all() as Array<Record<string, unknown>>;
+        )
+        .all() as Array<Record<string, unknown>>);
   const hits: ResolveHit[] = [];
   for (const r of rows) {
     const key = selectorRegistryKey({
@@ -352,7 +357,12 @@ function readSwitchSecret(secretEnc: string | null): string | null {
 }
 
 async function runSwitch(
-  hit: { controlUrl: string; selector: string; secretEnc: string | null; subscriptionId: string },
+  hit: {
+    controlUrl: string;
+    selector: string;
+    secretEnc: string | null;
+    subscriptionId: string;
+  },
   setAsideKey: string,
   now: number,
   kind: ProxyRefusalKind
@@ -365,7 +375,7 @@ async function runSwitch(
   const prevSlot = lastSwitch.get(throttleKey);
   lastSwitch.set(throttleKey, now);
   const guarded = await passFetchTimeGuard(hit.controlUrl);
-  if (!guarded.pass) {
+  if (guarded.pass === false) {
     restoreSlot(throttleKey, prevSlot);
     await recordSelectorSwitchOutcome({
       subscriptionId: hit.subscriptionId,
@@ -448,8 +458,13 @@ function setAsideKind(entryKey: string, now: number): ProxyRefusalKind | null {
  * snapshot or the hard default. Unknown or unreadable values fall through to
  * the live snapshot path. Never throws.
  */
-function lastPersistedSwitchKind(subscriptionId: string): ProxyRefusalKind | null {
+async function lastPersistedSwitchKind(subscriptionId: string): Promise<ProxyRefusalKind | null> {
   try {
+    const store = getSelectedProxySubscriptionStore();
+    if (store) {
+      const kind = (await store.get(subscriptionId))?.selector_last_switch_kind;
+      return typeof kind === "string" && kind.length > 0 ? (kind as ProxyRefusalKind) : null;
+    }
     const db = getDbInstance();
     const row = db
       .prepare("SELECT selector_last_switch_kind FROM proxy_subscriptions WHERE id = ?")
@@ -472,15 +487,15 @@ function restoreSlot(throttleKey: string, prev: number | undefined): void {
  * earlier outcome); live snapshot as fallback for the synchronous quota
  * caller; hard default last so the column never stays unexplained.
  */
-function switchOutcomeKind(
+async function switchOutcomeKind(
   setAsideKey: string,
   now: number,
   propagated?: ProxyRefusalKind,
   subscriptionId?: string
-): ProxyRefusalKind {
+): Promise<ProxyRefusalKind> {
   if (propagated !== undefined) return propagated;
   if (subscriptionId !== undefined) {
-    const kept = lastPersistedSwitchKind(subscriptionId);
+    const kept = await lastPersistedSwitchKind(subscriptionId);
     if (kept !== null) return kept;
   }
   return setAsideKind(setAsideKey, now) ?? "ip_quota_429";
@@ -496,13 +511,16 @@ export async function maybeSwitchOnSetAside(
 ): Promise<SelectorTriggerResult> {
   try {
     if (!isProxySkipRecentlyFailedEnabled()) return { switched: false, reason: "flag-off" };
-    if (anyControlUrlConfigured === false) {
+    if (!getSelectedProxySubscriptionStore() && anyControlUrlConfigured === false) {
       return { switched: false, reason: "no-control" };
     }
-    if (anyControlUrlConfigured === null && !refreshControlUrlCache()) {
+    if (
+      (getSelectedProxySubscriptionStore() || anyControlUrlConfigured === null) &&
+      !(await refreshControlUrlCache())
+    ) {
       return { switched: false, reason: "no-control" };
     }
-    const pairs = resolvePairs(setAsideKey);
+    const pairs = await resolvePairs(setAsideKey);
     if (pairs.length === 0) return { switched: false, reason: "unmapped" };
     // Deterministic tie-break: first pair in (updated_at DESC, id ASC) order.
     const hit = pairs[0]!;
@@ -513,11 +531,11 @@ export async function maybeSwitchOnSetAside(
       await recordSelectorSwitchOutcome({
         subscriptionId: hit.subscriptionId,
         result: "throttled",
-        kind: switchOutcomeKind(setAsideKey, now, opts?.kind, hit.subscriptionId),
+        kind: await switchOutcomeKind(setAsideKey, now, opts?.kind, hit.subscriptionId),
       });
       return { switched: false, reason: "throttled" };
     }
-    return runSwitch(hit, setAsideKey, now, switchOutcomeKind(setAsideKey, now, opts?.kind));
+    return runSwitch(hit, setAsideKey, now, await switchOutcomeKind(setAsideKey, now, opts?.kind));
   } catch {
     return { switched: false, reason: "network-error" };
   }

@@ -5,9 +5,10 @@
  */
 
 import { randomBytes } from "node:crypto";
+import { getSelectedPostgresDatabase } from "./controlPlaneContext";
+import { createPostgresRelayProxyRepository } from "./postgres/relayProxyRepository";
 import { getDbInstance } from "./core";
 import { rowToCamel } from "./core";
-
 // ── Types ────────────────────────────────────────────────────────────────────
 
 export interface RelayToken {
@@ -155,7 +156,10 @@ export function getRelayToken(id: string): RelayToken | null {
   const row = db.prepare("SELECT * FROM relay_tokens WHERE id = ?").get(id) as
     RelayTokenRow | undefined;
   if (!row) return null;
-  return { ...(rowToCamel(row) as unknown as RelayToken), enabled: row.enabled === 1 };
+  return {
+    ...(rowToCamel(row) as unknown as RelayToken),
+    enabled: row.enabled === 1,
+  };
 }
 
 export function getRelayTokenByHash(
@@ -166,7 +170,10 @@ export function getRelayTokenByHash(
     .prepare("SELECT * FROM relay_tokens WHERE token_hash = ? AND enabled = 1")
     .get(tokenHash) as RelayTokenRow | undefined;
   if (!row) return null;
-  return { ...(rowToCamel(row) as unknown as RelayToken), enabled: row.enabled === 1 };
+  return {
+    ...(rowToCamel(row) as unknown as RelayToken),
+    enabled: row.enabled === 1,
+  };
 }
 
 export function updateRelayToken(
@@ -366,4 +373,99 @@ export function getRelayLogs(tokenId?: string, limit = 50): RelayLogRow[] {
   return db
     .prepare("SELECT * FROM relay_logs ORDER BY created_at DESC LIMIT ?")
     .all(limit) as RelayLogRow[];
+}
+
+export async function createRelayTokenAsync(
+  input: CreateRelayTokenInput
+): Promise<ReturnType<typeof createRelayToken>> {
+  const postgres = getSelectedPostgresDatabase();
+  return postgres
+    ? createPostgresRelayProxyRepository(postgres).create(input)
+    : createRelayToken(input);
+}
+
+export async function getRelayTokensAsync(): Promise<ReturnType<typeof getRelayTokens>> {
+  const postgres = getSelectedPostgresDatabase();
+  return postgres ? createPostgresRelayProxyRepository(postgres).list() : getRelayTokens();
+}
+
+export async function getRelayTokenAsync(id: string): Promise<ReturnType<typeof getRelayToken>> {
+  const postgres = getSelectedPostgresDatabase();
+  return postgres ? createPostgresRelayProxyRepository(postgres).get(id) : getRelayToken(id);
+}
+
+export async function getRelayTokenByHashAsync(
+  tokenHash: string
+): Promise<ReturnType<typeof getRelayTokenByHash>> {
+  const postgres = getSelectedPostgresDatabase();
+  return postgres
+    ? createPostgresRelayProxyRepository(postgres).byHash(tokenHash)
+    : getRelayTokenByHash(tokenHash);
+}
+
+export async function updateRelayTokenAsync(
+  id: string,
+  updates: Partial<CreateRelayTokenInput>
+): Promise<ReturnType<typeof updateRelayToken>> {
+  const postgres = getSelectedPostgresDatabase();
+  return postgres
+    ? createPostgresRelayProxyRepository(postgres).update(id, updates)
+    : updateRelayToken(id, updates);
+}
+
+export async function deleteRelayTokenAsync(
+  id: string
+): Promise<ReturnType<typeof deleteRelayToken>> {
+  const postgres = getSelectedPostgresDatabase();
+  return postgres ? createPostgresRelayProxyRepository(postgres).delete(id) : deleteRelayToken(id);
+}
+
+export async function toggleRelayTokenAsync(
+  id: string,
+  enabled: boolean
+): Promise<ReturnType<typeof toggleRelayToken>> {
+  const postgres = getSelectedPostgresDatabase();
+  return postgres
+    ? createPostgresRelayProxyRepository(postgres).toggle(id, enabled)
+    : toggleRelayToken(id, enabled);
+}
+
+export async function checkRateLimitAsync(
+  tokenId: string,
+  existingToken?: RelayToken
+): Promise<ReturnType<typeof checkRateLimit>> {
+  const postgres = getSelectedPostgresDatabase();
+  return postgres
+    ? createPostgresRelayProxyRepository(postgres).check(tokenId, existingToken)
+    : checkRateLimit(tokenId, existingToken);
+}
+
+export async function recordRelayUsageAsync(
+  tokenId: string,
+  params: Parameters<typeof recordRelayUsage>[1]
+): Promise<ReturnType<typeof recordRelayUsage>> {
+  const postgres = getSelectedPostgresDatabase();
+  return postgres
+    ? createPostgresRelayProxyRepository(postgres).record(tokenId, params)
+    : recordRelayUsage(tokenId, params);
+}
+
+export async function getRelayUsageAsync(
+  tokenId: string,
+  since: number
+): Promise<ReturnType<typeof getRelayUsage>> {
+  const postgres = getSelectedPostgresDatabase();
+  return postgres
+    ? createPostgresRelayProxyRepository(postgres).usage(tokenId, since)
+    : getRelayUsage(tokenId, since);
+}
+
+export async function getRelayLogsAsync(
+  tokenId?: string,
+  limit = 50
+): Promise<ReturnType<typeof getRelayLogs>> {
+  const postgres = getSelectedPostgresDatabase();
+  return postgres
+    ? createPostgresRelayProxyRepository(postgres).logs(tokenId, limit)
+    : getRelayLogs(tokenId, limit);
 }

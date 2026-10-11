@@ -20,6 +20,10 @@
  * no real timers, no real DB, no real network.
  */
 
+import { parseDatabaseBackend } from "@/lib/db/backendSelection";
+import { getSelectedPersistenceIdentity } from "@/lib/db/controlPlaneContext";
+import { runPersistenceBackgroundWork } from "@/lib/db/persistenceRuntime";
+import { createPersistencePoller, type PersistencePoller } from "@/lib/config/persistencePoller";
 import { logger } from "@omniroute/open-sse/utils/logger.ts";
 import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error.ts";
 import type { BaseExecutor } from "@omniroute/open-sse/executors/base";
@@ -47,7 +51,9 @@ const log = logger("QuotaAutoPing");
 type JsonRecord = Record<string, unknown>;
 
 /** Provider config plus the ping model resolved for this tick (#11905). */
-type ResolvedQuotaAutoPingProviderConfig = QuotaAutoPingProviderConfig & { pingModel: string };
+type ResolvedQuotaAutoPingProviderConfig = QuotaAutoPingProviderConfig & {
+  pingModel: string;
+};
 
 export interface QuotaAutoPingConnection {
   id: string;
@@ -100,7 +106,12 @@ export interface QuotaAutoPingState {
 }
 
 export function createQuotaAutoPingState(): QuotaAutoPingState {
-  return { running: false, resetCache: {}, failureCache: {}, pingModelCache: {} };
+  return {
+    running: false,
+    resetCache: {},
+    failureCache: {},
+    pingModelCache: {},
+  };
 }
 
 let codexExecutorPromise: Promise<BaseExecutor> | null = null;
@@ -150,7 +161,13 @@ export async function resolveQuotaAutoPingModel(
 export function createDefaultQuotaAutoPingDeps(): QuotaAutoPingDeps {
   return {
     getSettings,
-    getProviderConnections,
+    getProviderConnections: async (filter) => {
+      const rows = await getProviderConnections(filter);
+      return rows.filter(
+        (row): row is typeof row & QuotaAutoPingConnection =>
+          typeof row.id === "string" && typeof row.provider === "string"
+      );
+    },
     updateProviderConnection,
     refreshAndUpdateCredentials: async (connection) =>
       refreshAndUpdateCredentialsWithResolver(connection, loadQuotaAutoPingExecutor),
@@ -451,7 +468,10 @@ async function pingConnection(
       lastPingedResetKey: resetKey,
       lastPingAt: new Date(nowMs).toISOString(),
     });
-    log.info(`${provider}:${current.id}: ping sent`, { resetAt, model: providerConfig.pingModel });
+    log.info(`${provider}:${current.id}: ping sent`, {
+      resetAt,
+      model: providerConfig.pingModel,
+    });
   });
 }
 
@@ -499,7 +519,10 @@ async function pingProviderConnections(
   state: QuotaAutoPingState,
   nowMs: number
 ): Promise<void> {
-  const connections = await deps.getProviderConnections({ provider, isActive: true });
+  const connections = await deps.getProviderConnections({
+    provider,
+    isActive: true,
+  });
   const targets = connections.filter(
     (conn) => conn.authType === "oauth" && enabledMap[conn.id] === true
   );
@@ -546,7 +569,9 @@ export async function runQuotaAutoPingTick(
       );
     }
   } catch (err) {
-    log.warn("tick error", { error: sanitizeErrorMessage((err as Error)?.message ?? String(err)) });
+    log.warn("tick error", {
+      error: sanitizeErrorMessage((err as Error)?.message ?? String(err)),
+    });
   } finally {
     state.running = false;
   }
@@ -556,7 +581,53 @@ let schedulerInterval: ReturnType<typeof setInterval> | null = null;
 const schedulerState = createQuotaAutoPingState();
 
 /** Start the in-process scheduler. Idempotent — a second call is a no-op. */
+interface NativeSchedulerOwner {
+  readonly identity: object;
+  readonly poller: PersistencePoller;
+  stopping?: Promise<void>;
+}
+const NATIVE_SCHEDULER = Symbol.for("omniroute.quotaAutoPing.postgresScheduler");
+const nativeGlobals = globalThis as typeof globalThis & {
+  [NATIVE_SCHEDULER]?: NativeSchedulerOwner;
+};
+
+function stopNativePoller(): Promise<void> {
+  const owner = nativeGlobals[NATIVE_SCHEDULER];
+  if (!owner) return Promise.resolve();
+
+  owner.stopping ??= owner.poller.stop().finally(() => {
+    if (nativeGlobals[NATIVE_SCHEDULER] === owner) nativeGlobals[NATIVE_SCHEDULER] = undefined;
+  });
+  return owner.stopping;
+}
+
 export function startQuotaAutoPing(): void {
+  if (parseDatabaseBackend() === "postgres") {
+    const identity = getSelectedPersistenceIdentity();
+    if (!identity) throw new Error("Native scheduler requires selected PostgreSQL persistence");
+    const existing = nativeGlobals[NATIVE_SCHEDULER];
+    if (existing) {
+      if (existing.identity !== identity || existing.stopping)
+        throw new Error("Native scheduler authority changed or is draining");
+      return;
+    }
+    const interval = QUOTA_AUTOPING_TICK_INTERVAL_MS;
+    const poller = createPersistencePoller({
+      intervalMs: interval,
+      initialDelayMs: 0,
+      check: async () => {
+        await runPersistenceBackgroundWork(async () => {
+          if (getSelectedPersistenceIdentity() !== identity)
+            throw new Error("Native scheduler persistence identity changed");
+          await runQuotaAutoPingTick(createDefaultQuotaAutoPingDeps(), schedulerState);
+        });
+      },
+      onFailure: () => {},
+    });
+    nativeGlobals[NATIVE_SCHEDULER] = { identity, poller };
+    poller.start();
+    return;
+  }
   if (schedulerInterval) return;
   log.info("scheduler started");
   runQuotaAutoPingTick(createDefaultQuotaAutoPingDeps(), schedulerState).catch(() => undefined);
@@ -568,8 +639,18 @@ export function startQuotaAutoPing(): void {
 
 /** Stop the in-process scheduler. Idempotent — a second call is a no-op. */
 export function stopQuotaAutoPing(): void {
+  if (parseDatabaseBackend() === "postgres") {
+    void stopNativePoller().catch(() => {});
+    return;
+  }
   if (!schedulerInterval) return;
   clearInterval(schedulerInterval);
   schedulerInterval = null;
   log.info("scheduler stopped");
+}
+
+/** Stop admission and wait for every accepted native tick. */
+export async function stopQuotaAutoPingAsync(): Promise<void> {
+  if (parseDatabaseBackend() !== "postgres") return stopQuotaAutoPing();
+  await stopNativePoller();
 }

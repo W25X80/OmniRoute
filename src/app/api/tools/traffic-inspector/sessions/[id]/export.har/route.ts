@@ -8,7 +8,7 @@
  */
 
 import { buildErrorBody, sanitizeErrorMessage } from "@omniroute/open-sse/utils/error.ts";
-import { getSession, getSessionRequests } from "@/lib/db/inspectorSessions";
+import { getSessionAsync, getSessionRequestsAsync } from "@/lib/db/inspectorSessions";
 import { toHar } from "@/lib/inspector/harExport";
 import type { InterceptedRequest } from "@/mitm/inspector/types";
 
@@ -19,7 +19,7 @@ interface Params {
 export async function GET(_request: Request, { params }: Params): Promise<Response> {
   const { id } = await params;
 
-  const session = getSession(id);
+  const session = await getSessionAsync(id);
   if (!session) {
     return new Response(JSON.stringify(buildErrorBody(404, "Session not found")), {
       status: 404,
@@ -28,7 +28,7 @@ export async function GET(_request: Request, { params }: Params): Promise<Respon
   }
 
   try {
-    const rows = getSessionRequests(id);
+    const rows = await getSessionRequestsAsync(id);
     const requests: InterceptedRequest[] = rows
       .map((r) => {
         try {

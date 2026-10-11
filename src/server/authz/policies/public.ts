@@ -1,6 +1,6 @@
 import type { AuthOutcome, PolicyContext, RoutePolicy } from "../context";
 import { allow } from "../context";
-import { hasValidLoopbackCliToken, LOCAL_CLI_SUBJECT } from "../peerContext";
+import { hasValidLoopbackCliTokenAsync, LOCAL_CLI_SUBJECT } from "../peerContext";
 
 export const publicPolicy: RoutePolicy = {
   routeClass: "PUBLIC",
@@ -17,7 +17,7 @@ export const publicPolicy: RoutePolicy = {
     // introduced by #11040 (GHSA-mvf8-qc78-5mxm hardening).
     // The verdict is strictly loopback + constant-time token comparison, the
     // same gate the MANAGEMENT policy applies.
-    if (hasValidLoopbackCliToken(ctx)) {
+    if (await hasValidLoopbackCliTokenAsync(ctx)) {
       return allow({ ...LOCAL_CLI_SUBJECT });
     }
     return allow({ kind: "anonymous", id: "anonymous" });

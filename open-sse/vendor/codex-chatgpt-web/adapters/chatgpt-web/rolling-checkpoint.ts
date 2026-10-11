@@ -1,7 +1,8 @@
 /* Adapted from miuuyy/codex-chatgpt-web commit 09877fa21ffdbf20979623ef501046fc02a750d7 (MIT). */
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
-import { atomicWriteFile } from "../../config";
+import { access, readFile } from "node:fs/promises";
+import { atomicWriteFile, atomicWriteFileAsync } from "../../config";
 import { estimateTokens } from "../../lib/token-estimate";
 import { parseRequest } from "../../responses/parser";
 import type { CodexParsedRequest } from "../../types";
@@ -290,11 +291,16 @@ function validateStoredCheckpoint(value: unknown): StoredChatGptLunaCheckpoint {
 /** Exact-parent, per-thread checkpoint store. Full Codex history remains canonical on mismatch. */
 export class ChatGptLunaCheckpointStore {
   private loaded = false;
+  private prepared = false;
+  private preparing?: Promise<void>;
+  private staged?: string;
+  private flushing?: Promise<void>;
   private readonly checkpoints = new Map<string, StoredChatGptLunaCheckpoint>();
 
   constructor(
     private readonly path?: string,
-    private readonly now: () => number = Date.now
+    private readonly now: () => number = Date.now,
+    private readonly fileMode: "sync" | "async" = "sync"
   ) {}
 
   apply(parsed: CodexParsedRequest): {
@@ -406,12 +412,18 @@ export class ChatGptLunaCheckpointStore {
   }
 
   private load(): void {
+    if (this.fileMode === "async") {
+      if (!this.prepared) throw new Error("Async ChatGPT state must be prepared before use");
+      return;
+    }
     if (this.loaded) return;
     this.loaded = true;
     if (!this.path || !existsSync(this.path)) return;
-    const payload = JSON.parse(
-      readFileSync(this.path, "utf8")
-    ) as Partial<StoredChatGptLunaCheckpointFile>;
+    this.loadSnapshot(readFileSync(this.path, "utf8"));
+  }
+
+  private loadSnapshot(text: string): void {
+    const payload = JSON.parse(text) as Partial<StoredChatGptLunaCheckpointFile>;
     if (payload.version !== 1 || !Array.isArray(payload.checkpoints)) {
       throw new Error(`Invalid ChatGPT Luna checkpoint store: ${this.path}`);
     }
@@ -431,6 +443,54 @@ export class ChatGptLunaCheckpointStore {
       version: 1,
       checkpoints: [...this.checkpoints.values()],
     };
-    atomicWriteFile(this.path, `${JSON.stringify(payload, null, 2)}\n`);
+    const serialized = `${JSON.stringify(payload, null, 2)}\n`;
+    if (this.fileMode === "async") this.staged = serialized;
+    else atomicWriteFile(this.path, serialized);
+  }
+  /** Native storage is prepared before the existing synchronous authority decisions run. */
+  async prepareAsync(): Promise<void> {
+    if (this.fileMode !== "async" || this.prepared) return;
+    if (this.preparing) return this.preparing;
+    const preparing = (async () => {
+      this.loaded = true;
+      if (this.path) {
+        let exists = true;
+        try {
+          await access(this.path);
+        } catch {
+          exists = false;
+        }
+        if (exists) this.loadSnapshot(await readFile(this.path, "utf8"));
+      }
+      this.prepared = true;
+    })();
+    this.preparing = preparing;
+    try {
+      await preparing;
+    } finally {
+      if (this.preparing === preparing) this.preparing = undefined;
+    }
+  }
+
+  /** A successful earlier ACK cannot clear a later staged snapshot. Errors propagate. */
+  async flushAsync(): Promise<void> {
+    if (this.fileMode !== "async") return;
+    while (this.flushing || this.staged !== undefined) {
+      if (this.flushing) {
+        await this.flushing;
+        continue;
+      }
+      const serialized = this.staged!;
+      const flushing = (async () => {
+        await atomicWriteFileAsync(this.path!, serialized);
+        if (this.staged === serialized) this.staged = undefined;
+      })();
+      this.flushing = flushing;
+      try {
+        await flushing;
+      } finally {
+        if (this.flushing === flushing) this.flushing = undefined;
+      }
+    }
   }
 }

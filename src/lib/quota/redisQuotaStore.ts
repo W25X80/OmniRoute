@@ -16,11 +16,12 @@
  * Part of: Group B — Quota Sharing Engine (plan 22, frente F6).
  */
 
-import { getPool, listAllocationsForApiKey } from "@/lib/db/quotaPools";
+import { getPoolAsync as getPool } from "@/lib/db/quotaPools";
 import { WINDOW_MS, dimensionKeyToString } from "./dimensions";
 import type { DimensionKey } from "./dimensions";
 import type { QuotaStore, PoolUsageSnapshot } from "./types";
 import { computeBurnRateFromWindow } from "./burnRate";
+import { validateQuotaEventTimeMs } from "./eventTime";
 
 // ---------------------------------------------------------------------------
 // Redis connection singleton
@@ -116,8 +117,13 @@ export class RedisQuotaStore implements QuotaStore {
    * Increment consumption by `cost` using INCRBYFLOAT (atomic) and refresh TTL.
    * Returns the new sliding-window effective value.
    */
-  async consume(apiKeyId: string, dim: DimensionKey, cost: number): Promise<number> {
-    const nowMs = Date.now();
+  async consume(
+    apiKeyId: string,
+    dim: DimensionKey,
+    cost: number,
+    eventTimeMs?: number
+  ): Promise<number> {
+    const nowMs = validateQuotaEventTimeMs(eventTimeMs === undefined ? Date.now() : eventTimeMs);
     const dimKey = dimensionKeyToString(dim);
     const windowMs = WINDOW_MS[dim.window];
     const currentBucket = Math.floor(nowMs / windowMs);
@@ -177,7 +183,7 @@ export class RedisQuotaStore implements QuotaStore {
    * Keys absent in Redis are treated as 0 (MGET returns null).
    */
   async poolConsumedTotal(poolId: string, dim: DimensionKey): Promise<number> {
-    const pool = getPool(poolId);
+    const pool = await getPool(poolId);
     if (!pool || pool.allocations.length === 0) return 0;
 
     const nowMs = Date.now();
@@ -213,7 +219,7 @@ export class RedisQuotaStore implements QuotaStore {
    */
   async poolUsage(poolId: string): Promise<PoolUsageSnapshot> {
     const nowMs = Date.now();
-    const pool = getPool(poolId);
+    const pool = await getPool(poolId);
 
     if (!pool) {
       return {
@@ -241,7 +247,7 @@ export class RedisQuotaStore implements QuotaStore {
     planDimensions: Array<{ unit: string; window: string; limit: number }>
   ): Promise<PoolUsageSnapshot> {
     const nowMs = Date.now();
-    const pool = getPool(poolId);
+    const pool = await getPool(poolId);
 
     if (!pool) {
       return {

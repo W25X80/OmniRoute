@@ -10,7 +10,10 @@ import { z } from "zod";
 
 import { requireCliToolsAuth } from "@/lib/api/requireCliToolsAuth";
 import { guardCliConfigWrite } from "@/lib/api/cliConfigWriteGuard";
-import { deleteCliToolLastConfigured, saveCliToolLastConfigured } from "@/lib/db/cliToolState";
+import {
+  deleteCliToolLastConfiguredAsync,
+  saveCliToolLastConfiguredAsync,
+} from "@/lib/db/cliToolState";
 import { getResolvedModelCapabilities } from "@/lib/modelCapabilities";
 import { resolveApiKey } from "@/shared/services/apiKeyResolver";
 import { createBackup } from "@/shared/services/backupService";
@@ -214,7 +217,7 @@ export async function POST(request: Request): Promise<Response> {
     await createBackup(TOOL_ID, configPath);
     await writeAtomic(configPath, toml);
     try {
-      saveCliToolLastConfigured(TOOL_ID);
+      await saveCliToolLastConfiguredAsync(TOOL_ID);
     } catch {
       logger.warn("Failed to record Grok Build config time");
     }
@@ -252,7 +255,7 @@ export async function DELETE(request: Request): Promise<Response> {
     await createBackup(TOOL_ID, configPath);
     await writeAtomic(configPath, resetGrokBuildConfig(current));
     try {
-      deleteCliToolLastConfigured(TOOL_ID);
+      await deleteCliToolLastConfiguredAsync(TOOL_ID);
     } catch {
       logger.warn("Failed to clear Grok Build config time");
     }

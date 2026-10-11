@@ -1,14 +1,11 @@
+import { addParamToBlocklistAsync } from "@/lib/db/paramFilters";
 // Reactive 400 field-downgrade (and auto-learn) retry, extracted verbatim in
 // behavior from BaseExecutor.execute() (base.ts) to keep that file under its
 // frozen size cap. On an upstream 400 that names an offending request field,
 // the field is deleted from the live body and the SAME url is retried once per
 // field; "Unsupported parameter" errors are optionally persisted to the
 // provider's param blocklist (#6625).
-import {
-  getParamFilterConfig,
-  addParamToBlocklist,
-  isAutoLearnGloballyEnabled,
-} from "@/lib/db/paramFilters";
+import { getParamFilterConfig, isAutoLearnGloballyEnabled } from "@/lib/db/paramFilters";
 import { HTTP_STATUS } from "../../config/constants.ts";
 import {
   findOffendingField,
@@ -62,7 +59,7 @@ async function applyAutoLearnRecovery(
       const shouldAutoLearn = isAutoLearnGloballyEnabled() || config?.autoLearn === true;
       if (shouldAutoLearn) {
         strippedFields.add(autoLearned);
-        addParamToBlocklist(provider, autoLearned, model);
+        await addParamToBlocklistAsync(provider, autoLearned, model);
         delete record[autoLearned];
         const retryBody = await serializeBody(body);
         log?.info?.(

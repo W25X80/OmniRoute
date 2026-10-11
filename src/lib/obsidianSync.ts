@@ -1,19 +1,13 @@
 import fs from "node:fs";
+import { readFile, realpath, stat, unlink } from "node:fs/promises";
 import path from "node:path";
-import { resolveDataDir } from "./dataPaths";
+import { parseDatabaseBackend } from "@/lib/db/backendSelection";
+import { resolveDataDir, resolveDataDirAsync } from "./dataPaths";
 import {
-  getObsidianVaultPath,
-  setObsidianVaultPath,
-  clearObsidianVaultPath,
-  getWebdavUsername,
-  setWebdavUsername,
-  getWebdavPassword,
-  setWebdavPassword,
-  clearWebdavUsername,
-  clearWebdavPassword,
-  getWebdavEnabled,
-  setWebdavEnabled,
-  clearWebdavEnabled,
+  getWebdavConfigurationAsync,
+  getObsidianVaultPathAsync as getObsidianVaultPath,
+  saveObsidianSyncConfigurationAsync,
+  clearObsidianSyncConfigurationAsync,
 } from "./db/obsidian";
 
 export type ObsidianSyncStatus = {
@@ -28,12 +22,13 @@ export type ObsidianSyncEnableResult =
   | { success: false; error: string };
 
 export async function getObsidianSyncStatus(): Promise<ObsidianSyncStatus> {
-  const vaultPath = getObsidianVaultPath();
-  const webdavEnabled = getWebdavEnabled();
-  const webdavUsername = getWebdavUsername();
-  const webdavPassword = getWebdavPassword();
-
-  return { vaultPath, webdavEnabled, webdavUsername, webdavPassword };
+  const configuration = await getWebdavConfigurationAsync();
+  return {
+    vaultPath: configuration.vaultPath,
+    webdavEnabled: configuration.enabled,
+    webdavUsername: configuration.username,
+    webdavPassword: configuration.password,
+  };
 }
 
 /** Canonical (symlink-resolved) form of a path; falls back to the lexical resolve. */
@@ -67,6 +62,20 @@ export function vaultPathOverlapsDataDir(resolvedVaultPath: string): boolean {
   return isSameOrInside(dataDir, vault) || isSameOrInside(vault, dataDir);
 }
 
+async function canonicalPathAsync(target: string): Promise<string> {
+  try {
+    return await realpath(target);
+  } catch {
+    return path.resolve(target);
+  }
+}
+
+export async function vaultPathOverlapsDataDirAsync(resolvedVaultPath: string): Promise<boolean> {
+  const vault = await canonicalPathAsync(resolvedVaultPath);
+  const dataDir = await canonicalPathAsync(await resolveDataDirAsync());
+  return isSameOrInside(dataDir, vault) || isSameOrInside(vault, dataDir);
+}
+
 export const VAULT_OVERLAPS_DATA_DIR_ERROR =
   "Vault path must not be the OmniRoute data directory, a directory inside it, or a directory that contains it";
 
@@ -75,28 +84,36 @@ export async function enableObsidianVaultSync(
 ): Promise<ObsidianSyncEnableResult> {
   const resolvedPath = path.resolve(vaultPath);
 
-  if (!fs.existsSync(resolvedPath)) {
-    return { success: false, error: `Vault directory not found: ${resolvedPath}` };
+  const native = parseDatabaseBackend() === "postgres";
+  const nativeStat = native ? await stat(resolvedPath).catch(() => null) : undefined;
+  if (native ? !nativeStat : !fs.existsSync(resolvedPath)) {
+    return {
+      success: false,
+      error: `Vault directory not found: ${resolvedPath}`,
+    };
   }
 
-  const stat = fs.statSync(resolvedPath);
-  if (!stat.isDirectory()) {
-    return { success: false, error: `Path is not a directory: ${resolvedPath}` };
+  const directoryStat = native ? nativeStat! : fs.statSync(resolvedPath);
+  if (!directoryStat.isDirectory()) {
+    return {
+      success: false,
+      error: `Path is not a directory: ${resolvedPath}`,
+    };
   }
 
-  if (vaultPathOverlapsDataDir(resolvedPath)) {
+  if (
+    native
+      ? await vaultPathOverlapsDataDirAsync(resolvedPath)
+      : vaultPathOverlapsDataDir(resolvedPath)
+  ) {
     return { success: false, error: VAULT_OVERLAPS_DATA_DIR_ERROR };
   }
 
   try {
-    setObsidianVaultPath(resolvedPath);
-
     const username = generateRandomString(12);
     const password = generateRandomString(24);
 
-    setWebdavUsername(username);
-    setWebdavPassword(password);
-    setWebdavEnabled(true);
+    await saveObsidianSyncConfigurationAsync(resolvedPath, username, password);
 
     return { success: true, vaultPath: resolvedPath, username, password };
   } catch (error) {
@@ -105,16 +122,17 @@ export async function enableObsidianVaultSync(
   }
 }
 
-export async function disableObsidianVaultSync(): Promise<{ success: boolean; error?: string }> {
+export async function disableObsidianVaultSync(): Promise<{
+  success: boolean;
+  error?: string;
+}> {
   try {
-    const vaultPath = getObsidianVaultPath();
+    const vaultPath = await getObsidianVaultPath();
     if (vaultPath) {
-      removeStignore(vaultPath);
+      if (parseDatabaseBackend() === "postgres") await removeStignoreAsync(vaultPath);
+      else removeStignore(vaultPath);
     }
-    clearObsidianVaultPath();
-    clearWebdavUsername();
-    clearWebdavPassword();
-    clearWebdavEnabled();
+    await clearObsidianSyncConfigurationAsync();
     return { success: true };
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
@@ -134,6 +152,15 @@ function removeStignore(vaultPath: string): void {
     }
   } catch {
     // Non-critical
+  }
+}
+
+async function removeStignoreAsync(vaultPath: string): Promise<void> {
+  try {
+    const file = path.join(vaultPath, ".stignore");
+    if ((await readFile(file, "utf-8")).includes("# Managed by OmniRoute")) await unlink(file);
+  } catch {
+    // Non-critical, matching the synchronous cleanup policy.
   }
 }
 

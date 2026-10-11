@@ -1,3 +1,5 @@
+import { getSelectedDetailedLogRepository } from "./postgres/detailedLogRepository";
+import { isNoLogAsync } from "../compliance/noLog";
 /**
  * Detailed Request Logs DB Layer (#378)
  *
@@ -171,4 +173,62 @@ function mapDetailedLogRow(row: Record<string, unknown>): RequestDetailLog {
     target_format: typeof row.target_format === "string" ? row.target_format : null,
     duration_ms: typeof row.duration_ms === "number" ? row.duration_ms : 0,
   };
+}
+
+export async function saveRequestDetailLogAsync(entry: RequestDetailLog): Promise<void> {
+  const postgres = getSelectedDetailedLogRepository();
+  if (!postgres) {
+    saveRequestDetailLog(entry);
+    return;
+  }
+  if (Boolean(entry.no_log) || (entry.api_key_id ? await isNoLogAsync(entry.api_key_id) : false))
+    return;
+  await postgres.save(
+    [
+      entry.id ?? uuidv4(),
+      entry.call_log_id ?? null,
+      entry.timestamp ?? new Date().toISOString(),
+      serializePayloadForStorage(protectPayloadForLog(entry.client_request)),
+      serializePayloadForStorage(protectPayloadForLog(entry.translated_request)),
+      serializePayloadForStorage(
+        protectPayloadForLog(compactStructuredStreamPayload(entry.provider_response))
+      ),
+      serializePayloadForStorage(
+        protectPayloadForLog(compactStructuredStreamPayload(entry.client_response))
+      ),
+      entry.provider ?? null,
+      entry.model ?? null,
+      entry.source_format ?? null,
+      entry.target_format ?? null,
+      entry.duration_ms ?? 0,
+    ],
+    entry.api_key_id
+  );
+}
+export async function getRequestDetailLogsAsync(
+  limit = 50,
+  offset = 0
+): Promise<RequestDetailLog[]> {
+  const postgres = getSelectedDetailedLogRepository();
+  return postgres
+    ? (await postgres.list(limit, offset)).map(mapDetailedLogRow)
+    : getRequestDetailLogs(limit, offset);
+}
+export async function getRequestDetailLogByIdAsync(id: string): Promise<RequestDetailLog | null> {
+  const postgres = getSelectedDetailedLogRepository();
+  if (!postgres) return getRequestDetailLogById(id);
+  const row = await postgres.byId(id);
+  return row ? mapDetailedLogRow(row) : null;
+}
+export async function getRequestDetailLogByCallLogIdAsync(
+  id: string
+): Promise<RequestDetailLog | null> {
+  const postgres = getSelectedDetailedLogRepository();
+  if (!postgres) return getRequestDetailLogByCallLogId(id);
+  const row = await postgres.byCallLogId(id);
+  return row ? mapDetailedLogRow(row) : null;
+}
+export async function getRequestDetailLogCountAsync(): Promise<number> {
+  const postgres = getSelectedDetailedLogRepository();
+  return postgres ? postgres.count() : getRequestDetailLogCount();
 }

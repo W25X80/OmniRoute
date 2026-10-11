@@ -1,3 +1,16 @@
+import { parseDatabaseBackend } from "../../src/lib/db/backendSelection";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { runPersistenceBackgroundWork } from "../../src/lib/db/persistenceRuntime";
+import {
+  getSelectedReasoningCacheRepository,
+  getSelectedReasoningCacheAuthority,
+  setReasoningCacheAsync,
+  getReasoningCacheStatsAsync,
+  getReasoningCacheEntriesAsync,
+  clearAllReasoningCacheAsync,
+  deleteReasoningCacheAsync,
+  cleanupExpiredReasoningAsync,
+} from "../../src/lib/db/reasoningCache";
 /**
  * Reasoning Replay Cache — In-memory + DB hybrid service.
  *
@@ -24,6 +37,7 @@ import {
   setReasoningCache,
 } from "../../src/lib/db/reasoningCache.ts";
 import { isFeatureFlagEnabled } from "../../src/shared/utils/featureFlags.ts";
+import { logger } from "../utils/logger.ts";
 import { isInternalReasoningPlaceholder } from "../utils/reasoningPlaceholder.ts";
 
 // ──────────────── Provider/Model Detection ────────────────
@@ -152,6 +166,8 @@ type ToolCallLike = {
 };
 
 const memoryCache = new Map<string, MemoryCacheEntry>();
+const authorityCaches = new WeakMap<object, typeof memoryCache>();
+const hydratedReplay = new AsyncLocalStorage<Map<string, string | null>>();
 const MAX_MEMORY_ENTRIES = 200;
 const MAX_ENTRY_BYTES = 10000;
 const TTL_MS = 2 * 60 * 60 * 1000; // 2 hours
@@ -170,13 +186,13 @@ let replays = 0;
 function evictOldest(): void {
   let oldestKey: string | null = null;
   let oldestTime = Infinity;
-  for (const [key, entry] of memoryCache) {
+  for (const [key, entry] of getReasoningMemoryCache()) {
     if (entry.createdAt < oldestTime) {
       oldestTime = entry.createdAt;
       oldestKey = key;
     }
   }
-  if (oldestKey) memoryCache.delete(oldestKey);
+  if (oldestKey) getReasoningMemoryCache().delete(oldestKey);
 }
 
 /**
@@ -184,9 +200,9 @@ function evictOldest(): void {
  */
 function purgeExpiredMemory(): void {
   const now = Date.now();
-  for (const [key, entry] of memoryCache) {
+  for (const [key, entry] of getReasoningMemoryCache()) {
     if (now >= entry.expiresAt) {
-      memoryCache.delete(key);
+      getReasoningMemoryCache().delete(key);
     }
   }
 }
@@ -214,6 +230,16 @@ export function cacheReasoningByKey(
   model: string,
   reasoning: string
 ): void {
+  void cacheReasoningByKeyWork(key, provider, model, reasoning);
+}
+
+function cacheReasoningByKeyWork(
+  key: string,
+  provider: string,
+  model: string,
+  reasoning: string,
+  enqueueNativeWrite?: (retainedReasoning: string) => void
+): void | Promise<void> {
   if (!isReasoningReplayEnabled() || !key || !reasoning) return;
   // ponytail: never store the internal replay placeholder — models echo it
   // and it poisons the cache (upstream echo loop, OmniRoute #9573).
@@ -226,10 +252,10 @@ export function cacheReasoningByKey(
   const now = Date.now();
 
   // Memory write
-  if (memoryCache.size >= MAX_MEMORY_ENTRIES) {
+  if (getReasoningMemoryCache().size >= MAX_MEMORY_ENTRIES) {
     evictOldest();
   }
-  memoryCache.set(key, {
+  getReasoningMemoryCache().set(key, {
     reasoning,
     provider,
     model,
@@ -237,6 +263,16 @@ export function cacheReasoningByKey(
     createdAt: now,
   });
 
+  if (getSelectedReasoningCacheRepository()) {
+    const retained = reasoning;
+    if (enqueueNativeWrite) {
+      enqueueNativeWrite(retained);
+      return;
+    }
+    return runPersistenceBackgroundWork(() =>
+      setReasoningCacheAsync(key, provider, model, retained, TTL_MS)
+    ).catch(() => {});
+  }
   try {
     setReasoningCache(key, provider, model, reasoning, TTL_MS);
   } catch {
@@ -343,6 +379,45 @@ export function cacheReasoningFromAssistantMessage(
   model: string,
   context?: AssistantMessageCacheContext
 ): number {
+  return captureAssistantMessageReasoning(message, context, (key, reasoning) => {
+    cacheReasoningByKey(key, provider, model, reasoning);
+  });
+}
+
+/** Settles optional native writes; the returned key count is not a durable-write receipt. */
+export async function cacheReasoningFromAssistantMessageAsync(
+  message: AssistantMessageLike | null | undefined,
+  provider: string,
+  model: string,
+  context?: AssistantMessageCacheContext
+): Promise<number> {
+  const pending: Array<{ key: string; reasoning: string }> = [];
+  const count = captureAssistantMessageReasoning(message, context, (key, reasoning) => {
+    cacheReasoningByKeyWork(key, provider, model, reasoning, (retainedReasoning) => {
+      pending.push({ key, reasoning: retainedReasoning });
+    });
+  });
+  if (pending.length > 0) {
+    await runPersistenceBackgroundWork(async () => {
+      for (const entry of pending) {
+        try {
+          await setReasoningCacheAsync(entry.key, provider, model, entry.reasoning, TTL_MS);
+        } catch {
+          // Each optional write is independent; keep serving retained memory and later keys.
+        }
+      }
+    }).catch(() => {
+      logger("REASONING_CACHE").warn("Optional reasoning capture persistence unavailable");
+    });
+  }
+  return count;
+}
+
+function captureAssistantMessageReasoning(
+  message: AssistantMessageLike | null | undefined,
+  context: AssistantMessageCacheContext | undefined,
+  capture: (key: string, reasoning: string) => void
+): number {
   if (context?.videoTranscriptSensitive) return 0;
   if (!message || message.role !== "assistant") {
     return 0;
@@ -376,11 +451,11 @@ export function cacheReasoningFromAssistantMessage(
     const cacheKey = buildAssistantMessageCacheKey(scope, messages, messages.length - 1);
     if (!cacheKey) return 0;
 
-    cacheReasoningByKey(cacheKey, provider, model, reasoning);
+    capture(cacheKey, reasoning);
     return 1;
   }
 
-  cacheReasoningBatch(toolCallIds, provider, model, reasoning);
+  for (const id of toolCallIds) capture(id, reasoning);
   return toolCallIds.length;
 }
 
@@ -400,12 +475,12 @@ function lookupStoredReasoning(toolCallId: string): string | null {
   }
 
   // 1. Check memory
-  const mem = memoryCache.get(toolCallId);
+  const mem = getReasoningMemoryCache().get(toolCallId);
   if (mem) {
     if (Date.now() < mem.expiresAt) {
       // ponytail: never replay the internal placeholder from memory.
       if (isInternalReasoningPlaceholder(mem.reasoning)) {
-        memoryCache.delete(toolCallId);
+        getReasoningMemoryCache().delete(toolCallId);
         misses++;
         return null;
       }
@@ -413,7 +488,14 @@ function lookupStoredReasoning(toolCallId: string): string | null {
       return mem.reasoning;
     }
     // Expired in memory — remove
-    memoryCache.delete(toolCallId);
+    getReasoningMemoryCache().delete(toolCallId);
+  }
+
+  if (getSelectedReasoningCacheRepository()) {
+    const reasoning = hydratedReplay.getStore()?.get(toolCallId) ?? null;
+    if (reasoning) hits++;
+    else misses++;
+    return reasoning;
   }
 
   // 2. Fallback to DB
@@ -441,7 +523,7 @@ function lookupStoredReasoning(toolCallId: string): string | null {
       promotedReasoning = promotedReasoning.slice(0, MAX_ENTRY_BYTES);
     }
     // Promote back to memory for fast subsequent lookups
-    memoryCache.set(toolCallId, {
+    getReasoningMemoryCache().set(toolCallId, {
       reasoning: promotedReasoning,
       provider: dbResult.provider,
       model: dbResult.model,
@@ -503,7 +585,7 @@ export function getReasoningCacheServiceStats(): {
   const replayRate = totalLookups > 0 ? ((replays / totalLookups) * 100).toFixed(1) : "0.0";
 
   return {
-    memoryEntries: memoryCache.size,
+    memoryEntries: getReasoningMemoryCache().size,
     dbEntries: dbStats.totalEntries,
     totalEntries: dbStats.totalEntries,
     totalChars: dbStats.totalChars,
@@ -543,11 +625,11 @@ export function getReasoningCacheServiceEntries(
 export function clearReasoningCacheAll(provider?: string): number {
   // Clear memory
   if (provider) {
-    for (const [key, entry] of memoryCache) {
-      if (entry.provider === provider) memoryCache.delete(key);
+    for (const [key, entry] of getReasoningMemoryCache()) {
+      if (entry.provider === provider) getReasoningMemoryCache().delete(key);
     }
   } else {
-    memoryCache.clear();
+    getReasoningMemoryCache().clear();
   }
 
   // Reset counters
@@ -567,7 +649,7 @@ export function clearReasoningCacheAll(provider?: string): number {
  */
 export function deleteReasoningCacheEntry(toolCallId: string): number {
   if (!toolCallId) return 0;
-  const existedInMemory = memoryCache.delete(toolCallId);
+  const existedInMemory = getReasoningMemoryCache().delete(toolCallId);
   let deletedFromDb = 0;
   try {
     deletedFromDb = deleteReasoningCache(toolCallId);
@@ -612,6 +694,7 @@ function getCleanupIntervalMs(): number {
 }
 
 function startAutoCleanup(): void {
+  if (parseDatabaseBackend() === "postgres") return;
   // Run once immediately on boot
   try {
     const deleted = cleanupReasoningCache();
@@ -639,3 +722,138 @@ function startAutoCleanup(): void {
 
 // Start on module load — every consumer of reasoning cache benefits.
 startAutoCleanup();
+
+function getReasoningMemoryCache(): typeof memoryCache {
+  const authority = getSelectedReasoningCacheAuthority();
+  if (!authority) return memoryCache;
+  let selected = authorityCaches.get(authority);
+  if (!selected) {
+    selected = new Map();
+    authorityCaches.set(authority, selected);
+  }
+  return selected;
+}
+
+export function withReasoningReplaySnapshot<T>(body: () => T): T {
+  return hydratedReplay.run(new Map(), body);
+}
+
+/** Hydrate exact IDs and normalized transcript digests without retaining request bodies. */
+export async function hydrateReasoningReplay(body: unknown, scope?: string | null): Promise<void> {
+  const repository = getSelectedReasoningCacheRepository();
+  const snapshot = hydratedReplay.getStore();
+  if (!repository || !snapshot || !isReasoningReplayEnabled()) return;
+  const keys = new Set<string>();
+  const record = body && typeof body === "object" ? (body as Record<string, unknown>) : {};
+  const messages = Array.isArray(record.messages)
+    ? (record.messages as AssistantMessageLike[])
+    : [];
+  for (let i = 0; i < messages.length; i++) {
+    const message = messages[i];
+    if (message?.role === "assistant") {
+      const key = buildAssistantMessageCacheKey(scope, messages, i);
+      if (key) keys.add(key);
+    }
+  }
+  const pending: unknown[] = [body];
+  let visited = 0;
+  while (pending.length) {
+    const value = pending.pop();
+    if (++visited > 100000) throw new Error("Reasoning replay input is too large to hydrate");
+    if (Array.isArray(value)) {
+      pending.push(...value);
+      continue;
+    }
+    if (!value || typeof value !== "object") continue;
+    const item = value as Record<string, unknown>;
+    if ((item.type === "tool_use" || item.type === "function_call") && typeof item.id === "string")
+      keys.add(item.id);
+    if (Array.isArray(item.tool_calls))
+      for (const call of item.tool_calls) {
+        if (call && typeof call === "object" && typeof call.id === "string") keys.add(call.id);
+      }
+    pending.push(...Object.values(item).filter((child) => child && typeof child === "object"));
+  }
+  if (keys.size > 2048) throw new Error("Reasoning replay input exceeds the supported key count");
+  const missing: string[] = [];
+  for (const key of keys) {
+    if (snapshot.has(key)) continue;
+    const entry = getReasoningMemoryCache().get(key);
+    if (entry && entry.expiresAt > Date.now() && !isInternalReasoningPlaceholder(entry.reasoning))
+      snapshot.set(key, entry.reasoning);
+    else {
+      snapshot.set(key, null);
+      missing.push(key);
+    }
+  }
+  if (!missing.length) return;
+  try {
+    const persisted = await repository.getMany(missing);
+    for (const entry of persisted) {
+      const expiresAt = Date.parse(entry.expiresAt);
+      if (expiresAt > Date.now() && !isInternalReasoningPlaceholder(entry.reasoning))
+        snapshot.set(entry.key, entry.reasoning.slice(0, MAX_ENTRY_BYTES));
+    }
+  } catch {
+    /* Reasoning cache is optional; preserve a bounded cache miss. */
+  }
+}
+
+export async function cleanupReasoningCacheAsync(): Promise<number> {
+  purgeExpiredMemory();
+  try {
+    return await cleanupExpiredReasoningAsync();
+  } catch {
+    return 0;
+  }
+}
+
+export async function getReasoningCacheServiceEntriesAsync(
+  opts: Parameters<typeof getReasoningCacheServiceEntries>[0] = {}
+): Promise<unknown[]> {
+  try {
+    return await getReasoningCacheEntriesAsync(opts);
+  } catch {
+    return [];
+  }
+}
+
+export async function getReasoningCacheServiceStatsAsync() {
+  if (!getSelectedReasoningCacheRepository()) return getReasoningCacheServiceStats();
+  purgeExpiredMemory();
+  const db = await getReasoningCacheStatsAsync();
+  const total = hits + misses;
+  return {
+    memoryEntries: getReasoningMemoryCache().size,
+    dbEntries: db.totalEntries,
+    totalEntries: db.totalEntries,
+    totalChars: db.totalChars,
+    hits,
+    misses,
+    replays,
+    replayRate: `${total ? ((replays / total) * 100).toFixed(1) : "0.0"}%`,
+    byProvider: db.byProvider,
+    byModel: db.byModel,
+    oldestEntry: db.oldestEntry,
+    newestEntry: db.newestEntry,
+  };
+}
+
+export async function clearReasoningCacheAllAsync(provider?: string): Promise<number> {
+  if (!getSelectedReasoningCacheRepository()) return clearReasoningCacheAll(provider);
+  const removed = await clearAllReasoningCacheAsync(provider);
+  for (const [key, entry] of getReasoningMemoryCache())
+    if (!provider || entry.provider === provider) getReasoningMemoryCache().delete(key);
+  hits = 0;
+  misses = 0;
+  replays = 0;
+  return removed;
+}
+
+export async function deleteReasoningCacheEntryAsync(key: string): Promise<number> {
+  if (!getSelectedReasoningCacheRepository()) return deleteReasoningCacheEntry(key);
+  if (!key) return 0;
+  const removed = await deleteReasoningCacheAsync(key);
+  const cached = getReasoningMemoryCache().delete(key);
+  return removed + (cached && !removed ? 1 : 0);
+}

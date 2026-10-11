@@ -1,3 +1,5 @@
+import { parseDatabaseBackend } from "../../../src/lib/db/backendSelection";
+import { loadAllRulesForLanguageAsync } from "./ruleLoader.ts";
 import type {
   CavemanConfig,
   CavemanRule,
@@ -309,9 +311,31 @@ function hasProtectedStructure(text: string): boolean {
   return PROTECTED_STRUCTURE_RE.test(text);
 }
 
+function resolveCavemanLanguage(text: string, config: CavemanConfig): string {
+  const detected = config.autoDetectLanguage
+    ? detectCompressionLanguage(text)
+    : (config.language ?? "en");
+  const enabled = config.enabledLanguagePacks ?? ["en", detected];
+  return config.autoDetectLanguage
+    ? detected
+    : enabled.includes(detected)
+      ? detected
+      : enabled.includes("en")
+        ? "en"
+        : detected;
+}
+
 export function cavemanCompress(
   body: ChatRequestBody,
   options?: Partial<CavemanConfig>
+): CompressionResult {
+  return cavemanCompressPrepared(body, options);
+}
+
+function cavemanCompressPrepared(
+  body: ChatRequestBody,
+  options?: Partial<CavemanConfig>,
+  preparedRules?: ReadonlyMap<string, readonly CavemanRule[]>
 ): CompressionResult {
   const startMs = performance.now();
   const config: CavemanConfig = { ...DEFAULT_CAVEMAN_CONFIG, ...options };
@@ -385,24 +409,13 @@ export function cavemanCompress(
         : { text: textPart, blocks: [] };
       preservedBlockCount += blocks.length;
 
-      const detectedLanguage = config.autoDetectLanguage
-        ? detectCompressionLanguage(textPart)
-        : (config.language ?? "en");
-      const enabledPacks = config.enabledLanguagePacks ?? ["en", detectedLanguage];
-      // When auto-detect is on, honor the detected language directly: the detector only
-      // returns languages that have a rule pack, and falling back to the English pack on
-      // non-English text mangles it (the EN `articles` rule deletes pt-BR "a"/"o").
-      // enabledPacks still gates MANUAL pack selection (auto-detect off). (B-LANG-DORMANT)
-      const language = config.autoDetectLanguage
-        ? detectedLanguage
-        : enabledPacks.includes(detectedLanguage)
-          ? detectedLanguage
-          : enabledPacks.includes("en")
-            ? "en"
-            : detectedLanguage;
-      const rules = getRulesForContext(msg.role, config.intensity, language).filter(
-        (rule) => !config.skipRules.includes(rule.name)
-      );
+      const language = resolveCavemanLanguage(textPart, config);
+      const rules = getRulesForContext(
+        msg.role,
+        config.intensity,
+        language,
+        preparedRules ? (preparedRules.get(language) ?? []) : undefined
+      ).filter((rule) => !config.skipRules.includes(rule.name));
       const { text: rulesApplied, appliedRules } = applyRulesToText(extractedText, rules);
       allAppliedRules.push(...appliedRules);
 
@@ -468,4 +481,40 @@ export function cavemanCompress(
   };
 
   return result;
+}
+
+/** Inline native compression prepares only languages that the existing message gates use. */
+export async function cavemanCompressAsync(
+  body: ChatRequestBody,
+  options?: Partial<CavemanConfig>
+): Promise<CompressionResult> {
+  if (parseDatabaseBackend() !== "postgres") return cavemanCompress(body, options);
+  const config: CavemanConfig = { ...DEFAULT_CAVEMAN_CONFIG, ...options };
+  const languages = new Set<string>();
+  if (config.enabled && Array.isArray(body.messages)) {
+    for (const message of body.messages) {
+      if (!config.compressRoles.includes(message.role as "user" | "assistant" | "system")) continue;
+      const content = message.content;
+      const joined =
+        typeof content === "string"
+          ? content
+          : Array.isArray(content)
+            ? content
+                .map((part) => (part && typeof part.text === "string" ? part.text : ""))
+                .filter(Boolean)
+                .join("\n")
+            : "";
+      if (!joined || joined.length < config.minMessageLength) continue;
+      mapTextContent(message, (text) => {
+        if (text && text.length >= config.minMessageLength)
+          languages.add(resolveCavemanLanguage(text, config));
+        return text;
+      });
+    }
+  }
+  const prepared = new Map<string, readonly CavemanRule[]>();
+  for (const language of languages) {
+    prepared.set(language, language ? await loadAllRulesForLanguageAsync(language) : []);
+  }
+  return cavemanCompressPrepared(body, config, prepared);
 }

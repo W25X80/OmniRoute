@@ -1,3 +1,4 @@
+import { isDatabaseFileMaintenanceAvailable } from "@/lib/db/persistenceCapabilities";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { matchesCron } from "@/lib/jobs/cronMatch";
@@ -67,6 +68,7 @@ function writeLastRunAt(schedule: BackupSchedule, at: Date) {
  * (with the real current time).
  */
 export async function runBackupScheduleTick(now: Date = new Date()): Promise<boolean> {
+  if (!isDatabaseFileMaintenanceAvailable()) return false;
   const schedule = readSchedule();
   if (!schedule || !schedule.enabled || !schedule.cron) return false;
   if (!matchesCron(schedule.cron, now)) return false;
@@ -111,6 +113,7 @@ export async function runBackupScheduleTick(now: Date = new Date()): Promise<boo
 }
 
 export function startBackupScheduleJob() {
+  if (!isDatabaseFileMaintenanceAvailable()) return null;
   if (timer) {
     return timer;
   }

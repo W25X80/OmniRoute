@@ -106,7 +106,16 @@ import {
   clampMcpAccessibilityConfig,
   type McpAccessibilityConfig,
 } from "../services/compression/engines/mcpAccessibility/constants.ts";
-import { getDbInstance, ensureDbInitialized } from "../../src/lib/db/core.ts";
+import { getDbInstance } from "../../src/lib/db/core.ts";
+import {
+  ensurePersistenceReady,
+  runPersistenceRequest,
+  closePersistenceRuntime,
+} from "../../src/lib/db/persistenceRuntime.ts";
+import {
+  getPostgresAuditRepository,
+  readMcpServerConfigurationAsync,
+} from "../../src/lib/db/audit.ts";
 import { isMcpScopeEnforcementEnabled } from "../../src/shared/utils/featureFlags.ts";
 import { toSafeMcpErrorMessage } from "./errorMessage.ts";
 import { registerRadarCatalogTool } from "./radarCatalog.ts";
@@ -227,9 +236,32 @@ function withScopeEnforcement(
 
 export interface CreateMcpServerOptions {
   blockedProviders?: string[] | (() => string[]);
+  persistenceConfiguration?: {
+    descriptionCompressionEnabled: boolean;
+    accessibilityConfig: McpAccessibilityConfig;
+  };
+}
+
+/** Load the selected asynchronous configuration before constructing the tool registry. */
+export async function createMcpServerAsync(options?: CreateMcpServerOptions): Promise<McpServer> {
+  return runPersistenceRequest(async () => {
+    const configuration = await readMcpServerConfigurationAsync();
+    if (!configuration) return createMcpServer(options);
+    await skillRegistry.loadFromDatabase();
+    return createMcpServer({
+      ...options,
+      persistenceConfiguration: {
+        descriptionCompressionEnabled: configuration.mcpDescriptionCompressionEnabled !== false,
+        accessibilityConfig: clampMcpAccessibilityConfig(configuration.mcpAccessibility),
+      },
+    });
+  });
 }
 
 export function createMcpServer(options?: CreateMcpServerOptions): McpServer {
+  if (getPostgresAuditRepository() && !options?.persistenceConfiguration) {
+    throw new Error("PostgreSQL MCP server construction requires asynchronous configuration");
+  }
   const resolveBlockedProviders = (): string[] => {
     if (typeof options?.blockedProviders === "function") {
       return options.blockedProviders();
@@ -247,8 +279,12 @@ export function createMcpServer(options?: CreateMcpServerOptions): McpServer {
     name: "omniroute",
     version: APP_CONFIG.version,
   });
-  const mcpDescriptionCompressionEnabled = readMcpDescriptionCompressionEnabled();
-  const mcpAccessibilityConfig = readMcpAccessibilityConfig();
+  const mcpDescriptionCompressionEnabled = options?.persistenceConfiguration
+    ? options.persistenceConfiguration.descriptionCompressionEnabled
+    : readMcpDescriptionCompressionEnabled();
+  const mcpAccessibilityConfig = options?.persistenceConfiguration
+    ? options.persistenceConfiguration.accessibilityConfig
+    : readMcpAccessibilityConfig();
   // F4.3 tool-cardinality: opt-in tool profile (MCP_TOOL_DENY / MCP_TOOL_ALLOW). null = no filter.
   const toolProfile = readMcpToolProfileFromEnv(process.env);
   const registerTool = server.registerTool.bind(server);
@@ -272,7 +308,11 @@ export function createMcpServer(options?: CreateMcpServerOptions): McpServer {
           return result;
         }
       : handler;
-    const registered = registerTool(name, metadata, filteredHandler as never);
+    const scopedHandler = (args: unknown, extra?: unknown) =>
+      runPersistenceRequest(() =>
+        (filteredHandler as (a: unknown, e?: unknown) => Promise<TextToolResult>)(args, extra)
+      );
+    const registered = registerTool(name, metadata, scopedHandler as never);
     if (toolProfile && reduceToolManifest([{ name, scopes: [] }], toolProfile).length === 0) {
       // Denied by the cardinality profile: keep the registration valid but disable it so the tool
       // is not announced in tools/list (token savings). The default profile never reaches here.
@@ -673,10 +713,20 @@ export function createMcpServer(options?: CreateMcpServerOptions): McpServer {
             const parsedArgs = toolDef.inputSchema.parse(args ?? {});
             // @ts-ignore - handler type lost through dynamic Object.values() access
             const result = await toolDef.handler(parsedArgs, extra);
-            return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: JSON.stringify(result, null, 2),
+                },
+              ],
+            };
           } catch (err) {
             const msg = toSafeMcpErrorMessage(err, "Memory tool execution failed");
-            return { content: [{ type: "text" as const, text: `Error: ${msg}` }], isError: true };
+            return {
+              content: [{ type: "text" as const, text: `Error: ${msg}` }],
+              isError: true,
+            };
           }
         },
         toolDef.scopes
@@ -700,10 +750,20 @@ export function createMcpServer(options?: CreateMcpServerOptions): McpServer {
             const parsedArgs = toolDef.inputSchema.parse(args ?? {});
             // @ts-ignore - handler type lost through dynamic Object.values() access
             const result = await toolDef.handler(parsedArgs, extra);
-            return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: JSON.stringify(result, null, 2),
+                },
+              ],
+            };
           } catch (err) {
             const msg = toSafeMcpErrorMessage(err, "Skill tool execution failed");
-            return { content: [{ type: "text" as const, text: `Error: ${msg}` }], isError: true };
+            return {
+              content: [{ type: "text" as const, text: `Error: ${msg}` }],
+              isError: true,
+            };
           }
         },
         toolDef.scopes
@@ -727,10 +787,20 @@ export function createMcpServer(options?: CreateMcpServerOptions): McpServer {
             const parsedArgs = toolDef.inputSchema.parse(args ?? {});
             // @ts-expect-error - handler type lost through dynamic Object.values() access
             const result = await toolDef.handler(parsedArgs, extra);
-            return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: JSON.stringify(result, null, 2),
+                },
+              ],
+            };
           } catch (err) {
             const msg = toSafeMcpErrorMessage(err, "Agent skill tool execution failed");
-            return { content: [{ type: "text" as const, text: `Error: ${msg}` }], isError: true };
+            return {
+              content: [{ type: "text" as const, text: `Error: ${msg}` }],
+              isError: true,
+            };
           }
         },
         toolDef.scopes
@@ -754,10 +824,20 @@ export function createMcpServer(options?: CreateMcpServerOptions): McpServer {
             const parsedArgs = toolDef.inputSchema.parse(args ?? {});
             // @ts-expect-error - handler type lost through dynamic Object.values() access
             const result = await toolDef.handler(parsedArgs);
-            return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: JSON.stringify(result, null, 2),
+                },
+              ],
+            };
           } catch (err) {
             const msg = toSafeMcpErrorMessage(err, "GitHub skill tool execution failed");
-            return { content: [{ type: "text" as const, text: `Error: ${msg}` }], isError: true };
+            return {
+              content: [{ type: "text" as const, text: `Error: ${msg}` }],
+              isError: true,
+            };
           }
         },
         toolDef.scopes
@@ -781,10 +861,20 @@ export function createMcpServer(options?: CreateMcpServerOptions): McpServer {
             const parsedArgs = toolDef.inputSchema.parse(args ?? {});
             // @ts-ignore: handler expected specific object
             const result = await toolDef.handler(parsedArgs, extra);
-            return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: JSON.stringify(result, null, 2),
+                },
+              ],
+            };
           } catch (err) {
             const msg = toSafeMcpErrorMessage(err, "Plugin tool execution failed");
-            return { content: [{ type: "text" as const, text: `Error: ${msg}` }], isError: true };
+            return {
+              content: [{ type: "text" as const, text: `Error: ${msg}` }],
+              isError: true,
+            };
           }
         },
         toolDef.scopes
@@ -808,10 +898,20 @@ export function createMcpServer(options?: CreateMcpServerOptions): McpServer {
             const parsedArgs = toolDef.inputSchema.parse(args ?? {});
             // @ts-ignore - handler type lost through dynamic Object.values() access
             const result = await toolDef.handler(parsedArgs, extra);
-            return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: JSON.stringify(result, null, 2),
+                },
+              ],
+            };
           } catch (err) {
             const msg = toSafeMcpErrorMessage(err, "Compression tool execution failed");
-            return { content: [{ type: "text" as const, text: `Error: ${msg}` }], isError: true };
+            return {
+              content: [{ type: "text" as const, text: `Error: ${msg}` }],
+              isError: true,
+            };
           }
         },
         toolDef.scopes
@@ -844,11 +944,19 @@ export function createMcpServer(options?: CreateMcpServerOptions): McpServer {
               const parsedArgs = toolDef.inputSchema.parse(args ?? {});
               const result = await toolDef.handler(parsedArgs, extra);
               return {
-                content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
+                content: [
+                  {
+                    type: "text" as const,
+                    text: JSON.stringify(result, null, 2),
+                  },
+                ],
               };
             } catch (err) {
               const msg = toSafeMcpErrorMessage(err, "Pool tool execution failed");
-              return { content: [{ type: "text" as const, text: `Error: ${msg}` }], isError: true };
+              return {
+                content: [{ type: "text" as const, text: `Error: ${msg}` }],
+                isError: true,
+              };
             }
           },
           toolDef.scopes
@@ -873,10 +981,20 @@ export function createMcpServer(options?: CreateMcpServerOptions): McpServer {
             const parsedArgs = toolDef.inputSchema.parse(args ?? {});
             // @ts-ignore: handler expected specific object
             const result = await toolDef.handler(parsedArgs, extra);
-            return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: JSON.stringify(result, null, 2),
+                },
+              ],
+            };
           } catch (err) {
             const msg = toSafeMcpErrorMessage(err, "Gamification tool execution failed");
-            return { content: [{ type: "text" as const, text: `Error: ${msg}` }], isError: true };
+            return {
+              content: [{ type: "text" as const, text: `Error: ${msg}` }],
+              isError: true,
+            };
           }
         },
         toolDef.scopes
@@ -900,10 +1018,20 @@ export function createMcpServer(options?: CreateMcpServerOptions): McpServer {
             const parsedArgs = toolDef.inputSchema.parse(args ?? {});
             // @ts-ignore: handler expected specific object
             const result = await toolDef.handler(parsedArgs, extra);
-            return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: JSON.stringify(result, null, 2),
+                },
+              ],
+            };
           } catch (err) {
             const msg = toSafeMcpErrorMessage(err, "Notion tool execution failed");
-            return { content: [{ type: "text" as const, text: `Error: ${msg}` }], isError: true };
+            return {
+              content: [{ type: "text" as const, text: `Error: ${msg}` }],
+              isError: true,
+            };
           }
         },
         toolDef.scopes
@@ -927,7 +1055,14 @@ export function createMcpServer(options?: CreateMcpServerOptions): McpServer {
             const parsedArgs = toolDef.inputSchema.parse(args ?? {});
             // @ts-ignore: handler expected specific object
             const result = await toolDef.handler(parsedArgs, extra);
-            return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: JSON.stringify(result, null, 2),
+                },
+              ],
+            };
           } catch (error) {
             const msg = toSafeMcpErrorMessage(error, "Local corpus tool execution failed");
             return {
@@ -957,10 +1092,20 @@ export function createMcpServer(options?: CreateMcpServerOptions): McpServer {
             const parsedArgs = toolDef.inputSchema.parse(args ?? {});
             // @ts-ignore: handler expected specific object
             const result = await toolDef.handler(parsedArgs, extra);
-            return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: JSON.stringify(result, null, 2),
+                },
+              ],
+            };
           } catch (err) {
             const msg = toSafeMcpErrorMessage(err, "Obsidian tool execution failed");
-            return { content: [{ type: "text" as const, text: `Error: ${msg}` }], isError: true };
+            return {
+              content: [{ type: "text" as const, text: `Error: ${msg}` }],
+              isError: true,
+            };
           }
         },
         toolDef.scopes
@@ -996,7 +1141,10 @@ export function createMcpServer(options?: CreateMcpServerOptions): McpServer {
               );
               return {
                 content: [
-                  { type: "text" as const, text: JSON.stringify(execution.output, null, 2) },
+                  {
+                    type: "text" as const,
+                    text: JSON.stringify(execution.output, null, 2),
+                  },
                 ],
               };
             } catch (err) {
@@ -1025,11 +1173,11 @@ export function createMcpServer(options?: CreateMcpServerOptions): McpServer {
  * Called when `omniroute --mcp` is used.
  */
 export async function startMcpStdio(): Promise<void> {
-  await ensureDbInitialized();
+  await ensurePersistenceReady();
   // Stdout is reserved for JSON-RPC — bin/mcpStdioConsoleGuard.mjs is preloaded via
   // `node --import` (see bin/mcp-server.mjs) so console.log/warn already redirect to
   // stderr before this module's own imports evaluate.
-  const server = createMcpServer();
+  const server = await createMcpServerAsync();
   const transport = new StdioServerTransport();
   const version = APP_CONFIG.version;
   const stopHeartbeat = startMcpHeartbeat({
@@ -1038,25 +1186,54 @@ export async function startMcpStdio(): Promise<void> {
     allowedScopes: Array.from(MCP_ALLOWED_SCOPES),
     toolCount: TOTAL_MCP_TOOL_COUNT,
   });
-  const stopHeartbeatOnce = () => {
-    stopHeartbeat();
+  let resolveClosed!: () => void;
+  const closed = new Promise<void>((resolve) => {
+    resolveClosed = resolve;
+  });
+  const previousOnClose = server.server.onclose;
+  server.server.onclose = () => {
+    previousOnClose?.();
+    resolveClosed();
   };
-  process.once("exit", stopHeartbeatOnce);
-  process.once("SIGINT", stopHeartbeatOnce);
-  process.once("SIGTERM", stopHeartbeatOnce);
+  let closing: Promise<void> | undefined;
+  const disconnect = () => {
+    closing ??= server.close().finally(resolveClosed);
+    return closing;
+  };
+  const onTerminate = () => {
+    void disconnect().catch(() => {
+      console.error("[MCP] Failed to disconnect the stdio transport.");
+    });
+  };
+  process.stdin.once("end", onTerminate);
+  process.stdin.once("error", onTerminate);
+  process.once("SIGINT", onTerminate);
+  process.once("SIGTERM", onTerminate);
+  process.once("exit", stopHeartbeat);
 
   console.error("[MCP] OmniRoute MCP Server starting (stdio transport)...");
   try {
     await server.connect(transport);
     console.error("[MCP] OmniRoute MCP Server connected and ready.");
+    // SDK connect resolves after initialization, not when the client closes stdin.
+    await closed;
   } finally {
-    if (closeAuditDb()) {
-      console.error("[MCP] Audit database checkpointed and closed.");
+    await stopHeartbeat();
+    process.stdin.off("end", onTerminate);
+    process.stdin.off("error", onTerminate);
+    process.off("SIGINT", onTerminate);
+    process.off("SIGTERM", onTerminate);
+    process.off("exit", stopHeartbeat);
+    try {
+      await disconnect();
+      await runPersistenceRequest(() => {
+        if (closeAuditDb()) console.error("[MCP] Audit database checkpointed and closed.");
+      });
+    } finally {
+      // Only the standalone stdio process owns the complete persistence runtime.
+      // HTTP session shutdown never closes the shared application's database pool.
+      await closePersistenceRuntime();
     }
-    stopHeartbeatOnce();
-    process.off("exit", stopHeartbeatOnce);
-    process.off("SIGINT", stopHeartbeatOnce);
-    process.off("SIGTERM", stopHeartbeatOnce);
   }
 }
 

@@ -10,6 +10,17 @@
  */
 
 import { getDbInstance } from "../db/core";
+import { assertSqliteBackendAllowed } from "../db/controlPlaneContext";
+import { getPostgresAuditRepository } from "../db/audit";
+import {
+  normalizeAuditLogRow,
+  serializeAuditValue,
+  type AuditLogEntry,
+  type AuditLogFilter,
+  type AuditLogRow,
+  type AuditLogWriteEntry,
+} from "../db/auditSemantics";
+export type { AuditLogEntry } from "../db/auditSemantics";
 import type { SqliteAdapter } from "@/lib/db/adapters/types";
 import { getClientIpFromRequest } from "../ipUtils";
 import {
@@ -20,7 +31,7 @@ import {
   getCallLogsTableMaxRows,
   getProxyLogsTableMaxRows,
 } from "../logEnv";
-import { getUserDatabaseSettings } from "../db/databaseSettings";
+import { getUserDatabaseSettings, getUserDatabaseSettingsAsync } from "../db/databaseSettings";
 import { generateRequestId, getRequestId } from "@/shared/utils/requestId";
 import { HIGH_LEVEL_ACTIONS } from "@/lib/audit/highLevelActions";
 
@@ -33,156 +44,12 @@ function getDb() {
   }
 }
 
-type AuditLogWriteEntry = {
-  action: string;
-  actor?: string;
-  target?: string;
-  details?: unknown;
-  metadata?: unknown;
-  ipAddress?: string;
-  resourceType?: string;
-  status?: string;
-  requestId?: string;
-  createdAt?: string;
-};
-
-type AuditLogFilter = {
-  action?: string;
-  actor?: string;
-  target?: string;
-  resourceType?: string;
-  status?: string;
-  requestId?: string;
-  from?: string;
-  to?: string;
-  limit?: number;
-  offset?: number;
-  /** When "high", restricts results to HIGH_LEVEL_ACTIONS only (B7). */
-  levelFilter?: "high";
-};
-
-type AuditLogRow = Record<string, unknown> & {
-  id?: number | null;
-  action?: string | null;
-  actor?: string | null;
-  target?: string | null;
-  status?: string | null;
-  details?: string | null;
-  metadata?: string | null;
-  ip_address?: string | null;
-  resource_type?: string | null;
-  request_id?: string | null;
-  timestamp?: string | null;
-};
-
-/**
- * Public shape of a normalized audit-log entry returned by `getAuditLog` /
- * `normalizeAuditLogRow`. Includes the column-level fields callers (and
- * tests) reach into directly — `action`, `actor`, `target`, `id`, `status`,
- * `timestamp` — alongside the derived/parsed fields. The
- * `Record<string, unknown>` intersection preserves the existing behaviour of
- * spreading any extra DB columns (e.g. schema additions) without losing
- * compile-time access to the known ones.
- */
-export type AuditLogEntry = Record<string, unknown> & {
-  id?: number | null;
-  action?: string | null;
-  actor?: string | null;
-  target?: string | null;
-  status: string | null;
-  timestamp: string;
-  createdAt: string;
-  details: unknown;
-  metadata: unknown;
-  ip_address: string | null;
-  ip: string | null;
-  resource_type: string | null;
-  resourceType: string | null;
-  request_id: string | null;
-  requestId: string | null;
-};
-
 const AUDIT_LOG_REQUIRED_COLUMNS: Record<string, string> = {
   resource_type: "TEXT",
   status: "TEXT",
   request_id: "TEXT",
   metadata: "TEXT",
 };
-
-const SENSITIVE_AUDIT_KEYS = new Set([
-  "apikey",
-  "extraapikeys",
-  "accesstoken",
-  "refreshtoken",
-  "idtoken",
-  "authtoken",
-  "jwttoken",
-  "token",
-  "secret",
-  "password",
-  "authorization",
-  "cookie",
-  "setcookie",
-  "consoleapikey",
-  "clientsecret",
-]);
-
-function normalizeAuditKey(key: string) {
-  return key.replace(/[^a-z0-9]/gi, "").toLowerCase();
-}
-
-function isSensitiveAuditKey(key: string) {
-  const normalized = normalizeAuditKey(key);
-  if (!normalized) return false;
-  if (SENSITIVE_AUDIT_KEYS.has(normalized)) return true;
-  return (
-    normalized.endsWith("apikey") ||
-    normalized.endsWith("token") ||
-    normalized.endsWith("secret") ||
-    normalized.endsWith("password")
-  );
-}
-
-function sanitizeAuditValue(value: unknown): unknown {
-  if (Array.isArray(value)) {
-    return value.map((item) => sanitizeAuditValue(item));
-  }
-
-  if (value && typeof value === "object") {
-    return Object.fromEntries(
-      Object.entries(value as Record<string, unknown>).map(([key, nestedValue]) => [
-        key,
-        isSensitiveAuditKey(key) ? "[redacted]" : sanitizeAuditValue(nestedValue),
-      ])
-    );
-  }
-
-  return value;
-}
-
-function serializeAuditValue(value: unknown): string | null {
-  if (value === undefined || value === null || value === "") return null;
-  const sanitizedValue = sanitizeAuditValue(value);
-  if (typeof sanitizedValue === "string") {
-    return sanitizedValue;
-  }
-  try {
-    return JSON.stringify(sanitizedValue);
-  } catch {
-    return String(sanitizedValue);
-  }
-}
-
-function parseAuditValue(value: unknown): unknown {
-  if (value === undefined || value === null || value === "") return null;
-  if (typeof value !== "string") return value;
-
-  try {
-    return JSON.parse(value);
-  } catch {
-    return value;
-  }
-}
 
 function ensureAuditLogSchema(db: SqliteAdapter) {
   db.exec(`
@@ -203,7 +70,9 @@ function ensureAuditLogSchema(db: SqliteAdapter) {
 
   let columns: Array<{ name: string }> = [];
   try {
-    columns = db.prepare("PRAGMA table_info(audit_log)").all() as Array<{ name: string }>;
+    columns = db.prepare("PRAGMA table_info(audit_log)").all() as Array<{
+      name: string;
+    }>;
   } catch {
     columns = [];
   }
@@ -273,30 +142,6 @@ function buildAuditLogQuery(filter: AuditLogFilter = {}): AuditLogQuery {
   };
 }
 
-function normalizeAuditLogRow(row: AuditLogRow): AuditLogEntry {
-  const details = parseAuditValue(row.details);
-  const metadata = parseAuditValue(row.metadata);
-  const resourceType = typeof row.resource_type === "string" ? row.resource_type : null;
-  const requestId = typeof row.request_id === "string" ? row.request_id : null;
-  const ip = typeof row.ip_address === "string" ? row.ip_address : null;
-  const timestamp = typeof row.timestamp === "string" ? row.timestamp : new Date().toISOString();
-
-  return {
-    ...(row as Record<string, unknown>),
-    timestamp,
-    createdAt: timestamp,
-    details,
-    metadata: metadata ?? (details && typeof details === "object" ? details : null),
-    ip_address: ip,
-    ip,
-    resource_type: resourceType,
-    resourceType,
-    request_id: requestId,
-    requestId,
-    status: typeof row.status === "string" ? row.status : null,
-  };
-}
-
 export function getAuditRequestContext(request?: {
   headers?: Headers | { get?: (name: string) => string | null };
   socket?: { remoteAddress?: string };
@@ -312,6 +157,7 @@ export function getAuditRequestContext(request?: {
  * Initialize the audit_log table.
  */
 export function initAuditLog() {
+  if (getPostgresAuditRepository()) return;
   const db = getDb();
   if (!db) return;
 
@@ -328,18 +174,13 @@ export function initAuditLog() {
  * @param {Object|string} [entry.details] - Additional details
  * @param {string} [entry.ipAddress] - Client IP
  */
-export function logAuditEvent(entry: {
-  action: string;
-  actor?: string;
-  target?: string;
-  details?: unknown;
-  metadata?: unknown;
-  ipAddress?: string;
-  resourceType?: string;
-  status?: string;
-  requestId?: string;
-  createdAt?: string;
-}) {
+export function logAuditEvent(entry: AuditLogWriteEntry) {
+  const postgres = getPostgresAuditRepository();
+  if (postgres) {
+    // Observe the optional asynchronous write; administrative audit remains best effort.
+    void postgres.write(entry).catch(() => {});
+    return;
+  }
   const db = getDb();
   if (!db) return;
 
@@ -396,6 +237,7 @@ export function logAuditEvent(entry: {
  * @returns {Array<{ id: number, timestamp: string, action: string, actor: string, target: string, details: any, ip_address: string }>}
  */
 export function getAuditLog(filter: AuditLogFilter = {}): AuditLogEntry[] {
+  assertSqliteBackendAllowed();
   const db = getDb();
   if (!db) return [];
 
@@ -415,22 +257,43 @@ export function getAuditLog(filter: AuditLogFilter = {}): AuditLogEntry[] {
 }
 
 export function countAuditLog(filter: AuditLogFilter = {}) {
+  assertSqliteBackendAllowed();
   const db = getDb();
   if (!db) return 0;
 
   ensureAuditLogSchema(db);
   const { where, params } = buildAuditLogQuery(filter);
   const row = db.prepare(`SELECT COUNT(*) as count FROM audit_log ${where}`).get(...params) as
-    | { count?: number }
-    | undefined;
+    { count?: number } | undefined;
   return Number(row?.count || 0);
+}
+
+/** Awaitable counterparts keep existing synchronous SQLite consumers unchanged. */
+export async function logAuditEventAsync(entry: AuditLogWriteEntry): Promise<void> {
+  const postgres = getPostgresAuditRepository();
+  if (!postgres) return logAuditEvent(entry);
+  try {
+    await postgres.write(entry);
+  } catch {
+    // Preserve the source administrative audit contract on either backend.
+  }
+}
+
+export async function getAuditLogAsync(filter: AuditLogFilter = {}): Promise<AuditLogEntry[]> {
+  const postgres = getPostgresAuditRepository();
+  return postgres ? postgres.list(filter) : getAuditLog(filter);
+}
+
+export async function countAuditLogAsync(filter: AuditLogFilter = {}): Promise<number> {
+  const postgres = getPostgresAuditRepository();
+  return postgres ? postgres.count(filter) : countAuditLog(filter);
 }
 
 // ─── No-Log Opt-Out ────────────────
 // Moved to ./noLog.ts to break the callLogs → compliance → callLogs ESM cycle
 // that deadlocks the bundled MCP server under Node.js 24 (#2650). Re-exported
 // here so downstream callers that import from "../compliance" keep working.
-export { isNoLog, setNoLog } from "./noLog";
+export { isNoLog, isNoLogAsync, setNoLog } from "./noLog";
 
 // ─── Log Retention / Cleanup ────────────────
 
@@ -464,6 +327,8 @@ export function getRetentionDays() {
  * }}
  */
 export async function cleanupExpiredLogs() {
+  const postgres = getPostgresAuditRepository();
+  if (postgres) return cleanupPostgresExpiredLogs(postgres);
   const db = getDb();
   const appRetentionDays = getAppLogRetentionDays();
   const callRetentionDays = getCallLogRetentionDays();
@@ -495,10 +360,18 @@ export async function cleanupExpiredLogs() {
   // letting an explicit env var win (and falling back to env for non-DB deployments).
   const callOverride = getCallLogRetentionDaysOverride();
   const appOverride = getAppLogRetentionDaysOverride();
-  let dbRetention: { usageHistory: number; callLogs: number; mcpAudit: number } | null = null;
+  let dbRetention: {
+    usageHistory: number;
+    callLogs: number;
+    mcpAudit: number;
+  } | null = null;
   try {
     const r = getUserDatabaseSettings().retention;
-    dbRetention = { usageHistory: r.usageHistory, callLogs: r.callLogs, mcpAudit: r.mcpAudit };
+    dbRetention = {
+      usageHistory: r.usageHistory,
+      callLogs: r.callLogs,
+      mcpAudit: r.mcpAudit,
+    };
   } catch {
     /* settings table unavailable (e.g. very early startup) — keep env fallback */
   }
@@ -635,4 +508,52 @@ export async function cleanupExpiredLogs() {
     callLogsMaxRows,
     proxyLogsMaxRows,
   };
+}
+
+async function cleanupPostgresExpiredLogs(
+  repository: NonNullable<ReturnType<typeof getPostgresAuditRepository>>
+) {
+  const appRetentionDays = getAppLogRetentionDays();
+  const callRetentionDays = getCallLogRetentionDays();
+  const callLogsMaxRows = getCallLogsTableMaxRows();
+  const proxyLogsMaxRows = getProxyLogsTableMaxRows();
+  // Failed settings reads abort the destructive pass; a shorter fallback is not safe.
+  const retention = (await getUserDatabaseSettingsAsync()).retention;
+  const callOverride = getCallLogRetentionDaysOverride();
+  const appOverride = getAppLogRetentionDaysOverride();
+  const day = 24 * 60 * 60 * 1000;
+  const now = Date.now();
+  const cutoff = (days: number) => new Date(now - days * day).toISOString();
+  const usageCutoff = cutoff(callOverride ?? retention.usageHistory ?? callRetentionDays);
+  const callCutoff = cutoff(callOverride ?? retention.callLogs ?? callRetentionDays);
+  const appCutoff = cutoff(appRetentionDays);
+  const mcpCutoff = cutoff(appOverride ?? retention.mcpAudit ?? appRetentionDays);
+  const { cleanupUsageHistory } = await import("../db/cleanup");
+  const { deleteCallLogsBefore, trimCallLogsToMaxRows } = await import("../usage/callLogs");
+  const usage = await cleanupUsageHistory(usageCutoff);
+  const call = await deleteCallLogsBefore(callCutoff);
+  const result = {
+    deletedUsage: usage.deleted,
+    deletedCallLogs: call.deletedRows,
+    deletedProxyLogs: await repository.deleteBefore("proxy_logs", callCutoff),
+    deletedRequestDetailLogs: await repository.deleteBefore("request_detail_logs", callCutoff),
+    deletedAuditLogs: await repository.deleteBefore("audit_log", appCutoff),
+    deletedMcpAuditLogs: await repository.deleteBefore("mcp_tool_audit", mcpCutoff),
+    trimmedCallLogs:
+      callLogsMaxRows > 0 ? (await trimCallLogsToMaxRows(callLogsMaxRows)).deletedRows : 0,
+    trimmedProxyLogs: proxyLogsMaxRows > 0 ? await repository.trimProxy(proxyLogsMaxRows) : 0,
+    appRetentionDays,
+    callRetentionDays,
+    callLogsMaxRows,
+    proxyLogsMaxRows,
+  };
+  await logAuditEventAsync({
+    action: "compliance.cleanup",
+    actor: "system",
+    target: "log-retention",
+    resourceType: "maintenance",
+    status: usage.errors ? "partial" : "success",
+    details: result,
+  });
+  return result;
 }

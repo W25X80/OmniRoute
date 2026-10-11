@@ -1,3 +1,12 @@
+import { getSelectedPostgresDatabase } from "./controlPlaneContext";
+import {
+  insertCompressionAnalyticsRowPostgres,
+  attachCompressionUsageReceiptPostgres,
+  getPerEngineAnalyticsPostgres,
+  getCompressionAnalyticsSummaryPostgres,
+  getLatestCompressionAnalyticsRunPostgres,
+} from "./postgres/compressionAnalyticsRepository";
+import { createPostgresCompressionTelemetryRepository } from "./postgres/compressionTelemetryRepository";
 import { getDbInstance } from "./core";
 
 export interface CompressionAnalyticsRow {
@@ -658,4 +667,75 @@ export function getLatestCompressionAnalyticsRun(): LatestCompressionAnalyticsRu
         LIMIT 1`
     )
     .get() as LatestCompressionAnalyticsRun | undefined;
+}
+
+export async function insertCompressionAnalyticsRowAsync(
+  row: CompressionAnalyticsRow
+): Promise<void> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? insertCompressionAnalyticsRowPostgres(database, row)
+    : insertCompressionAnalyticsRow(row);
+}
+
+export async function insertCompressionEngineBreakdownAsync(
+  rows: CompressionEngineBreakdownRow[]
+): Promise<void> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresCompressionTelemetryRepository(database).insertBreakdown(rows)
+    : insertCompressionEngineBreakdown(rows);
+}
+
+export async function attachCompressionUsageReceiptAsync(
+  requestId: string | null | undefined,
+  usage: Record<string, unknown> | null | undefined,
+  source: "provider" | "estimated" | "stream" = "provider"
+): Promise<void> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? attachCompressionUsageReceiptPostgres(database, requestId, usage, source)
+    : attachCompressionUsageReceipt(requestId, usage, source);
+}
+
+export async function getPerEngineAnalyticsAsync(engineId: string, days = 7) {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? getPerEngineAnalyticsPostgres(database, engineId, days)
+    : getPerEngineAnalytics(engineId, days);
+}
+
+export async function getCompressionAnalyticsSummaryAsync(since?: string) {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? getCompressionAnalyticsSummaryPostgres(database, since)
+    : getCompressionAnalyticsSummary(since);
+}
+
+export async function getLatestCompressionAnalyticsRunAsync() {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? getLatestCompressionAnalyticsRunPostgres(database)
+    : getLatestCompressionAnalyticsRun();
+}
+
+export async function recordContextEditingTelemetryAsync(
+  requestId: string | null | undefined,
+  telemetry: Parameters<typeof recordContextEditingTelemetry>[1],
+  provider: string | null = "claude"
+): Promise<void> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return recordContextEditingTelemetry(requestId, telemetry, provider);
+  const tokens = telemetry?.clearedInputTokens ?? 0;
+  if (!Number.isFinite(tokens) || tokens <= 0) return;
+  await insertCompressionAnalyticsRowAsync({
+    timestamp: new Date().toISOString(),
+    provider,
+    engine: "context-editing",
+    mode: "context-editing",
+    original_tokens: tokens,
+    compressed_tokens: 0,
+    tokens_saved: tokens,
+    request_id: requestId ? `${requestId}::context-editing` : null,
+  });
 }

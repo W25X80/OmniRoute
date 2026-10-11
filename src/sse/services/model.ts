@@ -1,3 +1,8 @@
+import { getSelectedPostgresDatabase } from "@/lib/db/controlPlaneContext";
+import {
+  hasPostgresCatalogSnapshot,
+  withPostgresCatalogSnapshot,
+} from "@/lib/db/postgres/catalogSnapshot";
 // Re-export from open-sse with localDb integration
 import { getModelAliases, getCustomModels } from "@/lib/db/models";
 import { getComboByName, getComboById, getComboByNameInsensitive } from "@/lib/db/combos";
@@ -78,7 +83,7 @@ function buildWildcardAliasMap(settings: Record<string, unknown>): Record<string
  */
 async function getCombinedModelAliases(): Promise<Record<string, unknown>> {
   const [dbAliases, settings, autoAliases] = await Promise.all([
-    getModelAliases().catch(() => ({})),
+    await getModelAliases().catch(() => ({})),
     getCachedSettings().catch(() => ({}) as Record<string, unknown>),
     getSyncedAutoAliases().catch(() => ({}) as Record<string, string>),
   ]);
@@ -381,8 +386,8 @@ async function lookupModelMeta(
 }> {
   try {
     const [customModels, liveCatalog, compatOverrides] = await Promise.all([
-      getCustomModels(providerId),
-      getActiveSyncedCatalog(providerId),
+      await getCustomModels(providerId),
+      await getActiveSyncedCatalog(providerId),
       // #10898 / #7620: model-compat overrides (apiFormat/targetFormat/
       // supportsVision, isHidden, ...) are stored keyed on the id the operator
       // wrote them under. For a no-auth alias the model prefix resolves to the
@@ -438,7 +443,7 @@ async function lookupModelMeta(
     const compatOverrideMatch = Array.isArray(compatOverrides)
       ? compatOverrides.find((m) => m.id === resolvedModelId || m.id === modelId)
       : undefined;
-    const effortBaseModelId = getRegisteredProviderEffortBaseModelId(providerId, modelId);
+    const effortBaseModelId = await getRegisteredProviderEffortBaseModelId(providerId, modelId);
 
     const liveBackedEffortVariant =
       effortBaseModelId !== null && syncedModels.some((model) => model.id === effortBaseModelId);
@@ -497,160 +502,172 @@ function stripRedundantNodeRoutingSegments(model: string, routingIds: unknown[])
  * Get full model info (parse or resolve)
  */
 export async function getModelInfo(modelStr) {
-  // Reject the raw common-provider identity before compatible-node lookup or
-  // stripModelPrefix can erase/remap it. Ordinary bare model aliases remain
-  // operator-owned; the two retired bare ids are intentionally blocked.
-  assertCommonChatGptWebModelAvailable(modelStr);
-  const parsed = parseModel(modelStr);
-  // Fail before compatible-node lookup and stripModelPrefix can erase or remap
-  // a retired provider identity. Executor/auth tombstones are later defenses;
-  // they cannot see the original prefix after either remapping path.
-  assertRuntimeProviderAvailable(parsed.providerAlias);
-  assertRuntimeProviderAvailable(parsed.provider);
-  const { extendedContext } = parsed;
+  const catalogDatabase = getSelectedPostgresDatabase();
+  const execute = async () => {
+    // Reject the raw common-provider identity before compatible-node lookup or
+    // stripModelPrefix can erase/remap it. Ordinary bare model aliases remain
+    // operator-owned; the two retired bare ids are intentionally blocked.
+    assertCommonChatGptWebModelAvailable(modelStr);
+    const parsed = parseModel(modelStr);
+    // Fail before compatible-node lookup and stripModelPrefix can erase or remap
+    // a retired provider identity. Executor/auth tombstones are later defenses;
+    // they cannot see the original prefix after either remapping path.
+    assertRuntimeProviderAvailable(parsed.providerAlias);
+    assertRuntimeProviderAvailable(parsed.provider);
+    const { extendedContext } = parsed;
 
-  // Fail closed before a custom compatible node or stripModelPrefix can reinterpret
-  // an exact retired provider id/alias as an unrelated live provider.
-  assertMicrosoftDesignerWebProviderAvailable(parsed.providerAlias || parsed.provider);
+    // Fail closed before a custom compatible node or stripModelPrefix can reinterpret
+    // an exact retired provider id/alias as an unrelated live provider.
+    assertMicrosoftDesignerWebProviderAvailable(parsed.providerAlias || parsed.provider);
 
-  const assertResolvedModelAvailable = (info: any) => {
-    assertCommonChatGptWebProviderAvailable(info?.provider);
-    return info;
-  };
+    const assertResolvedModelAvailable = (info: any) => {
+      assertCommonChatGptWebProviderAvailable(info?.provider);
+      return info;
+    };
 
-  const attachRuntimeModelMeta = async (info: any) => {
-    assertResolvedModelAvailable(info);
-    if (!info?.provider || !info?.model) return info;
+    const attachRuntimeModelMeta = async (info: any) => {
+      assertResolvedModelAvailable(info);
+      if (!info?.provider || !info?.model) return info;
 
-    const providerId = String(info.provider);
-    const requestedModelId = String(info.model);
-    const { modelId, metadata, available } = await lookupModelMeta(
-      providerId,
-      requestedModelId,
-      modelStr
-    );
-
-    if (!available) {
-      return {
-        provider: null,
-        model: requestedModelId,
-        extendedContext: info.extendedContext,
-        errorType: "model_not_found",
-        errorMessage: `Model '${requestedModelId}' is not available in the active live catalog for provider '${providerId}'.`,
-      };
-    }
-
-    const resolvedInfo = modelId !== info.model ? { ...info, model: modelId } : info;
-
-    return Object.keys(metadata).length > 0 ? { ...resolvedInfo, ...metadata } : resolvedInfo;
-  };
-
-  // Check custom provider nodes first (for both alias and non-alias formats)
-  if (parsed.providerAlias || parsed.provider) {
-    // Ensure prefixToCheck is always a concise identifier, not a full model string
-    const prefixToCheck = parsed.providerAlias || parsed.provider;
-
-    // Compatible-node prefixes are user-defined. They must not be allowed to
-    // shadow built-in provider ids/aliases (e.g. `cf` → cloudflare-ai). When
-    // prefixToCheck matches a built-in registry id/alias, skip the compatible-
-    // node prefix lookup so the request still routes to the built-in provider.
-    // Internal UUID-prefixed node ids (e.g. "openai-compatible-responses-...")
-    // are never in the reserved set, so the #2778 combo path still works.
-    // Ported from upstream 9router 047fdc89. Set shared with the write-path
-    // validation guard (src/shared/constants/reservedProviderPrefixes.ts) so
-    // both sides can never drift apart.
-    const isReservedPrefix =
-      typeof prefixToCheck === "string" && getReservedProviderPrefixes().has(prefixToCheck);
-
-    if (!isReservedPrefix) {
-      // Check OpenAI Compatible nodes
-      // Match by node.prefix (user-defined alias) OR node.id (internal UUID id stored by
-      // combo steps), so that combo targets using the internal node id still resolve
-      // correctly (#2778).
-      const openaiNodes = await getCachedProviderNodes({ type: "openai-compatible" });
-      const matchedOpenAI = openaiNodes.find(
-        (node) => node.prefix === prefixToCheck || node.id === prefixToCheck
+      const providerId = String(info.provider);
+      const requestedModelId = String(info.model);
+      const { modelId, metadata, available } = await lookupModelMeta(
+        providerId,
+        requestedModelId,
+        modelStr
       );
-      if (matchedOpenAI) {
-        const normalizedModel = stripRedundantNodeRoutingSegments(parsed.model as string, [
-          matchedOpenAI.prefix,
-          matchedOpenAI.id,
-        ]);
-        const { modelId, metadata } = await lookupModelMeta(
-          matchedOpenAI.id as string,
-          normalizedModel
-        );
-        return assertResolvedModelAvailable({
-          provider: matchedOpenAI.id,
-          model: modelId,
-          extendedContext,
-          ...metadata,
-        });
+
+      if (!available) {
+        return {
+          provider: null,
+          model: requestedModelId,
+          extendedContext: info.extendedContext,
+          errorType: "model_not_found",
+          errorMessage: `Model '${requestedModelId}' is not available in the active live catalog for provider '${providerId}'.`,
+        };
       }
 
-      // Check Anthropic Compatible nodes
-      const anthropicNodes = await getCachedProviderNodes({ type: "anthropic-compatible" });
-      const matchedAnthropic = anthropicNodes.find(
-        (node) => node.prefix === prefixToCheck || node.id === prefixToCheck
-      );
-      if (matchedAnthropic) {
-        const normalizedModel = stripRedundantNodeRoutingSegments(parsed.model as string, [
-          matchedAnthropic.prefix,
-          matchedAnthropic.id,
-        ]);
-        const { modelId, metadata } = await lookupModelMeta(
-          matchedAnthropic.id as string,
-          normalizedModel
+      const resolvedInfo = modelId !== info.model ? { ...info, model: modelId } : info;
+
+      return Object.keys(metadata).length > 0 ? { ...resolvedInfo, ...metadata } : resolvedInfo;
+    };
+
+    // Check custom provider nodes first (for both alias and non-alias formats)
+    if (parsed.providerAlias || parsed.provider) {
+      // Ensure prefixToCheck is always a concise identifier, not a full model string
+      const prefixToCheck = parsed.providerAlias || parsed.provider;
+
+      // Compatible-node prefixes are user-defined. They must not be allowed to
+      // shadow built-in provider ids/aliases (e.g. `cf` → cloudflare-ai). When
+      // prefixToCheck matches a built-in registry id/alias, skip the compatible-
+      // node prefix lookup so the request still routes to the built-in provider.
+      // Internal UUID-prefixed node ids (e.g. "openai-compatible-responses-...")
+      // are never in the reserved set, so the #2778 combo path still works.
+      // Ported from upstream 9router 047fdc89. Set shared with the write-path
+      // validation guard (src/shared/constants/reservedProviderPrefixes.ts) so
+      // both sides can never drift apart.
+      const isReservedPrefix =
+        typeof prefixToCheck === "string" && getReservedProviderPrefixes().has(prefixToCheck);
+
+      if (!isReservedPrefix) {
+        // Check OpenAI Compatible nodes
+        // Match by node.prefix (user-defined alias) OR node.id (internal UUID id stored by
+        // combo steps), so that combo targets using the internal node id still resolve
+        // correctly (#2778).
+        const openaiNodes = await getCachedProviderNodes({ type: "openai-compatible" });
+        const matchedOpenAI = openaiNodes.find(
+          (node) => node.prefix === prefixToCheck || node.id === prefixToCheck
         );
-        return assertResolvedModelAvailable({
-          provider: matchedAnthropic.id,
-          model: modelId,
-          extendedContext,
-          ...metadata,
-        });
+        if (matchedOpenAI) {
+          const normalizedModel = stripRedundantNodeRoutingSegments(parsed.model as string, [
+            matchedOpenAI.prefix,
+            matchedOpenAI.id,
+          ]);
+          const { modelId, metadata } = await lookupModelMeta(
+            matchedOpenAI.id as string,
+            normalizedModel
+          );
+          return assertResolvedModelAvailable({
+            provider: matchedOpenAI.id,
+            model: modelId,
+            extendedContext,
+            ...metadata,
+          });
+        }
+
+        // Check Anthropic Compatible nodes
+        const anthropicNodes = await getCachedProviderNodes({ type: "anthropic-compatible" });
+        const matchedAnthropic = anthropicNodes.find(
+          (node) => node.prefix === prefixToCheck || node.id === prefixToCheck
+        );
+        if (matchedAnthropic) {
+          const normalizedModel = stripRedundantNodeRoutingSegments(parsed.model as string, [
+            matchedAnthropic.prefix,
+            matchedAnthropic.id,
+          ]);
+          const { modelId, metadata } = await lookupModelMeta(
+            matchedAnthropic.id as string,
+            normalizedModel
+          );
+          return assertResolvedModelAvailable({
+            provider: matchedAnthropic.id,
+            model: modelId,
+            extendedContext,
+            ...metadata,
+          });
+        }
+      }
+
+      // stripModelPrefix: if enabled, strip provider prefix and re-resolve
+      // the bare model name using existing heuristics (claude-* → anthropic, etc.)
+      try {
+        const settings = await getCachedSettings();
+        if (settings.stripModelPrefix === true) {
+          const strippedResult = await getModelInfoCore(parsed.model, getCombinedModelAliases);
+          return assertResolvedModelAvailable({ ...strippedResult, extendedContext });
+        }
+      } catch {
+        // If settings read fails, fall through to normal resolution
       }
     }
 
-    // stripModelPrefix: if enabled, strip provider prefix and re-resolve
-    // the bare model name using existing heuristics (claude-* → anthropic, etc.)
-    try {
-      const settings = await getCachedSettings();
-      if (settings.stripModelPrefix === true) {
-        const strippedResult = await getModelInfoCore(parsed.model, getCombinedModelAliases);
-        return assertResolvedModelAvailable({ ...strippedResult, extendedContext });
-      }
-    } catch {
-      // If settings read fails, fall through to normal resolution
+    if (!parsed.isAlias) {
+      return await attachRuntimeModelMeta(await getModelInfoCore(modelStr, null));
     }
-  }
 
-  if (!parsed.isAlias) {
-    return await attachRuntimeModelMeta(await getModelInfoCore(modelStr, null));
-  }
-
-  return await attachRuntimeModelMeta(await getModelInfoCore(modelStr, getCombinedModelAliases));
+    return await attachRuntimeModelMeta(await getModelInfoCore(modelStr, getCombinedModelAliases));
+  };
+  if (catalogDatabase && !hasPostgresCatalogSnapshot(catalogDatabase))
+    return withPostgresCatalogSnapshot(catalogDatabase, execute);
+  return execute();
 }
 
 export async function getModelInfoOrRetirementResponse(modelId: string) {
-  try {
-    return await getModelInfo(modelId);
-  } catch (error) {
-    if (isMicrosoftDesignerWebProviderRetiredError(error)) {
-      return { error: errorResponse(HTTP_STATUS.GONE, error.message) };
+  const catalogDatabase = getSelectedPostgresDatabase();
+  const execute = async () => {
+    try {
+      return await getModelInfo(modelId);
+    } catch (error) {
+      if (isMicrosoftDesignerWebProviderRetiredError(error)) {
+        return { error: errorResponse(HTTP_STATUS.GONE, error.message) };
+      }
+      if (isRuntimeProviderRetirementError(error)) {
+        return {
+          error: errorResponse(error.status, error.message, {
+            type: "provider_error",
+            code: error.code,
+          }),
+        };
+      }
+      if (isCommonChatGptWebRetirementError(error)) {
+        return { error: commonChatGptWebRetirementResponse() };
+      }
+      throw error;
     }
-    if (isRuntimeProviderRetirementError(error)) {
-      return {
-        error: errorResponse(error.status, error.message, {
-          type: "provider_error",
-          code: error.code,
-        }),
-      };
-    }
-    if (isCommonChatGptWebRetirementError(error)) {
-      return { error: commonChatGptWebRetirementResponse() };
-    }
-    throw error;
-  }
+  };
+  if (catalogDatabase && !hasPostgresCatalogSnapshot(catalogDatabase))
+    return withPostgresCatalogSnapshot(catalogDatabase, execute);
+  return execute();
 }
 
 /**
@@ -658,38 +675,44 @@ export async function getModelInfoOrRetirementResponse(modelId: string) {
  * @returns {Promise<Object|null>} Full combo object or null if not a combo
  */
 export async function getCombo(modelStr) {
-  // Try exact match first (supports combos actually named "combo/ANY")
-  let combo = await getComboByName(modelStr);
-  if (combo && Array.isArray(combo.models) && combo.models.length > 0) {
-    return combo;
-  }
-
-  // Fallback: Strip combo/ prefix if present
-  if (modelStr.startsWith("combo/")) {
-    const nameToSearch = modelStr.substring(6);
-    combo = await getComboByName(nameToSearch);
+  const catalogDatabase = getSelectedPostgresDatabase();
+  const execute = async () => {
+    // Try exact match first (supports combos actually named "combo/ANY")
+    let combo = await getComboByName(modelStr);
     if (combo && Array.isArray(combo.models) && combo.models.length > 0) {
       return combo;
     }
-  }
 
-  // #4446: the opencode-plugin publishes combos as ModelV2 `id: combo.id`, and
-  // the OpenCode `--model` dispatch path forwards a lowercased bare slug. The
-  // exact, case-sensitive name match above misses both a combo addressed by its
-  // stored id (UUID/slug) and a lowercased display name (e.g. "master-light" for
-  // a combo named "MASTER-LIGHT"). These two fallbacks only run after the exact
-  // match fails, so they never re-route a combo that already resolves today.
-  combo = await getComboById(modelStr);
-  if (combo && Array.isArray(combo.models) && combo.models.length > 0) {
-    return combo;
-  }
+    // Fallback: Strip combo/ prefix if present
+    if (modelStr.startsWith("combo/")) {
+      const nameToSearch = modelStr.substring(6);
+      combo = await getComboByName(nameToSearch);
+      if (combo && Array.isArray(combo.models) && combo.models.length > 0) {
+        return combo;
+      }
+    }
 
-  combo = await getComboByNameInsensitive(modelStr);
-  if (combo && Array.isArray(combo.models) && combo.models.length > 0) {
-    return combo;
-  }
+    // #4446: the opencode-plugin publishes combos as ModelV2 `id: combo.id`, and
+    // the OpenCode `--model` dispatch path forwards a lowercased bare slug. The
+    // exact, case-sensitive name match above misses both a combo addressed by its
+    // stored id (UUID/slug) and a lowercased display name (e.g. "master-light" for
+    // a combo named "MASTER-LIGHT"). These two fallbacks only run after the exact
+    // match fails, so they never re-route a combo that already resolves today.
+    combo = await getComboById(modelStr);
+    if (combo && Array.isArray(combo.models) && combo.models.length > 0) {
+      return combo;
+    }
 
-  return null;
+    combo = await getComboByNameInsensitive(modelStr);
+    if (combo && Array.isArray(combo.models) && combo.models.length > 0) {
+      return combo;
+    }
+
+    return null;
+  };
+  if (catalogDatabase && !hasPostgresCatalogSnapshot(catalogDatabase))
+    return withPostgresCatalogSnapshot(catalogDatabase, execute);
+  return execute();
 }
 
 /**
@@ -702,28 +725,34 @@ export async function getCombo(modelStr) {
  * 3. null (no combo — single-model request)
  */
 export async function getComboForModel(modelStr) {
-  // 1. Existing behavior — exact combo name match
-  let combo = await getCombo(modelStr);
-  if (combo) return combo;
-
-  // Client context tags are ignored only after exact lookup, preserving literal
-  // combo names such as "Claude [1m]" while allowing "Claude[500k]" to use "Claude".
-  const baseModelStr = stripContextWindowSuffix(modelStr);
-  if (baseModelStr && baseModelStr !== modelStr) {
-    combo = await getCombo(baseModelStr);
+  const catalogDatabase = getSelectedPostgresDatabase();
+  const execute = async () => {
+    // 1. Existing behavior — exact combo name match
+    let combo = await getCombo(modelStr);
     if (combo) return combo;
-  }
 
-  // 2. NEW — check model-combo mappings table (pattern match)
-  try {
-    const { resolveComboForModel } = await import("@/lib/db/modelComboMappings");
-    const mapped = await resolveComboForModel(baseModelStr || modelStr);
-    if (mapped && (mapped as any).models?.length > 0) {
-      return mapped;
+    // Client context tags are ignored only after exact lookup, preserving literal
+    // combo names such as "Claude [1m]" while allowing "Claude[500k]" to use "Claude".
+    const baseModelStr = stripContextWindowSuffix(modelStr);
+    if (baseModelStr && baseModelStr !== modelStr) {
+      combo = await getCombo(baseModelStr);
+      if (combo) return combo;
     }
-  } catch {
-    // If the mappings table doesn't exist yet (pre-migration), continue gracefully
-  }
 
-  return null;
+    // 2. NEW — check model-combo mappings table (pattern match)
+    try {
+      const { resolveComboForModel } = await import("@/lib/db/modelComboMappings");
+      const mapped = await resolveComboForModel(baseModelStr || modelStr);
+      if (mapped && (mapped as any).models?.length > 0) {
+        return mapped;
+      }
+    } catch {
+      // If the mappings table doesn't exist yet (pre-migration), continue gracefully
+    }
+
+    return null;
+  };
+  if (catalogDatabase && !hasPostgresCatalogSnapshot(catalogDatabase))
+    return withPostgresCatalogSnapshot(catalogDatabase, execute);
+  return execute();
 }

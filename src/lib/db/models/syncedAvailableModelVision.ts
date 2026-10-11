@@ -1,3 +1,5 @@
+import { getSelectedPostgresDatabase } from "../controlPlaneContext";
+import { catalogNamespaceRows, requirePostgresCatalogSnapshot } from "../postgres/catalogSnapshot";
 /**
  * Synced-available-model vision lookup (#14081).
  *
@@ -119,6 +121,21 @@ export function resetSyncedVisionVerdictMemoForTests(): void {
 export function listSyncedAvailableModelVision(
   options: SyncedAvailableModelVisionReadOptions = {}
 ): SyncedAvailableModelVisionMap {
+  if (!options.getDatabase && getSelectedPostgresDatabase()) {
+    requirePostgresCatalogSnapshot();
+    const result = new Map<string, Set<string>>();
+    for (const row of catalogNamespaceRows("syncedAvailableModels")) {
+      const providerId = row.key.split(":")[0];
+      if (!providerId) continue;
+      const ids = collectVisionModelIds(providerId, row.value);
+      if (!ids.length) continue;
+      const models = result.get(providerId) ?? new Set<string>();
+      for (const id of ids) models.add(id);
+      result.set(providerId, models);
+    }
+    return result;
+  }
+
   try {
     const db = options.getDatabase?.() ?? getDbInstance();
     const rows = db
@@ -160,6 +177,19 @@ export function getSyncedAvailableModelVision(
   bulk?: SyncedAvailableModelVisionMap | null,
   options: SyncedAvailableModelVisionReadOptions = {}
 ): boolean | null {
+  if (!options.getDatabase && getSelectedPostgresDatabase()) {
+    if (!providerId || !modelId) return null;
+    if (bulk) {
+      try {
+        return readVerdictFromMap(bulk, providerId, modelId);
+      } catch {
+        return null;
+      }
+    }
+    requirePostgresCatalogSnapshot();
+    return readVerdictFromMap(listSyncedAvailableModelVision(), providerId, modelId);
+  }
+
   if (!providerId || !modelId) return null;
   if (bulk) {
     try {

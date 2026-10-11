@@ -13,7 +13,7 @@ import {
   getCliRuntimeStatus,
   getCliPrimaryConfigPath,
 } from "@/shared/services/cliRuntime";
-import { getAllCliToolLastConfigured } from "@/lib/db/cliToolState";
+import { getAllCliToolLastConfiguredAsync } from "@/lib/db/cliToolState";
 import { checkToolConfigStatus } from "@/lib/cliTools/checkToolConfigStatus";
 import { findOmniRouteQwenCodeModel } from "@/shared/services/qwenCodeConfig";
 import {
@@ -82,7 +82,9 @@ async function extractEndpointFromConfig(
         return match ? match[1] : null;
       }
       case "omp": {
-        const omnirouteBlock = content.match(/omniroute:\s*\n(?:[^\n]+\n)*?\s*baseUrl:\s*["']?([^"'\r\n]+)["']?/i);
+        const omnirouteBlock = content.match(
+          /omniroute:\s*\n(?:[^\n]+\n)*?\s*baseUrl:\s*["']?([^"'\r\n]+)["']?/i
+        );
         if (omnirouteBlock) return omnirouteBlock[1].trim();
         const match =
           content.match(/baseUrl:\s*["']?([^"'\r\n]*(?:omniroute|20128)[^"'\r\n]*)["']?/i) ||
@@ -211,7 +213,7 @@ export async function GET(request: Request): Promise<Response> {
 
     // Merge last-configured timestamps from SQLite (non-critical)
     try {
-      const lastConfigured = getAllCliToolLastConfigured();
+      const lastConfigured = await getAllCliToolLastConfiguredAsync();
       for (const [toolId, timestamp] of Object.entries(lastConfigured)) {
         if (statuses[toolId]) {
           statuses[toolId].config.lastConfiguredAt = timestamp;

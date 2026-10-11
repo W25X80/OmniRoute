@@ -1,3 +1,5 @@
+import { getSelectedPostgresDatabase } from "./controlPlaneContext";
+import { createPostgresOperationsRepository } from "./postgres/operationsRepository";
 import { normalizeComboStep } from "@/lib/combos/steps";
 import { getSyntheticApiKeyIds } from "@/shared/constants/apiKeyIdentities";
 
@@ -16,7 +18,7 @@ export interface DbHealthIssue {
 }
 
 /** Derived from the adapter contract so a new driver cannot drift out of sync here. */
-export type DbDriverName = SqliteAdapter["driver"];
+export type DbDriverName = SqliteAdapter["driver"] | "postgresql";
 
 export interface DbDriverHealth {
   name: DbDriverName;
@@ -30,6 +32,7 @@ export interface DbDriverHealth {
 }
 
 export interface DbHealthCheckResult {
+  integrityScope?: "connectivity-and-application-references";
   isHealthy: boolean;
   issues: DbHealthIssue[];
   repairedCount: number;
@@ -683,4 +686,16 @@ export function runDbHealthCheck(
     checkedAt,
     driver: describeDbDriver(db),
   };
+}
+
+export async function runManagedDatabaseHealthCheck(
+  options: {
+    autoRepair?: boolean;
+    skipIntegrityCheck?: boolean;
+  } = {}
+): Promise<DbHealthCheckResult> {
+  const database = getSelectedPostgresDatabase();
+  if (database) return createPostgresOperationsRepository(database).healthCheck(options);
+  const { runManagedDbHealthCheck } = await import("./core");
+  return runManagedDbHealthCheck(options);
 }

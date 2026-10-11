@@ -22,7 +22,7 @@ import { checkCertInstalled } from "@/mitm/cert/install";
 import { resolveActiveCertPath } from "@/mitm/cert/activeCert";
 import { resolveMitmDataDir } from "@/mitm/dataDir";
 import { summarizeDiagnostics } from "@/mitm/inspector/diagnostics";
-import { getAllAgentBridgeStates } from "@/lib/db/agentBridgeState";
+import { getAllAgentBridgeStatesAsync } from "@/lib/db/agentBridgeState";
 import { checkDNSEntryForAgent } from "@/mitm/dns/dnsConfig";
 
 /** Best-effort TCP reachability probe; resolves false on error/timeout. */
@@ -64,7 +64,7 @@ export async function GET(request: Request): Promise<Response> {
     let dnsConfigured = status.dnsConfigured;
     if (!agentId) {
       // Check if ANY agent has DNS configured (aggregate view)
-      const agentStates = await getAllAgentBridgeStates();
+      const agentStates = await getAllAgentBridgeStatesAsync();
       dnsConfigured =
         agentStates.length > 0 &&
         agentStates.some((s) => s.dns_enabled && checkDNSEntryForAgent(s.agent_id));

@@ -1,3 +1,8 @@
+import { getSelectedPostgresDatabase } from "./db/controlPlaneContext";
+import {
+  hasPostgresCatalogSnapshot,
+  withPostgresCatalogSnapshot,
+} from "./db/postgres/catalogSnapshot";
 /**
  * freeProviderRankings.ts — Compute rankings for free providers based on model ELO scores.
  *
@@ -13,7 +18,10 @@ import { providerHasFreeModels } from "@/shared/utils/freeModels";
 import { REGISTRY } from "@omniroute/open-sse/config/providerRegistry";
 import { listModelIntelligence } from "./db/modelIntelligence";
 import { getProviderConnections } from "./db/providers";
-import { getProviderUsageSince, type ProviderUsageRow } from "./db/callLogStats";
+import {
+  getProviderUsageSinceAsync as getProviderUsageSince,
+  type ProviderUsageRow,
+} from "./db/callLogStats";
 import { familyCanonicalOf } from "./providerFamilyAgg";
 import { getCustomModels } from "./db/models";
 // Type-only: reuse the health vocabulary instead of forking it.
@@ -516,6 +524,11 @@ export async function computeFreeProviderRankings(
   limit: number = 50,
   opts: FreeProviderRankingFilterOptions = {}
 ): Promise<FreeProviderRanking[]> {
+  const database = getSelectedPostgresDatabase();
+  if (database && !hasPostgresCatalogSnapshot(database))
+    return withPostgresCatalogSnapshot(database, () =>
+      computeFreeProviderRankings(category, limit, opts)
+    );
   const freeProviders = getFreeProviders();
   const intelligenceEntries = listModelIntelligence({
     source: "arena_elo",
@@ -605,7 +618,7 @@ export async function computeFreeProviderRankings(
       const since = new Date(Date.now() - windowMs).toISOString();
       filtered = attachProviderUsage(
         filtered,
-        getProviderUsageSince(since),
+        await getProviderUsageSince(since),
         windowMs / (60 * 60 * 1000)
       );
     }

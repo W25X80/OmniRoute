@@ -11,9 +11,9 @@ import { getMitmStatus, getAllAgentsStatus, getCachedPassword } from "@/mitm/man
 import { isSudoPasswordRequired, checkDNSEntryForAgent } from "@/mitm/dns/dnsConfig";
 import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
 import { createErrorResponse } from "@/lib/api/errorResponse";
-import { getAllAgentBridgeStates } from "@/lib/db/agentBridgeState";
-import { getAllBypassPatterns } from "@/lib/db/agentBridgeBypass";
-import { getMappingsForAgent } from "@/lib/db/agentBridgeMappings";
+import { getAllAgentBridgeStatesAsync } from "@/lib/db/agentBridgeState";
+import { getAllBypassPatternsAsync } from "@/lib/db/agentBridgeBypass";
+import { getMappingsForAgentAsync } from "@/lib/db/agentBridgeMappings";
 import { checkCertInstalled } from "@/mitm/cert/install";
 import { resolveActiveCertPath } from "@/mitm/cert/activeCert";
 import { resolveMitmDataDir } from "@/mitm/dataDir";
@@ -27,14 +27,14 @@ export async function GET(): Promise<Response> {
     const [serverStatus, agents, agentStates, bypassPatterns] = await Promise.all([
       getMitmStatus(),
       getAllAgentsStatus(),
-      getAllAgentBridgeStates(),
-      getAllBypassPatterns(),
+      await getAllAgentBridgeStatesAsync(),
+      await getAllBypassPatternsAsync(),
     ]);
 
     // Load mappings for all registered agents
     const mappingsEntries = await Promise.all(
       ALL_TARGETS.map(async (t) => {
-        const mappings = getMappingsForAgent(t.id);
+        const mappings = await getMappingsForAgentAsync(t.id);
         return [
           t.id,
           mappings.map((m) => ({ source: m.source_model, target: m.target_model })),

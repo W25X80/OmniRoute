@@ -1,5 +1,6 @@
+import { getSelectedPostgresDatabase } from "./controlPlaneContext";
+import { createPostgresUpstreamProxyRepository } from "./postgres/upstreamProxyRepository";
 import { getDbInstance } from "./core";
-
 type JsonRecord = Record<string, unknown>;
 
 export interface OneproxyProxyRecord {
@@ -55,6 +56,11 @@ export async function listOneproxyProxies(options?: {
   minQuality?: number;
   limit?: number;
 }): Promise<OneproxyProxyRecord[]> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres)
+    return (await createPostgresUpstreamProxyRepository(postgres).oneproxy(options)).map(
+      mapProxyRow
+    );
   const db = getDbInstance();
 
   let sql = "SELECT * FROM proxy_registry WHERE source = 'oneproxy' AND status = 'active'";

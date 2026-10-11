@@ -11,7 +11,7 @@
  */
 
 import { buildErrorBody, sanitizeErrorMessage } from "@omniroute/open-sse/utils/error.ts";
-import { listCustomHosts } from "@/lib/db/inspectorCustomHosts";
+import { listCustomHostsAsync } from "@/lib/db/inspectorCustomHosts";
 import {
   getHttpProxyHandle,
   getSystemProxyState,
@@ -20,7 +20,7 @@ import {
 
 export async function GET(): Promise<Response> {
   try {
-    const customHosts = listCustomHosts();
+    const customHosts = await listCustomHostsAsync();
     const httpProxy = getHttpProxyHandle();
     const systemProxy = getSystemProxyState();
 

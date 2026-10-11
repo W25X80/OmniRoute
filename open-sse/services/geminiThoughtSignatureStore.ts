@@ -1,3 +1,13 @@
+import { setImmediate as yieldEventLoop } from "node:timers/promises";
+import { AsyncLocalStorage } from "node:async_hooks";
+import {
+  isPostgresSignatureStoreSelected,
+  postgresSignatureCacheAuthority,
+  readPersistedGeminiThoughtSignatures,
+  writePersistedGeminiThoughtSignature,
+  clearPersistedGeminiThoughtSignatures,
+} from "../../src/lib/db/geminiThoughtSignatures.ts";
+import { runPersistenceBackgroundWork } from "../../src/lib/db/persistenceRuntime.ts";
 import { getDbInstance } from "../../src/lib/db/core.ts";
 
 const MAX_SIGNATURES = 1000;
@@ -138,6 +148,19 @@ export function storeGeminiThoughtSignature(toolCallId: unknown, signature: unkn
     expiresAt: now + MEMORY_TTL_MS,
   });
 
+  if (isPostgresSignatureStoreSelected()) {
+    const memory = postgresSignatureMemory();
+    memory.set(toolCallId, { signature, expiresAt: now + MEMORY_TTL_MS });
+    while (memory.size > MAX_SIGNATURES) memory.delete(memory.keys().next().value!);
+    queuePostgresSignatureWrite("store", () =>
+      writePersistedGeminiThoughtSignature(
+        toolCallId,
+        serializePersistedEntry({ signature, createdAt: now, expiresAt: now + PERSISTED_TTL_MS })
+      )
+    );
+    return;
+  }
+
   try {
     const db = getDbInstance();
     db.prepare("INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES (?, ?, ?)").run(
@@ -154,6 +177,17 @@ export function storeGeminiThoughtSignature(toolCallId: unknown, signature: unkn
 export function getGeminiThoughtSignature(toolCallId: unknown) {
   if (typeof toolCallId !== "string" || !toolCallId) return null;
 
+  if (isPostgresSignatureStoreSelected()) {
+    const hydrated = hydratedSignatures.getStore()?.get(toolCallId);
+    if (hydrated !== undefined) return hydrated;
+    const memory = postgresSignatureMemory();
+    const entry = memory.get(toolCallId);
+    if (!entry || entry.expiresAt <= Date.now()) {
+      memory.delete(toolCallId);
+      return null;
+    }
+    return entry.signature;
+  }
   pruneExpired();
   const entry = signatures.get(toolCallId);
   if (entry) return entry.signature;
@@ -311,6 +345,11 @@ export function resolveGeminiThoughtSignature(
 export function clearGeminiThoughtSignatures() {
   signatures.clear();
   signatureCacheMode = "enabled";
+  if (isPostgresSignatureStoreSelected()) {
+    postgresSignatureMemory().clear();
+    queuePostgresSignatureWrite("clear", clearPersistedGeminiThoughtSignatures);
+    return;
+  }
   try {
     const db = getDbInstance();
     db.prepare("DELETE FROM key_value WHERE namespace = ?").run(NAMESPACE);
@@ -326,4 +365,68 @@ export function clearGeminiThoughtSignatureMemoryForTests() {
 export function getGeminiThoughtSignatureMemorySizeForTests() {
   pruneExpired();
   return signatures.size;
+}
+
+const postgresMemoryByAuthority = new WeakMap<object, Map<string, Entry>>();
+function postgresSignatureMemory(): Map<string, Entry> {
+  const authority = postgresSignatureCacheAuthority();
+  if (!authority) throw new Error("PostgreSQL signature cache is not selected");
+  let memory = postgresMemoryByAuthority.get(authority);
+  if (!memory) {
+    memory = new Map();
+    postgresMemoryByAuthority.set(authority, memory);
+  }
+  return memory;
+}
+const hydratedSignatures = new AsyncLocalStorage<ReadonlyMap<string, string>>();
+let signatureWriteTail: Promise<void> = Promise.resolve();
+let pendingSignatureWrites = 0;
+
+function queuePostgresSignatureWrite(operation: string, body: () => Promise<void>): void {
+  if (pendingSignatureWrites >= MAX_SIGNATURES) {
+    warnPersistenceError(operation, new Error("Gemini signature write queue is full"));
+    return;
+  }
+  pendingSignatureWrites++;
+  const previous = signatureWriteTail;
+  const work = runPersistenceBackgroundWork(async () => {
+    await previous;
+    await body();
+  });
+  signatureWriteTail = work
+    .catch((error) => warnPersistenceError(operation, error))
+    .finally(() => {
+      pendingSignatureWrites--;
+    });
+}
+
+export function flushGeminiThoughtSignatureWrites(): Promise<void> {
+  return signatureWriteTail;
+}
+
+/** Hydrate the bounded durable authority before invoking pure translators. */
+export async function withPreparedGeminiThoughtSignatures<T>(operation: () => T): Promise<T> {
+  if (!isPostgresSignatureStoreSelected()) return operation();
+  // The durable tier is capped at 2,000 entries. Loading that bounded authority
+  // avoids truncating a long request's tool identities before finding a live key.
+  let rows: Map<string, string>;
+  try {
+    rows = await readPersistedGeminiThoughtSignatures();
+  } catch (error) {
+    warnPersistenceError("read", error);
+    rows = new Map();
+  }
+  const hydrated = new Map<string, string>();
+  let parsedRows = 0;
+  for (const [key, value] of rows) {
+    if (++parsedRows % 100 === 0) await yieldEventLoop();
+    const parsed = parsePersistedEntry(value);
+    if (!parsed) continue;
+    hydrated.set(key, parsed.entry.signature);
+    if (parsed.shouldRewrite)
+      queuePostgresSignatureWrite("rewrite", () =>
+        writePersistedGeminiThoughtSignature(key, serializePersistedEntry(parsed.entry))
+      );
+  }
+  return hydratedSignatures.run(hydrated, operation);
 }

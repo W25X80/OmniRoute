@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
-import { revokeAccessToken } from "@/lib/db/accessTokens";
+import { revokeAccessTokenAsync } from "@/lib/db/accessTokens";
 
 /**
  * DELETE /api/cli/tokens/:id — revoke an access token (by id or display prefix).
@@ -14,7 +14,7 @@ export async function DELETE(request: Request, { params }: { params: Promise<{ i
   if (authError) return authError;
 
   const { id } = await params;
-  const result = revokeAccessToken(id);
+  const result = await revokeAccessTokenAsync(id);
   if (result.ambiguous) {
     return NextResponse.json(
       { error: "Token prefix matches more than one token" },

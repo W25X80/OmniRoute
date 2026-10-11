@@ -1,3 +1,5 @@
+import fsPromises from "node:fs/promises";
+import { parseDatabaseBackend } from "../../src/lib/db/backendSelection";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { Worker } from "node:worker_threads";
@@ -169,7 +171,9 @@ export async function solveDeepSeekPowAsync(
   options: SolveDeepSeekPowOptions = {}
 ): Promise<number> {
   const validated = validateChallenge(algorithm, challenge, salt, difficulty, expireAt);
-  return solveInWorker(validated, options);
+  return parseDatabaseBackend() === "postgres"
+    ? solveInWorkerNative(validated, options)
+    : solveInWorker(validated, options);
 }
 
 export function solveDeepSeekPow(
@@ -184,4 +188,82 @@ export function solveDeepSeekPow(
   // the event loop and remains abortable.
   const validated = validateChallenge(algorithm, challenge, salt, difficulty, expireAt);
   return solveSynchronously(validated);
+}
+
+const NATIVE_POW_CAPACITY = Symbol.for("omniroute.nativeDeepSeekPowCapacity");
+const powGlobals = globalThis as typeof globalThis & {
+  [NATIVE_POW_CAPACITY]?: { active: number };
+};
+
+function solveInWorkerNative(
+  validated: ValidatedChallenge,
+  options: SolveDeepSeekPowOptions
+): Promise<number> {
+  const { signal } = options;
+  if (signal?.aborted) return Promise.reject(createAbortError());
+  const capacity = (powGlobals[NATIVE_POW_CAPACITY] ??= { active: 0 });
+  if (capacity.active >= MAX_CONCURRENT_WORKERS) {
+    return Promise.reject(
+      new Error(`DeepSeek PoW worker capacity reached (${MAX_CONCURRENT_WORKERS})`)
+    );
+  }
+  const timeoutMs = resolveTimeoutMs(options.timeoutMs);
+  const workerPath = path.join(process.cwd(), "open-sse/lib/deepseek-pow-worker.mjs");
+  // Reserve before awaiting metadata, so concurrent preparation never over-admits workers.
+  capacity.active++;
+  return new Promise<number>((resolve, reject) => {
+    let worker: Worker | undefined;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    let settled = false;
+    const finish = (error: Error | null, answer?: number, terminate = false) => {
+      if (settled) return;
+      settled = true;
+      if (timeout) clearTimeout(timeout);
+      signal?.removeEventListener("abort", onAbort);
+      capacity.active--;
+      if (terminate && worker) void worker.terminate();
+      if (error) reject(error);
+      else resolve(answer as number);
+    };
+    const onAbort = () => finish(createAbortError(), undefined, true);
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) onAbort();
+    void (async () => {
+      try {
+        await fsPromises.access(workerPath);
+      } catch {
+        finish(new Error(`DeepSeek PoW worker script not found at ${workerPath}`));
+        return;
+      }
+      if (settled) return;
+      try {
+        worker = new Worker(workerPath, { workerData: validated });
+      } catch (error) {
+        finish(error instanceof Error ? error : new Error(String(error)));
+        return;
+      }
+      timeout = setTimeout(() => {
+        finish(new Error(`DeepSeek PoW computation exceeded ${timeoutMs}ms`), undefined, true);
+      }, timeoutMs);
+      worker.once("message", (answer: unknown) => {
+        if (!Number.isSafeInteger(answer) || (answer as number) < -1) {
+          finish(new Error("DeepSeek PoW worker returned an invalid answer"), undefined, true);
+        } else finish(null, answer as number);
+      });
+      worker.once("error", (error) =>
+        finish(error instanceof Error ? error : new Error(String(error)), undefined, true)
+      );
+      worker.once("exit", (code) => {
+        finish(
+          new Error(
+            code !== 0
+              ? `DeepSeek PoW worker exited with code ${code}`
+              : "DeepSeek PoW worker exited without an answer"
+          )
+        );
+      });
+    })().catch((error: unknown) =>
+      finish(error instanceof Error ? error : new Error(String(error)), undefined, true)
+    );
+  });
 }

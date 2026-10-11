@@ -1,3 +1,5 @@
+import { getSelectedPostgresDatabase } from "./controlPlaneContext";
+import { createPostgresAgentMetadataRepository } from "./postgres/agentMetadataRepository";
 import { getDbInstance } from "./core";
 
 export interface ApiKeyContextSource {
@@ -93,9 +95,10 @@ export function setApiKeyContextSource(
 
 export function deleteApiKeyContextSource(apiKeyId: string, sourceType: string): void {
   const db = getDbInstance();
-  db.prepare(
-    "DELETE FROM api_key_context_sources WHERE api_key_id = ? AND source_type = ?"
-  ).run(apiKeyId, sourceType);
+  db.prepare("DELETE FROM api_key_context_sources WHERE api_key_id = ? AND source_type = ?").run(
+    apiKeyId,
+    sourceType
+  );
 }
 
 export function listApiKeyContextSources(apiKeyId: string): ApiKeyContextSource[] {
@@ -104,4 +107,40 @@ export function listApiKeyContextSources(apiKeyId: string): ApiKeyContextSource[
     .prepare("SELECT * FROM api_key_context_sources WHERE api_key_id = ?")
     .all(apiKeyId) as ContextSourceRow[];
   return rows.map(rowToSource);
+}
+
+export async function getApiKeyContextSourceAsync(
+  ...args: Parameters<typeof getApiKeyContextSource>
+): Promise<Awaited<ReturnType<typeof getApiKeyContextSource>>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresAgentMetadataRepository(database).getApiKeyContextSource(...args)
+    : getApiKeyContextSource(...args);
+}
+
+export async function setApiKeyContextSourceAsync(
+  ...args: Parameters<typeof setApiKeyContextSource>
+): Promise<Awaited<ReturnType<typeof setApiKeyContextSource>>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresAgentMetadataRepository(database).setApiKeyContextSource(...args)
+    : setApiKeyContextSource(...args);
+}
+
+export async function deleteApiKeyContextSourceAsync(
+  ...args: Parameters<typeof deleteApiKeyContextSource>
+): Promise<Awaited<ReturnType<typeof deleteApiKeyContextSource>>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresAgentMetadataRepository(database).deleteApiKeyContextSource(...args)
+    : deleteApiKeyContextSource(...args);
+}
+
+export async function listApiKeyContextSourcesAsync(
+  ...args: Parameters<typeof listApiKeyContextSources>
+): Promise<Awaited<ReturnType<typeof listApiKeyContextSources>>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresAgentMetadataRepository(database).listApiKeyContextSources(...args)
+    : listApiKeyContextSources(...args);
 }

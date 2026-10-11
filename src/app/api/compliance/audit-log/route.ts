@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { countAuditLog, getAuditLog } from "@/lib/compliance/index";
+import { countAuditLogAsync, getAuditLogAsync } from "@/lib/compliance/index";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 import { AuditLogQuerySchema } from "@/shared/schemas/quota";
 import { buildErrorBody } from "@omniroute/open-sse/utils/error";
@@ -41,8 +41,8 @@ export async function GET(request: Request) {
       levelFilter,
     };
 
-    const logs = getAuditLog(filters);
-    const total = countAuditLog(filters);
+    const logs = await getAuditLogAsync(filters);
+    const total = await countAuditLogAsync(filters);
     return NextResponse.json(logs, {
       headers: {
         "x-total-count": String(total),

@@ -1,3 +1,7 @@
+import {
+  getSelectedUsageHistoryRepository,
+  type UsageSaveReceipt,
+} from "../db/postgres/usageHistoryRepository";
 /**
  * Usage History — extracted from usageDb.js (T-15)
  *
@@ -624,13 +628,13 @@ function finalizePendingDetailAt(
   connectionId: string,
   modelKey: string,
   index: number,
-  metadata: PendingRequestMetadata
+  metadata: PendingRequestMetadata,
+  completedAt = Date.now()
 ): string | null {
   if (!isSafeKey(modelKey)) return null;
   const details = pendingRequests.details[connectionId]?.[modelKey];
   if (!details?.length || index < 0 || index >= details.length) return null;
 
-  const completedAt = Date.now();
   const updated = {
     ...details[index],
     ...normalizePendingMetadata(metadata),
@@ -664,7 +668,8 @@ export function finalizePendingRequest(
 
 export function finalizePendingRequestById(
   id: string | null | undefined,
-  metadata: PendingRequestMetadata
+  metadata: PendingRequestMetadata,
+  completedAt?: number
 ): boolean {
   if (!id) return false;
   const detail = pendingById.get(id);
@@ -673,7 +678,9 @@ export function finalizePendingRequestById(
   if (!isSafeKey(modelKey)) return false;
   const details = pendingRequests.details[detail.connectionId]?.[modelKey];
   const index = details?.findIndex((entry) => entry.id === id) ?? -1;
-  return finalizePendingDetailAt(detail.connectionId, modelKey, index, metadata) !== null;
+  return (
+    finalizePendingDetailAt(detail.connectionId, modelKey, index, metadata, completedAt) !== null
+  );
 }
 
 /**
@@ -684,14 +691,15 @@ export function finalizeMostRecentPendingRequest(
   model: string,
   provider: string,
   connectionId: string | null,
-  metadata: PendingRequestMetadata
+  metadata: PendingRequestMetadata,
+  completedAt?: number
 ) {
   if (!connectionId) return;
   const modelKey = provider ? `${model} (${provider})` : model;
   if (!isSafeKey(modelKey)) return;
   const details = pendingRequests.details[connectionId]?.[modelKey];
   if (!details?.length) return;
-  finalizePendingDetailAt(connectionId, modelKey, details.length - 1, metadata);
+  finalizePendingDetailAt(connectionId, modelKey, details.length - 1, metadata, completedAt);
 }
 
 export { getCompletedDetails } from "./completedRequestDetails";
@@ -752,37 +760,41 @@ const MAX_ROWS = 10000;
 
 /**
  * Returns an object compatible with the old LowDB interface.
- * Only `api/usage/analytics/route.js` uses this — it reads `db.data.history`.
+ * Only `api/usage/analytics/route.js` uses this — it reads `db!.data.history`.
  *
  * @param sinceIso - ISO timestamp to filter from (inclusive)
  * @param limit - Max rows to return (default 10,000)
  * @param cursor - Timestamp cursor for pagination (exclusive, for next page)
  */
 export async function getUsageDb(sinceIso?: string | null, limit?: number, cursor?: string | null) {
-  const db = getDbInstance();
+  const postgres = getSelectedUsageHistoryRepository();
+  const db = postgres ? undefined : getDbInstance();
   const maxRows = Number.isFinite(Number(limit)) && Number(limit) > 0 ? Number(limit) : MAX_ROWS;
 
   let rows;
-  if (cursor) {
+  const postgresPage = postgres ? await postgres.page(sinceIso, maxRows, cursor) : null;
+  if (postgresPage) {
+    rows = postgresPage.rows;
+  } else if (cursor) {
     // Cursor-based pagination (next page after cursor)
     // Use > cursor to get rows after the last timestamp of previous page (ASC order)
     rows = sinceIso
-      ? db
+      ? db!
           .prepare(
             `SELECT * FROM usage_history WHERE timestamp >= ? AND timestamp > ? ORDER BY timestamp ASC LIMIT ?`
           )
           .all(sinceIso, cursor, maxRows)
-      : db
+      : db!
           .prepare(`SELECT * FROM usage_history WHERE timestamp > ? ORDER BY timestamp ASC LIMIT ?`)
           .all(cursor, maxRows);
   } else if (sinceIso) {
     // Initial query with date filter
-    rows = db
+    rows = db!
       .prepare(`SELECT * FROM usage_history WHERE timestamp >= ? ORDER BY timestamp ASC LIMIT ?`)
       .all(sinceIso, maxRows);
   } else {
     // No filter - get all (with limit)
-    rows = db.prepare(`SELECT * FROM usage_history ORDER BY timestamp ASC LIMIT ?`).all(maxRows);
+    rows = db!.prepare(`SELECT * FROM usage_history ORDER BY timestamp ASC LIMIT ?`).all(maxRows);
   }
 
   const history = rows.map((row) => {
@@ -814,8 +826,11 @@ export async function getUsageDb(sinceIso?: string | null, limit?: number, curso
   await attachCpaAccountLabels(history);
 
   // Provide next cursor if we hit the limit (more rows exist)
-  const nextCursor =
-    rows.length === maxRows ? toStringOrNull(asRecord(rows[rows.length - 1]).timestamp) : null;
+  const nextCursor = postgresPage
+    ? postgresPage.nextCursor
+    : rows.length === maxRows
+      ? toStringOrNull(asRecord(rows[rows.length - 1]).timestamp)
+      : null;
 
   return { data: { history, nextCursor } };
 }
@@ -867,7 +882,13 @@ export interface UsageEntry {
 /**
  * Save request usage entry to SQLite.
  */
-export async function saveRequestUsage(entry: UsageEntry) {
+export async function saveRequestUsage(entry: UsageEntry): Promise<void> {
+  const postgres = getSelectedUsageHistoryRepository();
+  if (postgres) {
+    const receipt = await postgres.save(entry);
+    if (receipt.inserted) emitUsageRecorded(entry.provider, entry.connectionId);
+    return;
+  }
   if (!shouldPersistToDisk) return;
 
   try {
@@ -1000,7 +1021,8 @@ export interface UsageHistoryFilter {
  * Get usage history with optional filters.
  */
 export async function getUsageHistory(filter: UsageHistoryFilter = {}) {
-  const db = getDbInstance();
+  const postgres = getSelectedUsageHistoryRepository();
+  const db = postgres ? undefined : getDbInstance();
   let sql = "SELECT * FROM usage_history";
   const conditions: string[] = [];
   const params: Record<string, unknown> = {};
@@ -1027,7 +1049,7 @@ export async function getUsageHistory(filter: UsageHistoryFilter = {}) {
   }
   sql += " ORDER BY timestamp ASC";
 
-  const rows = db.prepare(sql).all(params);
+  const rows = postgres ? await postgres.history(filter) : db!.prepare(sql).all(params);
   const history = rows.map((row) => {
     const r = asRecord(row);
     return {
@@ -1095,7 +1117,8 @@ export async function getModelLatencyStats(
   const minSamples = resolvePositiveOption(options.minSamples, 1);
   const maxRows = resolvePositiveOption(options.maxRows, 10000);
 
-  const db = getDbInstance();
+  const postgres = getSelectedUsageHistoryRepository();
+  const db = postgres ? undefined : getDbInstance();
   const sinceIso = new Date(Date.now() - windowHours * 60 * 60 * 1000).toISOString();
 
   type LatencyRow = {
@@ -1119,17 +1142,19 @@ export async function getModelLatencyStats(
     queryParams.model = options.model;
   }
 
-  const rows = db
-    .prepare(
-      `
+  const rows = postgres
+    ? await postgres.latency(options, sinceIso, maxRows)
+    : (db!
+        .prepare(
+          `
       SELECT provider, model, success, latency_ms, ttft_ms, tokens_output, tokens_reasoning
       FROM usage_history
       WHERE ${conditions.join(" AND ")}
       ORDER BY timestamp DESC
       LIMIT @maxRows
     `
-    )
-    .all(queryParams) as LatencyRow[];
+        )
+        .all(queryParams) as LatencyRow[]);
 
   const grouped = new Map<string, ReturnType<typeof createLatencyBucket>>();
 
@@ -1193,17 +1218,20 @@ export async function appendRequestLog({
  */
 export async function getRecentLogs(limit = 200) {
   try {
-    const db = getDbInstance();
-    const rows = db
-      .prepare(
-        `
+    const postgres = getSelectedUsageHistoryRepository();
+    const db = postgres ? undefined : getDbInstance();
+    const rows = postgres
+      ? await postgres.recentLogs(limit)
+      : (db!
+          .prepare(
+            `
         SELECT timestamp, model, provider, account, tokens_in, tokens_out, status
         FROM call_logs
         ORDER BY timestamp DESC
         LIMIT ?
       `
-      )
-      .all(limit) as Array<Record<string, unknown>>;
+          )
+          .all(limit) as Array<Record<string, unknown>>);
 
     return rows.map((row) => {
       const timestamp =
@@ -1223,4 +1251,18 @@ export async function getRecentLogs(limit = 200) {
     );
     return [];
   }
+}
+
+/** The committed history identity lets other accounting owners avoid seeding the same event twice. */
+export async function saveRequestUsageWithReceipt(
+  entry: UsageEntry
+): Promise<UsageSaveReceipt | undefined> {
+  const postgres = getSelectedUsageHistoryRepository();
+  if (!postgres) {
+    await saveRequestUsage(entry);
+    return undefined;
+  }
+  const receipt = await postgres.save(entry);
+  if (receipt.inserted) emitUsageRecorded(entry.provider, entry.connectionId);
+  return receipt;
 }

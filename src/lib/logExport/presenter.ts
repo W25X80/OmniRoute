@@ -4,7 +4,10 @@
  * so a stored credential can never leak into a response by accident.
  */
 
-import { countCallLogsAfterRowId } from "@/lib/usage/callLogExportSource";
+import {
+  countCallLogsAfterRowId,
+  countCallLogsAfterRowIdAsync,
+} from "@/lib/usage/callLogExportSource";
 import type { LogExportDestinationRow } from "@/lib/db/logExportDestinations";
 import { getLogExportDestinationType } from "./registry";
 import { redactDestinationConfig } from "./secrets";
@@ -31,7 +34,10 @@ export interface LogExportDestinationView {
   updatedAt: string;
 }
 
-export function toDestinationView(row: LogExportDestinationRow): LogExportDestinationView {
+function buildDestinationView(
+  row: LogExportDestinationRow,
+  pending: number
+): LogExportDestinationView {
   const type = getLogExportDestinationType(row.type);
   return {
     id: row.id,
@@ -47,11 +53,21 @@ export function toDestinationView(row: LogExportDestinationRow): LogExportDestin
     maxRowsPerRun: row.maxRowsPerRun,
     cursorRowId: row.cursorRowId,
     exportedTotal: row.exportedTotal,
-    pending: countCallLogsAfterRowId(row.cursorRowId),
+    pending,
     lastRunAt: row.lastRunAt,
     lastStatus: row.lastStatus,
     lastError: row.lastError,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
   };
+}
+
+export function toDestinationView(row: LogExportDestinationRow): LogExportDestinationView {
+  return buildDestinationView(row, countCallLogsAfterRowId(row.cursorRowId));
+}
+
+export async function toDestinationViewAsync(
+  row: LogExportDestinationRow
+): Promise<LogExportDestinationView> {
+  return buildDestinationView(row, await countCallLogsAfterRowIdAsync(row.cursorRowId));
 }

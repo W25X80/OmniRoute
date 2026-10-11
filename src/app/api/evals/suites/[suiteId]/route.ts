@@ -1,5 +1,9 @@
 import { NextResponse } from "next/server";
-import { deleteCustomEvalSuite, getCustomEvalSuite, saveCustomEvalSuite } from "@/lib/db/evals";
+import {
+  deleteCustomEvalSuiteAsync,
+  getCustomEvalSuiteAsync,
+  saveCustomEvalSuiteAsync,
+} from "@/lib/db/evals";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
 import { evalSuiteSaveSchema } from "@/shared/validation/schemas";
@@ -10,7 +14,7 @@ export async function GET(request: Request, { params }: { params: Promise<{ suit
 
   try {
     const { suiteId } = await params;
-    const suite = getCustomEvalSuite(suiteId);
+    const suite = await getCustomEvalSuiteAsync(suiteId);
     if (!suite) {
       return NextResponse.json({ error: "Eval suite not found" }, { status: 404 });
     }
@@ -49,12 +53,12 @@ export async function PUT(request: Request, { params }: { params: Promise<{ suit
 
   try {
     const { suiteId } = await params;
-    const existing = getCustomEvalSuite(suiteId);
+    const existing = await getCustomEvalSuiteAsync(suiteId);
     if (!existing) {
       return NextResponse.json({ error: "Eval suite not found" }, { status: 404 });
     }
 
-    const suite = saveCustomEvalSuite({ ...validation.data, id: suiteId });
+    const suite = await saveCustomEvalSuiteAsync({ ...validation.data, id: suiteId });
     return NextResponse.json({ suite });
   } catch (error: any) {
     return NextResponse.json(
@@ -73,7 +77,7 @@ export async function DELETE(
 
   try {
     const { suiteId } = await params;
-    const deleted = deleteCustomEvalSuite(suiteId);
+    const deleted = await deleteCustomEvalSuiteAsync(suiteId);
     if (!deleted) {
       return NextResponse.json({ error: "Eval suite not found" }, { status: 404 });
     }

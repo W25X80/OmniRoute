@@ -12,10 +12,11 @@
 // (3) past 2000 total rows, evict the oldest rows first. Surplus rows are counted
 // in `rejected` with `reason: "cap-evicted"` — a push is a dated observation,
 // never a batch error.
+import { normalizeEgressAddress } from "@/shared/network/egressAddress";
+import { getSelectedPostgresDatabase } from "./controlPlaneContext";
+import { createPostgresOperatorEgressRepository } from "./postgres/proxyOperatorEgressRepository";
 import { getDbInstance } from "./core";
 import { normalizeProxyHostForLog } from "../proxyLogHost";
-import { normalizeEgressAddress } from "@/shared/network/egressAddress";
-
 export const OPERATOR_EGRESS_MAX_ADDRESSES_PER_MEMBER = 10;
 export const OPERATOR_EGRESS_MAX_ROWS_TOTAL = 2000;
 export const OPERATOR_EGRESS_DEFAULT_WINDOW_HOURS = 24;
@@ -116,7 +117,11 @@ export function isKnownProxyMember(host: string, port: number): boolean {
  * statement per row, one transaction per call.
  */
 export function upsertOperatorEgress(rows: OperatorEgressPushRow[]): OperatorEgressUpsertResult {
-  const result: OperatorEgressUpsertResult = { stored: 0, ignored: 0, rejected: [] };
+  const result: OperatorEgressUpsertResult = {
+    stored: 0,
+    ignored: 0,
+    rejected: [],
+  };
   if (rows.length === 0) return result;
   const db = getDbInstance();
   const nowIso = new Date().toISOString();
@@ -139,7 +144,10 @@ export function upsertOperatorEgress(rows: OperatorEgressPushRow[]): OperatorEgr
         typeof row.observedAt !== "string" ||
         !row.observedAt
       ) {
-        result.rejected.push({ member: `${row.host}:${row.port}`, reason: "invalid-member" });
+        result.rejected.push({
+          member: `${row.host}:${row.port}`,
+          reason: "invalid-member",
+        });
         continue;
       }
       if (!isKnownProxyMember(row.host, port)) result.ignored += row.addresses.length;
@@ -204,12 +212,18 @@ function evictOperatorEgressLocked(
     }>;
     perMember.run(host, port, host, port, OPERATOR_EGRESS_MAX_ADDRESSES_PER_MEMBER);
     for (const row of evicted) {
-      rejected.push({ member: key, address: row.address, reason: "cap-evicted" });
+      rejected.push({
+        member: key,
+        address: row.address,
+        reason: "cap-evicted",
+      });
     }
   }
   // (3) Total cap: past 2000 rows, evict the oldest rows first.
   const total = (
-    db.prepare("SELECT COUNT(*) AS n FROM proxy_operator_egress").get() as { n: number }
+    db.prepare("SELECT COUNT(*) AS n FROM proxy_operator_egress").get() as {
+      n: number;
+    }
   ).n;
   if (total > OPERATOR_EGRESS_MAX_ROWS_TOTAL) {
     const overflow = total - OPERATOR_EGRESS_MAX_ROWS_TOTAL;
@@ -261,7 +275,10 @@ export function readOperatorEgressForMember(
          WHERE host = ? AND port = ? AND observed_at >= ?
          ORDER BY observed_at DESC`
       )
-      .all(normalizedHost, port, cutoff) as Array<{ address: string; observed_at: string }>;
+      .all(normalizedHost, port, cutoff) as Array<{
+      address: string;
+      observed_at: string;
+    }>;
     for (const row of rows) {
       const normalized = normalizeEgressAddress(row.address);
       if (normalized === null) continue;
@@ -273,4 +290,31 @@ export function readOperatorEgressForMember(
   } catch {
     return empty;
   }
+}
+
+export async function isKnownProxyMemberAsync(host: string, port: number): Promise<boolean> {
+  const postgres = getSelectedPostgresDatabase();
+  return postgres
+    ? createPostgresOperatorEgressRepository(postgres).known(host, port)
+    : isKnownProxyMember(host, port);
+}
+
+export async function upsertOperatorEgressAsync(
+  rows: OperatorEgressPushRow[]
+): Promise<OperatorEgressUpsertResult> {
+  const postgres = getSelectedPostgresDatabase();
+  return postgres
+    ? createPostgresOperatorEgressRepository(postgres).upsert(rows)
+    : upsertOperatorEgress(rows);
+}
+
+export async function readOperatorEgressForMemberAsync(
+  host: string,
+  port: number,
+  nowMs = Date.now()
+): Promise<OperatorEgressRead> {
+  const postgres = getSelectedPostgresDatabase();
+  return postgres
+    ? createPostgresOperatorEgressRepository(postgres).read(host, port, nowMs)
+    : readOperatorEgressForMember(host, port, nowMs);
 }

@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 
-import { getRawProviderConnections, getProviderConnectionsCount } from "@/lib/db/providers";
+import { getRawProviderConnections, getProviderConnectionsCountAsync } from "@/lib/db/providers";
 import { getAllCircuitBreakerStatuses } from "@/shared/utils/circuitBreaker";
 import { resolveProviderId } from "@/shared/constants/providers";
 import { TERMINAL_CONNECTION_STATUSES } from "@/lib/quota/connectionRecovery";
@@ -264,7 +264,7 @@ export async function GET(req: NextRequest) {
     let totalConnections = connections.length;
     let countFailed = false;
     try {
-      totalConnections = getProviderConnectionsCount({ provider });
+      totalConnections = await getProviderConnectionsCountAsync({ provider });
     } catch (err) {
       // Non-critical: connections.length is acceptable fallback
       console.error("[API] resilience/connections count error:", err);

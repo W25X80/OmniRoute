@@ -6,7 +6,7 @@
 import { z } from "zod";
 import { resolveTarget } from "@/mitm/targets/index";
 import { detectAgent } from "@/mitm/detection/index";
-import { getAgentBridgeState, upsertAgentBridgeState } from "@/lib/db/agentBridgeState";
+import { getAgentBridgeStateAsync, upsertAgentBridgeStateAsync } from "@/lib/db/agentBridgeState";
 import type { AgentId } from "@/mitm/types";
 import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
 import { createErrorResponse } from "@/lib/api/errorResponse";
@@ -25,7 +25,7 @@ export async function GET(_request: Request, { params }: Params): Promise<Respon
       return createErrorResponse({ status: 404, message: `Agent not found: ${id}` });
     }
     const detection = detectAgent(id as AgentId);
-    const state = getAgentBridgeState(id) ?? null;
+    const state = (await getAgentBridgeStateAsync(id)) ?? null;
     return Response.json({ agent: target, detection, state });
   } catch (err) {
     const msg = sanitizeErrorMessage(err instanceof Error ? err.message : String(err));
@@ -53,8 +53,11 @@ export async function PATCH(request: Request, { params }: Params): Promise<Respo
   }
 
   try {
-    upsertAgentBridgeState({ agent_id: id, setup_completed: parsed.data.setup_completed });
-    const state = getAgentBridgeState(id);
+    await upsertAgentBridgeStateAsync({
+      agent_id: id,
+      setup_completed: parsed.data.setup_completed,
+    });
+    const state = await getAgentBridgeStateAsync(id);
     return Response.json({ ok: true, state });
   } catch (err) {
     const msg = sanitizeErrorMessage(err instanceof Error ? err.message : String(err));

@@ -1,3 +1,6 @@
+import { normalizeRadarIdentity, normalizeDisplayName } from "./radar/persistenceSemantics";
+export { normalizeRadarIdentity, normalizeDisplayName } from "./radar/persistenceSemantics";
+import { getSelectedPostgresDatabase } from "./controlPlaneContext";
 /**
  * radar.ts — Radar client local DB module
  *
@@ -348,45 +351,6 @@ export function setRadarIntelCache(entry: {
     );
 }
 
-// ---------------------------------------------------------------------------
-// radar_local_model_state
-// ---------------------------------------------------------------------------
-
-const RADAR_PROVIDER_PATTERN = /^[a-z0-9][a-z0-9._-]{0,99}$/i;
-const CONTROL_CHARACTER_PATTERN = /[\u0000-\u001f\u007f]/;
-
-function normalizeRadarIdentity(
-  provider: unknown,
-  modelId: unknown
-): { provider: string; modelId: string } | null {
-  const normalizedProvider = typeof provider === "string" ? provider.trim() : "";
-  const normalizedModelId = typeof modelId === "string" ? modelId.trim() : "";
-  if (!RADAR_PROVIDER_PATTERN.test(normalizedProvider)) return null;
-  if (
-    normalizedModelId.length < 1 ||
-    normalizedModelId.length > 200 ||
-    CONTROL_CHARACTER_PATTERN.test(normalizedModelId)
-  ) {
-    return null;
-  }
-  return { provider: normalizedProvider, modelId: normalizedModelId };
-}
-
-function normalizeDisplayName(value: unknown): string | null | undefined {
-  if (value === undefined) return undefined;
-  if (value === null) return null;
-  if (typeof value !== "string") return undefined;
-  const normalized = value.trim();
-  if (
-    normalized.length < 1 ||
-    normalized.length > 160 ||
-    CONTROL_CHARACTER_PATTERN.test(normalized)
-  ) {
-    return undefined;
-  }
-  return normalized;
-}
-
 function rowToRadarLocalModelState(row: RadarLocalModelStateRow): RadarLocalModelState {
   return {
     provider: row.provider,
@@ -557,4 +521,194 @@ export function getRadarLocalMergeState(): RadarLocalMergeState {
   }
 
   return { localOverrides, tombstones };
+}
+
+export async function getRadarCacheAsync(
+  ...args: Parameters<typeof getRadarCache>
+): Promise<ReturnType<typeof getRadarCache>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceRadar");
+    return postgres.transaction((transaction) => native.getRadarCache(transaction, ...args));
+  }
+  return getRadarCache(...args);
+}
+
+export async function setRadarCacheAsync(
+  ...args: Parameters<typeof setRadarCache>
+): Promise<ReturnType<typeof setRadarCache>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceRadar");
+    return postgres.transaction((transaction) => native.setRadarCache(transaction, ...args));
+  }
+  return setRadarCache(...args);
+}
+
+export async function getRadarSettingsAsync(
+  ...args: Parameters<typeof getRadarSettings>
+): Promise<ReturnType<typeof getRadarSettings>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceRadar");
+    return postgres.transaction((transaction) => native.getRadarSettings(transaction, ...args));
+  }
+  return getRadarSettings(...args);
+}
+
+export async function setRadarOptInAsync(
+  ...args: Parameters<typeof setRadarOptIn>
+): Promise<ReturnType<typeof setRadarOptIn>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceRadar");
+    return postgres.transaction((transaction) => native.setRadarOptIn(transaction, ...args));
+  }
+  return setRadarOptIn(...args);
+}
+
+export async function setRadarKeyAsync(
+  ...args: Parameters<typeof setRadarKey>
+): Promise<ReturnType<typeof setRadarKey>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceRadar");
+    return postgres.transaction((transaction) => native.setRadarKey(transaction, ...args));
+  }
+  return setRadarKey(...args);
+}
+
+export async function getRadarReferralsCacheAsync(
+  ...args: Parameters<typeof getRadarReferralsCache>
+): Promise<ReturnType<typeof getRadarReferralsCache>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceRadar");
+    return postgres.transaction((transaction) =>
+      native.getRadarReferralsCache(transaction, ...args)
+    );
+  }
+  return getRadarReferralsCache(...args);
+}
+
+export async function setRadarReferralsCacheAsync(
+  ...args: Parameters<typeof setRadarReferralsCache>
+): Promise<ReturnType<typeof setRadarReferralsCache>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceRadar");
+    return postgres.transaction((transaction) =>
+      native.setRadarReferralsCache(transaction, ...args)
+    );
+  }
+  return setRadarReferralsCache(...args);
+}
+
+export async function getRadarOffersCacheAsync(
+  ...args: Parameters<typeof getRadarOffersCache>
+): Promise<ReturnType<typeof getRadarOffersCache>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceRadar");
+    return postgres.transaction((transaction) => native.getRadarOffersCache(transaction, ...args));
+  }
+  return getRadarOffersCache(...args);
+}
+
+export async function setRadarOffersCacheAsync(
+  ...args: Parameters<typeof setRadarOffersCache>
+): Promise<ReturnType<typeof setRadarOffersCache>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceRadar");
+    return postgres.transaction((transaction) => native.setRadarOffersCache(transaction, ...args));
+  }
+  return setRadarOffersCache(...args);
+}
+
+export async function getRadarIntelCacheAsync(
+  ...args: Parameters<typeof getRadarIntelCache>
+): Promise<ReturnType<typeof getRadarIntelCache>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceRadar");
+    return postgres.transaction((transaction) => native.getRadarIntelCache(transaction, ...args));
+  }
+  return getRadarIntelCache(...args);
+}
+
+export async function setRadarIntelCacheAsync(
+  ...args: Parameters<typeof setRadarIntelCache>
+): Promise<ReturnType<typeof setRadarIntelCache>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceRadar");
+    return postgres.transaction((transaction) => native.setRadarIntelCache(transaction, ...args));
+  }
+  return setRadarIntelCache(...args);
+}
+
+export async function listRadarLocalModelStateAsync(
+  ...args: Parameters<typeof listRadarLocalModelState>
+): Promise<ReturnType<typeof listRadarLocalModelState>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceRadar");
+    return postgres.transaction((transaction) =>
+      native.listRadarLocalModelState(transaction, ...args)
+    );
+  }
+  return listRadarLocalModelState(...args);
+}
+
+export async function setRadarLocalModelOverrideAsync(
+  ...args: Parameters<typeof setRadarLocalModelOverride>
+): Promise<ReturnType<typeof setRadarLocalModelOverride>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceRadar");
+    return postgres.transaction((transaction) =>
+      native.setRadarLocalModelOverride(transaction, ...args)
+    );
+  }
+  return setRadarLocalModelOverride(...args);
+}
+
+export async function clearRadarLocalModelOverrideAsync(
+  ...args: Parameters<typeof clearRadarLocalModelOverride>
+): Promise<ReturnType<typeof clearRadarLocalModelOverride>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceRadar");
+    return postgres.transaction((transaction) =>
+      native.clearRadarLocalModelOverride(transaction, ...args)
+    );
+  }
+  return clearRadarLocalModelOverride(...args);
+}
+
+export async function setRadarModelTombstoneAsync(
+  ...args: Parameters<typeof setRadarModelTombstone>
+): Promise<ReturnType<typeof setRadarModelTombstone>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceRadar");
+    return postgres.transaction((transaction) =>
+      native.setRadarModelTombstone(transaction, ...args)
+    );
+  }
+  return setRadarModelTombstone(...args);
+}
+
+export async function getRadarLocalMergeStateAsync(
+  ...args: Parameters<typeof getRadarLocalMergeState>
+): Promise<ReturnType<typeof getRadarLocalMergeState>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceRadar");
+    return postgres.transaction((transaction) =>
+      native.getRadarLocalMergeState(transaction, ...args)
+    );
+  }
+  return getRadarLocalMergeState(...args);
 }

@@ -15,6 +15,12 @@
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import {
+  withNativeThreadCacheFile,
+  readNativeThreadCacheFile,
+  writeNativeThreadCacheFile,
+} from "../utils/nativeThreadCacheFile.ts";
+import { parseDatabaseBackend } from "@/lib/db/backendSelection";
 import { BaseExecutor, type ExecuteInput } from "./base.ts";
 import { makeExecutorErrorResult as makeErrorResult } from "../utils/error.ts";
 import {
@@ -212,6 +218,11 @@ function setThreadBinding(key: string, binding: ThreadBinding) {
   memoryThreads.set(key, binding);
   const disk = loadThreadDisk();
   disk[key] = binding;
+  pruneThreadBindings(disk);
+  saveThreadDisk(disk);
+}
+
+function pruneThreadBindings(disk: Record<string, ThreadBinding>): void {
   const keys = Object.keys(disk);
   if (keys.length > THREAD_CACHE_MAX) {
     keys
@@ -222,7 +233,6 @@ function setThreadBinding(key: string, binding: ThreadBinding) {
         memoryThreads.delete(k);
       });
   }
-  saveThreadDisk(disk);
 }
 
 export function clearHyperAgentThreadBindingsForTests(opts?: { disk?: boolean }): void {
@@ -385,6 +395,22 @@ export function resolveHyperAgentThreadBinding(
   clientThreadId?: string,
   clientSessionId?: string
 ): HyperAgentThreadResolve {
+  return resolveHyperAgentThreadBindingFromCache(
+    cookieKey,
+    messages,
+    clientThreadId,
+    clientSessionId,
+    getThreadBinding
+  );
+}
+
+function resolveHyperAgentThreadBindingFromCache(
+  cookieKey: string,
+  messages: ChatMessage[],
+  clientThreadId: string | undefined,
+  clientSessionId: string | undefined,
+  lookup: (key: string) => ThreadBinding | null
+): HyperAgentThreadResolve {
   const clientId = (clientThreadId || "").trim();
   const clientSess = (clientSessionId || "").trim();
   const prefix = historyPrefixBeforeLastUser(messages);
@@ -405,7 +431,7 @@ export function resolveHyperAgentThreadBinding(
 
   // 1) Exact history prefix (works when assistant text is unchanged across turns)
   if (prefixKey) {
-    const cached = getThreadBinding(prefixKey);
+    const cached = lookup(prefixKey);
     if (cached?.threadId && cached.projectKey === cookieKey) {
       return {
         threadId: cached.threadId,
@@ -418,7 +444,7 @@ export function resolveHyperAgentThreadBinding(
 
   // 2) Root user task (stable across agentic tool_calls reverse-convert + tool loops)
   if (rootKey && hasAssistantMessage(messages)) {
-    const cached = getThreadBinding(rootKey);
+    const cached = lookup(rootKey);
     if (cached?.threadId && cached.projectKey === cookieKey) {
       return {
         threadId: cached.threadId,
@@ -433,7 +459,7 @@ export function resolveHyperAgentThreadBinding(
   if (hasAssistantMessage(messages)) {
     const asstKey = lastAssistantFingerprint(cookieKey, prefix.length ? prefix : messages);
     if (asstKey) {
-      const cached = getThreadBinding(asstKey);
+      const cached = lookup(asstKey);
       if (cached?.threadId && cached.projectKey === cookieKey) {
         return {
           threadId: cached.threadId,
@@ -448,12 +474,66 @@ export function resolveHyperAgentThreadBinding(
   return { threadId: "", sessionId: "", isFollowUp: false, prefixKey: null };
 }
 
+export async function resolveHyperAgentThreadBindingAsync(
+  cookieKey: string,
+  messages: ChatMessage[],
+  clientThreadId?: string,
+  clientSessionId?: string
+): Promise<HyperAgentThreadResolve> {
+  const missing = new Set<string>();
+  const memoryLookup = (key: string): ThreadBinding | null => {
+    const entry = memoryThreads.get(key);
+    if (!entry) missing.add(key);
+    return entry ?? null;
+  };
+  const result = resolveHyperAgentThreadBindingFromCache(
+    cookieKey,
+    messages,
+    clientThreadId,
+    clientSessionId,
+    memoryLookup
+  );
+  if (result.isFollowUp || missing.size === 0) return result;
+  const path = threadCachePath();
+  return withNativeThreadCacheFile(path, async () => {
+    const disk = await readNativeThreadCacheFile<ThreadBinding>(path);
+    for (const key of missing) {
+      if (!memoryThreads.has(key) && disk[key]) memoryThreads.set(key, disk[key]);
+    }
+    return resolveHyperAgentThreadBindingFromCache(
+      cookieKey,
+      messages,
+      clientThreadId,
+      clientSessionId,
+      (key) => memoryThreads.get(key) ?? null
+    );
+  });
+}
+
 export function storeHyperAgentThreadAfterTurn(
   cookieKey: string,
   messages: ChatMessage[],
   assistantText: string,
   threadId: string,
   sessionId: string
+): string | null {
+  return storeHyperAgentThreadAfterTurnWithBindings(
+    cookieKey,
+    messages,
+    assistantText,
+    threadId,
+    sessionId,
+    setThreadBinding
+  );
+}
+
+function storeHyperAgentThreadAfterTurnWithBindings(
+  cookieKey: string,
+  messages: ChatMessage[],
+  assistantText: string,
+  threadId: string,
+  sessionId: string,
+  setBinding: (key: string, binding: ThreadBinding) => void
 ): string | null {
   if (!cookieKey || !threadId) return null;
   const full: ChatMessage[] = [...messages, { role: "assistant", content: assistantText || "" }];
@@ -473,17 +553,47 @@ export function storeHyperAgentThreadAfterTurn(
     updatedAt: Date.now(),
   };
   const key = conversationFingerprint(cookieKey, full);
-  setThreadBinding(key, binding);
+  setBinding(key, binding);
   const prefix = historyPrefixBeforeLastUser(messages);
   if (prefix.length > 0 && hasAssistantMessage(prefix)) {
-    setThreadBinding(conversationFingerprint(cookieKey, prefix), binding);
+    setBinding(conversationFingerprint(cookieKey, prefix), binding);
   }
   const asstKey = lastAssistantFingerprint(cookieKey, full);
-  if (asstKey) setThreadBinding(asstKey, binding);
+  if (asstKey) setBinding(asstKey, binding);
   // Always pin root user task → thread so tool-loop follow-ups (mutated assistant
   // content after Agentic reverse conversion) still hit the same HyperAgent thread.
   const rootKey = rootUserFingerprint(cookieKey, messages);
-  if (rootKey) setThreadBinding(rootKey, binding);
+  if (rootKey) setBinding(rootKey, binding);
+  return key;
+}
+
+export async function storeHyperAgentThreadAfterTurnAsync(
+  cookieKey: string,
+  messages: ChatMessage[],
+  assistantText: string,
+  threadId: string,
+  sessionId: string
+): Promise<string | null> {
+  const entries: [string, ThreadBinding][] = [];
+  const key = storeHyperAgentThreadAfterTurnWithBindings(
+    cookieKey,
+    messages,
+    assistantText,
+    threadId,
+    sessionId,
+    (name, binding) => entries.push([name, binding])
+  );
+  if (!key) return null;
+  const path = threadCachePath();
+  await withNativeThreadCacheFile(path, async () => {
+    const disk = await readNativeThreadCacheFile<ThreadBinding>(path);
+    for (const [name, binding] of entries) {
+      memoryThreads.set(name, binding);
+      disk[name] = binding;
+      pruneThreadBindings(disk);
+    }
+    await writeNativeThreadCacheFile(path, disk);
+  });
   return key;
 }
 
@@ -877,12 +987,20 @@ export class HyperAgentExecutor extends BaseExecutor {
       ((input as { headers?: Record<string, string> }).headers as
         Record<string, string> | undefined);
     const clientIds = readClientThreadIds(requestBody, inboundHeaders ?? undefined);
-    const binding = resolveHyperAgentThreadBinding(
-      cookieKey,
-      messages,
-      clientIds.threadId,
-      clientIds.sessionId
-    );
+    const nativeFiles = parseDatabaseBackend() === "postgres";
+    const binding = nativeFiles
+      ? await resolveHyperAgentThreadBindingAsync(
+          cookieKey,
+          messages,
+          clientIds.threadId,
+          clientIds.sessionId
+        )
+      : resolveHyperAgentThreadBinding(
+          cookieKey,
+          messages,
+          clientIds.threadId,
+          clientIds.sessionId
+        );
 
     let threadId = binding.threadId;
     let sessionId = binding.sessionId || null;
@@ -966,7 +1084,9 @@ export class HyperAgentExecutor extends BaseExecutor {
             );
           }
           const parsed2 = await parseHyperAgentSseStream(res2);
-          return finalize(parsed2, messages, clientFacing, threadId, cookieKey, wantStream);
+          return nativeFiles
+            ? await finalizeNative(parsed2, messages, clientFacing, threadId, cookieKey, wantStream)
+            : finalize(parsed2, messages, clientFacing, threadId, cookieKey, wantStream);
         }
         return makeErrorResult(
           res.status >= 400 && res.status < 600 ? res.status : 502,
@@ -979,7 +1099,9 @@ export class HyperAgentExecutor extends BaseExecutor {
       const parsed = await parseHyperAgentSseStream(res);
       // Prefer session from stream; keep prior if stream omitted on follow-up
       if (!parsed.sessionId && sessionId) parsed.sessionId = sessionId;
-      return finalize(parsed, messages, clientFacing, threadId, cookieKey, wantStream);
+      return nativeFiles
+        ? await finalizeNative(parsed, messages, clientFacing, threadId, cookieKey, wantStream)
+        : finalize(parsed, messages, clientFacing, threadId, cookieKey, wantStream);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       const status = /cookie|401|unauthor/i.test(msg) ? 401 : /timeout/i.test(msg) ? 504 : 502;
@@ -997,6 +1119,39 @@ function finalize(
   wantStream?: boolean
 ) {
   const text = (parsed.text || "").trim();
+  if (text)
+    storeHyperAgentThreadAfterTurn(cookieKey, messages, text, threadId, parsed.sessionId || "");
+  return finalizeResponse(parsed, messages, clientFacing, threadId, wantStream);
+}
+
+async function finalizeNative(
+  parsed: { text: string; sessionId: string; modelId: string; events: number },
+  messages: ChatMessage[],
+  clientFacing: string,
+  threadId: string,
+  cookieKey: string,
+  wantStream?: boolean
+) {
+  const text = (parsed.text || "").trim();
+  if (text)
+    await storeHyperAgentThreadAfterTurnAsync(
+      cookieKey,
+      messages,
+      text,
+      threadId,
+      parsed.sessionId || ""
+    );
+  return finalizeResponse(parsed, messages, clientFacing, threadId, wantStream);
+}
+
+function finalizeResponse(
+  parsed: { text: string; sessionId: string; modelId: string; events: number },
+  messages: ChatMessage[],
+  clientFacing: string,
+  threadId: string,
+  wantStream?: boolean
+) {
+  const text = (parsed.text || "").trim();
   if (!text) {
     return makeErrorResult(
       502,
@@ -1005,7 +1160,6 @@ function finalize(
       `${ORIGIN}/api/threads`
     );
   }
-  storeHyperAgentThreadAfterTurn(cookieKey, messages, text, threadId, parsed.sessionId || "");
   const modelOut = parsed.modelId || clientFacing;
   const response = wantStream
     ? pseudoStreamResponse(text, modelOut, threadId, parsed.sessionId)

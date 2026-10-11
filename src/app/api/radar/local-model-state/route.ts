@@ -8,10 +8,10 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 import { buildErrorBody, sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
 import {
-  clearRadarLocalModelOverride,
-  listRadarLocalModelState,
-  setRadarLocalModelOverride,
-  setRadarModelTombstone,
+  clearRadarLocalModelOverrideAsync,
+  listRadarLocalModelStateAsync,
+  setRadarLocalModelOverrideAsync,
+  setRadarModelTombstoneAsync,
 } from "@/lib/db/radar";
 import { isAuthenticated } from "@/shared/utils/apiAuth";
 import { CORS_HEADERS, handleCorsOptions } from "@/shared/utils/cors";
@@ -92,8 +92,8 @@ async function readJson(request: Request): Promise<ReadJsonResult> {
   }
 }
 
-function stateResponse(): NextResponse {
-  return json({ states: listRadarLocalModelState() });
+async function stateResponse(): Promise<NextResponse> {
+  return json({ states: await listRadarLocalModelStateAsync() });
 }
 
 function internalError(cause: unknown): NextResponse {
@@ -108,7 +108,7 @@ export async function GET(request: Request): Promise<NextResponse> {
   const authError = await authorize(request);
   if (authError) return authError;
   try {
-    return stateResponse();
+    return await stateResponse();
   } catch (cause: unknown) {
     return internalError(cause);
   }
@@ -130,10 +130,10 @@ export async function PATCH(request: Request): Promise<NextResponse> {
       patch.displayName = displayName;
     }
     if (Object.prototype.hasOwnProperty.call(parsed.data, "enabled")) patch.enabled = enabled;
-    if (!setRadarLocalModelOverride(provider, modelId, patch)) {
+    if (!(await setRadarLocalModelOverrideAsync(provider, modelId, patch))) {
       return error(400, "Invalid Radar local override");
     }
-    return stateResponse();
+    return await stateResponse();
   } catch (cause: unknown) {
     return internalError(cause);
   }
@@ -150,10 +150,10 @@ export async function PUT(request: Request): Promise<NextResponse> {
 
   try {
     const { provider, modelId, tombstoned } = parsed.data;
-    if (!setRadarModelTombstone(provider, modelId, tombstoned)) {
+    if (!(await setRadarModelTombstoneAsync(provider, modelId, tombstoned))) {
       return error(400, "Invalid Radar tombstone");
     }
-    return stateResponse();
+    return await stateResponse();
   } catch (cause: unknown) {
     return internalError(cause);
   }
@@ -171,10 +171,10 @@ export async function DELETE(request: Request): Promise<NextResponse> {
   if (!parsed.success) return error(400, "provider and modelId are required");
 
   try {
-    if (!clearRadarLocalModelOverride(parsed.data.provider, parsed.data.modelId)) {
+    if (!(await clearRadarLocalModelOverrideAsync(parsed.data.provider, parsed.data.modelId))) {
       return error(400, "Invalid Radar local override");
     }
-    return stateResponse();
+    return await stateResponse();
   } catch (cause: unknown) {
     return internalError(cause);
   }

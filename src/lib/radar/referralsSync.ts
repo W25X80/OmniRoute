@@ -22,7 +22,7 @@ import { RadarReferralsFeedSchema, type RadarReferralsFeed } from "./referralsFe
 import { RadarTierSchema, type RadarTier } from "./feedSchema";
 import { verifyFeedBytes } from "./verify";
 import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
-import { isFeatureFlagEnabled } from "@/shared/utils/featureFlags";
+import { isFeatureFlagEnabledAsync } from "@/shared/utils/featureFlags";
 import type { RadarSettingsSnapshot } from "./sync";
 
 // ---------------------------------------------------------------------------
@@ -81,7 +81,7 @@ export interface RadarReferralsCacheEntry {
 export interface ReferralsSyncDeps {
   fetch?: typeof globalThis.fetch;
   now?: () => Date;
-  getFlag?: (key: string) => boolean;
+  getFlag?: (key: string) => boolean | Promise<boolean>;
   getSettings?: () => RadarSettingsSnapshot;
   getCache?: () => RadarReferralsCacheEntry | null;
   setCache?: (entry: RadarReferralsCacheEntry) => void;
@@ -155,7 +155,7 @@ export async function syncRadarReferrals(
   const {
     fetch: fetchFn = globalThis.fetch,
     now = () => new Date(),
-    getFlag = isFeatureFlagEnabled,
+    getFlag = isFeatureFlagEnabledAsync,
     getSettings: getSettingsFn,
     getCache: getCacheFn,
     setCache: setCacheFn,
@@ -163,7 +163,7 @@ export async function syncRadarReferrals(
 
   try {
     // Step 1: Feature flag gate
-    const flagOn = getFlag("RADAR_ENABLED");
+    const flagOn = await getFlag("RADAR_ENABLED");
     if (!flagOn) {
       return { status: "disabled" };
     }
@@ -174,7 +174,7 @@ export async function syncRadarReferrals(
       settings = getSettingsFn();
     } else {
       const mod = await import("@/lib/db/radar");
-      settings = mod.getRadarSettings();
+      settings = await mod.getRadarSettingsAsync();
     }
     if (!settings.optIn) {
       return { status: "opt_out" };
@@ -267,7 +267,7 @@ export async function syncRadarReferrals(
       existingCache = getCacheFn();
     } else {
       const mod = await import("@/lib/db/radar");
-      existingCache = mod.getRadarReferralsCache();
+      existingCache = await mod.getRadarReferralsCacheAsync();
     }
 
     if (existingCache) {
@@ -297,7 +297,7 @@ export async function syncRadarReferrals(
       setCacheFn(cacheEntry);
     } else {
       const mod = await import("@/lib/db/radar");
-      mod.setRadarReferralsCache(cacheEntry);
+      await mod.setRadarReferralsCacheAsync(cacheEntry);
     }
 
     return { status: "updated", generatedAt: feed.generatedAt, tier: servedTier };

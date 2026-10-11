@@ -60,13 +60,13 @@ export async function migrateCodexConnectionDefaultsFromLegacySettings(): Promis
 
     if (!defaultsChanged) continue;
 
-    await updateProviderConnection(connection.id, {
+    await updateProviderConnection(connection.id as string, {
       providerSpecificData: {
         ...providerSpecificData,
         requestDefaults: nextDefaults,
       },
     });
-    updatedConnectionIds.push(connection.id);
+    updatedConnectionIds.push(connection.id as string);
   }
 
   await updateSettings({

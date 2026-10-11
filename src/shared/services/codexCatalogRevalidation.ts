@@ -1,3 +1,4 @@
+import fsPromises from "node:fs/promises";
 /**
  * Codex catalog revalidation (Codex provider only)
  *
@@ -11,6 +12,9 @@
 
 import { readFileSync } from "node:fs";
 import path from "node:path";
+import { parseDatabaseBackend } from "@/lib/db/backendSelection";
+import { getSelectedPersistenceIdentity } from "@/lib/db/controlPlaneContext";
+import { runPersistenceBackgroundWork } from "@/lib/db/persistenceRuntime";
 import { isCodexDiscoveryModelExcluded } from "@/shared/services/codexDiscoveryPolicy";
 import {
   getSyncedAvailableModelsForConnection,
@@ -79,6 +83,52 @@ export function resolveCodexCatalogAppVersion(
   const packageVersion = hasPackageVersionOverride
     ? options.packageVersion
     : readInstalledPackageVersion(runtimeRoot);
+  return typeof packageVersion === "string" && packageVersion.trim()
+    ? `pkg:${packageVersion.trim()}`
+    : null;
+}
+
+/** Resolve fresh per revalidation, preserving build/file/package precedence. */
+export async function resolveCodexCatalogAppVersionAsync(
+  env: NodeJS.ProcessEnv = process.env,
+  options: AppVersionOptions = {}
+): Promise<string | null> {
+  if (parseDatabaseBackend() !== "postgres") return resolveCodexCatalogAppVersion(env, options);
+  const environment = { ...env };
+  const runtimeRoot = options.runtimeRoot || process.cwd();
+  const hasPackageVersionOverride = Object.prototype.hasOwnProperty.call(options, "packageVersion");
+  const packageVersionOverride = options.packageVersion;
+  for (const value of [environment.OMNIROUTE_BUILD_SHA, environment.BUILD_SHA]) {
+    if (typeof value === "string" && value.trim()) return `build:${value.trim()}`;
+  }
+  const candidates = [
+    [path.join(runtimeRoot, "BUILD_SHA"), "build"],
+    [path.join(runtimeRoot, ".build", "next", "BUILD_ID"), "next"],
+    [path.join(runtimeRoot, ".next", "BUILD_ID"), "next"],
+  ];
+  for (const [filePath, prefix] of candidates) {
+    try {
+      const value = (await fsPromises.readFile(filePath, "utf8")).trim();
+      if (value) return `${prefix}:${value}`;
+    } catch {
+      // Match the synchronous file priority and missing/unreadable fallback.
+    }
+  }
+  const envPackageVersion = environment.npm_package_version || environment.OMNIROUTE_VERSION;
+  if (typeof envPackageVersion === "string" && envPackageVersion.trim()) {
+    return `pkg:${envPackageVersion.trim()}`;
+  }
+  let packageVersion: unknown = packageVersionOverride;
+  if (!hasPackageVersionOverride) {
+    try {
+      const pkg: unknown = JSON.parse(
+        await fsPromises.readFile(path.join(runtimeRoot, "package.json"), "utf8")
+      );
+      packageVersion = (pkg as { version?: unknown } | null)?.version;
+    } catch {
+      packageVersion = null;
+    }
+  }
   return typeof packageVersion === "string" && packageVersion.trim()
     ? `pkg:${packageVersion.trim()}`
     : null;
@@ -340,7 +390,7 @@ export function createCodexCatalogRevalidationCoordinator(
 async function performCodexCatalogRevalidation(
   options: CodexCatalogRevalidationRequest
 ): Promise<void> {
-  const appVersion = resolveCodexCatalogAppVersion();
+  const appVersion = await resolveCodexCatalogAppVersionAsync();
   const { resolveModelSyncInternalBaseUrl } = await import("./modelSyncScheduler");
   const apiBaseUrl = resolveModelSyncInternalBaseUrl(options.apiBaseUrl);
 
@@ -366,7 +416,7 @@ export function revalidateCodexCatalogs(options: CodexCatalogRevalidationRequest
 export async function revalidateCodexCatalogsOnStartup(options?: {
   apiBaseUrl?: string;
 }): Promise<void> {
-  const appVersion = resolveCodexCatalogAppVersion();
+  const appVersion = await resolveCodexCatalogAppVersionAsync();
   const previousVersion = await readPreviousVersionMarker();
   const reason = appVersion
     ? resolveBootRevalidationReason(previousVersion, appVersion)
@@ -375,7 +425,74 @@ export async function revalidateCodexCatalogsOnStartup(options?: {
   await revalidateCodexCatalogs({ apiBaseUrl: options?.apiBaseUrl, reason });
 }
 
+interface NativeCodexRevalidationOwner {
+  readonly identity: object;
+  stopped: boolean;
+  pending: Set<Promise<void>>;
+  cancelTimers: Set<() => void>;
+  stopping?: Promise<void>;
+}
+const NATIVE_CODEX_REVALIDATION = Symbol.for("omniroute.postgresCodexCatalogRevalidation");
+const nativeCodexGlobals = globalThis as typeof globalThis & {
+  [NATIVE_CODEX_REVALIDATION]?: NativeCodexRevalidationOwner;
+};
+
+function scheduleNativeRun(run: () => Promise<void>): void {
+  const identity = getSelectedPersistenceIdentity();
+  if (!identity) throw new Error("Codex revalidation requires selected PostgreSQL persistence");
+  let owner = nativeCodexGlobals[NATIVE_CODEX_REVALIDATION];
+  if (owner) {
+    if (owner.identity !== identity || owner.stopped)
+      throw new Error("Codex revalidation authority changed or is draining");
+  } else {
+    owner = { identity, stopped: false, pending: new Set(), cancelTimers: new Set() };
+    nativeCodexGlobals[NATIVE_CODEX_REVALIDATION] = owner;
+  }
+  const selected = owner;
+  const work = runPersistenceBackgroundWork(async () => {
+    if (getSelectedPersistenceIdentity() !== identity)
+      throw new Error("Codex revalidation persistence identity changed");
+    const scheduled = await new Promise<boolean>((resolve) => {
+      let timer: ReturnType<typeof setTimeout>;
+      const cancel = () => complete(false);
+      const complete = (allowed: boolean) => {
+        clearTimeout(timer);
+        selected.cancelTimers.delete(cancel);
+        resolve(allowed);
+      };
+      selected.cancelTimers.add(cancel);
+      timer = setTimeout(() => complete(true), 0);
+      timer.unref?.();
+      if (selected.stopped) cancel();
+    });
+    if (scheduled && !selected.stopped) await run();
+  });
+  selected.pending.add(work);
+  // Preserve the authored success-only reporting policy for optional catalog revalidation.
+  void work.catch(() => {}).finally(() => selected.pending.delete(work));
+}
+
+/** Cancel scheduled callbacks and await any accepted revalidation's actual completion. */
+export async function stopCodexCatalogRevalidation(): Promise<void> {
+  if (parseDatabaseBackend() !== "postgres") return;
+  const owner = nativeCodexGlobals[NATIVE_CODEX_REVALIDATION];
+  if (!owner) return;
+  if (!owner.stopping) {
+    owner.stopped = true;
+    for (const cancel of [...owner.cancelTimers]) cancel();
+    owner.stopping = Promise.allSettled([...owner.pending]).then(() => {
+      if (nativeCodexGlobals[NATIVE_CODEX_REVALIDATION] === owner)
+        nativeCodexGlobals[NATIVE_CODEX_REVALIDATION] = undefined;
+    });
+  }
+  await owner.stopping;
+}
+
 function scheduleRun(run: () => Promise<void>): void {
+  if (parseDatabaseBackend() === "postgres") {
+    scheduleNativeRun(run);
+    return;
+  }
   const timer = setTimeout(() => {
     void run().catch(() => {
       // silent — success line only on full success

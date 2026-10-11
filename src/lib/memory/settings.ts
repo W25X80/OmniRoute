@@ -1,3 +1,4 @@
+import { getSelectedMemoryRepository } from "../db/memory";
 import { getSettings } from "@/lib/db/settings";
 import type { MemoryConfig } from "./types";
 
@@ -223,6 +224,16 @@ export function toMemoryRetrievalConfig(
 }
 
 export async function getMemorySettings(): Promise<MemorySettings> {
+  if (getSelectedMemoryRepository()) {
+    const settings = normalizeMemorySettings(await getSettings());
+    return {
+      ...settings,
+      primaryBackend: settings.primaryBackend === "sqlite" ? "postgres" : settings.primaryBackend,
+      fallbackBackends: [
+        ...new Set(settings.fallbackBackends.map((id) => (id === "sqlite" ? "postgres" : id))),
+      ],
+    };
+  }
   if (cachedMemorySettings !== null) {
     return cachedMemorySettings;
   }

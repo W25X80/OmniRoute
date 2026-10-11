@@ -1,4 +1,6 @@
-import { getAllProviderLimitsCache } from "@/lib/db/providerLimits";
+import { getAllProviderLimitsCacheAsync } from "@/lib/db/providerLimits";
+import { parseDatabaseBackend } from "@/lib/db/backendSelection";
+import { getProviderConnectionsCountAsync } from "@/lib/db/providers";
 import { NextResponse } from "next/server";
 export const dynamic = "force-dynamic";
 import { getAuditRequestContext, logAuditEvent } from "@/lib/compliance/index";
@@ -9,7 +11,6 @@ import {
 import {
   getProviderConnections,
   getProviderConnectionById,
-  getProviderConnectionsCount,
   createProviderConnection,
   deleteProviderConnections,
   updateProviderConnection,
@@ -133,11 +134,11 @@ export async function GET(request: Request) {
     const filter = provider ? { provider } : {};
 
     const connections = await getProviderConnections(filter, limit, offset);
-    const total = getProviderConnectionsCount(filter);
+    const total = await getProviderConnectionsCountAsync(filter);
     const revealKeys = isApiKeyRevealEnabled();
 
     const quotaCache = connections.some((c) => c.provider === "codex")
-      ? getAllProviderLimitsCache()
+      ? await getAllProviderLimitsCacheAsync()
       : {};
 
     // Hide or mask sensitive fields
@@ -270,9 +271,14 @@ export async function POST(request: Request) {
           ? providerSpecificData.validationId
           : "";
       try {
-        const { finalizeValidatedChatGptWebCodexSecrets } =
-          await import("@omniroute/open-sse/services/chatgptWebCodexAdmin.ts");
-        const finalized = finalizeValidatedChatGptWebCodexSecrets(apiKey || "", validationId);
+        const {
+          finalizeValidatedChatGptWebCodexSecrets,
+          finalizeValidatedChatGptWebCodexSecretsAsync,
+        } = await import("@omniroute/open-sse/services/chatgptWebCodexAdmin.ts");
+        const finalized =
+          parseDatabaseBackend() === "postgres"
+            ? await finalizeValidatedChatGptWebCodexSecretsAsync(apiKey || "", validationId)
+            : finalizeValidatedChatGptWebCodexSecrets(apiKey || "", validationId);
         persistedApiKey = finalized.encodedCredential;
         providerSpecificData = { ...(providerSpecificData || {}) };
         delete providerSpecificData.validationId;

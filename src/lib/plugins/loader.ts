@@ -55,6 +55,7 @@ export interface LoadedPlugin {
   manifest: PluginManifestWithDefaults;
   plugin: Plugin;
   cleanup: () => void;
+  cleanupAsync?: () => Promise<void>;
 }
 
 export interface LoadPluginOptions {
@@ -431,7 +432,32 @@ export async function loadPlugin(
     log.info("loader.cleanup", { name: manifest.name });
   };
 
-  return { name: manifest.name, manifest, plugin, cleanup };
+  const cleanupAsync = async (): Promise<void> => {
+    if (!child.pid || child.exitCode !== null || child.signalCode !== null) {
+      cleanup();
+      return;
+    }
+    await new Promise<void>((resolve, reject) => {
+      const finish = () => {
+        clearTimeout(deadline);
+        child.removeListener("close", finish);
+        resolve();
+      };
+      const deadline = setTimeout(() => {
+        child.removeListener("close", finish);
+        reject(new Error("Plugin child cleanup did not complete"));
+      }, SIGKILL_GRACE_MS + 1000);
+      child.once("close", finish);
+      try {
+        cleanup();
+      } catch (error) {
+        clearTimeout(deadline);
+        child.removeListener("close", finish);
+        reject(error);
+      }
+    });
+  };
+  return { name: manifest.name, manifest, plugin, cleanup, cleanupAsync };
 }
 
 /**

@@ -1,5 +1,7 @@
+import { parseDatabaseBackend } from "../../../src/lib/db/backendSelection";
 import type {
   CompressionConfig,
+  CavemanConfig,
   CompressionMode,
   CompressionPipelineStep,
   CompressionResult,
@@ -14,7 +16,7 @@ import type {
   ImageTransportFidelity,
 } from "./engines/types.ts";
 import { applyLiteCompression } from "./lite.ts";
-import { cavemanCompress } from "./caveman.ts";
+import { cavemanCompress, cavemanCompressAsync } from "./caveman.ts";
 import { compressAggressive } from "./aggressive.ts";
 import { ultraCompress, ultraCompressHeuristic } from "./ultra.ts";
 import { createCompressionStats } from "./stats.ts";
@@ -38,7 +40,7 @@ import { registerBuiltinCompressionEngines } from "./engines/index.ts";
 import { getCompressionEngine, getEngineEntry } from "./engines/registry.ts";
 import { codexResponsesEngine } from "./engines/codexResponses/index.ts";
 import { applyOmniglyphSingleMode } from "./engines/omniglyphSingleMode.ts";
-import { applyRtkCompression } from "./engines/rtk/index.ts";
+import { applyRtkCompression, applyRtkCompressionAsync } from "./engines/rtk/index.ts";
 import { adaptBodyForCompression } from "./bodyAdapter.ts";
 import {
   detectCachingContext,
@@ -272,6 +274,31 @@ export function selectCompressionStrategy(
     .mode as CompressionMode;
 }
 
+function resolveStandardCavemanConfig(options?: {
+  config?: CompressionConfig;
+}): Partial<CavemanConfig> {
+  return {
+    ...(options?.config?.cavemanConfig ?? {}),
+    ...(options?.config?.languageConfig?.enabled
+      ? {
+          language: options.config.languageConfig.defaultLanguage,
+          autoDetectLanguage: options.config.languageConfig.autoDetect,
+          enabledLanguagePacks: options.config.languageConfig.enabledPacks,
+        }
+      : {}),
+    ...(options?.config?.preserveSystemPrompt !== false
+      ? {
+          compressRoles: (options?.config?.cavemanConfig?.compressRoles ?? ["user"]).filter(
+            (role) => role !== "system"
+          ),
+        }
+      : {}),
+    // Selecting the "standard" mode runs caveman regardless of the per-engine
+    // cavemanConfig.enabled flag (that flag gates stacked steps). (B-MODE-ENGINE-DECOUPLE)
+    enabled: true,
+  };
+}
+
 export function applyCompression(
   body: Record<string, unknown>,
   mode: CompressionMode,
@@ -394,26 +421,7 @@ function runCompression(
     return adapter.adapted ? { ...result, body: adapter.restore(result.body) } : result;
   }
   if (mode === "standard") {
-    const cavemanConfig = {
-      ...(options?.config?.cavemanConfig ?? {}),
-      ...(options?.config?.languageConfig?.enabled
-        ? {
-            language: options.config.languageConfig.defaultLanguage,
-            autoDetectLanguage: options.config.languageConfig.autoDetect,
-            enabledLanguagePacks: options.config.languageConfig.enabledPacks,
-          }
-        : {}),
-      ...(options?.config?.preserveSystemPrompt !== false
-        ? {
-            compressRoles: (options?.config?.cavemanConfig?.compressRoles ?? ["user"]).filter(
-              (role) => role !== "system"
-            ),
-          }
-        : {}),
-      // Selecting the "standard" mode runs caveman regardless of the per-engine
-      // cavemanConfig.enabled flag (that flag gates stacked steps). (B-MODE-ENGINE-DECOUPLE)
-      enabled: true,
-    };
+    const cavemanConfig = resolveStandardCavemanConfig(options);
     const result = cavemanCompress(
       compressionBody as Parameters<typeof cavemanCompress>[0],
       cavemanConfig
@@ -506,6 +514,8 @@ export async function applyCompressionAsync(
     config?: CompressionConfig;
     principalId?: string;
     onEngineStep?: (step: StackedCompressionStep) => void;
+    bailout?: BailoutConfig;
+    riskGate?: RiskGateConfig;
     cachingContext?: CachingDetectionContext;
   }
 ): Promise<CompressionResult> {
@@ -531,6 +541,8 @@ async function runCompressionAsync(
     config?: CompressionConfig;
     principalId?: string;
     onEngineStep?: (step: StackedCompressionStep) => void;
+    bailout?: BailoutConfig;
+    riskGate?: RiskGateConfig;
     cachingContext?: CachingDetectionContext;
   }
 ): Promise<CompressionResult> {
@@ -545,6 +557,8 @@ async function runCompressionAsync(
         targetFormat: options.targetFormat,
         compressionStage: options.compressionStage,
         config: options.config,
+        bailout: options.bailout,
+        riskGate: options.riskGate,
       }
     : undefined;
   const { isCompressionWorkerEligible } = await import("./compressionWorkerProtocol.ts");
@@ -622,6 +636,26 @@ async function runCompressionAsync(
   // Ultra's optional SLM (model) tier is async — route it here when a model is configured.
   if (mode === "ultra") {
     return applyUltraAsync(body, options);
+  }
+  if (parseDatabaseBackend() === "postgres" && (mode === "rtk" || mode === "standard")) {
+    // Mirror the inner synchronous entrypoint guards at this delegation boundary.
+    return withCompressionEntrypointGuardsAsync(body, options, (guarded) =>
+      withRiskGateAsync(guarded, resolveRiskGate(options), async (riskBody) => {
+        if (mode === "rtk")
+          return applyRtkCompressionAsync(riskBody, {
+            config: { ...(options?.config?.rtkConfig ?? {}), enabled: true },
+          });
+        const adapter = adaptBodyForCompression(
+          riskBody,
+          options?.config?.codexResponsesConfig?.preserveToolNames
+        );
+        const result = await cavemanCompressAsync(
+          adapter.body as Parameters<typeof cavemanCompress>[0],
+          resolveStandardCavemanConfig(options)
+        );
+        return adapter.adapted ? { ...result, body: adapter.restore(result.body) } : result;
+      })
+    );
   }
   return applyCompression(body, mode, options);
 }

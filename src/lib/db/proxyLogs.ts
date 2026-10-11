@@ -1,3 +1,5 @@
+import * as postgres from "./postgres/proxyLogsRepository";
+import { getPostgresUsageDatabase } from "./postgres/usageQueries";
 /**
  * db/proxyLogs.ts — Read queries over the `proxy_logs` table.
  * Extracted from the /api/logs/export route handler.
@@ -121,6 +123,25 @@ export function getRecentEgressIpForConnection(
     .get(connectionId, since) as { egress_ip: string; timestamp: string } | undefined;
   if (!row) return null;
   return { egressIp: row.egress_ip, at: row.timestamp };
+}
+
+/** Distinct siblings observed on the same egress IP, scoped to the caller's provider family. */
+export function getEgressSiblingConnectionIds(
+  egressIp: string,
+  since: string,
+  excludedConnectionId: string,
+  providers: readonly string[]
+): string[] {
+  const db = getDbInstance();
+  const familyPlaceholders = providers.map(() => "?").join(",");
+  return db
+    .prepare(
+      `SELECT DISTINCT connection_id FROM proxy_logs
+       WHERE egress_ip = ? AND timestamp >= ? AND connection_id != ?
+       AND provider IN (${familyPlaceholders})`
+    )
+    .all(egressIp, since, excludedConnectionId, ...providers)
+    .map((row: { connection_id: string }) => row.connection_id);
 }
 
 /**
@@ -383,4 +404,105 @@ export function getPoolEgressObservation(
     maxConnectionsOnOneExit: perExit.reduce((max, row) => Math.max(max, row.n), 0),
     failures: getPoolEgressFailureBreakdown(scope, scopeId, since),
   };
+}
+
+export async function exportProxyLogsSinceAsync(since: string): Promise<Record<string, unknown>[]> {
+  const database = getPostgresUsageDatabase();
+  return database ? postgres.exportProxyLogsSince(database, since) : exportProxyLogsSince(since);
+}
+
+export async function countProxyLogsSinceAsync(since: string): Promise<number> {
+  const database = getPostgresUsageDatabase();
+  return database ? postgres.countProxyLogsSince(database, since) : countProxyLogsSince(since);
+}
+
+export async function getRecentEgressIpForConnectionAsync(
+  connectionId: string,
+  since: string
+): Promise<{ egressIp: string; at: string } | null> {
+  const database = getPostgresUsageDatabase();
+  return database
+    ? postgres.getRecentEgressIpForConnection(database, connectionId, since)
+    : getRecentEgressIpForConnection(connectionId, since);
+}
+
+export async function getEgressSiblingConnectionIdsAsync(
+  egressIp: string,
+  since: string,
+  excludedConnectionId: string,
+  providers: readonly string[]
+): Promise<string[]> {
+  const database = getPostgresUsageDatabase();
+  return database
+    ? postgres.getEgressSiblingConnectionIds(
+        database,
+        egressIp,
+        since,
+        excludedConnectionId,
+        providers
+      )
+    : getEgressSiblingConnectionIds(egressIp, since, excludedConnectionId, providers);
+}
+
+export async function getRecentEgressIpForProxyAsync(
+  host: string,
+  port: number
+): Promise<{ egressIp: string; at: string } | null> {
+  const database = getPostgresUsageDatabase();
+  return database
+    ? postgres.getRecentEgressIpForProxy(database, host, port)
+    : getRecentEgressIpForProxy(host, port);
+}
+
+export async function getRecentEgressIpsForProxyAsync(
+  host: string,
+  port: number,
+  sinceIso: string,
+  limit = 3
+): Promise<string[]> {
+  const database = getPostgresUsageDatabase();
+  return database
+    ? postgres.getRecentEgressIpsForProxy(database, host, port, sinceIso, limit)
+    : getRecentEgressIpsForProxy(host, port, sinceIso, limit);
+}
+
+export async function getPoolEgressFailureBreakdownAsync(
+  scope: string,
+  scopeId: string | null,
+  since: string
+): Promise<PoolEgressFailureBreakdown> {
+  const database = getPostgresUsageDatabase();
+  return database
+    ? postgres.getPoolEgressFailureBreakdown(database, scope, scopeId, since)
+    : getPoolEgressFailureBreakdown(scope, scopeId, since);
+}
+
+export async function updateAttemptTimingAsync(
+  id: string,
+  patch: { headersMs?: number | null; firstChunkMs?: number | null }
+): Promise<boolean> {
+  const database = getPostgresUsageDatabase();
+  return database
+    ? postgres.updateAttemptTiming(database, id, patch)
+    : updateAttemptTiming(id, patch);
+}
+
+export async function getPoolEgressObservationAsync(
+  scope: string,
+  scopeId: string | null,
+  since: string
+): Promise<PoolEgressObservation> {
+  const database = getPostgresUsageDatabase();
+  return database
+    ? postgres.getPoolEgressObservation(database, scope, scopeId, since)
+    : getPoolEgressObservation(scope, scopeId, since);
+}
+
+export async function* iterateProxyLogsSinceAsync(
+  since: string,
+  limit: number
+): AsyncGenerator<Record<string, unknown>, void, void> {
+  const database = getPostgresUsageDatabase();
+  if (database) yield* postgres.iterateProxyLogsSince(database, since, limit);
+  else yield* iterateProxyLogsSince(since, limit);
 }

@@ -1,30 +1,14 @@
-import { getDbInstance, pingDb } from "@/lib/db/core";
-import { listPools } from "@/lib/db/quotaPools";
-
-interface ProviderStatusRow {
-  id: string;
-  provider: string;
-  is_active: number | boolean | null;
-  test_status: string | null;
-  last_error: string | null;
-}
-
-function readProviderStatusRows(): ProviderStatusRow[] {
-  const db = getDbInstance();
-  return db
-    .prepare<ProviderStatusRow>(
-      "SELECT id, provider, is_active, test_status, last_error FROM provider_connections"
-    )
-    .all();
-}
+import { pingDbAsync } from "@/lib/db/core";
+import { getProviderConnectionStatusRowsAsync } from "@/lib/db/providerStatus";
+import { listPoolsAsync as listPools } from "@/lib/db/quotaPools";
 
 export async function buildOmniRouteStatus() {
   const [connections, circuitModule, quotaMonitorModule] = await Promise.all([
-    Promise.resolve(readProviderStatusRows()),
+    getProviderConnectionStatusRowsAsync(),
     import("@/shared/utils/circuitBreaker").catch(() => null),
     import("../../open-sse/services/quotaMonitor").catch(() => null),
   ]);
-  const pools = listPools().items;
+  const pools = (await listPools()).items;
   const circuitStatuses = circuitModule?.getAllCircuitBreakerStatuses() ?? null;
   const quotaSummary = quotaMonitorModule?.getQuotaMonitorSummary() ?? null;
   const active = connections.filter(
@@ -36,7 +20,7 @@ export async function buildOmniRouteStatus() {
   const healthy = active.filter((connection) => connection.test_status === "active");
 
   return {
-    gateway: pingDb() ? "healthy" : "degraded",
+    gateway: (await pingDbAsync()) ? "healthy" : "degraded",
     catalog: { available: true },
     providers: {
       configured: connections.length,

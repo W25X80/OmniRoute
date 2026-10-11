@@ -14,7 +14,7 @@
  * @module usage/costLedgerRecorder
  */
 
-import { recordLedgerEntrySafe } from "@/lib/db/costLedger";
+import { recordLedgerEntrySafeAsync } from "@/lib/db/costLedger";
 import { getPricingForModel } from "@/lib/db/settings/pricing";
 import { getLoggedInputTokens, getLoggedOutputTokens, getReasoningTokens } from "./tokenAccounting";
 import { toNumber } from "@/shared/utils/numeric";
@@ -49,7 +49,7 @@ export async function recordLedgerFromCost(input: CostLedgerRecorderInput): Prom
       }
     }
 
-    recordLedgerEntrySafe({
+    await recordLedgerEntrySafeAsync({
       apiKeyId: input.apiKeyId,
       provider: input.provider || "unknown",
       model: input.model || "unknown",

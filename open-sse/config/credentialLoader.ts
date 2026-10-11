@@ -1,3 +1,6 @@
+import fsPromises from "node:fs/promises";
+import { parseDatabaseBackend } from "../../src/lib/db/backendSelection";
+import { getServerLifecyclePhase } from "../../src/lib/serverLifecycle";
 /**
  * Credential Loader — Reads provider credentials from an external JSON file.
  *
@@ -45,7 +48,7 @@ function resolveCredentialsPath(): string {
 
   try {
     resolveDataDir = require("@/lib/dataPaths").resolveDataDir;
-  } catch (err) {
+  } catch (_err) {
     const fallbackDataDir = process.env.DATA_DIR || join(process.cwd(), "data");
     console.warn(
       `[CREDENTIALS] Could not load dataPaths module, using fallback: ${fallbackDataDir}`
@@ -57,6 +60,9 @@ function resolveCredentialsPath(): string {
 }
 
 export function loadProviderCredentials<T extends Record<string, unknown>>(providers: T): T {
+  if (parseDatabaseBackend() === "postgres" && getServerLifecyclePhase() === "ready") {
+    throw new Error("Native provider credentials require asynchronous preparation");
+  }
   if (cachedProviders && Date.now() - lastLoadTime < CONFIG_TTL_MS) {
     return cachedProviders as T;
   }
@@ -119,5 +125,98 @@ export function loadProviderCredentials<T extends Record<string, unknown>>(provi
 
   cachedProviders = providers;
   lastLoadTime = Date.now();
+  return providers;
+}
+
+let asyncLastLoadTime = 0;
+let asyncCachedProviders: Record<string, unknown> | null = null;
+
+async function resolveCredentialsPathAsync(): Promise<string> {
+  try {
+    const { resolveDataDirAsync } = await import("@/lib/dataPaths.ts");
+    return join(await resolveDataDirAsync(), "provider-credentials.json");
+  } catch {
+    const fallbackDataDir = process.env.DATA_DIR || join(process.cwd(), "data");
+    console.warn(
+      `[CREDENTIALS] Could not load dataPaths module, using fallback: ${fallbackDataDir}`
+    );
+    return join(fallbackDataDir, "provider-credentials.json");
+  }
+}
+
+async function credentialsFileExistsAsync(filePath: string): Promise<boolean> {
+  try {
+    await fsPromises.access(filePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function loadProviderCredentialsAsync<T extends Record<string, unknown>>(
+  providers: T
+): Promise<T> {
+  if (asyncCachedProviders && Date.now() - asyncLastLoadTime < CONFIG_TTL_MS) {
+    return asyncCachedProviders as T;
+  }
+
+  const credPath = await resolveCredentialsPathAsync();
+
+  if (!(await credentialsFileExistsAsync(credPath))) {
+    if (!credGlobals().__omnirouteCredNoFileLogged) {
+      console.log("[CREDENTIALS] No external credentials file found, using defaults.");
+      credGlobals().__omnirouteCredNoFileLogged = true;
+    }
+    asyncCachedProviders = providers;
+    asyncLastLoadTime = Date.now();
+    return providers;
+  }
+
+  try {
+    const raw = await fsPromises.readFile(credPath, "utf-8");
+    const external = JSON.parse(raw) as Record<string, unknown>;
+
+    let overrideCount = 0;
+
+    const mutableProviders = providers as MutableProviderRecord;
+
+    for (const [providerKey, creds] of Object.entries(external)) {
+      if (!mutableProviders[providerKey]) {
+        console.log(
+          `[CREDENTIALS] Warning: unknown provider "${providerKey}" in credentials file, skipping.`
+        );
+        continue;
+      }
+
+      if (!creds || typeof creds !== "object") {
+        console.log(
+          `[CREDENTIALS] Warning: provider "${providerKey}" value must be an object, got ${typeof creds}. Skipping.`
+        );
+        continue;
+      }
+
+      const credentialOverrides = creds as ProviderCredentialOverrides;
+      for (const field of CREDENTIAL_FIELDS) {
+        if (credentialOverrides[field] !== undefined) {
+          mutableProviders[providerKey][field] = credentialOverrides[field];
+          overrideCount++;
+        }
+      }
+    }
+
+    const isReload = asyncCachedProviders !== null;
+    console.log(
+      `[CREDENTIALS] ${isReload ? "Reloaded" : "Loaded"} external credentials: ${overrideCount} field(s) from ${credPath}`
+    );
+  } catch (err) {
+    const reason =
+      err instanceof SyntaxError
+        ? "Invalid JSON format"
+        : (err as NodeJS.ErrnoException).code || "read error";
+    console.log(`[CREDENTIALS] Error reading credentials file (${reason}). Using defaults.`);
+  }
+
+  asyncCachedProviders = providers;
+  asyncLastLoadTime = Date.now();
   return providers;
 }

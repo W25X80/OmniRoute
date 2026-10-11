@@ -1,3 +1,8 @@
+import {
+  getSelectedPostgresDatabase,
+  UnsupportedPersistenceDomainError,
+} from "./controlPlaneContext";
+import { createPostgresServerToolExecutionRepository } from "./postgres/serverToolExecutionRepository";
 import { randomUUID } from "node:crypto";
 import type { SqliteAdapter } from "./adapters/types";
 import { getDbInstance } from "./core";
@@ -238,4 +243,38 @@ export function finalizeServerToolExecution(
   })();
 
   return result.changes > 0;
+}
+
+export async function readRowAsync(
+  db: SqliteAdapter | undefined,
+  executionId: string
+): Promise<ReturnType<typeof readRow>> {
+  const database = getSelectedPostgresDatabase();
+  if (database && db) throw new UnsupportedPersistenceDomainError();
+  return database
+    ? createPostgresServerToolExecutionRepository(database).readRow(executionId)
+    : readRow(db ?? getDbInstance(), executionId);
+}
+
+export async function claimServerToolExecutionAsync(
+  input: Parameters<typeof claimServerToolExecution>[0],
+  db?: SqliteAdapter,
+  nowMs?: number
+): Promise<ServerToolClaim> {
+  const database = getSelectedPostgresDatabase();
+  if (database && db) throw new UnsupportedPersistenceDomainError();
+  return database
+    ? createPostgresServerToolExecutionRepository(database).claimServerToolExecution(input, nowMs)
+    : claimServerToolExecution(input, db ?? getDbInstance(), nowMs);
+}
+
+export async function finalizeServerToolExecutionAsync(
+  input: Parameters<typeof finalizeServerToolExecution>[0],
+  db?: SqliteAdapter
+): Promise<boolean> {
+  const database = getSelectedPostgresDatabase();
+  if (database && db) throw new UnsupportedPersistenceDomainError();
+  return database
+    ? createPostgresServerToolExecutionRepository(database).finalizeServerToolExecution(input)
+    : finalizeServerToolExecution(input, db ?? getDbInstance());
 }

@@ -8,9 +8,25 @@
  */
 
 import { logger } from "../../../open-sse/utils/logger.ts";
-import { assertPluginHandlerAllowed, canInitializeRequestPlugins } from "./executionGuard";
+import { assertPluginHandlerAllowed, canInitializeRequestPluginsAsync } from "./executionGuard";
 
 const log = logger("PLUGIN_HOOKS");
+import { getAgentRuntimeAuthority, requiresDurableAgentPersistence } from "../db/agentRuntimeState";
+type PluginRuntimeState = {
+  hooks: Map<string, HookRegistration[]>;
+  rateLimits: Map<string, RateLimitState>;
+  boot: Promise<void> | null;
+};
+const states = new WeakMap<object, PluginRuntimeState>();
+function runtimeState(): PluginRuntimeState {
+  const authority = getAgentRuntimeAuthority();
+  let state = states.get(authority);
+  if (!state) {
+    state = { hooks: new Map(), rateLimits: new Map(), boot: null };
+    states.set(authority, state);
+  }
+  return state;
+}
 
 // ── Types ──
 
@@ -56,16 +72,14 @@ interface RateLimitState {
   windowStart: number;
 }
 
-const rateLimitMap: Map<string, RateLimitState> = new Map();
-
 function isRateLimited(pluginName: string): boolean {
   const now = Date.now();
   const key = pluginName;
-  const state = rateLimitMap.get(key);
+  const state = runtimeState().rateLimits.get(key);
 
   if (!state || now - state.windowStart >= RATE_LIMIT_WINDOW_MS) {
     // New window
-    rateLimitMap.set(key, { count: 1, windowStart: now });
+    runtimeState().rateLimits.set(key, { count: 1, windowStart: now });
     return false;
   }
 
@@ -78,8 +92,6 @@ function isRateLimited(pluginName: string): boolean {
 
 // ── Registry ──
 
-const hooks: Map<string, HookRegistration[]> = new Map();
-
 /**
  * Register a handler for an event.
  */
@@ -89,10 +101,10 @@ export function registerHook(
   handler: HookHandler,
   priority: number = 100
 ): void {
-  if (!hooks.has(event)) {
-    hooks.set(event, []);
+  if (!runtimeState().hooks.has(event)) {
+    runtimeState().hooks.set(event, []);
   }
-  const list = hooks.get(event)!;
+  const list = runtimeState().hooks.get(event)!;
 
   // Prevent duplicate registration
   if (list.some((r) => r.pluginName === pluginName && r.handler === handler)) {
@@ -110,27 +122,27 @@ export function registerHook(
  * Also evicts the plugin's rate-limit state so uninstalled plugins don't leak memory.
  */
 export function unregisterHooks(pluginName: string): void {
-  for (const [event, list] of hooks.entries()) {
+  for (const [event, list] of runtimeState().hooks.entries()) {
     const before = list.length;
     const filtered = list.filter((r) => r.pluginName !== pluginName);
     if (filtered.length !== before) {
-      hooks.set(event, filtered);
+      runtimeState().hooks.set(event, filtered);
       log.info("hook.unregistered", { event, pluginName, removed: before - filtered.length });
     }
   }
   // Evict rate-limit state so uninstalled plugins don't accumulate entries
-  rateLimitMap.delete(pluginName);
+  runtimeState().rateLimits.delete(pluginName);
 }
 
 /**
  * Unregister a specific handler.
  */
 export function unregisterHook(event: string, pluginName: string): void {
-  const list = hooks.get(event);
+  const list = runtimeState().hooks.get(event);
   if (!list) return;
   const before = list.length;
   const filtered = list.filter((r) => r.pluginName !== pluginName);
-  hooks.set(event, filtered);
+  runtimeState().hooks.set(event, filtered);
   if (before !== filtered.length) {
     log.info("hook.unregistered", { event, pluginName });
   }
@@ -142,7 +154,7 @@ export function unregisterHook(event: string, pluginName: string): void {
  * Rate-limited per plugin: max 100 calls per second.
  */
 export async function emitHook(event: string, payload: unknown): Promise<void> {
-  const list = hooks.get(event);
+  const list = runtimeState().hooks.get(event);
   if (!list || list.length === 0) return;
 
   for (const reg of list) {
@@ -178,7 +190,7 @@ export async function emitHookBlocking(
   body?: unknown;
   metadata?: Record<string, unknown>;
 }> {
-  const list = hooks.get(event) || [];
+  const list = runtimeState().hooks.get(event) || [];
   const ctx = (payload || {}) as Record<string, unknown>;
   let mergedBody: unknown = ctx.body;
   let mergedMetadata: Record<string, unknown> = (ctx.metadata as Record<string, unknown>) || {};
@@ -309,20 +321,19 @@ export async function runOnStreamComplete(payload: PluginOnStreamCompletePayload
  *
  * The import is dynamic because manager.ts imports this module.
  */
-let pluginBoot: Promise<void> | null = null;
-
 function ensurePluginsLoaded(): Promise<void> {
-  if (!pluginBoot) {
-    pluginBoot = (async () => {
+  const state = runtimeState();
+  if (!state.boot) {
+    state.boot = (async () => {
       const { pluginManager } = await import("./manager");
       await pluginManager.loadAll();
     })().catch((err: unknown) => {
-      // Retry on the next request rather than wedging every later call.
-      pluginBoot = null;
+      state.boot = null;
       log.error("hooks.boot_failed", { error: err instanceof Error ? err.message : String(err) });
+      if (requiresDurableAgentPersistence()) throw err;
     });
   }
-  return pluginBoot;
+  return state.boot;
 }
 
 /**
@@ -331,7 +342,7 @@ function ensurePluginsLoaded(): Promise<void> {
 export async function runOnRequest(ctx: PluginContext): Promise<PluginResult> {
   // A strict proof must fail if any plugin policy is active, never skip that policy.
   // When no plugins exist, avoid lazy loading arbitrary plugin code in this request.
-  if (!canInitializeRequestPlugins()) return {};
+  if (!(await canInitializeRequestPluginsAsync())) return {};
   await ensurePluginsLoaded();
   return emitHookBlocking("onRequest", ctx);
 }
@@ -341,7 +352,7 @@ export async function runOnRequest(ctx: PluginContext): Promise<PluginResult> {
  */
 export async function runOnResponse(ctx: PluginContext, response: unknown): Promise<unknown> {
   let currentResponse = response;
-  const list = hooks.get("onResponse") || [];
+  const list = runtimeState().hooks.get("onResponse") || [];
   for (const reg of list) {
     assertPluginHandlerAllowed();
     try {
@@ -373,20 +384,27 @@ export async function runOnError(ctx: PluginContext, error: Error): Promise<void
  * Get all registered hooks for an event.
  */
 export function getHooks(event: string): HookRegistration[] {
-  return hooks.get(event) ?? [];
+  return runtimeState().hooks.get(event) ?? [];
 }
 
 /**
  * Get all events that have registered handlers.
  */
 export function getActiveEvents(): string[] {
-  return [...hooks.entries()].filter(([, list]) => list.length > 0).map(([event]) => event);
+  return [...runtimeState().hooks.entries()]
+    .filter(([, list]) => list.length > 0)
+    .map(([event]) => event);
 }
 
 /**
  * Reset all hooks and rate limit state (for testing).
  */
 export function resetHooks(): void {
-  hooks.clear();
-  rateLimitMap.clear();
+  runtimeState().hooks.clear();
+  runtimeState().rateLimits.clear();
+}
+
+/** Called after request/background draining; it never initializes a runtime. */
+export function disposeSelectedPluginHooksRuntime(): void {
+  states.delete(getAgentRuntimeAuthority());
 }

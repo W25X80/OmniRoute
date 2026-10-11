@@ -3,6 +3,7 @@ export * from "./baseAgent.ts";
 export * from "./registry.ts";
 export * from "./db.ts";
 
-import { createCloudAgentTaskTable } from "./db.ts";
+// Schema initialization belongs to persistence bootstrap and lazy SQLite task CRUD.
 
-createCloudAgentTaskTable();
+import { initializeLegacyCloudAgentTaskTableOnImport } from "../db/cloudAgentTasks";
+initializeLegacyCloudAgentTaskTableOnImport();

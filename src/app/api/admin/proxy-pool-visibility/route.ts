@@ -2,7 +2,11 @@ import { NextResponse } from "next/server";
 export const dynamic = "force-dynamic";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 import { createErrorResponse } from "@/lib/api/errorResponse";
-import { getProxyById, getScopePoolEgressRows, getScopeRotationStrategy } from "@/lib/db/proxies";
+import {
+  getProxyById,
+  getScopePoolEgressRowsAsync,
+  getScopeRotationStrategy,
+} from "@/lib/db/proxies";
 import { isScopeIdMissing } from "@/lib/db/proxies/mappers";
 import { rankPoolCandidates } from "@/lib/db/proxies/rotation";
 import { isProxySkipRecentlyFailedEnabled } from "@/shared/utils/featureFlags";
@@ -175,7 +179,7 @@ export async function GET(request: Request) {
     }
     const normalizedScopeId = scope === "global" ? null : scopeId;
     const [rows, strategy] = await Promise.all([
-      getScopePoolEgressRows(scope, normalizedScopeId),
+      await getScopePoolEgressRowsAsync(scope, normalizedScopeId),
       getScopeRotationStrategy(scope, normalizedScopeId),
     ]);
     const { ordered, rankedBy } = rankRows(rows as MemberRow[]);

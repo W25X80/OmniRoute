@@ -1,3 +1,14 @@
+import { assertSqliteBackendAllowed } from "./controlPlaneContext";
+import { getSelectedPostgresDatabase } from "./controlPlaneContext";
+import {
+  catalogNamespaceRows,
+  requirePostgresCatalogSnapshot,
+  isPostgresCatalogMutation,
+  mutatePostgresCatalog,
+  putCatalogValue,
+  deleteCatalogValue,
+  afterPostgresCatalogCommit,
+} from "./postgres/catalogSnapshot";
 /**
  * db/interceptionRules.ts — Per-model web-search / web-fetch interception rules (#3384).
  *
@@ -107,10 +118,14 @@ function toProviderInterceptionRules(raw: unknown): ProviderInterceptionRules | 
 // ── Read ────────────────────────────────────────────────────────────────────
 
 function readNamespace(namespace: string): Record<string, unknown> {
-  const db = getDbInstance();
-  const rows = db
-    .prepare("SELECT key, value FROM key_value WHERE namespace = ?")
-    .all(namespace) as Array<{ key: string; value: string }>;
+  requirePostgresCatalogSnapshot();
+
+  const db = getSelectedPostgresDatabase() ? undefined : getDbInstance();
+  const rows = (
+    getSelectedPostgresDatabase()
+      ? catalogNamespaceRows(namespace)
+      : db!.prepare("SELECT key, value FROM key_value WHERE namespace = ?").all(namespace)
+  ) as Array<{ key: string; value: string }>;
 
   const values: Record<string, unknown> = {};
   for (const row of rows) {
@@ -130,6 +145,11 @@ function loadAllRules(): Map<string, ProviderInterceptionRules> {
 }
 
 function loadRulesCached(): Map<string, ProviderInterceptionRules> {
+  if (getSelectedPostgresDatabase()) {
+    requirePostgresCatalogSnapshot();
+    return loadAllRules();
+  }
+
   if (rulesCache === null) {
     rulesCache = loadAllRules();
   }
@@ -144,38 +164,57 @@ export function getInterceptionRules(provider: string): ProviderInterceptionRule
 }
 
 /** Upsert the entire interception rule set for a provider. Invalidates the cache. */
-export function setInterceptionRules(provider: string, rules: ProviderInterceptionRules): void {
-  const normalizedProvider = toNormalizedString(provider);
-  if (!normalizedProvider) return;
+export async function setInterceptionRulesAsync(
+  provider: string,
+  rules: ProviderInterceptionRules
+): Promise<void> {
+  const catalogDatabase = getSelectedPostgresDatabase();
+  const execute = async () => {
+    const normalizedProvider = toNormalizedString(provider);
+    if (!normalizedProvider) return;
 
-  const db = getDbInstance();
-  const stmt = db.prepare(
-    "INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES (?, ?, ?)"
-  );
+    const db = getSelectedPostgresDatabase() ? undefined : getDbInstance();
+    const stmt = getSelectedPostgresDatabase()
+      ? undefined
+      : db!.prepare("INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES (?, ?, ?)");
 
-  const normalized: ProviderInterceptionRules = {
-    interceptSearch: rules.interceptSearch,
-    interceptFetch: rules.interceptFetch,
-    fetchBackend: rules.fetchBackend,
-    fetchProxyUrl: rules.fetchProxyUrl,
-    models: rules.models && Object.keys(rules.models).length > 0 ? rules.models : undefined,
+    const normalized: ProviderInterceptionRules = {
+      interceptSearch: rules.interceptSearch,
+      interceptFetch: rules.interceptFetch,
+      fetchBackend: rules.fetchBackend,
+      fetchProxyUrl: rules.fetchProxyUrl,
+      models: rules.models && Object.keys(rules.models).length > 0 ? rules.models : undefined,
+    };
+
+    getSelectedPostgresDatabase()
+      ? await putCatalogValue(NAMESPACE, normalizedProvider, JSON.stringify(normalized))
+      : stmt!.run(NAMESPACE, normalizedProvider, JSON.stringify(normalized));
+    if (getSelectedPostgresDatabase()) afterPostgresCatalogCommit(invalidateCache);
+    else invalidateCache();
   };
-
-  stmt.run(NAMESPACE, normalizedProvider, JSON.stringify(normalized));
-  invalidateCache();
+  if (catalogDatabase && !isPostgresCatalogMutation(catalogDatabase))
+    return mutatePostgresCatalog(catalogDatabase, execute);
+  return execute();
 }
 
 /** Delete the interception rules for a provider. Resets that provider to default behavior. */
-export function deleteInterceptionRules(provider: string): void {
-  const normalizedProvider = toNormalizedString(provider);
-  if (!normalizedProvider) return;
+export async function deleteInterceptionRulesAsync(provider: string): Promise<void> {
+  const catalogDatabase = getSelectedPostgresDatabase();
+  const execute = async () => {
+    const normalizedProvider = toNormalizedString(provider);
+    if (!normalizedProvider) return;
 
-  const db = getDbInstance();
-  db.prepare("DELETE FROM key_value WHERE namespace = ? AND key = ?").run(
-    NAMESPACE,
-    normalizedProvider
-  );
-  invalidateCache();
+    const db = getSelectedPostgresDatabase() ? undefined : getDbInstance();
+    getSelectedPostgresDatabase()
+      ? await deleteCatalogValue(NAMESPACE, normalizedProvider)
+      : db!
+          .prepare("DELETE FROM key_value WHERE namespace = ? AND key = ?")
+          .run(NAMESPACE, normalizedProvider);
+    invalidateCache();
+  };
+  if (catalogDatabase && !isPostgresCatalogMutation(catalogDatabase))
+    return mutatePostgresCatalog(catalogDatabase, execute);
+  return execute();
 }
 
 /**
@@ -225,4 +264,39 @@ export function resolveInterceptFetch(
   }
 
   return rules.interceptFetch;
+}
+
+export function setInterceptionRules(provider: string, rules: ProviderInterceptionRules): void {
+  assertSqliteBackendAllowed();
+  const normalizedProvider = toNormalizedString(provider);
+  if (!normalizedProvider) return;
+
+  const db = getDbInstance();
+  const stmt = db.prepare(
+    "INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES (?, ?, ?)"
+  );
+
+  const normalized: ProviderInterceptionRules = {
+    interceptSearch: rules.interceptSearch,
+    interceptFetch: rules.interceptFetch,
+    fetchBackend: rules.fetchBackend,
+    fetchProxyUrl: rules.fetchProxyUrl,
+    models: rules.models && Object.keys(rules.models).length > 0 ? rules.models : undefined,
+  };
+
+  stmt.run(NAMESPACE, normalizedProvider, JSON.stringify(normalized));
+  invalidateCache();
+}
+
+export function deleteInterceptionRules(provider: string): void {
+  assertSqliteBackendAllowed();
+  const normalizedProvider = toNormalizedString(provider);
+  if (!normalizedProvider) return;
+
+  const db = getDbInstance();
+  db.prepare("DELETE FROM key_value WHERE namespace = ? AND key = ?").run(
+    NAMESPACE,
+    normalizedProvider
+  );
+  invalidateCache();
 }

@@ -12,6 +12,7 @@
  */
 
 import fs from "node:fs";
+import { readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 import type { SkillArea } from "./types";
 
@@ -237,29 +238,67 @@ export function parseCliRegistry(): ParsedCliRegistry {
       continue; // skip unreadable files
     }
 
-    const parent = COMMAND_PARENT_MAP[basename];
-    const rawCmds = extractCommandsFromContent(content, parent ?? basename, Boolean(parent));
-    if (rawCmds.length === 0) continue;
-
-    for (let i = 0; i < rawCmds.length; i++) {
-      const rc = rawCmds[i];
-      const cliCmd: CliCommand = {
-        name: rc.name,
-        description: rc.description,
-        flags: rc.flags,
-        isSubcommand: Boolean(parent) || i > 0,
-      };
-
-      commands.set(rc.name, cliCmd);
-
-      if (!families.has(family)) {
-        families.set(family, []);
-      }
-      families.get(family)!.push(cliCmd);
-    }
+    appendParsedCliCommands(commands, families, basename, family, content);
   }
 
   return { commands, families };
+}
+
+export async function parseCliRegistryAsync(): Promise<ParsedCliRegistry> {
+  const commandsDir = path.resolve(process.cwd(), "bin", "cli", "commands");
+  let files: string[];
+  try {
+    files = (await readdir(commandsDir)).filter((file) => file.endsWith(".mjs"));
+  } catch (err) {
+    throw new Error(
+      `cliRegistryParser: could not read ${commandsDir}. ` +
+        `Run from project root. Underlying error: ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
+  const commands = new Map<string, CliCommand>();
+  const families = new Map<SkillArea, CliCommand[]>();
+  for (const file of files) {
+    const basename = path.basename(file, ".mjs");
+    const family = FILE_FAMILY_MAP[basename];
+    if (!family) continue;
+    let content: string;
+    try {
+      content = await readFile(path.join(commandsDir, file), "utf-8");
+    } catch {
+      continue;
+    }
+    appendParsedCliCommands(commands, families, basename, family, content);
+  }
+  return { commands, families };
+}
+
+function appendParsedCliCommands(
+  commands: Map<string, CliCommand>,
+  families: Map<SkillArea, CliCommand[]>,
+  basename: string,
+  family: SkillArea,
+  content: string
+): void {
+  const parent = COMMAND_PARENT_MAP[basename];
+  const rawCmds = extractCommandsFromContent(content, parent ?? basename, Boolean(parent));
+  if (rawCmds.length === 0) return;
+
+  for (let i = 0; i < rawCmds.length; i++) {
+    const rc = rawCmds[i];
+    const cliCmd: CliCommand = {
+      name: rc.name,
+      description: rc.description,
+      flags: rc.flags,
+      isSubcommand: Boolean(parent) || i > 0,
+    };
+
+    commands.set(rc.name, cliCmd);
+
+    if (!families.has(family)) {
+      families.set(family, []);
+    }
+    families.get(family)!.push(cliCmd);
+  }
 }
 
 /**

@@ -1,3 +1,4 @@
+import { getSelectedPostgresDatabase } from "./controlPlaneContext";
 /**
  * Database module: InspectorCustomHosts
  * CRUD operations for inspector_custom_hosts table.
@@ -85,4 +86,70 @@ export function isCustomHost(host: string): boolean {
     .prepare("SELECT 1 AS found FROM inspector_custom_hosts WHERE host = ? AND enabled = 1")
     .get(host) as { found: number } | undefined;
   return row !== undefined;
+}
+
+export async function listCustomHostsAsync(
+  ...args: Parameters<typeof listCustomHosts>
+): Promise<ReturnType<typeof listCustomHosts>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceInspector");
+    return postgres.transaction((transaction) => native.listCustomHosts(transaction, ...args));
+  }
+  return listCustomHosts(...args);
+}
+
+export async function addCustomHostAsync(
+  ...args: Parameters<typeof addCustomHost>
+): Promise<ReturnType<typeof addCustomHost>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceInspector");
+    return postgres.transaction((transaction) => native.addCustomHost(transaction, ...args));
+  }
+  return addCustomHost(...args);
+}
+
+export async function removeCustomHostAsync(
+  ...args: Parameters<typeof removeCustomHost>
+): Promise<ReturnType<typeof removeCustomHost>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceInspector");
+    return postgres.transaction((transaction) => native.removeCustomHost(transaction, ...args));
+  }
+  return removeCustomHost(...args);
+}
+
+export async function toggleCustomHostAsync(
+  ...args: Parameters<typeof toggleCustomHost>
+): Promise<ReturnType<typeof toggleCustomHost>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceInspector");
+    return postgres.transaction((transaction) => native.toggleCustomHost(transaction, ...args));
+  }
+  return toggleCustomHost(...args);
+}
+
+export async function touchLastSeenAsync(
+  ...args: Parameters<typeof touchLastSeen>
+): Promise<ReturnType<typeof touchLastSeen>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceInspector");
+    return postgres.transaction((transaction) => native.touchLastSeen(transaction, ...args));
+  }
+  return touchLastSeen(...args);
+}
+
+export async function isCustomHostAsync(
+  ...args: Parameters<typeof isCustomHost>
+): Promise<ReturnType<typeof isCustomHost>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceInspector");
+    return postgres.transaction((transaction) => native.isCustomHost(transaction, ...args));
+  }
+  return isCustomHost(...args);
 }

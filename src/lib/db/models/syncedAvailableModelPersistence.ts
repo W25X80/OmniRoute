@@ -1,3 +1,15 @@
+import { runPersistenceBackgroundWork } from "../persistenceRuntime";
+import { assertSqliteBackendAllowed } from "../controlPlaneContext";
+import { getSelectedPostgresDatabase } from "../controlPlaneContext";
+import {
+  catalogValue,
+  isPostgresCatalogMutation,
+  mutatePostgresCatalog,
+  putCatalogValue,
+  deleteCatalogValue,
+  deleteCatalogMatchingKeys,
+  afterPostgresCatalogCommit,
+} from "../postgres/catalogSnapshot";
 /** Canonical comparison and write helpers for connection-scoped synced model catalogs. */
 
 import { backupDbFile } from "../backup";
@@ -22,6 +34,15 @@ type ModelNormalizer<T> = (models: unknown) => T[];
 let reconcileAfterSyncTimer: ReturnType<typeof setTimeout> | null = null;
 
 function scheduleReconcileAfterSyncWrite(): void {
+  if (getSelectedPostgresDatabase()) {
+    void runPersistenceBackgroundWork(async () => {
+      const reconciler = await import("../../contextWindowResolver");
+      await reconciler.runContextWindowReconcile();
+    }).catch(() => {
+      // Periodic reconciliation retries this optional follow-up.
+    });
+    return;
+  }
   if (reconcileAfterSyncTimer) return; // debounce bursty multi-connection writes
   reconcileAfterSyncTimer = setTimeout(() => {
     reconcileAfterSyncTimer = null;
@@ -35,6 +56,7 @@ function scheduleReconcileAfterSyncWrite(): void {
 }
 
 export function finishSyncedAvailableModelsWrite(): void {
+  if (getSelectedPostgresDatabase()) return;
   backupDbFile("pre-write");
   invalidateModelCatalogCache();
 }
@@ -44,16 +66,84 @@ export function finishSyncedAvailableModelsWrite(): void {
  * Returns the number of connection-scoped synced model lists removed.
  */
 export async function deleteSyncedAvailableModelsForProvider(providerId: string): Promise<number> {
-  const db = getDbInstance();
-  const keyPrefix = `${providerId}:`;
-  const result = db
-    .prepare(
-      "DELETE FROM key_value WHERE namespace = 'syncedAvailableModels' AND substr(key, 1, ?) = ?"
-    )
-    .run(keyPrefix.length, keyPrefix);
-  const changes = Number(result.changes || 0);
-  if (changes > 0) finishSyncedAvailableModelsWrite();
-  return changes;
+  const catalogDatabase = getSelectedPostgresDatabase();
+  const execute = async () => {
+    const db = getSelectedPostgresDatabase() ? undefined : getDbInstance();
+    const keyPrefix = `${providerId}:`;
+    const result = getSelectedPostgresDatabase()
+      ? await deleteCatalogMatchingKeys(
+          "syncedAvailableModels",
+          (key) => [...key].slice(0, keyPrefix.length).join("") === keyPrefix
+        )
+      : db!
+          .prepare(
+            "DELETE FROM key_value WHERE namespace = 'syncedAvailableModels' AND substr(key, 1, ?) = ?"
+          )
+          .run(keyPrefix.length, keyPrefix);
+    const changes = Number(result.changes || 0);
+    if (changes > 0) finishSyncedAvailableModelsWrite();
+    return changes;
+  };
+  if (catalogDatabase && !isPostgresCatalogMutation(catalogDatabase))
+    return mutatePostgresCatalog(catalogDatabase, execute);
+  return execute();
+}
+
+export async function persistCanonicalSyncedAvailableModelsAsync<T>(
+  key: string,
+  normalizedModels: T[],
+  normalizeModels: ModelNormalizer<T>
+): Promise<boolean> {
+  const catalogDatabase = getSelectedPostgresDatabase();
+  const execute = async () => {
+    const db = getSelectedPostgresDatabase() ? undefined : getDbInstance();
+    const existingRow = getSelectedPostgresDatabase()
+      ? catalogValue("syncedAvailableModels", key)
+      : db!
+          .prepare(
+            "SELECT value FROM key_value WHERE namespace = 'syncedAvailableModels' AND key = ?"
+          )
+          .get(key);
+    const existingValue = getKeyValue(existingRow).value;
+    let existingModels: T[] | null = null;
+    if (existingValue !== null) {
+      try {
+        existingModels = normalizeModels(JSON.parse(existingValue));
+      } catch {
+        existingModels = null;
+      }
+    }
+
+    const unchanged =
+      (normalizedModels.length > 0 &&
+        existingModels !== null &&
+        JSON.stringify(existingModels) === JSON.stringify(normalizedModels)) ||
+      (normalizedModels.length === 0 && existingValue === null);
+    if (unchanged) return false;
+
+    if (normalizedModels.length === 0) {
+      getSelectedPostgresDatabase()
+        ? await deleteCatalogValue("syncedAvailableModels", key)
+        : db!
+            .prepare("DELETE FROM key_value WHERE namespace = 'syncedAvailableModels' AND key = ?")
+            .run(key);
+    } else {
+      getSelectedPostgresDatabase()
+        ? await putCatalogValue("syncedAvailableModels", key, JSON.stringify(normalizedModels))
+        : db!
+            .prepare(
+              "INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES ('syncedAvailableModels', ?, ?)"
+            )
+            .run(key, JSON.stringify(normalizedModels));
+    }
+    finishSyncedAvailableModelsWrite();
+    if (getSelectedPostgresDatabase()) afterPostgresCatalogCommit(scheduleReconcileAfterSyncWrite);
+    else scheduleReconcileAfterSyncWrite();
+    return true;
+  };
+  if (catalogDatabase && !isPostgresCatalogMutation(catalogDatabase))
+    return mutatePostgresCatalog(catalogDatabase, execute);
+  return execute();
 }
 
 export function persistCanonicalSyncedAvailableModels<T>(
@@ -61,6 +151,7 @@ export function persistCanonicalSyncedAvailableModels<T>(
   normalizedModels: T[],
   normalizeModels: ModelNormalizer<T>
 ): boolean {
+  assertSqliteBackendAllowed();
   const db = getDbInstance();
   const existingRow = db
     .prepare("SELECT value FROM key_value WHERE namespace = 'syncedAvailableModels' AND key = ?")

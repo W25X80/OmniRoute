@@ -1,3 +1,13 @@
+import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/errorSanitization.ts";
+import {
+  getSelectedPersistenceIdentity,
+  UnsupportedPersistenceDomainError,
+} from "../db/controlPlaneContext";
+import {
+  isApplicationPersistenceIdentity,
+  runPersistenceBackgroundWork,
+} from "../db/persistenceRuntime";
+import { getSelectedCallLogRepository } from "../db/postgres/callLogRepository";
 import { getDbInstance } from "../db/core";
 import type { PendingRequestDetail } from "./usageHistory";
 
@@ -156,56 +166,104 @@ function isUnset(value: unknown): boolean {
   return value === undefined || value === null;
 }
 
-export function maybeEnrichCompletedDetail(updated: PendingRequestDetail, connectionId: string) {
-  void (async () => {
-    try {
-      if (!isUnset(updated.providerResponse) && !isUnset(updated.clientResponse)) return;
+async function enrichCompletedDetail(
+  updated: PendingRequestDetail,
+  connectionId: string,
+  sinceIsoOverride?: string
+) {
+  if (!isUnset(updated.providerResponse) && !isUnset(updated.clientResponse)) return;
 
-      const db = getDbInstance();
-      const sinceIso = new Date(Date.now() - 30_000).toISOString();
-      const rows = db
+  const postgres = getSelectedCallLogRepository();
+  const db = postgres ? undefined : getDbInstance();
+  const sinceIso = sinceIsoOverride ?? new Date(Date.now() - 30_000).toISOString();
+  const rows = postgres
+    ? await postgres.requestArtifactPaths(connectionId, updated.model, sinceIso)
+    : (db!
         .prepare(
           `SELECT artifact_relpath FROM call_logs WHERE connection_id = ? AND model = ? AND timestamp >= ? ORDER BY timestamp DESC LIMIT 5`
         )
-        .all(connectionId, updated.model, sinceIso) as Array<{ artifact_relpath: string | null }>;
-      for (const row of rows) {
-        if (!row.artifact_relpath) continue;
-        const { readCallArtifact, isSizeLimitOmissionMarker } = await import("./callLogArtifacts");
-        const art = readCallArtifact(row.artifact_relpath);
-        if (art.state !== "ready" || !art.artifact) continue;
-        const pipeline = art.artifact.pipeline as
-          { providerResponse?: unknown; clientResponse?: unknown } | undefined;
-        // pipeline.* first: it is the translated payload of one specific side.
-        // `responseBody` is a single coarse value handed to both sides, so it
-        // may only fill a side still empty AFTER the pipeline had its turn --
-        // testing emptiness once before the loop let it overwrite the payload
-        // just recovered, showing a provider payload as the client response.
-        if (isUnset(updated.providerResponse) && pipeline?.providerResponse) {
-          updated.providerResponse = pipeline.providerResponse;
-        }
-        if (isUnset(updated.clientResponse) && pipeline?.clientResponse) {
-          updated.clientResponse = pipeline.clientResponse;
-        }
-        // A size-limited artifact stores an omission marker string in place of
-        // the body. It is truthy, so recovering it here overwrites a real
-        // payload with "[omitted: ...]".
-        const responseBody = isSizeLimitOmissionMarker(art.artifact.responseBody)
-          ? null
-          : art.artifact.responseBody;
-        if (responseBody) {
-          if (isUnset(updated.providerResponse)) updated.providerResponse = responseBody;
-          if (isUnset(updated.clientResponse)) updated.clientResponse = responseBody;
-        }
-        if (updated.providerResponse || updated.clientResponse) {
-          const current = completedDetails.get(updated.id);
-          if (current) {
-            // Usage can arrive while the artifact read is awaiting its import.
-            // Keep newer counters instead of restoring the pre-usage snapshot.
-            storeCompletedDetail({ ...updated, tokens: current.tokens ?? updated.tokens });
-          }
-          break;
-        }
+        .all(connectionId, updated.model, sinceIso) as Array<{
+        artifact_relpath: string | null;
+      }>);
+  for (const row of rows) {
+    if (!row.artifact_relpath) continue;
+    const { readCallArtifact, readCallArtifactAsync, isSizeLimitOmissionMarker } =
+      await import("./callLogArtifacts");
+    const art = postgres
+      ? await readCallArtifactAsync(row.artifact_relpath)
+      : readCallArtifact(row.artifact_relpath);
+    if (art.state !== "ready" || !art.artifact) continue;
+    const pipeline = art.artifact.pipeline as
+      { providerResponse?: unknown; clientResponse?: unknown } | undefined;
+    // pipeline.* first: it is the translated payload of one specific side.
+    // `responseBody` is a single coarse value handed to both sides, so it
+    // may only fill a side still empty AFTER the pipeline had its turn --
+    // testing emptiness once before the loop let it overwrite the payload
+    // just recovered, showing a provider payload as the client response.
+    if (isUnset(updated.providerResponse) && pipeline?.providerResponse) {
+      updated.providerResponse = pipeline.providerResponse;
+    }
+    if (isUnset(updated.clientResponse) && pipeline?.clientResponse) {
+      updated.clientResponse = pipeline.clientResponse;
+    }
+    // A size-limited artifact stores an omission marker string in place of
+    // the body. It is truthy, so recovering it here overwrites a real
+    // payload with "[omitted: ...]".
+    const responseBody = isSizeLimitOmissionMarker(art.artifact.responseBody)
+      ? null
+      : art.artifact.responseBody;
+    if (responseBody) {
+      if (isUnset(updated.providerResponse)) updated.providerResponse = responseBody;
+      if (isUnset(updated.clientResponse)) updated.clientResponse = responseBody;
+    }
+    if (updated.providerResponse || updated.clientResponse) {
+      const current = completedDetails.get(updated.id);
+      if (current) {
+        // Usage can arrive while the artifact read is awaiting its import.
+        // Keep newer counters instead of restoring the pre-usage snapshot.
+        storeCompletedDetail({
+          ...updated,
+          tokens: current.tokens ?? updated.tokens,
+        });
       }
+      break;
+    }
+  }
+}
+
+function reportNativeEnrichmentFailure(error: unknown): void {
+  console.warn(
+    "[usageHistory] failed to enrich completed detail from artifacts:",
+    sanitizeErrorMessage(error) || "Completed detail enrichment unavailable"
+  );
+}
+
+export function maybeEnrichCompletedDetail(updated: PendingRequestDetail, connectionId: string) {
+  if (!isUnset(updated.providerResponse) && !isUnset(updated.clientResponse)) return;
+  try {
+    const identity = getSelectedPersistenceIdentity();
+    if (identity) {
+      if (!isApplicationPersistenceIdentity(identity))
+        throw new UnsupportedPersistenceDomainError();
+      const sinceIso = new Date(Date.now() - 30_000).toISOString();
+      void runPersistenceBackgroundWork(async () => {
+        if (
+          !isApplicationPersistenceIdentity(identity) ||
+          getSelectedPersistenceIdentity() !== identity
+        )
+          throw new UnsupportedPersistenceDomainError();
+        await enrichCompletedDetail(updated, connectionId, sinceIso);
+      }).catch(reportNativeEnrichmentFailure);
+      return;
+    }
+  } catch (error) {
+    reportNativeEnrichmentFailure(error);
+    return;
+  }
+
+  void (async () => {
+    try {
+      await enrichCompletedDetail(updated, connectionId);
     } catch (e) {
       try {
         console.warn(

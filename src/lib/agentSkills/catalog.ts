@@ -6,7 +6,9 @@
  */
 
 import fs from "node:fs";
+import { access, readFile, readdir } from "node:fs/promises";
 import path from "node:path";
+import { parseDatabaseBackend } from "@/lib/db/backendSelection";
 import type { AgentSkill, SkillCoverage, SkillMarkdown } from "./types";
 import {
   CURATED_SKILLS,
@@ -146,6 +148,36 @@ export function computeCoverage(): SkillCoverage {
     presentIds = new Set();
   }
 
+  return coverageFromPresentIds(presentIds, catalog);
+}
+
+export async function computeCoverageAsync(): Promise<SkillCoverage> {
+  const catalog = getCatalog();
+  const skillsDir = path.resolve(process.cwd(), "skills");
+  let presentIds = new Set<string>();
+  try {
+    const entries = await readdir(skillsDir, { withFileTypes: true });
+    const present: string[] = [];
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      try {
+        await access(path.join(skillsDir, entry.name, "SKILL.md"));
+        present.push(entry.name);
+      } catch {
+        // Match the synchronous exists check; an unreadable or missing path is absent.
+      }
+    }
+    presentIds = new Set(present);
+  } catch {
+    // Directory doesn't exist yet — zero coverage.
+  }
+  return coverageFromPresentIds(presentIds, catalog);
+}
+
+function coverageFromPresentIds(
+  presentIds: ReadonlySet<string>,
+  catalog: AgentSkill[]
+): SkillCoverage {
   const apiHave = catalog.filter((s) => s.category === "api" && presentIds.has(s.id)).length;
   const cliHave = catalog.filter((s) => s.category === "cli" && presentIds.has(s.id)).length;
   const configTotal = CONFIG_SKILL_IDS.length;
@@ -185,7 +217,10 @@ export async function fetchSkillMarkdown(id: string): Promise<SkillMarkdown> {
 
   // 1. Try filesystem first
   try {
-    const raw = fs.readFileSync(localPath, "utf-8");
+    const raw =
+      parseDatabaseBackend() === "postgres"
+        ? await readFile(localPath, "utf-8")
+        : fs.readFileSync(localPath, "utf-8");
     const parsed = parseMarkdownFrontmatter(raw);
     return {
       id,

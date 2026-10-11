@@ -22,11 +22,10 @@ import {
   handleCreditsFailure,
 } from "../services/antigravityCredits.ts";
 import { persistCreditBalance, getAllPersistedCreditBalances } from "@/lib/db/creditBalance";
-import { setConnectionRateLimitUntil } from "@/lib/db/providers";
+import { setConnectionRateLimitUntil, setConnectionRateLimitUntilAsync } from "@/lib/db/providers";
 import { markAntigravityModelQuotaExhausted } from "../services/antigravityFamilyCooldown.ts";
 import { getMitmAlias } from "@/lib/db/models";
 import { resolveAntigravityOutputCap } from "./antigravityOutputCap.ts";
-export { MAX_ANTIGRAVITY_OUTPUT_TOKENS } from "./antigravityOutputCap.ts";
 import {
   ensureAntigravityProjectAssigned,
   ANTIGRAVITY_REQUIRES_MANUAL_PROJECT,
@@ -47,8 +46,6 @@ import {
   processAntigravitySSEText,
   flushAntigravitySSEText,
 } from "./antigravity/sseCollect.ts";
-// processAntigravitySSEPayload re-exported for external importers (tests).
-export { processAntigravitySSEPayload } from "./antigravity/sseCollect.ts";
 import {
   createCreditsExtractionTransform as createCreditsExtractionTransformImpl,
   type SsePassthroughResult,
@@ -78,6 +75,22 @@ import {
   getAntigravityEnvelopeUserAgent,
   getAntigravitySessionId,
 } from "../services/antigravityIdentity.ts";
+import {
+  getSelectedPostgresDatabase,
+  getSelectedPersistenceIdentity,
+  UnsupportedPersistenceDomainError,
+} from "@/lib/db/controlPlaneContext";
+import {
+  isApplicationPersistenceIdentity,
+  runPersistenceBackgroundWork,
+} from "@/lib/db/persistenceRuntime";
+import { sanitizeErrorMessage } from "../utils/errorSanitization.ts";
+import { getPersistedCreditBalanceAsync, persistCreditBalanceAsync } from "@/lib/db/creditBalance";
+
+export { MAX_ANTIGRAVITY_OUTPUT_TOKENS } from "./antigravityOutputCap.ts";
+
+// processAntigravitySSEPayload re-exported for external importers (tests).
+export { processAntigravitySSEPayload } from "./antigravity/sseCollect.ts";
 
 const MAX_RETRY_AFTER_MS = 60_000;
 const LONG_RETRY_THRESHOLD_MS = 60_000;
@@ -163,17 +176,34 @@ type AntigravityRequestEnvelope = Record<string, unknown> & {
 
 const MAX_CREDIT_BALANCE_ENTRIES = 50;
 const CREDIT_BALANCE_TTL_MS = 5 * 60 * 1000;
-const creditBalanceCache = new Map<string, { balance: number; updatedAt: number }>();
+type CreditCache = Map<string, { balance: number; updatedAt: number }>;
+const sqliteCreditCache: CreditCache = new Map();
+const CREDIT_CACHES = Symbol.for("omniroute.postgres.antigravityCredits");
+const creditGlobal = globalThis as typeof globalThis & {
+  [CREDIT_CACHES]?: WeakMap<object, CreditCache>;
+};
+const postgresCreditCaches = (creditGlobal[CREDIT_CACHES] ??= new WeakMap<object, CreditCache>());
+function getCreditCache(): CreditCache {
+  const identity = getSelectedPersistenceIdentity();
+  if (!identity) return sqliteCreditCache;
+  let cache = postgresCreditCaches.get(identity);
+  if (!cache) {
+    cache = new Map();
+    postgresCreditCaches.set(identity, cache);
+  }
+  return cache;
+}
 let creditCacheHydrated = false;
 
 function hydrateCreditCacheFromDb(): void {
+  if (getSelectedPostgresDatabase()) return;
   if (creditCacheHydrated) return;
   creditCacheHydrated = true;
   try {
     const persisted = getAllPersistedCreditBalances();
     for (const [accountId, balance] of persisted) {
-      if (!creditBalanceCache.has(accountId)) {
-        creditBalanceCache.set(accountId, { balance, updatedAt: Date.now() });
+      if (!getCreditCache().has(accountId)) {
+        getCreditCache().set(accountId, { balance, updatedAt: Date.now() });
       }
     }
   } catch {}
@@ -181,42 +211,54 @@ function hydrateCreditCacheFromDb(): void {
 
 function evictStaleCreditBalanceEntries(): void {
   const now = Date.now();
-  for (const [key, entry] of creditBalanceCache) {
+  for (const [key, entry] of getCreditCache()) {
     if (now - entry.updatedAt > CREDIT_BALANCE_TTL_MS) {
-      creditBalanceCache.delete(key);
+      getCreditCache().delete(key);
     }
   }
-  while (creditBalanceCache.size > MAX_CREDIT_BALANCE_ENTRIES) {
-    const oldestKey = creditBalanceCache.keys().next().value;
-    if (oldestKey !== undefined) creditBalanceCache.delete(oldestKey);
+  while (getCreditCache().size > MAX_CREDIT_BALANCE_ENTRIES) {
+    const oldestKey = getCreditCache().keys().next().value;
+    if (oldestKey !== undefined) getCreditCache().delete(oldestKey);
     else break;
   }
 }
 
-const _creditBalanceSweep = setInterval(evictStaleCreditBalanceEntries, 60_000);
+const _creditBalanceSweep = setInterval(() => {
+  void runPersistenceBackgroundWork(async () => evictStaleCreditBalanceEntries()).catch((error) =>
+    console.error("[Antigravity] Credit cache sweep failed", error)
+  );
+}, 60_000);
 if (typeof _creditBalanceSweep === "object" && "unref" in _creditBalanceSweep) {
   (_creditBalanceSweep as { unref?: () => void }).unref?.();
 }
 
 export function getAntigravityRemainingCredits(accountId: string): number | null {
   hydrateCreditCacheFromDb();
-  const entry = creditBalanceCache.get(accountId);
+  const entry = getCreditCache().get(accountId);
   if (!entry) return null;
   if (Date.now() - entry.updatedAt > CREDIT_BALANCE_TTL_MS) {
-    creditBalanceCache.delete(accountId);
+    getCreditCache().delete(accountId);
     return null;
   }
   return entry.balance;
 }
 
-export function updateAntigravityRemainingCredits(accountId: string, balance: number): void {
-  if (creditBalanceCache.size >= MAX_CREDIT_BALANCE_ENTRIES && !creditBalanceCache.has(accountId)) {
-    const oldestKey = creditBalanceCache.keys().next().value;
-    if (oldestKey !== undefined) creditBalanceCache.delete(oldestKey);
+function updateCreditCache(cache: CreditCache, accountId: string, balance: number): void {
+  if (cache.size >= MAX_CREDIT_BALANCE_ENTRIES && !cache.has(accountId)) {
+    const oldestKey = cache.keys().next().value;
+    if (oldestKey !== undefined) cache.delete(oldestKey);
   }
-  creditBalanceCache.set(accountId, { balance, updatedAt: Date.now() });
+  cache.set(accountId, { balance, updatedAt: Date.now() });
+}
+
+export function updateAntigravityRemainingCredits(accountId: string, balance: number): void {
+  updateCreditCache(getCreditCache(), accountId, balance);
   try {
-    persistCreditBalance(accountId, balance);
+    if (getSelectedPostgresDatabase())
+      void runPersistenceBackgroundWork(() => persistCreditBalanceAsync(accountId, balance)).catch(
+        (error) => console.error("[Antigravity] Credit balance persistence failed", error)
+      );
+    else persistCreditBalance(accountId, balance);
   } catch {}
 }
 
@@ -248,6 +290,18 @@ export function markConnectionQuotaExhausted(
   try {
     if (markAntigravityModelQuotaExhausted(connectionId, retryAfterMs, model)) return;
     setConnectionRateLimitUntil(connectionId, Date.now() + retryAfterMs);
+  } catch {}
+}
+
+/** Await native persistence while retaining the source's best-effort quota marker contract. */
+export async function markConnectionQuotaExhaustedAsync(
+  connectionId: string,
+  retryAfterMs: number,
+  model?: string | null
+): Promise<void> {
+  try {
+    if (markAntigravityModelQuotaExhausted(connectionId, retryAfterMs, model)) return;
+    await setConnectionRateLimitUntilAsync(connectionId, Date.now() + retryAfterMs);
   } catch {}
 }
 
@@ -531,6 +585,7 @@ type AntigravityAttemptContext = {
   fallbackCount: number;
   physicalSendCounter: AntigravityPhysicalSendCounter;
   correlationId: string | null;
+  onCreditsUpdate?: (accountId: string, balance: number) => void;
 };
 
 /** Context threaded through the 429/503 handling helpers — adds the sent response. */
@@ -1259,6 +1314,7 @@ export class AntigravityExecutor extends BaseExecutor {
       log,
       upstreamExtraHeaders,
       correlationId = null,
+      runNativeStreamingPersistence,
     }: ExecuteInput,
     modelIdOverride?: string,
     physicalSendCounter: AntigravityPhysicalSendCounter = { value: 0 }
@@ -1266,6 +1322,23 @@ export class AntigravityExecutor extends BaseExecutor {
     await resolveAntigravityClientVersion(getAntigravityClientProfile(credentials));
     const fallbackCount = this.getFallbackCount();
     const l = toSafeAntigravityLog(log);
+    const creditOwner = runNativeStreamingPersistence
+      ? getSelectedPersistenceIdentity()
+      : undefined;
+    if (runNativeStreamingPersistence && !isApplicationPersistenceIdentity(creditOwner))
+      throw new UnsupportedPersistenceDomainError();
+    const creditCache = runNativeStreamingPersistence ? getCreditCache() : undefined;
+    const onCreditsUpdate = runNativeStreamingPersistence
+      ? (id: string, balance: number) => {
+          // Observe the cache synchronously in producer order; only SQL waits for a fresh scope.
+          void runNativeStreamingPersistence(() => persistCreditBalanceAsync(id, balance), {
+            owner: creditOwner!,
+            observe: () => updateCreditCache(creditCache!, id, balance),
+          }).catch((error) =>
+            l.warn("TELEMETRY", sanitizeErrorMessage(error) || "Credit balance update unavailable")
+          );
+        }
+      : undefined;
     let lastError = null;
     let lastStatus = 0;
     const retryAttemptsByUrl: Record<number, number> = {}; // Track retry attempts per URL
@@ -1330,6 +1403,7 @@ export class AntigravityExecutor extends BaseExecutor {
           fallbackCount,
           physicalSendCounter,
           correlationId,
+          ...(onCreditsUpdate ? { onCreditsUpdate } : {}),
         });
 
         if (outcome.action === "return") return outcome.result;
@@ -1459,7 +1533,8 @@ export class AntigravityExecutor extends BaseExecutor {
       transformedBody,
       accountId,
       signal,
-      log
+      log,
+      ctx.onCreditsUpdate
     );
     return { action: "return", result };
   }
@@ -1484,7 +1559,8 @@ export class AntigravityExecutor extends BaseExecutor {
     transformedBody: Record<string, unknown>,
     accountId: string,
     signal: AbortSignal | null | undefined,
-    log: SafeAntigravityLog
+    log: SafeAntigravityLog,
+    onCreditsUpdate = updateAntigravityRemainingCredits
   ): Promise<SsePassthroughResult> {
     if (!stream && response.ok && response.body) {
       return this.collectStreamToResponse(
@@ -1506,7 +1582,7 @@ export class AntigravityExecutor extends BaseExecutor {
       transformedBody,
       accountId,
       signal,
-      updateAntigravityRemainingCredits
+      onCreditsUpdate
     );
   }
 
@@ -1658,12 +1734,12 @@ export class AntigravityExecutor extends BaseExecutor {
           signal,
           log,
           accountId,
-          updateAntigravityRemainingCredits,
+          ctx.onCreditsUpdate ?? updateAntigravityRemainingCredits,
           ctx.physicalSendCounter,
           ctx.correlationId
         );
         if (creditsResult) return { kind: "return", result: creditsResult };
-        if (retryMs) markConnectionQuotaExhausted(accountId, retryMs, ctx.model);
+        if (retryMs) await markConnectionQuotaExhaustedAsync(accountId, retryMs, ctx.model);
       }
 
       return {
@@ -1705,3 +1781,12 @@ export class AntigravityExecutor extends BaseExecutor {
 }
 
 export default AntigravityExecutor;
+
+export async function getAntigravityRemainingCreditsAsync(id: string): Promise<number | null> {
+  if (!getSelectedPostgresDatabase()) return getAntigravityRemainingCredits(id);
+  const current = getAntigravityRemainingCredits(id);
+  if (current !== null) return current;
+  const balance = await getPersistedCreditBalanceAsync(id);
+  if (balance !== null) getCreditCache().set(id, { balance, updatedAt: Date.now() });
+  return balance;
+}

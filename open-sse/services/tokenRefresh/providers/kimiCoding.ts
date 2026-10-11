@@ -8,7 +8,8 @@ import {
   buildKimiCodeIdentityHeaders,
   normalizeKimiDeviceId,
 } from "../../../config/providers/registry/kimi/coding/runtime.ts";
-import { getKimiDeviceModel } from "../../../utils/kimiDevice.ts";
+import { getKimiDeviceModel, getKimiDeviceModelAsync } from "../../../utils/kimiDevice.ts";
+import { parseDatabaseBackend } from "@/lib/db/backendSelection";
 import { runWithProxyContext } from "../../../utils/proxyFetch.ts";
 import type { RefreshLogger } from "../shared.ts";
 
@@ -47,7 +48,11 @@ export async function refreshKimiCodingToken(
     typeof providerSpecificData?.deviceModel === "string"
       ? providerSpecificData.deviceModel.trim()
       : "";
-  const deviceModel = persistedDeviceModel || getKimiDeviceModel();
+  const deviceModel =
+    persistedDeviceModel ||
+    (parseDatabaseBackend() === "postgres"
+      ? await getKimiDeviceModelAsync()
+      : getKimiDeviceModel());
 
   try {
     const params = new URLSearchParams({

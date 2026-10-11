@@ -3,6 +3,15 @@
  */
 
 import { getDbInstance } from "../core";
+import { getSelectedPostgresDatabase } from "../controlPlaneContext";
+import {
+  getPostgresKeyValue,
+  writePostgresKeyValue,
+  deletePostgresKeyValue,
+  deletePostgresKeyValueNamespace,
+  withPostgresKeyValueMutation,
+  listPostgresKeyValues,
+} from "../postgres/keyValueRepository";
 
 /**
  * Escape SQLite `LIKE` wildcards so a combo name containing `%` or `_` cannot
@@ -38,11 +47,13 @@ export interface LKGPRecord {
 }
 
 export async function getLKGP(comboName: string, modelId: string): Promise<LKGPRecord | null> {
-  const db = getDbInstance();
+  const postgres = getSelectedPostgresDatabase();
   const key = `${comboName}:${modelId}`;
-  const row = db
-    .prepare("SELECT value FROM key_value WHERE namespace = 'lkgp' AND key = ?")
-    .get(key) as { value?: string } | undefined;
+  const row = postgres
+    ? { value: await getPostgresKeyValue(postgres, "lkgp", key) }
+    : (getDbInstance()
+        .prepare("SELECT value FROM key_value WHERE namespace = 'lkgp' AND key = ?")
+        .get(key) as { value?: string } | undefined);
   if (!row?.value) return null;
   try {
     const parsed = JSON.parse(row.value);
@@ -61,14 +72,19 @@ export async function setLKGP(
   providerId: string,
   connectionId?: string
 ) {
-  const db = getDbInstance();
   const key = `${comboName}:${modelId}`;
   const value: LKGPRecord = { provider: providerId };
   if (connectionId) value.connectionId = connectionId;
-  db.prepare("INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES ('lkgp', ?, ?)").run(
-    key,
-    JSON.stringify(value)
-  );
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    await withPostgresKeyValueMutation(postgres, (transaction) =>
+      writePostgresKeyValue(transaction, "lkgp", key, JSON.stringify(value))
+    );
+    return;
+  }
+  getDbInstance()
+    .prepare("INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES ('lkgp', ?, ?)")
+    .run(key, JSON.stringify(value));
 }
 
 export function clearAllLKGP(): void {
@@ -88,9 +104,15 @@ export function clearAllLKGP(): void {
  * else clears the stale pin.
  */
 export async function clearLKGP(comboName: string, modelId: string): Promise<void> {
-  const db = getDbInstance();
   const key = `${comboName}:${modelId}`;
-  db.prepare("DELETE FROM key_value WHERE namespace = 'lkgp' AND key = ?").run(key);
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    await withPostgresKeyValueMutation(postgres, (transaction) =>
+      deletePostgresKeyValue(transaction, "lkgp", key)
+    );
+  } else {
+    getDbInstance().prepare("DELETE FROM key_value WHERE namespace = 'lkgp' AND key = ?").run(key);
+  }
   const { invalidateCachedLKGP } = await import("../readCache");
   invalidateCachedLKGP(key);
 }
@@ -104,7 +126,7 @@ export async function clearLKGP(comboName: string, modelId: string): Promise<voi
  * unreachable rows.
  */
 export async function deleteLKGPByComboName(comboName: string): Promise<number> {
-  const staleKeys = deleteLKGPRowsByComboName(comboName);
+  const staleKeys = await deleteLKGPRowsByComboNameAsync(comboName);
 
   if (staleKeys.length === 0) return 0;
 
@@ -130,6 +152,30 @@ export async function deleteLKGPByConnectionIds(connectionIds: string[]): Promis
   const deletedConnectionIds = new Set(connectionIds.filter(Boolean));
   if (deletedConnectionIds.size === 0) return 0;
 
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const keys = await withPostgresKeyValueMutation(postgres, async (transaction) => {
+      const rows = await listPostgresKeyValues(transaction, "lkgp");
+      const keys: string[] = [];
+      for (const row of rows) {
+        if (!row.key || !row.value) continue;
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(row.value);
+        } catch {
+          continue;
+        }
+        if (typeof parsed !== "object" || parsed === null) continue;
+        const connectionId = (parsed as LKGPRecord).connectionId;
+        if (typeof connectionId === "string" && deletedConnectionIds.has(connectionId))
+          keys.push(row.key);
+      }
+      for (const key of keys) await deletePostgresKeyValue(transaction, "lkgp", key);
+      return keys;
+    });
+    await invalidatePostgresPins(keys);
+    return keys.length;
+  }
   const db = getDbInstance();
   const rows = db
     .prepare("SELECT key, value FROM key_value WHERE namespace = 'lkgp'")
@@ -168,4 +214,33 @@ export async function deleteLKGPByConnectionIds(connectionIds: string[]): Promis
   }
 
   return staleKeys.length;
+}
+
+async function invalidatePostgresPins(keys: readonly string[]): Promise<void> {
+  if (keys.length === 0) return;
+  const { invalidateCachedLKGP } = await import("../readCache");
+  for (const key of keys) invalidateCachedLKGP(key);
+}
+
+export async function deleteLKGPRowsByComboNameAsync(comboName: string): Promise<string[]> {
+  const postgres = getSelectedPostgresDatabase();
+  if (!postgres) return deleteLKGPRowsByComboName(comboName);
+  if (!comboName) return [];
+  return withPostgresKeyValueMutation(postgres, async (transaction) => {
+    const { rows } = await transaction.query<{ key: string }>(
+      `DELETE FROM omniroute.key_value WHERE namespace = 'lkgp' AND
+       starts_with(translate(key, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'),
+       translate($1::text, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')) RETURNING key`,
+      [`${comboName}:`]
+    );
+    return rows.map((row) => row.key).filter(Boolean);
+  });
+}
+
+export async function clearAllLKGPAsync(): Promise<void> {
+  const postgres = getSelectedPostgresDatabase();
+  if (!postgres) return clearAllLKGP();
+  await withPostgresKeyValueMutation(postgres, (transaction) =>
+    deletePostgresKeyValueNamespace(transaction, "lkgp")
+  );
 }

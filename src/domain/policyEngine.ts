@@ -11,6 +11,9 @@
 import { checkLockout } from "./lockoutPolicy";
 import { checkBudget } from "./costRules";
 import { resolveFallbackChain } from "./fallbackPolicy";
+import { checkLockoutAsync } from "./lockoutPolicy";
+import { checkBudgetAsync } from "./costRules";
+import { resolveFallbackChainAsync } from "./fallbackPolicy";
 
 interface PolicyRequest {
   model: string;
@@ -96,7 +99,10 @@ export function evaluateFirstAllowed(models: string[], baseRequest: Omit<PolicyR
   }
 
   // All models denied — return last denial
-  const lastVerdict = evaluateRequest({ ...baseRequest, model: models[models.length - 1] });
+  const lastVerdict = evaluateRequest({
+    ...baseRequest,
+    model: models[models.length - 1],
+  });
   return { model: null, verdict: lastVerdict };
 }
 
@@ -192,4 +198,54 @@ export class PolicyEngine {
 
     return result;
   }
+}
+
+export async function evaluateRequestAsync(request: PolicyRequest): Promise<PolicyVerdict> {
+  const { model, apiKeyId, clientIp } = request;
+  if (clientIp) {
+    const lockout = await checkLockoutAsync(clientIp);
+    if (lockout.locked)
+      return {
+        allowed: false,
+        reason: `Client locked out (${lockout.remainingMs}ms remaining)`,
+        adjustments: {},
+        policyPhase: "lockout",
+      };
+  }
+  if (apiKeyId) {
+    const budget = await checkBudgetAsync(apiKeyId);
+    if (!budget.allowed)
+      return {
+        allowed: false,
+        reason: `Budget exceeded: ${budget.reason || "daily limit reached"}`,
+        adjustments: {},
+        policyPhase: "budget",
+      };
+  }
+  return {
+    allowed: true,
+    reason: null,
+    adjustments: {
+      model,
+      fallbackChain: await resolveFallbackChainAsync(model),
+    },
+    policyPhase: "passed",
+  };
+}
+
+export async function evaluateFirstAllowedAsync(
+  models: string[],
+  baseRequest: Omit<PolicyRequest, "model">
+) {
+  for (const model of models) {
+    const verdict = await evaluateRequestAsync({ ...baseRequest, model });
+    if (verdict.allowed) return { model, verdict };
+  }
+  return {
+    model: null,
+    verdict: await evaluateRequestAsync({
+      ...baseRequest,
+      model: models[models.length - 1],
+    }),
+  };
 }

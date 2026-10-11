@@ -9,11 +9,11 @@
 import { buildErrorBody, sanitizeErrorMessage } from "@omniroute/open-sse/utils/error.ts";
 import { InspectorSessionPatchSchema } from "@/shared/schemas/inspector";
 import {
-  getSession,
-  getSessionRequests,
-  stopSession,
-  renameSession,
-  deleteSession,
+  getSessionAsync,
+  getSessionRequestsAsync,
+  stopSessionAsync,
+  renameSessionAsync,
+  deleteSessionAsync,
 } from "@/lib/db/inspectorSessions";
 
 interface Params {
@@ -24,14 +24,14 @@ export async function GET(_request: Request, { params }: Params): Promise<Respon
   const { id } = await params;
 
   try {
-    const session = getSession(id);
+    const session = await getSessionAsync(id);
     if (!session) {
       return new Response(JSON.stringify(buildErrorBody(404, "Session not found")), {
         status: 404,
         headers: { "content-type": "application/json" },
       });
     }
-    const requests = getSessionRequests(id).map((r) => {
+    const requests = (await getSessionRequestsAsync(id)).map((r) => {
       try {
         return JSON.parse(r.payload) as unknown;
       } catch {
@@ -69,7 +69,7 @@ export async function PATCH(request: Request, { params }: Params): Promise<Respo
     );
   }
 
-  const session = getSession(id);
+  const session = await getSessionAsync(id);
   if (!session) {
     return new Response(JSON.stringify(buildErrorBody(404, "Session not found")), {
       status: 404,
@@ -79,7 +79,7 @@ export async function PATCH(request: Request, { params }: Params): Promise<Respo
 
   try {
     if (parsed.data.action === "stop") {
-      stopSession(id);
+      await stopSessionAsync(id);
     } else if (parsed.data.action === "rename") {
       if (!parsed.data.name) {
         return new Response(
@@ -87,9 +87,9 @@ export async function PATCH(request: Request, { params }: Params): Promise<Respo
           { status: 400, headers: { "content-type": "application/json" } }
         );
       }
-      renameSession(id, parsed.data.name);
+      await renameSessionAsync(id, parsed.data.name);
     }
-    return Response.json(getSession(id));
+    return Response.json(await getSessionAsync(id));
   } catch (err) {
     const msg = sanitizeErrorMessage(err);
     return new Response(JSON.stringify(buildErrorBody(500, msg || "Failed to update session")), {
@@ -102,7 +102,7 @@ export async function PATCH(request: Request, { params }: Params): Promise<Respo
 export async function DELETE(_request: Request, { params }: Params): Promise<Response> {
   const { id } = await params;
 
-  const session = getSession(id);
+  const session = await getSessionAsync(id);
   if (!session) {
     return new Response(JSON.stringify(buildErrorBody(404, "Session not found")), {
       status: 404,
@@ -111,7 +111,7 @@ export async function DELETE(_request: Request, { params }: Params): Promise<Res
   }
 
   try {
-    deleteSession(id);
+    await deleteSessionAsync(id);
     return new Response(null, { status: 204 });
   } catch (err) {
     const msg = sanitizeErrorMessage(err);

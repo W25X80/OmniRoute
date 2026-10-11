@@ -3,6 +3,7 @@
  */
 
 import { v4 as uuidv4 } from "uuid";
+import { getSelectedControlPlane } from "./controlPlaneContext";
 
 import { isCommonChatGptWebRetiredProviderId } from "@/shared/constants/chatgptWebRetirement";
 import { getDbInstance, rowToCamel, cleanNulls } from "./core";
@@ -12,83 +13,32 @@ import { createLazyRowProxy } from "./providers/lazyConnectionView";
 import { invalidateDbCache, getCachedRawProviderConnections } from "./readCache";
 import { invalidateConnectionUpdate, type UpdateOpts } from "./readCache";
 import { reorderConnections } from "./providers/deletion";
-import { normalizeProviderSpecificData } from "@/lib/providers/requestDefaults";
-import { withDerivedCookieExpiry } from "@/shared/utils/webCookieExpiry";
-import { WEB_COOKIE_PROVIDERS } from "@/shared/constants/providers";
-import { ensureCodexFingerprintSeed } from "@omniroute/open-sse/config/codexIdentity.ts";
 import { bumpProxyConfigGeneration, getSettings } from "./settings";
-import {
-  getStoredManagementPassword,
-  isBcryptHash,
-  verifyManagementPassword,
-} from "@/lib/auth/managementPassword";
 import {
   webSessionCredentialKey,
   parseProviderSpecificData,
   isMatchingOauthIdentity,
   isWebCookieProviderId,
 } from "./webSessionDedup";
-import { LOCAL_PROVIDERS } from "@/shared/constants/providers";
 import { pickCodexConnectionForUser } from "@/lib/oauth/utils/codexConnectionSelection";
 import { isMicrosoftDesignerWebRetiredProviderId } from "@/shared/constants/designerWebRetirement";
 import { reconcileCodexUsageHistory } from "./providers/usageIdentityReconciliation";
 import { isRuntimeRetiredProviderId } from "@/shared/constants/providerRetirement";
 import { applyCodexChildCooldownClearOnUpdate } from "./providers/codexAccountState";
+import {
+  normalizeConnectionProviderSpecificData,
+  isLocalProviderId,
+  normalizeBaseUrlForDedup,
+  buildNewProviderConnection,
+  buildInsertConnectionRowParams,
+  buildUpdateConnectionRowParams as _buildUpdateConnectionRowParams,
+} from "./providers/persistenceSemantics";
 
-/**
- * normalizeProviderSpecificData + the Codex fingerprint-seed invariant: Codex
- * OAuth connections whose convergence mode derives account-scoped identities
- * (device/session/full — the default session included) carry a persisted
- * random seed (`codexFingerprintSeed`) as the derivation source. Created here
- * at the persistence choke point so every write path (manual create, OAuth
- * persist, edit, import) is covered; the seed is never regenerated once valid,
- * so identities stay put across saves. Pre-seed connections rotate from the
- * legacy connection-id derivation exactly once on their next write — the
- * OmniRoute analog of sub2api's migration-225 backfill (v0.1.178, #5696).
- */
-function normalizeConnectionProviderSpecificData(
-  provider: string | null,
-  providerSpecificData: unknown,
-  credentials: { accessToken?: unknown; refreshToken?: unknown },
-  existingProviderSpecificData?: unknown
-) {
-  const normalized = normalizeProviderSpecificData(provider, providerSpecificData);
-  const withExpiry = withDerivedCookieExpiryForProvider(provider, normalized, credentials);
-  if (provider !== "codex") return withExpiry;
-  return ensureCodexFingerprintSeed(
-    withExpiry,
-    credentials,
-    (existingProviderSpecificData as Record<string, unknown> | null) ?? null
-  );
-}
-
-function withDerivedCookieExpiryForProvider(
-  provider: string | null,
-  providerSpecificData: unknown,
-  credentials: { accessToken?: unknown; refreshToken?: unknown } | unknown
-): Record<string, unknown> {
-  const key = String(provider || "").toLowerCase();
-  if (!(WEB_COOKIE_PROVIDERS as Record<string, unknown>)[key]) {
-    // Both branches must satisfy the Codex seed signature below; the
-    // passthrough keeps whatever shape normalization already returned.
-    return (providerSpecificData ?? {}) as Record<string, unknown>;
-  }
-  const source = credentials as Record<string, unknown> | null;
-  const credential =
-    source && typeof source === "object"
-      ? (typeof source.apiKey === "string" && source.apiKey) ||
-        (typeof source.cookie === "string" && source.cookie) ||
-        null
-      : null;
-  return withDerivedCookieExpiry(providerSpecificData, credential);
-}
 import {
   withNullableMaxConcurrent,
   withNullableQuotaWindowThresholds,
   withNullableRateLimitOverrides,
-  normalizeBooleanColumn,
   sanitizeRateLimitOverrides,
-  serializeJsonField,
   toRecord,
   sanitizeQuotaWindowThresholds,
   toStringOrNull,
@@ -99,67 +49,11 @@ type JsonRecord = Record<string, unknown>;
 
 const CONNECTION_CREDENTIAL_FIELDS = ["apiKey", "accessToken", "refreshToken", "idToken"] as const;
 
-/** Thrown when a write would store the dashboard login password as a provider credential. */
-export class ManagementPasswordAsCredentialError extends Error {
-  readonly code = "MANAGEMENT_PASSWORD_AS_CREDENTIAL" as const;
+export { ManagementPasswordAsCredentialError } from "./providers/credentialGuard";
+import { assertApiKeyIsNotManagementPassword as assertCredential } from "./providers/credentialGuard";
 
-  constructor() {
-    super(
-      "That value is the dashboard login password, not a provider API key. Storing it would " +
-        "send it upstream on every request routed through this connection."
-    );
-    this.name = "ManagementPasswordAsCredentialError";
-  }
-}
-
-/**
- * Refuse to store the dashboard login password as a connection API key.
- *
- * A browser that autofills the management password into the API-key field
- * produces a connection whose credential authenticates against nothing, and
- * every request routed through it comes back 401. Rejecting it in the form
- * would not be enough: the same autofill fires again while an operator is
- * repairing the connection by hand, so the refusal has to sit on the write
- * path that all of those forms funnel into.
- *
- * Only an actual match blocks the write. A settings row that cannot be read,
- * or a bcrypt call that throws, logs and allows -- a guard against one specific
- * operator mistake must not become a way to lock out every connection write.
- *
- * Deliberately narrower than CONNECTION_CREDENTIAL_FIELDS. The OAuth tokens
- * arrive from a provider's token endpoint, and the refresh path writes them
- * back through updateProviderConnection on every renewal, so checking them
- * would put a bcrypt round on a renewal path to defend a field no autofill
- * reaches. apiKey is the only credential an operator types into a form.
- */
 async function assertApiKeyIsNotManagementPassword(apiKey: unknown): Promise<void> {
-  if (typeof apiKey !== "string") return;
-  const trimmed = apiKey.trim();
-  if (!trimmed) return;
-
-  try {
-    const settings = (await getSettings()) as JsonRecord;
-    const stored = getStoredManagementPassword(settings);
-    // Only a stored bcrypt hash is comparable. A fresh install that has never
-    // bootstrapped a password has nothing to collide with.
-    if (!isBcryptHash(stored)) return;
-    // Both forms of the value, because neither the login route nor the
-    // set-password route trims: a paste carries whitespace the password does
-    // not have, and a password is allowed to carry whitespace of its own. The
-    // second comparison only runs when the first fails on a different string.
-    const matches =
-      (await verifyManagementPassword(trimmed, stored)) ||
-      (trimmed !== apiKey && (await verifyManagementPassword(apiKey, stored)));
-    if (!matches) return;
-  } catch (err) {
-    console.warn(
-      "[Providers] could not check the credential against the dashboard password:",
-      err instanceof Error ? err.message : String(err)
-    );
-    return;
-  }
-
-  throw new ManagementPasswordAsCredentialError();
+  await assertCredential(apiKey, getSettings);
 }
 
 interface StatementLike<TRow = unknown> {
@@ -245,6 +139,8 @@ export async function getProviderConnections(
   offset?: number,
   columns?: string[]
 ) {
+  const selected = getSelectedControlPlane();
+  if (selected) return selected.providers.list(filter, limit, offset, columns);
   const useCache = !columns?.length && limit === undefined && offset === undefined;
   const raw = useCache
     ? await getCachedRawProviderConnections(filter)
@@ -271,6 +167,8 @@ export async function getRawProviderConnections(
   offset?: number,
   columns?: string[]
 ) {
+  const selected = getSelectedControlPlane();
+  if (selected) return selected.providers.listRaw(filter, limit, offset, columns);
   const db = getDbInstance() as unknown as DbLike;
   let selectCols = "*";
   if (columns?.length) {
@@ -324,6 +222,11 @@ export async function getRawProviderConnections(
   });
 }
 
+export async function getProviderConnectionsCountAsync(filter: JsonRecord = {}): Promise<number> {
+  const selected = getSelectedControlPlane();
+  return selected ? selected.providers.count(filter) : getProviderConnectionsCount(filter);
+}
+
 export function getProviderConnectionsCount(filter: JsonRecord = {}): number {
   const db = getDbInstance() as unknown as DbLike;
   let sql = "SELECT count(*) as cnt FROM provider_connections";
@@ -352,6 +255,8 @@ export function getProviderConnectionsCount(filter: JsonRecord = {}): number {
 }
 
 export async function getProviderConnectionById(id: string) {
+  const selected = getSelectedControlPlane();
+  if (selected) return selected.providers.findById(id);
   const db = getDbInstance() as unknown as DbLike;
   const row = db.prepare("SELECT * FROM provider_connections WHERE id = ?").get(id);
   if (!row) return null;
@@ -405,6 +310,15 @@ export function getProviderConnectionDisplayMetadata(
   });
 }
 
+export async function getProviderConnectionDisplayMetadataAsync(
+  connectionIds: readonly string[]
+): Promise<ProviderConnectionDisplayMetadata[]> {
+  const selected = getSelectedControlPlane();
+  return selected
+    ? selected.providers.displayMetadata(connectionIds)
+    : getProviderConnectionDisplayMetadata(connectionIds);
+}
+
 // #3368 PR6 — dedup web-session cookie/token credentials on connection create.
 // Re-importing the same session (e.g. via bulk web-session import) under a
 // different or blank name must update the existing connection instead of
@@ -422,18 +336,6 @@ export function getProviderConnectionDisplayMetadata(
  * Gate the extra baseUrl check to this provider set only — hosted-provider
  * dedup must stay untouched.
  */
-function isLocalProviderId(providerId: unknown): boolean {
-  return (
-    typeof providerId === "string" &&
-    Object.prototype.hasOwnProperty.call(LOCAL_PROVIDERS, providerId)
-  );
-}
-
-/** Trim + strip a trailing slash so cosmetic differences don't defeat the match. */
-function normalizeBaseUrlForDedup(value: unknown): string {
-  return typeof value === "string" ? value.trim().replace(/\/+$/, "") : "";
-}
-
 /**
  * Find the cookie connection an incoming import should overwrite.
  *
@@ -501,6 +403,8 @@ function findExistingCookieConnection(
 }
 
 export async function createProviderConnection(data: JsonRecord) {
+  const selected = getSelectedControlPlane();
+  if (selected) return selected.providers.create(data);
   await assertApiKeyIsNotManagementPassword(data.apiKey);
   const db = getDbInstance() as unknown as DbLike;
   const now = new Date().toISOString();
@@ -693,115 +597,18 @@ export async function createProviderConnection(data: JsonRecord) {
     return returnedConnection;
   }
 
-  // Generate name: prefer explicit name, then email, then a stable short-ID label.
-  // Avoid sequential "Account N" — it reassigns when accounts are deleted/reordered.
-  let connectionName = data.name || null;
-  if (!connectionName && (data.authType === "oauth" || data.authType === "access_token")) {
-    if (data.email) {
-      connectionName = data.email as string;
-    } else if (data.displayName) {
-      connectionName = data.displayName as string;
-    }
-    // Otherwise leave null — UI will fall back to getAccountDisplayName() → "Account #<id>"
-  }
-
-  // Auto-increment priority
-  let connectionPriority = data.priority;
-  if (!connectionPriority) {
-    const max = db
-      .prepare("SELECT MAX(priority) as maxP FROM provider_connections WHERE provider = ?")
-      .get(data.provider) as JsonRecord | undefined;
-    const maxPriority = toNumberOrZero(toRecord(max).maxP);
-    connectionPriority = maxPriority + 1;
-  }
-
-  const connection: Record<string, unknown> = {
-    id: uuidv4(),
-    provider: data.provider,
-    authType: data.authType || "oauth",
-    name: connectionName,
-    priority: connectionPriority,
-    isActive: data.isActive !== undefined ? data.isActive : true,
-    createdAt: now,
-    updatedAt: now,
-    proxyEnabled: normalizeBooleanColumn(data.proxyEnabled, true),
-    perKeyProxyEnabled: normalizeBooleanColumn(data.perKeyProxyEnabled, false),
-    quotaVisible: normalizeBooleanColumn(data.quotaVisible, true),
-  };
-
-  // Optional fields
-  const optionalFields = [
-    "displayName",
-    "email",
-    "globalPriority",
-    "defaultModel",
-    "accessToken",
-    "refreshToken",
-    "expiresAt",
-    // #5326's payload sets this and _insertConnectionRow binds it, but it was
-    // missing from this allowlist — so every created row stored NULL however good
-    // the payload was. The update path already carries it (`data.tokenExpiresAt`).
-    "tokenExpiresAt",
-    "tokenType",
-    "scope",
-    "idToken",
-    "projectId",
-    "apiKey",
-    "testStatus",
-    "lastTested",
-    "lastError",
-    "lastErrorAt",
-    "lastErrorType",
-    "lastErrorSource",
-    "rateLimitedUntil",
-    "expiresIn",
-    "errorCode",
-    "consecutiveUseCount",
-    "rateLimitProtection",
-    "group",
-    "maxConcurrent",
-    "proxyEnabled",
-    "perKeyProxyEnabled",
-    "quotaVisible",
-    "quotaWindowThresholds",
-    "rateLimitOverrides",
-    "healthCheckInterval",
-  ];
-  for (const field of optionalFields) {
-    if (data[field] !== undefined && data[field] !== null) {
-      connection[field] = data[field];
-    }
-  }
-  if (normalizedProviderSpecificData && Object.keys(normalizedProviderSpecificData).length > 0) {
-    connection.providerSpecificData = normalizedProviderSpecificData;
-  }
-  // Sanitize the window-thresholds map up front so the in-memory `connection`
-  // matches the row we're about to insert. The serialize path runs the same
-  // sanitizer on the way to SQLite. Assigning null (when sanitize collapses
-  // to no-overrides) keeps the field present on the returned object so the
-  // UI can tell "field was read, no overrides" apart from "field absent."
-  if ("quotaWindowThresholds" in connection) {
-    const result = sanitizeQuotaWindowThresholds(connection.quotaWindowThresholds);
-    if (result.rejected.length > 0) {
-      throw new Error(
-        `Refusing to persist quotaWindowThresholds with rejected keys: ${result.rejected.join(", ")}`
-      );
-    }
-    connection.quotaWindowThresholds = result.sanitized;
-  }
-
-  // Same sanitization for rateLimitOverrides — keep in-memory representation
-  // in sync with what gets persisted. Reject (don't silently drop) invalid
-  // keys/values so a direct DB writer can't lose operator intent.
-  if ("rateLimitOverrides" in connection) {
-    const result = sanitizeRateLimitOverrides(connection.rateLimitOverrides);
-    if (result.rejected.length > 0) {
-      throw new Error(
-        `Refusing to persist rateLimitOverrides with rejected keys: ${result.rejected.join(", ")}`
-      );
-    }
-    connection.rateLimitOverrides = result.sanitized;
-  }
+  const max = !data.priority
+    ? (db
+        .prepare("SELECT MAX(priority) as maxP FROM provider_connections WHERE provider = ?")
+        .get(data.provider) as JsonRecord | undefined)
+    : undefined;
+  const connection = buildNewProviderConnection(
+    data,
+    normalizedProviderSpecificData,
+    now,
+    uuidv4(),
+    toNumberOrZero(toRecord(max).maxP)
+  );
 
   _insertConnectionRow(db, encryptConnectionFields({ ...connection }));
   const providerId = toStringOrNull(data.provider);
@@ -857,112 +664,12 @@ function _insertConnectionRow(db: DbLike, conn: JsonRecord) {
       @createdAt, @updatedAt
     )
   `
-  ).run({
-    id: conn.id,
-    provider: conn.provider,
-    authType: conn.authType || null,
-    name: conn.name || null,
-    email: conn.email || null,
-    priority: conn.priority || 0,
-    isActive: conn.isActive === false ? 0 : 1,
-    accessToken: conn.accessToken || null,
-    refreshToken: conn.refreshToken || null,
-    expiresAt: conn.expiresAt || null,
-    tokenExpiresAt: conn.tokenExpiresAt || null,
-    scope: conn.scope || null,
-    projectId: conn.projectId || null,
-    testStatus: conn.testStatus || null,
-    errorCode: conn.errorCode || null,
-    lastError: conn.lastError || null,
-    lastErrorAt: conn.lastErrorAt || null,
-    lastErrorType: conn.lastErrorType || null,
-    lastErrorSource: conn.lastErrorSource || null,
-    backoffLevel: conn.backoffLevel || 0,
-    rateLimitedUntil: conn.rateLimitedUntil || null,
-    healthCheckInterval: conn.healthCheckInterval ?? null,
-    lastHealthCheckAt: conn.lastHealthCheckAt || null,
-    lastTested: conn.lastTested || null,
-    apiKey: conn.apiKey || null,
-    idToken: conn.idToken || null,
-    providerSpecificData: conn.providerSpecificData
-      ? JSON.stringify(conn.providerSpecificData)
-      : null,
-    expiresIn: conn.expiresIn || null,
-    displayName: conn.displayName || null,
-    globalPriority: conn.globalPriority || null,
-    defaultModel: conn.defaultModel || null,
-    tokenType: conn.tokenType || null,
-    consecutiveUseCount: conn.consecutiveUseCount || 0,
-    rateLimitProtection:
-      conn.rateLimitProtection === true || conn.rateLimitProtection === 1 ? 1 : 0,
-    lastUsedAt: conn.lastUsedAt || null,
-    group: conn.group || null,
-    maxConcurrent: conn.maxConcurrent ?? null,
-    proxyEnabled: normalizeBooleanColumn(conn.proxyEnabled, true) ? 1 : 0,
-    perKeyProxyEnabled: normalizeBooleanColumn(conn.perKeyProxyEnabled, false) ? 1 : 0,
-    quotaVisible: normalizeBooleanColumn(conn.quotaVisible, true) ? 1 : 0,
-    quotaWindowThresholdsJson: serializeJsonField(conn.quotaWindowThresholds),
-    rateLimitOverridesJson: serializeJsonField(conn.rateLimitOverrides),
-    createdAt: conn.createdAt,
-    updatedAt: conn.updatedAt,
-  });
+  ).run(buildInsertConnectionRowParams(conn));
 }
 
 // Assembles the `.run()` params for _updateConnectionRow's UPDATE statement.
 // Split out purely to keep _updateConnectionRow under the max-lines-per-function
 // gate — same field mapping/normalization as before, just relocated.
-function _buildUpdateConnectionRowParams(id: string, data: JsonRecord, now: unknown) {
-  return {
-    id,
-    provider: data.provider,
-    authType: data.authType || null,
-    name: data.name || null,
-    email: data.email || null,
-    priority: data.priority || 0,
-    isActive: data.isActive === false ? 0 : 1,
-    accessToken: data.accessToken || null,
-    refreshToken: data.refreshToken || null,
-    expiresAt: data.expiresAt || null,
-    tokenExpiresAt: data.tokenExpiresAt || null,
-    scope: data.scope || null,
-    projectId: data.projectId || null,
-    testStatus: data.testStatus || null,
-    errorCode: data.errorCode || null,
-    lastError: data.lastError || null,
-    lastErrorAt: data.lastErrorAt || null,
-    lastErrorType: data.lastErrorType || null,
-    lastErrorSource: data.lastErrorSource || null,
-    backoffLevel: data.backoffLevel || 0,
-    rateLimitedUntil: data.rateLimitedUntil || null,
-    healthCheckInterval: data.healthCheckInterval ?? null,
-    lastHealthCheckAt: data.lastHealthCheckAt || null,
-    lastTested: data.lastTested || null,
-    apiKey: data.apiKey || null,
-    idToken: data.idToken || null,
-    providerSpecificData: data.providerSpecificData
-      ? JSON.stringify(data.providerSpecificData)
-      : null,
-    expiresIn: data.expiresIn || null,
-    displayName: data.displayName || null,
-    globalPriority: data.globalPriority || null,
-    defaultModel: data.defaultModel || null,
-    tokenType: data.tokenType || null,
-    consecutiveUseCount: data.consecutiveUseCount || 0,
-    rateLimitProtection:
-      data.rateLimitProtection === true || data.rateLimitProtection === 1 ? 1 : 0,
-    lastUsedAt: data.lastUsedAt || null,
-    group: data.group || null,
-    maxConcurrent: data.maxConcurrent ?? null,
-    quotaWindowThresholdsJson: serializeJsonField(data.quotaWindowThresholds),
-    proxyEnabled: normalizeBooleanColumn(data.proxyEnabled, true) ? 1 : 0,
-    perKeyProxyEnabled: normalizeBooleanColumn(data.perKeyProxyEnabled, false) ? 1 : 0,
-    quotaVisible: normalizeBooleanColumn(data.quotaVisible, true) ? 1 : 0,
-    rateLimitOverridesJson: serializeJsonField(data.rateLimitOverrides),
-    lastPingAt: data.lastPingAt || null,
-    lastPingedResetKey: data.lastPingedResetKey || null,
-    updatedAt: now,
-  };
-}
 
 function _updateConnectionRow(db: DbLike, id: string, data: JsonRecord) {
   const now = data.updatedAt || new Date().toISOString();
@@ -999,6 +706,8 @@ function _updateConnectionRow(db: DbLike, id: string, data: JsonRecord) {
 }
 
 export async function updateProviderConnection(id: string, data: JsonRecord, opts?: UpdateOpts) {
+  const selected = getSelectedControlPlane();
+  if (selected) return selected.providers.update(id, data, opts);
   const db = getDbInstance() as unknown as DbLike;
   const existing = db.prepare("SELECT * FROM provider_connections WHERE id = ?").get(id);
   if (!existing) return null;
@@ -1099,8 +808,11 @@ export {
   applyCodexChildCooldownClearOnUpdate,
   stripCodexChildCooldownFields,
   stripCodexChildCooldownsFromConnection,
+  stripCodexChildCooldownsFromConnectionAsync,
   hasCodexScopeCooldown,
+  hasCodexScopeCooldownAsync,
   liftCodexScopeCooldownOnHeadroom,
+  liftCodexScopeCooldownOnHeadroomAsync,
 } from "./providers/codexAccountState";
 
 /**
@@ -1114,6 +826,8 @@ export async function touchConnectionLastUsed(
   id: string,
   consecutiveUseCount: number
 ): Promise<void> {
+  const selected = getSelectedControlPlane();
+  if (selected) return selected.providers.touchLastUsed(id, consecutiveUseCount);
   if (!id) return;
   const db = getDbInstance() as unknown as DbLike;
   const now = new Date().toISOString();
@@ -1139,6 +853,8 @@ export async function touchConnectionLastUsed(
  * check. Lightweight targeted UPDATE, mirrors touchConnectionLastUsed.
  */
 export async function touchConnectionSyncedModelsAt(id: string): Promise<void> {
+  const selected = getSelectedControlPlane();
+  if (selected) return selected.providers.touchSyncedModelsAt(id);
   if (!id) return;
   const db = getDbInstance() as unknown as DbLike;
   const now = new Date().toISOString();
@@ -1164,6 +880,8 @@ export async function touchConnectionSyncedModelsAt(id: string): Promise<void> {
  * state, so this must not bust the expensive-to-rebuild `/v1/models` cache.
  */
 export async function resetConnectionBackoff(id: string): Promise<void> {
+  const selected = getSelectedControlPlane();
+  if (selected) return selected.providers.resetBackoff(id);
   if (!id) return;
   const db = getDbInstance() as unknown as DbLike;
   const now = new Date().toISOString();
@@ -1191,6 +909,8 @@ export async function cleanupProviderConnections() {
 }
 
 export async function getDistinctGroups(): Promise<string[]> {
+  const selected = getSelectedControlPlane();
+  if (selected) return selected.providers.distinctGroups();
   const db = getDbInstance() as unknown as DbLike;
   const rows = db
     .prepare(
@@ -1200,7 +920,12 @@ export async function getDistinctGroups(): Promise<string[]> {
   return rows.map((r) => String(r.group ?? "")).filter(Boolean);
 }
 
-export { autoMigrateLegacyEncryptedConnections, getGheCopilotHosts } from "./providers/migrations";
+export {
+  autoMigrateLegacyEncryptedConnections,
+  autoMigrateLegacyEncryptedConnectionsAsync,
+  getGheCopilotHosts,
+  getGheCopilotHostsAsync,
+} from "./providers/migrations";
 export {
   deleteProviderConnection,
   deleteProviderConnections,
@@ -1213,6 +938,7 @@ export {
 export {
   getProviderNodes,
   getProviderNodesCount,
+  getProviderNodesCountAsync,
   getProviderNodeById,
   resolveProviderNodeForConnection,
   createProviderNode,
@@ -1221,12 +947,18 @@ export {
 } from "./providers/nodes";
 export {
   setConnectionRateLimitUntil,
+  setConnectionRateLimitUntilAsync,
   markConnectionRateLimitedUntil,
+  markConnectionRateLimitedUntilAsync,
   clearConnectionRateLimit,
+  clearConnectionRateLimitAsync,
   getEffectiveQuotaUsage,
   clearStaleCrashCooldowns,
+  clearStaleCrashCooldownsAsync,
   formatResetCountdown,
   isConnectionRateLimited,
+  isConnectionRateLimitedAsync,
   getRateLimitedConnections,
+  getRateLimitedConnectionsAsync,
   clearConnectionErrorIfUnchanged,
 } from "./providers/rateLimit";

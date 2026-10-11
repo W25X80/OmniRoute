@@ -1,3 +1,8 @@
+import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
+import {
+  requireSqliteMaintenance,
+  persistenceCapabilityResponse,
+} from "@/lib/db/persistenceCapabilities";
 import { NextRequest, NextResponse } from "next/server";
 import { isAuthenticated } from "@/shared/utils/apiAuth";
 import { runNow, getState } from "@/lib/db/vacuumScheduler";
@@ -8,6 +13,7 @@ export async function POST(request: NextRequest) {
   }
 
   try {
+    requireSqliteMaintenance("sqlite-optimization");
     // Delegate to the scheduler so the manual run also writes
     // lastRunAt / lastDurationMs to key_value, which the UI reads
     // via getDatabaseSettings().stats.lastVacuumAt. Using the old
@@ -33,18 +39,17 @@ export async function POST(request: NextRequest) {
       return NextResponse.json(
         {
           success: false,
-          error: result.error || "VACUUM failed",
+          error: sanitizeErrorMessage(result.error || "VACUUM failed"),
           duration: result.durationMs,
         },
         { status: 500 }
       );
     }
-  } catch (error: any) {
+  } catch (error: unknown) {
+    const unavailable = persistenceCapabilityResponse(error);
+    if (unavailable) return NextResponse.json(unavailable, { status: 501 });
     console.error("[API] VACUUM endpoint error:", error);
-    return NextResponse.json(
-      { error: "Failed to run VACUUM", details: error.message },
-      { status: 500 }
-    );
+    return NextResponse.json({ error: "Failed to run VACUUM" }, { status: 500 });
   }
 }
 
@@ -52,5 +57,12 @@ export async function GET(request: NextRequest) {
   if (!(await isAuthenticated(request))) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
-  return NextResponse.json({ state: getState() });
+  try {
+    requireSqliteMaintenance("sqlite-optimization");
+    return NextResponse.json({ state: getState() });
+  } catch (error) {
+    const unavailable = persistenceCapabilityResponse(error);
+    if (unavailable) return NextResponse.json(unavailable, { status: 501 });
+    throw error;
+  }
 }

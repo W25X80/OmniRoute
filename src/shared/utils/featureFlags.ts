@@ -1,4 +1,16 @@
-import { getFeatureFlagOverride } from "@/lib/db/featureFlags";
+import {
+  getSelectedPostgresDatabase,
+  getSelectedPersistenceIdentity,
+} from "@/lib/db/controlPlaneContext";
+import {
+  catalogEnvironmentValue,
+  hasPostgresCatalogSnapshot,
+} from "@/lib/db/postgres/catalogSnapshot";
+import {
+  getFeatureFlagOverride,
+  getFeatureFlagOverrideAsync,
+  getFeatureFlagOverridesAsync,
+} from "@/lib/db/featureFlags";
 import {
   FEATURE_FLAG_DEFINITIONS,
   type FeatureFlagDefinition,
@@ -13,7 +25,7 @@ export function resolveFeatureFlag(key: string): string {
   const dbOverride = getFeatureFlagOverride(key);
   if (dbOverride !== undefined) return dbOverride;
 
-  const envValue = process.env[key];
+  const envValue = featureFlagEnvironmentValue(key);
   if (envValue !== undefined && envValue !== "") return envValue;
 
   const definition = FEATURE_FLAG_DEFINITIONS.find((d) => d.key === key);
@@ -47,7 +59,7 @@ export function resolveAllFeatureFlags(): Array<{
     if (dbOverride !== undefined) {
       return { key: definition.key, effectiveValue: dbOverride, source: "db", definition };
     }
-    const envValue = process.env[definition.key];
+    const envValue = featureFlagEnvironmentValue(definition.key);
     if (envValue !== undefined && envValue !== "") {
       return { key: definition.key, effectiveValue: envValue, source: "env", definition };
     }
@@ -106,6 +118,7 @@ export function isApiKeyRevealEnabledFlag(): boolean {
 }
 
 let lastResolvedMcpScopeEnforcement: boolean | undefined;
+const postgresMcpScopeEnforcement = new WeakMap<object, boolean>();
 
 /**
  * MCP tool-call scope enforcement. Resolved per call so the Feature Flags toggle
@@ -114,15 +127,22 @@ let lastResolvedMcpScopeEnforcement: boolean | undefined;
  * back to the environment variable the gate used before only if none ever did.
  */
 export function isMcpScopeEnforcementEnabled(): boolean {
+  let identity: object | undefined;
   try {
-    lastResolvedMcpScopeEnforcement = isFeatureFlagEnabled("OMNIROUTE_MCP_ENFORCE_SCOPES");
-    return lastResolvedMcpScopeEnforcement;
+    identity = getSelectedPersistenceIdentity();
+    const value = isFeatureFlagEnabled("OMNIROUTE_MCP_ENFORCE_SCOPES");
+    if (identity) postgresMcpScopeEnforcement.set(identity, value);
+    else lastResolvedMcpScopeEnforcement = value;
+    return value;
   } catch (error) {
     console.error(
       "[featureFlags] Failed to resolve OMNIROUTE_MCP_ENFORCE_SCOPES, keeping the last known value:",
       error instanceof Error ? error.message : error
     );
-    return lastResolvedMcpScopeEnforcement ?? process.env.OMNIROUTE_MCP_ENFORCE_SCOPES === "true";
+    return (
+      (identity ? postgresMcpScopeEnforcement.get(identity) : lastResolvedMcpScopeEnforcement) ??
+      featureFlagEnvironmentValue("OMNIROUTE_MCP_ENFORCE_SCOPES") === "true"
+    );
   }
 }
 
@@ -488,4 +508,51 @@ export function isDbHealthcheckStartupDeferredEnabled(): boolean {
     );
     return false;
   }
+}
+
+/** Async counterpart with the exact DB > nonempty env > definition/default policy. */
+export async function resolveFeatureFlagAsync(key: string): Promise<string> {
+  const override = await getFeatureFlagOverrideAsync(key);
+  if (override !== undefined) return override;
+  const envValue = featureFlagEnvironmentValue(key);
+  if (envValue !== undefined && envValue !== "") return envValue;
+  return (
+    FEATURE_FLAG_DEFINITIONS.find((definition) => definition.key === key)?.defaultValue ?? "false"
+  );
+}
+
+export async function isFeatureFlagEnabledAsync(key: string): Promise<boolean> {
+  const value = await resolveFeatureFlagAsync(key);
+  return value === "true" || value === "1" || value === "yes";
+}
+
+export async function resolveAllFeatureFlagsAsync(): Promise<
+  ReturnType<typeof resolveAllFeatureFlags>
+> {
+  const overrides = await getFeatureFlagOverridesAsync();
+  return FEATURE_FLAG_DEFINITIONS.map<ReturnType<typeof resolveAllFeatureFlags>[number]>(
+    (definition) => {
+      const dbOverride = overrides[definition.key];
+      if (dbOverride !== undefined) {
+        return { key: definition.key, effectiveValue: dbOverride, source: "db", definition };
+      }
+      const envValue = featureFlagEnvironmentValue(definition.key);
+      if (envValue !== undefined && envValue !== "") {
+        return { key: definition.key, effectiveValue: envValue, source: "env", definition };
+      }
+      return {
+        key: definition.key,
+        effectiveValue: definition.defaultValue,
+        source: "default",
+        definition,
+      };
+    }
+  );
+}
+
+function featureFlagEnvironmentValue(key: string): string | undefined {
+  const database = getSelectedPostgresDatabase();
+  return database && hasPostgresCatalogSnapshot(database)
+    ? catalogEnvironmentValue(key)
+    : process.env[key];
 }

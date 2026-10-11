@@ -1,8 +1,7 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
-
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
-import { getCostBySessionTag } from "@/lib/db/costLedger";
+import { getCostBySessionTagAsync } from "@/lib/db/costLedger";
 import { buildErrorBody } from "@omniroute/open-sse/utils/error.ts";
 
 const RUN_ID_REQUIRED = "run_id query param is required";
@@ -41,7 +40,7 @@ export async function GET(request: Request) {
       );
     }
 
-    const rows = getCostBySessionTag(parsed.data.run_id);
+    const rows = await getCostBySessionTagAsync(parsed.data.run_id);
     return NextResponse.json({ runId: parsed.data.run_id, rows });
   } catch (error) {
     console.error("[API] GET /api/usage/by-run error:", error);

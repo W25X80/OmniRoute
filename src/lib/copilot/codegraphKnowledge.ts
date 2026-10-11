@@ -38,24 +38,61 @@ export interface CodeGraphNode {
 
 let _db: unknown = null;
 let dbPathOverride: string | null | undefined;
+let pathRevision = 0;
+let workerContext: CodeGraphWorkerContext | null = null;
+let workerRequire: NodeRequire | null = null;
+
+export interface CodeGraphWorkerContext {
+  revision: number;
+  cwd: string;
+  moduleDirectory: string;
+  pathOverride?: string | null;
+}
+
+/** Pure context capture: filesystem discovery and SQL stay in the native child. */
+export function getCodeGraphWorkerContext(): CodeGraphWorkerContext {
+  return {
+    revision: pathRevision,
+    cwd: process.cwd(),
+    moduleDirectory: dirname(fileURLToPath(import.meta.url)),
+    ...(dbPathOverride !== undefined ? { pathOverride: dbPathOverride } : {}),
+  };
+}
+
+/** Child lifecycle only; legacy setters intentionally retain their original behavior. */
+export function closeCodeGraphWorkerDatabase(): void {
+  if (_db) (_db as { close: () => void }).close();
+  _db = null;
+}
+
+export function configureCodeGraphWorker(context: CodeGraphWorkerContext, load: NodeRequire): void {
+  workerRequire = load;
+  if (JSON.stringify(workerContext) !== JSON.stringify(context)) {
+    closeCodeGraphWorkerDatabase();
+    workerContext = context;
+  }
+}
 
 /** Override the index path for deterministic tests and embedded callers. */
 export function setCodeGraphPathForTest(path: string | null | undefined): void {
   dbPathOverride = path;
+  pathRevision += 1;
   _db = null;
 }
 
 function getDbPath(): string | null {
-  if (dbPathOverride !== undefined) return dbPathOverride;
+  if (!workerContext && dbPathOverride !== undefined) return dbPathOverride;
+  const context = workerContext ?? getCodeGraphWorkerContext();
+  if (context.pathOverride !== undefined) return context.pathOverride;
 
   // Try project root first (dev), then cwd, then DATA_DIR
   const candidates = [
-    join(process.cwd(), ".codegraph", "codegraph.db"),
-    join(process.cwd(), "..", ".codegraph", "codegraph.db"),
+    join(context.cwd, ".codegraph", "codegraph.db"),
+    join(context.cwd, "..", ".codegraph", "codegraph.db"),
   ];
 
   // Try to resolve from the project root
-  const __dirname = dirname(fileURLToPath(import.meta.url));
+  const __dirname = context.moduleDirectory;
 
   // Walk up to find .codegraph/
   let dir = __dirname;
@@ -99,7 +136,7 @@ function queryDb(query: string, params: unknown[] = []): CodeGraphQueryResult {
         // build, so failing closed to "not available" is safe. (#10060)
         if (isNextBuildPhase()) throw new Error("Skip better-sqlite3 during build");
 
-        const Database = require("better-sqlite3");
+        const Database = (workerRequire ?? require)("better-sqlite3");
         _db = new Database(dbPath, { readonly: true });
       } catch {
         return {

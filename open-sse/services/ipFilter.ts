@@ -6,6 +6,15 @@
 
 import { isIP } from "node:net";
 import { getDbInstance } from "../../src/lib/db/core.ts";
+import {
+  getPreparedNativeIPFilterSettings,
+  updateNativeIPFilterSettings,
+  type IPFilterUpdate,
+} from "../../src/lib/db/ipFilter.ts";
+import {
+  getSelectedPersistenceIdentity,
+  UnsupportedPersistenceDomainError,
+} from "../../src/lib/db/controlPlaneContext.ts";
 
 // In-memory IP lists
 let _config = {
@@ -30,6 +39,39 @@ let _config = {
 // tempBans remain in-memory-only as before.
 const IP_FILTER_NAMESPACE = "ipFilter";
 const IP_FILTER_KEY = "config";
+
+type TemporaryBan = { until: number; reason: string };
+const nativeTempBansKey = Symbol.for("omniroute.native.ip-filter.temp-bans.v1");
+const processState = globalThis as typeof globalThis & {
+  [nativeTempBansKey]?: WeakMap<object, Map<string, TemporaryBan>>;
+};
+const nativeTempBans = (processState[nativeTempBansKey] ??= new WeakMap());
+
+function currentConfig() {
+  const native = getPreparedNativeIPFilterSettings();
+  if (!native) {
+    ensureLoaded();
+    return _config;
+  }
+  const identity = getSelectedPersistenceIdentity()!;
+  let tempBans = nativeTempBans.get(identity);
+  if (!tempBans) nativeTempBans.set(identity, (tempBans = new Map()));
+  for (const [ip, ban] of tempBans) if (Date.now() >= ban.until) tempBans.delete(ip);
+  return {
+    ...native,
+    blacklist: new Set(native.blacklist),
+    whitelist: new Set(native.whitelist),
+    tempBans,
+  };
+}
+
+function currentTemporaryBans() {
+  return getSelectedPersistenceIdentity() ? currentConfig().tempBans : _config.tempBans;
+}
+
+function assertSyncMutationSupported(): void {
+  if (getSelectedPersistenceIdentity()) throw new UnsupportedPersistenceDomainError();
+}
 
 function ensureLoaded() {
   try {
@@ -83,6 +125,7 @@ if (typeof _tempBanSweep === "object" && "unref" in _tempBanSweep) {
  * Configure the IP filter
  */
 export function configureIPFilter(config) {
+  assertSyncMutationSupported();
   ensureLoaded();
   if (config.enabled !== undefined) _config.enabled = config.enabled;
   if (config.mode) _config.mode = config.mode;
@@ -95,13 +138,13 @@ export function configureIPFilter(config) {
  * Get current IP filter config (for API)
  */
 export function getIPFilterConfig() {
-  ensureLoaded();
+  const config = currentConfig();
   return {
-    enabled: _config.enabled,
-    mode: _config.mode,
-    blacklist: Array.from(_config.blacklist),
-    whitelist: Array.from(_config.whitelist),
-    tempBans: Array.from(_config.tempBans.entries()).map(([ip, info]) => ({
+    enabled: config.enabled,
+    mode: config.mode,
+    blacklist: Array.from(config.blacklist),
+    whitelist: Array.from(config.whitelist),
+    tempBans: Array.from(config.tempBans.entries()).map(([ip, info]) => ({
       ip,
       until: new Date(info.until).toISOString(),
       reason: info.reason,
@@ -116,41 +159,41 @@ export function getIPFilterConfig() {
  * @returns {{ allowed: boolean, reason?: string }}
  */
 export function checkIP(ip) {
-  ensureLoaded();
-  if (!_config.enabled) return { allowed: true };
+  const config = currentConfig();
+  if (!config.enabled) return { allowed: true };
   if (!ip) return { allowed: true };
 
   const normalizedIP = normalizeIP(ip);
 
   // Check temp bans first (highest priority)
-  const ban = _config.tempBans.get(normalizedIP);
+  const ban = config.tempBans.get(normalizedIP);
   if (ban) {
     if (Date.now() < ban.until) {
       return { allowed: false, reason: `Temporarily banned: ${ban.reason}` };
     }
-    _config.tempBans.delete(normalizedIP); // Expired
+    config.tempBans.delete(normalizedIP); // Expired
   }
 
-  switch (_config.mode) {
+  switch (config.mode) {
     case "whitelist":
       // Only whitelisted IPs allowed — but if the whitelist is empty the admin
       // has just switched to this mode and has not added IPs yet.  Allow the
       // request through so the admin can still reach the dashboard to populate
       // the list.  Once at least one entry exists, enforcement kicks in.
-      if (_config.whitelist.size === 0) {
+      if (config.whitelist.size === 0) {
         return { allowed: true };
       }
-      if (!matchesAny(normalizedIP, _config.whitelist)) {
+      if (!matchesAny(normalizedIP, config.whitelist)) {
         return { allowed: false, reason: "IP not in whitelist" };
       }
       return { allowed: true };
 
     case "whitelist-priority":
       // Whitelist overrides blacklist
-      if (matchesAny(normalizedIP, _config.whitelist)) {
+      if (matchesAny(normalizedIP, config.whitelist)) {
         return { allowed: true };
       }
-      if (matchesAny(normalizedIP, _config.blacklist)) {
+      if (matchesAny(normalizedIP, config.blacklist)) {
         return { allowed: false, reason: "IP blacklisted" };
       }
       return { allowed: true };
@@ -158,7 +201,7 @@ export function checkIP(ip) {
     case "blacklist":
     default:
       // Blacklisted IPs blocked
-      if (matchesAny(normalizedIP, _config.blacklist)) {
+      if (matchesAny(normalizedIP, config.blacklist)) {
         return { allowed: false, reason: "IP blacklisted" };
       }
       return { allowed: true };
@@ -170,7 +213,7 @@ export function checkIP(ip) {
  */
 export function tempBanIP(ip, durationMs, reason = "Automated ban") {
   const normalizedIP = normalizeIP(ip);
-  _config.tempBans.set(normalizedIP, {
+  currentTemporaryBans().set(normalizedIP, {
     until: Date.now() + durationMs,
     reason,
   });
@@ -180,13 +223,14 @@ export function tempBanIP(ip, durationMs, reason = "Automated ban") {
  * Remove a temporary ban
  */
 export function removeTempBan(ip) {
-  _config.tempBans.delete(normalizeIP(ip));
+  currentTemporaryBans().delete(normalizeIP(ip));
 }
 
 /**
  * Add IP to blacklist
  */
 export function addToBlacklist(ip) {
+  assertSyncMutationSupported();
   ensureLoaded();
   _config.blacklist.add(normalizeIP(ip));
   persist();
@@ -196,6 +240,7 @@ export function addToBlacklist(ip) {
  * Remove IP from blacklist
  */
 export function removeFromBlacklist(ip) {
+  assertSyncMutationSupported();
   ensureLoaded();
   _config.blacklist.delete(normalizeIP(ip));
   persist();
@@ -205,6 +250,7 @@ export function removeFromBlacklist(ip) {
  * Add IP to whitelist
  */
 export function addToWhitelist(ip) {
+  assertSyncMutationSupported();
   ensureLoaded();
   _config.whitelist.add(normalizeIP(ip));
   persist();
@@ -214,6 +260,7 @@ export function addToWhitelist(ip) {
  * Remove IP from whitelist
  */
 export function removeFromWhitelist(ip) {
+  assertSyncMutationSupported();
   ensureLoaded();
   _config.whitelist.delete(normalizeIP(ip));
   persist();
@@ -344,6 +391,12 @@ function extractClientIP(req) {
  * Reset config (for testing)
  */
 export function resetIPFilter() {
+  const identity = getSelectedPersistenceIdentity();
+  if (identity) {
+    getPreparedNativeIPFilterSettings();
+    nativeTempBans.delete(identity);
+    return;
+  }
   _config = {
     enabled: false,
     mode: "blacklist",
@@ -351,4 +404,46 @@ export function resetIPFilter() {
     whitelist: new Set(),
     tempBans: new Map(),
   };
+}
+
+/** Dashboard updates acknowledge durable native configuration before applying ephemeral actions. */
+export async function applyIPFilterUpdateAsync(update: IPFilterUpdate): Promise<void> {
+  if (getSelectedPersistenceIdentity()) {
+    const durable = {
+      enabled: update.enabled,
+      mode: update.mode,
+      blacklist: update.blacklist,
+      whitelist: update.whitelist,
+      ...(update.addBlacklist ? { addBlacklist: normalizeIP(update.addBlacklist) } : {}),
+      ...(update.removeBlacklist ? { removeBlacklist: normalizeIP(update.removeBlacklist) } : {}),
+      ...(update.addWhitelist ? { addWhitelist: normalizeIP(update.addWhitelist) } : {}),
+      ...(update.removeWhitelist ? { removeWhitelist: normalizeIP(update.removeWhitelist) } : {}),
+    };
+    if (
+      update.enabled !== undefined ||
+      update.mode ||
+      update.blacklist ||
+      update.whitelist ||
+      update.addBlacklist ||
+      update.removeBlacklist ||
+      update.addWhitelist ||
+      update.removeWhitelist
+    )
+      await updateNativeIPFilterSettings(durable);
+    else getPreparedNativeIPFilterSettings();
+  } else {
+    if (update.enabled !== undefined || update.mode || update.blacklist || update.whitelist)
+      configureIPFilter(update);
+    if (update.addBlacklist) addToBlacklist(update.addBlacklist);
+    if (update.removeBlacklist) removeFromBlacklist(update.removeBlacklist);
+    if (update.addWhitelist) addToWhitelist(update.addWhitelist);
+    if (update.removeWhitelist) removeFromWhitelist(update.removeWhitelist);
+  }
+  if (update.tempBan)
+    tempBanIP(
+      update.tempBan.ip,
+      update.tempBan.durationMs || 3600000,
+      update.tempBan.reason || "Manual ban"
+    );
+  if (update.removeBan) removeTempBan(update.removeBan);
 }

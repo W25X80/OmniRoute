@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { readRtkRawOutput } from "@omniroute/open-sse/services/compression/engines/rtk";
+import { readRtkRawOutputAsync as readRtkRawOutput } from "@omniroute/open-sse/services/compression/engines/rtk";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 
 export async function GET(request: Request, { params }: { params: Promise<{ id: string }> }) {
@@ -11,7 +11,7 @@ export async function GET(request: Request, { params }: { params: Promise<{ id: 
     return NextResponse.json({ error: "Invalid raw output id" }, { status: 400 });
   }
 
-  const content = readRtkRawOutput(id);
+  const content = await readRtkRawOutput(id);
   if (content === null) {
     return NextResponse.json({ error: "Raw output not found" }, { status: 404 });
   }

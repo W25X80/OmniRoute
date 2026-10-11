@@ -3,7 +3,7 @@
 import { NextResponse } from "next/server";
 import { requireCliToolsAuth } from "@/lib/api/requireCliToolsAuth";
 import { getCliRuntimeStatus, CLI_TOOL_IDS } from "@/shared/services/cliRuntime";
-import { getAllCliToolLastConfigured } from "@/lib/db/cliToolState";
+import { getAllCliToolLastConfiguredAsync } from "@/lib/db/cliToolState";
 import { checkToolConfigStatus } from "@/lib/cliTools/checkToolConfigStatus";
 
 /**
@@ -79,7 +79,7 @@ export async function GET(request: Request) {
 
     // Merge last-configured timestamps from SQLite
     try {
-      const lastConfigured = getAllCliToolLastConfigured();
+      const lastConfigured = await getAllCliToolLastConfiguredAsync();
       for (const [toolId, timestamp] of Object.entries(lastConfigured)) {
         if (statuses[toolId]) {
           statuses[toolId].lastConfiguredAt = timestamp;

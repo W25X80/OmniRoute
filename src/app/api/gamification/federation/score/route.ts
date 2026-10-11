@@ -1,7 +1,10 @@
+import { parseDatabaseBackend } from "@/lib/db/backendSelection";
+import { getSelectedPostgresDatabase } from "@/lib/db/controlPlaneContext";
+import { deriveFederationTokenHashAsync } from "@/lib/gamification/federationTokenDerivation";
 import { NextRequest, NextResponse } from "next/server";
 import { CORS_HEADERS, handleCorsOptions } from "@/shared/utils/cors";
 import { updateScore } from "@/lib/gamification/leaderboard";
-import { getConnectedServerByKeyHash } from "@/lib/db/gamification";
+import { getConnectedServerByKeyHashAsync as getConnectedServerByKeyHash } from "@/lib/db/gamification";
 import { z } from "zod";
 import crypto from "crypto";
 
@@ -22,10 +25,11 @@ export async function POST(request: NextRequest) {
   }
 
   const token = authHeader.slice(7);
-  const tokenHash = crypto
-    .pbkdf2Sync(token, "omniroute-federation-salt", 120000, 32, "sha256")
-    .toString("hex");
-  const server = getConnectedServerByKeyHash(tokenHash);
+  const tokenHash =
+    parseDatabaseBackend() === "postgres" || getSelectedPostgresDatabase()
+      ? await deriveFederationTokenHashAsync(token)
+      : crypto.pbkdf2Sync(token, "omniroute-federation-salt", 120000, 32, "sha256").toString("hex");
+  const server = await getConnectedServerByKeyHash(tokenHash);
 
   if (!server) {
     return NextResponse.json(

@@ -1,3 +1,5 @@
+import { getSelectedPostgresDatabase } from "../controlPlaneContext";
+import { afterProviderRuntimeWrite, writeProviderRuntime } from "../postgres/providerRuntime";
 import { backupDbFile } from "../backup";
 import { getDbInstance, rowToCamel } from "../core";
 import { invalidateDbCache } from "../readCache";
@@ -24,7 +26,33 @@ export async function clearCodexAccountCooldown(id: string, scope: Scope = "code
   return mutate(id, (data) => clearScope(data, scope));
 }
 
-function mutate(id: string, apply: (data: RecordValue) => void): RecordValue | null {
+async function mutate(id: string, apply: (data: RecordValue) => void): Promise<RecordValue | null> {
+  const database = getSelectedPostgresDatabase();
+  if (database) {
+    const result = await writeProviderRuntime(database, async (transaction) => {
+      const { rows } = await transaction.query<RecordValue>(
+        "SELECT * FROM omniroute.provider_connections WHERE id=$1 FOR UPDATE",
+        [id]
+      );
+      if (!rows[0] || rows[0].provider !== "codex") return null;
+      const connection = toRecord(rowToCamel(rows[0]));
+      const data = { ...toRecord(connection.providerSpecificData) };
+      const previous = JSON.stringify(data);
+      apply(data);
+      if (JSON.stringify(data) !== previous) {
+        await transaction.query(
+          "UPDATE omniroute.provider_connections SET provider_specific_data=$1,updated_at=$2 WHERE id=$3",
+          [JSON.stringify(data), new Date().toISOString(), id]
+        );
+      }
+      return data;
+    });
+    if (result)
+      await afterProviderRuntimeWrite("codex_recovery", () =>
+        invalidateDbCache("connections", undefined, { skipModelCatalog: true })
+      );
+    return result;
+  }
   const db = getDbInstance();
   const result = db.transaction(() => {
     const row = db.prepare("SELECT * FROM provider_connections WHERE id = ?").get(id);

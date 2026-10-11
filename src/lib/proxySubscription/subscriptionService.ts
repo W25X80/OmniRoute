@@ -19,9 +19,15 @@
  *     protocol translation + node selection). Without it, those nodes are
  *     reported but not routed.
  */
-import { decodeUserinfo } from "@/shared/utils/decodeUserinfo";
 import { randomUUID } from "crypto";
 import fs from "node:fs";
+import { decodeUserinfo } from "@/shared/utils/decodeUserinfo";
+import { areLocalProviderUrlsAllowed } from "@/shared/network/outboundUrlGuardPolicy";
+import { readStaleSwitchWarningAsync } from "../db/proxySubscriptionStore";
+import {
+  getSelectedProxySubscriptionStore,
+  persistSubscriptionRow,
+} from "../db/proxySubscriptionStore";
 import { getDbInstance } from "../db/core";
 import { backupDbFile } from "../db/backup";
 import { encrypt } from "../db/encryption";
@@ -54,7 +60,6 @@ import {
   isAnyResolvedAddressBlocked,
   type FetchGuardOptions,
 } from "./fetchGuard";
-import { areLocalProviderUrlsAllowed } from "@/shared/network/outboundUrlGuardPolicy";
 import { withRetry } from "./fetchRetry";
 import {
   isUsableSubscriptionContent,
@@ -62,7 +67,7 @@ import {
   redactedNodeSummary,
   type ParsedSubscription,
 } from "./parse";
-
+import type { CoreReloadMode as CoreReloadModeValue } from "./coreConfig/reload";
 export type ProxySubscriptionMode = "global" | "rule";
 export type ProxySubscriptionStatus = "ok" | "error" | "empty";
 
@@ -79,7 +84,6 @@ export type ProxySubscriptionErrorCode =
   | "CORE_RELOAD_UNDECLARED"
   | "CORE_RELOAD_FAILED";
 
-import type { CoreReloadMode as CoreReloadModeValue } from "./coreConfig/reload";
 export type { CoreReloadModeValue };
 
 /** Encode a user-facing error as `{ code, detail? }` for i18n on the client. */
@@ -228,6 +232,8 @@ function mapSubscriptionRow(row: unknown): ProxySubscriptionRecord {
 // ───────────────────────────── CRUD ─────────────────────────────
 
 export async function listSubscriptions(): Promise<ProxySubscriptionRecord[]> {
+  const store = getSelectedProxySubscriptionStore();
+  if (store) return (await store.list()).map(mapSubscriptionRow);
   const db = getDbInstance();
   const rows = db
     .prepare(
@@ -238,6 +244,11 @@ export async function listSubscriptions(): Promise<ProxySubscriptionRecord[]> {
 }
 
 export async function getSubscriptionById(id: string): Promise<ProxySubscriptionRecord | null> {
+  const store = getSelectedProxySubscriptionStore();
+  if (store) {
+    const row = await store.get(id);
+    return row ? mapSubscriptionRow(row) : null;
+  }
   const db = getDbInstance();
   const row = db
     .prepare(
@@ -253,7 +264,7 @@ export async function createSubscription(
   const id = randomUUID();
   const now = new Date().toISOString();
   const enabled = payload.enabled === true ? 1 : 0;
-  const db = getDbInstance();
+  const store = getSelectedProxySubscriptionStore();
   const controlUrl = payload.controlUrl ?? null;
   const coreConfigPath = payload.coreConfigPath ?? null;
   const controlSecretEnc =
@@ -261,26 +272,45 @@ export async function createSubscription(
       ? ((encrypt(payload.controlSecret) ?? null) as string | null)
       : null;
   const gapSeconds = clampSelectorGapSeconds(payload.selectorMinGapSeconds ?? 60);
-  db.prepare(
-    `INSERT INTO proxy_subscriptions
+  if (store) {
+    await store.insert({
+      id,
+      name: payload.name,
+      url: payload.url,
+      enabled,
+      mode: payload.mode || "global",
+      ruleProviders: payload.ruleProviders ?? null,
+      localCoreEndpoint: payload.localCoreEndpoint || null,
+      updateIntervalMinutes: payload.updateIntervalMinutes || 60,
+      controlUrl,
+      coreConfigPath,
+      controlSecretEnc,
+      gapSeconds,
+      now,
+    });
+  } else {
+    const db = getDbInstance();
+    db.prepare(
+      `INSERT INTO proxy_subscriptions
       (id, name, url, enabled, mode, rule_providers, local_core_endpoint, update_interval_minutes, control_url, core_config_path, control_secret_enc, selector_min_gap_seconds, status, created_at, updated_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'empty', ?, ?)`
-  ).run(
-    id,
-    payload.name,
-    payload.url,
-    enabled,
-    payload.mode || "global",
-    payload.ruleProviders ? JSON.stringify(payload.ruleProviders) : null,
-    payload.localCoreEndpoint || null,
-    payload.updateIntervalMinutes || 60,
-    controlUrl,
-    coreConfigPath,
-    controlSecretEnc,
-    gapSeconds,
-    now,
-    now
-  );
+    ).run(
+      id,
+      payload.name,
+      payload.url,
+      enabled,
+      payload.mode || "global",
+      payload.ruleProviders ? JSON.stringify(payload.ruleProviders) : null,
+      payload.localCoreEndpoint || null,
+      payload.updateIntervalMinutes || 60,
+      controlUrl,
+      coreConfigPath,
+      controlSecretEnc,
+      gapSeconds,
+      now,
+      now
+    );
+  }
   if (controlUrl) setAnyControlUrlConfigured(true);
   const created = (await getSubscriptionById(id))!;
   if (created.enabled) {
@@ -305,66 +335,6 @@ function readControlFields(
 function encryptSecretField(secret: string | null | undefined): string | null | undefined {
   if (secret === undefined) return undefined;
   return secret != null && secret.length > 0 ? ((encrypt(secret) ?? null) as string | null) : null;
-}
-
-function persistSubscriptionRow(
-  db: { prepare: (sql: string) => { run: (...args: unknown[]) => unknown } },
-  args: {
-    id: string;
-    name: string;
-    url: string;
-    enabled: number;
-    mode: string;
-    ruleProviders: string[] | null;
-    localCoreEndpoint: string | null;
-    updateIntervalMinutes: number;
-    controlUrl: string | null;
-    coreConfigPath: string | null;
-    controlSecretEnc: string | null | undefined;
-    gapSeconds: number;
-    now: string;
-  }
-): void {
-  if (args.controlSecretEnc === undefined) {
-    db.prepare(
-      `UPDATE proxy_subscriptions
-         SET name = ?, url = ?, enabled = ?, mode = ?, rule_providers = ?, local_core_endpoint = ?, update_interval_minutes = ?, control_url = ?, core_config_path = ?, selector_min_gap_seconds = ?, updated_at = ?
-       WHERE id = ?`
-    ).run(
-      args.name,
-      args.url,
-      args.enabled,
-      args.mode,
-      args.ruleProviders ? JSON.stringify(args.ruleProviders) : null,
-      args.localCoreEndpoint || null,
-      args.updateIntervalMinutes,
-      args.controlUrl,
-      args.coreConfigPath,
-      args.gapSeconds,
-      args.now,
-      args.id
-    );
-  } else {
-    db.prepare(
-      `UPDATE proxy_subscriptions
-         SET name = ?, url = ?, enabled = ?, mode = ?, rule_providers = ?, local_core_endpoint = ?, update_interval_minutes = ?, control_url = ?, core_config_path = ?, control_secret_enc = ?, selector_min_gap_seconds = ?, updated_at = ?
-       WHERE id = ?`
-    ).run(
-      args.name,
-      args.url,
-      args.enabled,
-      args.mode,
-      args.ruleProviders ? JSON.stringify(args.ruleProviders) : null,
-      args.localCoreEndpoint || null,
-      args.updateIntervalMinutes,
-      args.controlUrl,
-      args.coreConfigPath,
-      args.controlSecretEnc,
-      args.gapSeconds,
-      args.now,
-      args.id
-    );
-  }
 }
 
 async function refreshAfterUpdate(
@@ -403,7 +373,7 @@ export async function updateSubscription(
 ): Promise<ProxySubscriptionRecord | null> {
   const existing = await getSubscriptionById(id);
   if (!existing) return null;
-  const db = getDbInstance();
+  const db = getSelectedProxySubscriptionStore() ? null : getDbInstance();
   const { controlUrl, gapSeconds } = readControlFields(payload, existing);
   const now = new Date().toISOString();
   const enabledChanged = payload.enabled !== undefined && payload.enabled !== existing.enabled;
@@ -416,7 +386,7 @@ export async function updateSubscription(
   // payload.controlSecret replaces control_secret_enc when present (encrypt
   // at rest); absent leaves it.
   const controlSecretEnc = encryptSecretField(payload.controlSecret);
-  persistSubscriptionRow(db, {
+  await persistSubscriptionRow(db, {
     id,
     name: payload.name ?? existing.name,
     url: payload.url ?? existing.url,
@@ -454,13 +424,17 @@ export async function setSubscriptionEnabled(
 export async function deleteSubscription(id: string): Promise<boolean> {
   await unapplySubscription(id);
   // Remove subscription-sourced proxy rows (force-clears their assignments).
-  const db = getDbInstance();
-  const doomed = db
-    .prepare("SELECT core_config_path FROM proxy_subscriptions WHERE id = ?")
-    .get(id) as { core_config_path?: unknown } | undefined;
-  const rows = db
-    .prepare("SELECT id FROM proxy_registry WHERE subscription_id = ?")
-    .all(id) as Array<{ id: string }>;
+  const store = getSelectedProxySubscriptionStore();
+  const db = store ? null : getDbInstance();
+  const doomed = store
+    ? await store.get(id)
+    : (db!.prepare("SELECT core_config_path FROM proxy_subscriptions WHERE id = ?").get(id) as
+        { core_config_path?: unknown } | undefined);
+  const rows = store
+    ? await store.proxyIds(id)
+    : (db!.prepare("SELECT id FROM proxy_registry WHERE subscription_id = ?").all(id) as Array<{
+        id: string;
+      }>);
   for (const r of rows) {
     try {
       await deleteProxyById(r.id, { force: true });
@@ -469,7 +443,9 @@ export async function deleteSubscription(id: string): Promise<boolean> {
     }
   }
   clearCoreReloadState(id);
-  const res = db.prepare("DELETE FROM proxy_subscriptions WHERE id = ?").run(id);
+  const res = store
+    ? { changes: await store.delete(id) }
+    : db!.prepare("DELETE FROM proxy_subscriptions WHERE id = ?").run(id);
   // Best-effort: remove the side files this subscription owned. A missing
   // or locked file must not fail the delete (row already gone).
   if (typeof doomed?.core_config_path === "string") {
@@ -499,7 +475,9 @@ export async function deleteSubscription(id: string): Promise<boolean> {
  * blocked UNCONDITIONALLY regardless of that flag.
  */
 async function assertSafeFetchTarget(url: string): Promise<void> {
-  const guardOpts: FetchGuardOptions = { allowLocal: areLocalProviderUrlsAllowed() };
+  const guardOpts: FetchGuardOptions = {
+    allowLocal: areLocalProviderUrlsAllowed(),
+  };
   if (!isSubscriptionFetchUrlAllowed(url, guardOpts)) {
     throw new Error("Subscription URL is not allowed (scheme or host blocked)");
   }
@@ -534,14 +512,22 @@ async function doSafeFetch(url: string, headers: Record<string, string>): Promis
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), SUBSCRIPTION_FETCH_TIMEOUT_MS);
   try {
-    const res = await fetch(url, { redirect: "manual", signal: controller.signal, headers });
+    const res = await fetch(url, {
+      redirect: "manual",
+      signal: controller.signal,
+      headers,
+    });
     if (res.status >= 300 && res.status < 400) {
       const loc = res.headers.get("location");
       if (!loc) throw new Error("Subscription fetch redirected without Location");
       // Resolve relative redirects and re-validate the target (SSRF guard).
       const next = new URL(loc, url).toString();
       await assertSafeFetchTarget(next);
-      const res2 = await fetch(next, { redirect: "manual", signal: controller.signal, headers });
+      const res2 = await fetch(next, {
+        redirect: "manual",
+        signal: controller.signal,
+        headers,
+      });
       if (res2.status >= 300 && res2.status < 400) {
         throw new Error("Subscription fetch: too many redirects");
       }
@@ -688,7 +674,7 @@ async function syncSubscriptionUnsafe(id: string): Promise<SyncResult> {
       applied: false,
     };
   }
-  const db = getDbInstance();
+  const db = getSelectedProxySubscriptionStore() ? null : getDbInstance();
 
   const keptIds: string[] = [];
   let warning: string | null = null;
@@ -916,7 +902,7 @@ async function syncSubscriptionUnsafe(id: string): Promise<SyncResult> {
   // rides on `status = "ok"` with an `error` code. Rows with no bound pool
   // (`keptIds` empty) resolve to a sync error below; the switch columns still
   // feed the UI, and the standing warning is preserved through it.
-  const switchWarning = readStaleSwitchWarning(id);
+  const switchWarning = await readStaleSwitchWarningAsync(id);
   if (!warning && switchWarning) warning = switchWarning;
 
   // Determine status. A standing switch warning never flips the status:
@@ -982,25 +968,6 @@ export async function syncSubscription(id: string): Promise<SyncResult> {
   return run;
 }
 
-/** Read the standing switch-failure warning for a subscription, if any.
- * Returns a `SELECTOR_SWITCH_FAILED` error code while the last recorded
- * switch result is a failure, null otherwise (no record, or last was "ok").
- * Never throws (missing columns on old DBs → null). */
-export function readStaleSwitchWarning(subscriptionId: string): string | null {
-  try {
-    const db = getDbInstance();
-    const row = db
-      .prepare("SELECT selector_last_switch_result FROM proxy_subscriptions WHERE id = ?")
-      .get(subscriptionId) as { selector_last_switch_result?: unknown } | undefined;
-    const result =
-      typeof row?.selector_last_switch_result === "string" ? row.selector_last_switch_result : null;
-    if (!result || result === "ok" || result === "throttled") return null;
-    return subscriptionErrorCode("SELECTOR_SWITCH_FAILED", result);
-  } catch {
-    return null;
-  }
-}
-
 /** Record a switch outcome on the subscription row (columns from the
  * selector-control migration). On failure also sets `error` directly —
  * without touching `status` — so the warning shows before the next sync.
@@ -1013,6 +980,9 @@ export async function recordSelectorSwitchOutcome(args: {
   kind?: string | null;
 }): Promise<void> {
   try {
+    const store = getSelectedProxySubscriptionStore();
+    if (store)
+      return store.recordSwitch(args, subscriptionErrorCode("SELECTOR_SWITCH_FAILED", args.result));
     const db = getDbInstance();
     const now = new Date().toISOString();
     db.prepare(
@@ -1039,6 +1009,8 @@ async function updateSubscriptionStatus(
   lastErrorAt: string | null,
   consecutiveFailures: number
 ): Promise<void> {
+  const store = getSelectedProxySubscriptionStore();
+  if (store) return store.setStatus(id, status, error, lastNodes, lastErrorAt, consecutiveFailures);
   const db = getDbInstance();
   const now = new Date().toISOString();
   db.prepare(
@@ -1060,10 +1032,13 @@ export async function applySubscription(id: string): Promise<void> {
   const sub = await getSubscriptionById(id);
   if (!sub || !sub.enabled) return;
 
-  const db = getDbInstance();
-  const rows = db
-    .prepare("SELECT id FROM proxy_registry WHERE subscription_id = ? AND status != 'error'")
-    .all(id) as Array<{ id: string }>;
+  const store = getSelectedProxySubscriptionStore();
+  const db = store ? null : getDbInstance();
+  const rows = store
+    ? await store.proxyIds(id, true)
+    : (db!
+        .prepare("SELECT id FROM proxy_registry WHERE subscription_id = ? AND status != 'error'")
+        .all(id) as Array<{ id: string }>);
   const ids = rows.map((r) => r.id);
   if (ids.length === 0) return;
 
@@ -1079,6 +1054,12 @@ export async function applySubscription(id: string): Promise<void> {
 
 /** Remove the subscription's proxies from their bound scope(s). */
 export async function unapplySubscription(id: string): Promise<void> {
+  const store = getSelectedProxySubscriptionStore();
+  if (store) {
+    await store.detach(id);
+    await recomputeProxyEnabled();
+    return;
+  }
   const db = getDbInstance();
   const rows = db
     .prepare("SELECT id FROM proxy_registry WHERE subscription_id = ?")
@@ -1106,6 +1087,8 @@ export async function unapplySubscription(id: string): Promise<void> {
 // ───────────────────────────── proxyEnabled flag ─────────────────────────────
 
 async function hasNonSubscriptionGlobalProxy(): Promise<boolean> {
+  const store = getSelectedProxySubscriptionStore();
+  if (store) return store.nonSubscriptionGlobal();
   const db = getDbInstance();
   const row = db
     .prepare(
@@ -1116,6 +1099,11 @@ async function hasNonSubscriptionGlobalProxy(): Promise<boolean> {
 }
 
 async function recomputeProxyEnabled(): Promise<void> {
+  const store = getSelectedProxySubscriptionStore();
+  if (store)
+    return setProxyEnabledFlag(
+      (await store.boundEnabled()) || (await store.nonSubscriptionGlobal())
+    );
   const db = getDbInstance();
   // Must check for an ACTUALLY BOUND subscription proxy, not just an enabled
   // subscription row: unapplySubscription() detaches proxy_assignments without
@@ -1137,6 +1125,12 @@ async function recomputeProxyEnabled(): Promise<void> {
 }
 
 async function setProxyEnabledFlag(value: boolean): Promise<void> {
+  const store = getSelectedProxySubscriptionStore();
+  if (store) {
+    await store.setEnabledFlag(value);
+    bumpProxyConfigGeneration();
+    return;
+  }
   const db = getDbInstance();
   db.prepare(
     "INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES ('settings', 'proxyEnabled', ?)"
@@ -1189,3 +1183,5 @@ export function stopSubscriptionScheduler(): void {
   }
   schedulerStarted = false;
 }
+
+export { readStaleSwitchWarning, readStaleSwitchWarningAsync } from "../db/proxySubscriptionStore";

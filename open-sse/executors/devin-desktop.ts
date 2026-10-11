@@ -7,7 +7,10 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { gunzipSync } from "node:zlib";
+import { gunzip, gunzipSync } from "node:zlib";
+
+import { parseDatabaseBackend } from "../../src/lib/db/backendSelection";
+import { getSelectedPostgresDatabase } from "../../src/lib/db/controlPlaneContext";
 
 import { PROVIDERS } from "../config/constants.ts";
 import { buildErrorBody, sanitizeErrorMessage } from "../utils/error.ts";
@@ -739,6 +742,10 @@ export class DevinDesktopExecutor extends BaseExecutor {
     const responseId = `chatcmpl-devin-desktop-${Date.now()}`;
     const created = Math.floor(Date.now() / 1000);
     let activeReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+    // Capture the CPU profile before stream callbacks outlive the request's DB scope.
+    const nativeAsyncCompression =
+      parseDatabaseBackend() === "postgres" || Boolean(getSelectedPostgresDatabase());
+    let nativeCancelled = false;
 
     const stream = new ReadableStream<Uint8Array>({
       async start(controller) {
@@ -776,14 +783,7 @@ export class DevinDesktopExecutor extends BaseExecutor {
           activeReader = upstream.body?.getReader() ?? null;
           if (!activeReader) throw new Error("Devin Desktop response body is empty");
 
-          const handleFrame = (flags: number, payload: Uint8Array): boolean => {
-            if ((flags & ~(CONNECT_COMPRESSED_FLAG | CONNECT_END_STREAM_FLAG)) !== 0) {
-              throw new Error("Invalid Devin Desktop Connect frame flags");
-            }
-            const decodedPayload =
-              flags & CONNECT_COMPRESSED_FLAG
-                ? gunzipSync(payload, { maxOutputLength: MAX_CONNECT_FRAME_BYTES })
-                : payload;
+          const handleDecodedFrame = (flags: number, decodedPayload: Uint8Array): boolean => {
             if (flags & CONNECT_END_STREAM_FLAG) {
               if (sawEndStream) throw new Error("Duplicate Devin Desktop Connect end-stream frame");
               sawEndStream = true;
@@ -820,6 +820,41 @@ export class DevinDesktopExecutor extends BaseExecutor {
             return false;
           };
 
+          const handleFrame = (flags: number, payload: Uint8Array): boolean => {
+            if ((flags & ~(CONNECT_COMPRESSED_FLAG | CONNECT_END_STREAM_FLAG)) !== 0) {
+              throw new Error("Invalid Devin Desktop Connect frame flags");
+            }
+            const decodedPayload =
+              flags & CONNECT_COMPRESSED_FLAG
+                ? gunzipSync(payload, { maxOutputLength: MAX_CONNECT_FRAME_BYTES })
+                : payload;
+            return handleDecodedFrame(flags, decodedPayload);
+          };
+
+          const handleNativeFrame = async (
+            flags: number,
+            payload: Uint8Array
+          ): Promise<boolean> => {
+            if ((flags & ~(CONNECT_COMPRESSED_FLAG | CONNECT_END_STREAM_FLAG)) !== 0) {
+              throw new Error("Invalid Devin Desktop Connect frame flags");
+            }
+            const decodedPayload =
+              flags & CONNECT_COMPRESSED_FLAG
+                ? await new Promise<Buffer>((resolve, reject) => {
+                    gunzip(
+                      payload,
+                      { maxOutputLength: MAX_CONNECT_FRAME_BYTES },
+                      (error, decoded) => {
+                        if (error) reject(error);
+                        else resolve(decoded);
+                      }
+                    );
+                  })
+                : payload;
+            if (nativeCancelled) return false;
+            return handleDecodedFrame(flags, decodedPayload);
+          };
+
           const drain = (): boolean => {
             let offset = 0;
             while (pending.length - offset >= 5) {
@@ -847,22 +882,65 @@ export class DevinDesktopExecutor extends BaseExecutor {
             return false;
           };
 
+          const drainNative = async (): Promise<boolean> => {
+            let offset = 0;
+            while (pending.length - offset >= 5) {
+              const length = new DataView(
+                pending.buffer,
+                pending.byteOffset + offset + 1,
+                4
+              ).getUint32(0, false);
+              if (length > MAX_CONNECT_FRAME_BYTES) {
+                throw new Error("Devin Desktop Connect frame exceeds the safety limit");
+              }
+              if (pending.length - offset < 5 + length) break;
+              const flags = pending[offset];
+              const terminal = await handleNativeFrame(
+                flags,
+                pending.slice(offset + 5, offset + 5 + length)
+              );
+              if (nativeCancelled) return false;
+              offset += 5 + length;
+              if (terminal) {
+                if (pending.length !== offset) {
+                  throw new Error("Data follows the Devin Desktop Connect end-stream frame");
+                }
+                pending = new Uint8Array(0);
+                return true;
+              }
+            }
+            if (offset > 0) pending = pending.slice(offset);
+            return false;
+          };
+
           while (true) {
             const { done, value } = await activeReader.read();
+            if (nativeCancelled) return;
             if (value?.length) {
               pending = pending.length ? concatBytes([pending, value]) : Uint8Array.from(value);
-              if (drain()) {
+              const terminal = nativeAsyncCompression ? await drainNative() : drain();
+              if (nativeCancelled) return;
+              if (terminal) {
                 await activeReader.cancel("Devin Desktop Connect end-stream received");
                 break;
               }
             }
             if (done) break;
           }
-          if (!sawEndStream) drain();
+          if (!sawEndStream) {
+            if (nativeAsyncCompression) await drainNative();
+            else drain();
+          }
+          if (nativeCancelled) return;
           if (pending.length !== 0) throw new Error("Truncated Devin Desktop Connect frame");
           if (!sawEndStream) throw new Error("Devin Desktop Connect stream ended without trailers");
-          if (trailerError) {
-            const detail = sanitizeErrorMessage(`${trailerError.code}: ${trailerError.message}`);
+          // Frame callbacks populated these values before the ordered drain completed.
+          const completedTrailerError = trailerError as ConnectTrailerError | null;
+          const completedUsage = usage as DevinUsage | null;
+          if (completedTrailerError) {
+            const detail = sanitizeErrorMessage(
+              `${completedTrailerError.code}: ${completedTrailerError.message}`
+            );
             emitError(`Devin Desktop stream error: ${detail}`);
             return;
           }
@@ -880,32 +958,35 @@ export class DevinDesktopExecutor extends BaseExecutor {
               },
             ],
           };
-          if (usage) {
+          if (completedUsage) {
             finalPayload.usage = {
-              prompt_tokens: usage.inputTokens,
-              completion_tokens: usage.outputTokens,
-              total_tokens: usage.inputTokens + usage.outputTokens,
-              prompt_tokens_details: { cached_tokens: usage.cacheReadTokens },
-              cache_write_tokens: usage.cacheWriteTokens,
+              prompt_tokens: completedUsage.inputTokens,
+              completion_tokens: completedUsage.outputTokens,
+              total_tokens: completedUsage.inputTokens + completedUsage.outputTokens,
+              prompt_tokens_details: { cached_tokens: completedUsage.cacheReadTokens },
+              cache_write_tokens: completedUsage.cacheWriteTokens,
             };
           }
           emit(finalPayload);
           controller.enqueue(TEXT_ENCODER.encode("data: [DONE]\n\n"));
         } catch (error) {
+          if (nativeCancelled) return;
           try {
             await activeReader?.cancel("Devin Desktop Connect stream failed");
           } catch {
             // Preserve the original protocol/decode error below.
           }
+          if (nativeCancelled) return;
           const safe = sanitizeErrorMessage(error instanceof Error ? error.message : String(error));
           emitError(`Devin Desktop stream error: ${safe}`);
         } finally {
           activeReader?.releaseLock();
           activeReader = null;
-          controller.close();
+          if (!nativeCancelled) controller.close();
         }
       },
       async cancel(reason) {
+        if (nativeAsyncCompression) nativeCancelled = true;
         await activeReader?.cancel(reason);
       },
     });

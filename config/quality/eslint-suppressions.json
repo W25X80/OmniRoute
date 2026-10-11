@@ -4,11 +4,6 @@
       "count": 1
     }
   },
-  "open-sse/config/credentialLoader.ts": {
-    "@typescript-eslint/no-unused-vars": {
-      "count": 1
-    }
-  },
   "open-sse/config/providerRegistry.ts": {
     "@typescript-eslint/no-unused-vars": {
       "count": 8
@@ -110,11 +105,6 @@
     }
   },
   "open-sse/executors/gitlab.ts": {
-    "@typescript-eslint/no-unused-vars": {
-      "count": 1
-    }
-  },
-  "open-sse/executors/glm.ts": {
     "@typescript-eslint/no-unused-vars": {
       "count": 1
     }
@@ -278,24 +268,9 @@
       "count": 1
     }
   },
-  "open-sse/mcp-server/tools/compressionTools.ts": {
-    "@typescript-eslint/no-unused-vars": {
-      "count": 2
-    }
-  },
-  "open-sse/mcp-server/tools/gamificationTools.ts": {
-    "@typescript-eslint/no-explicit-any": {
-      "count": 2
-    }
-  },
   "open-sse/mcp-server/tools/githubSkillTools.ts": {
     "@typescript-eslint/no-unused-vars": {
       "count": 1
-    }
-  },
-  "open-sse/mcp-server/tools/obsidianTools.ts": {
-    "@typescript-eslint/no-unused-vars": {
-      "count": 3
     }
   },
   "open-sse/mcp-server/tools/pickFastestModel.ts": {
@@ -303,11 +278,6 @@
       "count": 1
     },
     "no-restricted-syntax": {
-      "count": 1
-    }
-  },
-  "open-sse/mcp-server/tools/pluginTools.ts": {
-    "@typescript-eslint/no-explicit-any": {
       "count": 1
     }
   },
@@ -430,11 +400,6 @@
   "open-sse/services/compression/aggressive.ts": {
     "@typescript-eslint/no-unused-vars": {
       "count": 5
-    }
-  },
-  "open-sse/services/compression/engines/ccr/index.ts": {
-    "@typescript-eslint/no-unused-vars": {
-      "count": 1
     }
   },
   "open-sse/services/compression/engines/headroom/gcf/decode_generic.ts": {
@@ -993,11 +958,6 @@
       "count": 3
     }
   },
-  "src/app/api/memory/route.ts": {
-    "@typescript-eslint/no-unused-vars": {
-      "count": 2
-    }
-  },
   "src/app/api/middleware/hooks/[name]/route.ts": {
     "@typescript-eslint/no-unused-vars": {
       "count": 1
@@ -1041,11 +1001,6 @@
   "src/app/api/services/[name]/logs/route.ts": {
     "no-restricted-syntax": {
       "count": 1
-    }
-  },
-  "src/app/api/settings/obsidian/route.ts": {
-    "@typescript-eslint/no-unused-vars": {
-      "count": 2
     }
   },
   "src/app/api/settings/qdrant/route.ts": {
@@ -1123,7 +1078,7 @@
   },
   "src/app/api/v1/models/catalog.ts": {
     "@typescript-eslint/no-unused-vars": {
-      "count": 10
+      "count": 6
     }
   },
   "src/app/api/v1/models/catalogOpenrouter.ts": {
@@ -1256,39 +1211,19 @@
       "count": 1
     }
   },
-  "src/lib/compliance/index.ts": {
-    "@typescript-eslint/no-unused-vars": {
-      "count": 1
-    }
-  },
   "src/lib/copilot/engine.ts": {
-    "@typescript-eslint/no-unused-vars": {
-      "count": 2
-    }
-  },
-  "src/lib/copilot/tools.ts": {
     "@typescript-eslint/no-unused-vars": {
       "count": 2
     }
   },
   "src/lib/db/apiKeys.ts": {
     "@typescript-eslint/no-unused-vars": {
-      "count": 3
+      "count": 2
     }
   },
   "src/lib/db/comboForecast.ts": {
     "no-restricted-syntax": {
       "count": 1
-    }
-  },
-  "src/lib/db/compression.ts": {
-    "@typescript-eslint/no-unused-vars": {
-      "count": 1
-    }
-  },
-  "src/lib/db/compressionCacheStats.ts": {
-    "@typescript-eslint/no-unused-vars": {
-      "count": 2
     }
   },
   "src/lib/db/core.ts": {
@@ -1338,21 +1273,6 @@
   },
   "src/lib/db/providers/lazyConnectionView.ts": {
     "no-restricted-syntax": {
-      "count": 1
-    }
-  },
-  "src/lib/db/providers/usageIdentityReconciliation.ts": {
-    "@typescript-eslint/no-unused-vars": {
-      "count": 1
-    }
-  },
-  "src/lib/db/proxies.ts": {
-    "@typescript-eslint/no-unused-vars": {
-      "count": 1
-    }
-  },
-  "src/lib/db/quotaConsumption.ts": {
-    "@typescript-eslint/no-unused-vars": {
       "count": 1
     }
   },
@@ -1406,11 +1326,6 @@
       "count": 1
     }
   },
-  "src/lib/memory/retrieval.ts": {
-    "@typescript-eslint/no-unused-vars": {
-      "count": 1
-    }
-  },
   "src/lib/memory/sqliteBackend.ts": {
     "@typescript-eslint/no-unused-vars": {
       "count": 2
@@ -1425,11 +1340,6 @@
     "@typescript-eslint/no-unused-vars": {
       "count": 1
     },
-    "no-restricted-syntax": {
-      "count": 1
-    }
-  },
-  "src/lib/monitoring/providerHealthMatrix.ts": {
     "no-restricted-syntax": {
       "count": 1
     }
@@ -1479,27 +1389,12 @@
       "count": 1
     }
   },
-  "src/lib/plugins/manager.ts": {
-    "@typescript-eslint/no-unused-vars": {
-      "count": 1
-    }
-  },
   "src/lib/providers/validation.ts": {
     "@typescript-eslint/no-unused-vars": {
       "count": 1
     }
   },
   "src/lib/providers/validation/searchProviders.ts": {
-    "@typescript-eslint/no-unused-vars": {
-      "count": 1
-    }
-  },
-  "src/lib/quota/quotaAdapters.ts": {
-    "@typescript-eslint/no-unused-vars": {
-      "count": 1
-    }
-  },
-  "src/lib/quota/redisQuotaStore.ts": {
     "@typescript-eslint/no-unused-vars": {
       "count": 1
     }
@@ -1569,11 +1464,6 @@
       "count": 1
     }
   },
-  "src/lib/usage/callLogs.ts": {
-    "@typescript-eslint/no-unused-vars": {
-      "count": 1
-    }
-  },
   "src/lib/usage/costCalculator.ts": {
     "no-restricted-syntax": {
       "count": 1
@@ -1625,21 +1515,6 @@
   "src/mitm/cert/install.ts": {
     "@typescript-eslint/no-unused-vars": {
       "count": 3
-    }
-  },
-  "src/mitm/dns/provision.ts": {
-    "@typescript-eslint/no-unused-vars": {
-      "count": 1
-    }
-  },
-  "src/mitm/manager.ts": {
-    "@typescript-eslint/no-unused-vars": {
-      "count": 3
-    }
-  },
-  "src/server/ws/liveServer.ts": {
-    "@typescript-eslint/no-unused-vars": {
-      "count": 5
     }
   },
   "src/shared/components/DegradationBadge.tsx": {
@@ -1715,17 +1590,7 @@
       "count": 1
     }
   },
-  "src/shared/services/cloudSyncScheduler.ts": {
-    "@typescript-eslint/no-unused-vars": {
-      "count": 1
-    }
-  },
   "src/shared/services/initializeCloudSync.ts": {
-    "@typescript-eslint/no-unused-vars": {
-      "count": 1
-    }
-  },
-  "src/shared/utils/apiKey.ts": {
     "@typescript-eslint/no-unused-vars": {
       "count": 1
     }

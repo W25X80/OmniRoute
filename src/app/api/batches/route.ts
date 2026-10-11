@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 export const dynamic = "force-dynamic";
-import { listBatches } from "@/lib/db/batches";
+import { listBatchesAsync } from "@/lib/db/batches";
 import { getApiKeyRequestScope, resolveListScope } from "@/app/api/v1/_helpers/apiKeyScope";
 
 export async function GET(request: Request) {
@@ -18,7 +18,7 @@ export async function GET(request: Request) {
     const url = new URL(request.url);
     const limit = Number.parseInt(url.searchParams.get("limit") || "100", 10);
     const ownerFilter = listScope.mode === "api_key" ? listScope.apiKeyId : undefined;
-    const batches = listBatches(ownerFilter, limit);
+    const batches = await listBatchesAsync(ownerFilter, limit);
     return NextResponse.json({ batches });
   } catch (error) {
     console.log("Error fetching batches:", error);

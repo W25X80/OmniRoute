@@ -1,3 +1,21 @@
+import { parseDatabaseBackend } from "@/lib/db/backendSelection";
+import { getSelectedPersistenceIdentity } from "@/lib/db/controlPlaneContext";
+import { runPersistenceBackgroundWork } from "@/lib/db/persistenceRuntime";
+import { createPersistencePoller, type PersistencePoller } from "@/lib/config/persistencePoller";
+import { getSelectedPostgresDatabase, assertSqliteBackendAllowed } from "./db/controlPlaneContext";
+import {
+  catalogValue,
+  requirePostgresCatalogSnapshot,
+  mutatePostgresCatalog,
+  putCatalogValue,
+  deleteCatalogValue,
+  withPostgresCatalogSnapshot,
+  hasPostgresCatalogSnapshot,
+} from "./db/postgres/catalogSnapshot";
+import {
+  applyArenaEloRefreshAsync,
+  deleteModelIntelligenceBySourceAsync,
+} from "./db/modelIntelligence";
 /**
  * arenaEloSync.ts — Arena AI leaderboard ELO sync engine.
  *
@@ -178,10 +196,15 @@ const KV_READ_SQL = `SELECT value FROM key_value WHERE namespace = ? AND key = ?
 const KV_WRITE_SQL = `INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES (?, ?, ?)`;
 
 function readLastFailedAt(): number | null {
+  const native = Boolean(getSelectedPostgresDatabase());
+  if (native) requirePostgresCatalogSnapshot();
   try {
-    const db = getDbInstance();
-    const row = db.prepare(KV_READ_SQL).get("arena_elo", "lastFailedAt") as
-      { value: string } | undefined;
+    const db = native ? undefined : getDbInstance();
+    const row = (
+      native
+        ? catalogValue("arena_elo", "lastFailedAt")
+        : db.prepare(KV_READ_SQL).get("arena_elo", "lastFailedAt")
+    ) as { value: string } | undefined;
     if (!row?.value) return null;
     const ts = Date.parse(row.value);
     return Number.isFinite(ts) ? ts : null;
@@ -477,6 +500,9 @@ function withSynthesizedBaseRows(
  * @returns Sync result with model count and success status.
  */
 export async function syncArenaElo(dryRun = false): Promise<SyncResult> {
+  const database = getSelectedPostgresDatabase();
+  if (database && !hasPostgresCatalogSnapshot(database))
+    return withPostgresCatalogSnapshot(database, () => syncArenaElo(dryRun));
   if (syncInProgress) {
     return {
       success: false,
@@ -489,7 +515,7 @@ export async function syncArenaElo(dryRun = false): Promise<SyncResult> {
   try {
     // Backup DB before first sync (same pattern as pricingSync)
     if (!firstSyncDone && !dryRun) {
-      backupDbFile("pre-arena-elo-sync");
+      if (!database) backupDbFile("pre-arena-elo-sync");
       firstSyncDone = true;
     }
 
@@ -530,8 +556,15 @@ export async function syncArenaElo(dryRun = false): Promise<SyncResult> {
     if (!dryRun && entries.length > 0) {
       try {
         // Atomic replace: upsert all + prune not-in-refreshed-set in one tx.
-        applyArenaEloRefresh(entries);
-        clearLastFailedAt();
+        if (database)
+          await mutatePostgresCatalog(database, async () => {
+            await applyArenaEloRefreshAsync(entries);
+            await deleteCatalogValue("arena_elo", "lastFailedAt");
+          });
+        else {
+          applyArenaEloRefresh(entries);
+          clearLastFailedAt();
+        }
       } catch (err) {
         const message = getErrorMessage(err);
         console.warn(`[ARENA_ELO_SYNC] Failed to apply intelligence refresh: ${message}`);
@@ -565,7 +598,15 @@ export async function syncArenaElo(dryRun = false): Promise<SyncResult> {
     if (!dryRun) {
       // Persist the failure so restarts/periodic ticks back off instead of
       // retrying a dead upstream in a loop.
-      writeLastFailedAt(Date.now());
+      if (database) {
+        try {
+          await mutatePostgresCatalog(database, () =>
+            putCatalogValue("arena_elo", "lastFailedAt", new Date().toISOString())
+          );
+        } catch {
+          console.warn("[ARENA_ELO_SYNC] Failed to persist failure backoff");
+        }
+      } else writeLastFailedAt(Date.now());
     }
     return {
       success: false,
@@ -588,6 +629,7 @@ export async function syncArenaElo(dryRun = false): Promise<SyncResult> {
  * DELETE /api/intelligence/sync endpoint.
  */
 export function clearSyncedIntelligence(): void {
+  assertSqliteBackendAllowed();
   const deleted = deleteModelIntelligenceBySource("arena_elo");
   console.log(`[ARENA_ELO_SYNC] Cleared ${deleted} arena_elo intelligence entries`);
 }
@@ -603,7 +645,65 @@ export function clearSyncedIntelligence(): void {
  *
  * @param intervalMs - Override interval in milliseconds (defaults to env or 86400s).
  */
+interface NativeSchedulerOwner {
+  readonly identity: object;
+  readonly poller: PersistencePoller;
+  stopping?: Promise<void>;
+}
+const NATIVE_SCHEDULER = Symbol.for("omniroute.arenaEloSync.postgresScheduler");
+const nativeGlobals = globalThis as typeof globalThis & {
+  [NATIVE_SCHEDULER]?: NativeSchedulerOwner;
+};
+
+function isNativeSchedulerRunning(): boolean {
+  const owner = nativeGlobals[NATIVE_SCHEDULER];
+  return Boolean(owner && !owner.stopping);
+}
+
+function stopNativePoller(): Promise<void> {
+  const owner = nativeGlobals[NATIVE_SCHEDULER];
+  if (!owner) return Promise.resolve();
+
+  owner.stopping ??= owner.poller.stop().finally(() => {
+    if (nativeGlobals[NATIVE_SCHEDULER] === owner) nativeGlobals[NATIVE_SCHEDULER] = undefined;
+  });
+  return owner.stopping;
+}
+
 function startPeriodicSync(intervalMs?: number): void {
+  if (parseDatabaseBackend() === "postgres") {
+    const identity = getSelectedPersistenceIdentity();
+    if (!identity) throw new Error("Native scheduler requires selected PostgreSQL persistence");
+    const existing = nativeGlobals[NATIVE_SCHEDULER];
+    if (existing) {
+      if (existing.identity !== identity || existing.stopping)
+        throw new Error("Native scheduler authority changed or is draining");
+      return;
+    }
+    const interval = intervalMs ?? SYNC_INTERVAL_MS;
+    activeSyncIntervalMs = interval;
+    const poller = createPersistencePoller({
+      intervalMs: interval,
+      initialDelayMs: 0,
+      check: async (phase) => {
+        await runPersistenceBackgroundWork(async () => {
+          if (getSelectedPersistenceIdentity() !== identity)
+            throw new Error("Native scheduler persistence identity changed");
+          const result = await syncArenaElo();
+          if (result.success)
+            console.log(
+              `[ARENA_ELO_SYNC] ${phase === "start" ? "Initial" : "Periodic"} sync complete: ${result.modelCount} entries`
+            );
+        });
+      },
+      onFailure: () => {
+        console.warn("[ARENA_ELO_SYNC] Native periodic sync failed");
+      },
+    });
+    nativeGlobals[NATIVE_SCHEDULER] = { identity, poller };
+    poller.start();
+    return;
+  }
   if (syncTimer) return; // Already running
 
   const interval = intervalMs ?? SYNC_INTERVAL_MS;
@@ -651,6 +751,10 @@ function startPeriodicSync(intervalMs?: number): void {
  * Stop periodic Arena ELO sync and clean up the timer.
  */
 export function stopArenaEloSync(): void {
+  if (parseDatabaseBackend() === "postgres") {
+    void stopNativePoller().catch(() => {});
+    return;
+  }
   if (syncTimer) {
     clearInterval(syncTimer);
     syncTimer = null;
@@ -671,7 +775,7 @@ export function getArenaEloSyncStatus(): SyncStatus {
     lastSync: lastSyncTime,
     lastSyncModelCount,
     nextSync:
-      syncTimer && lastSyncTime
+      (isNativeSchedulerRunning() || syncTimer) && lastSyncTime
         ? new Date(new Date(lastSyncTime).getTime() + activeSyncIntervalMs).toISOString()
         : null,
     intervalMs: activeSyncIntervalMs,
@@ -701,4 +805,15 @@ export async function initArenaEloSync(): Promise<boolean> {
   }
   startPeriodicSync();
   return true;
+}
+
+export async function clearSyncedIntelligenceAsync(): Promise<void> {
+  if (!getSelectedPostgresDatabase()) return clearSyncedIntelligence();
+  const deleted = await deleteModelIntelligenceBySourceAsync("arena_elo");
+  console.log(`[ARENA_ELO_SYNC] Cleared ${deleted} arena_elo intelligence entries`);
+}
+
+export async function stopArenaEloSyncAsync(): Promise<void> {
+  if (parseDatabaseBackend() !== "postgres") return stopArenaEloSync();
+  await stopNativePoller();
 }

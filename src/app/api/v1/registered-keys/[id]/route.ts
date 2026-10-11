@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { isAuthenticated } from "@/shared/utils/apiAuth";
-import { getRegisteredKey, revokeRegisteredKey } from "@/lib/db/registeredKeys";
+import { getRegisteredKeyAsync, revokeRegisteredKeyAsync } from "@/lib/db/registeredKeys";
 
 // ─── GET /api/v1/registered-keys/[id] ────────────────────────────────────────
 
@@ -10,7 +10,7 @@ export async function GET(request: Request, { params }: { params: Promise<{ id: 
   }
 
   const resolvedParams = await params;
-  const key = getRegisteredKey(resolvedParams.id);
+  const key = await getRegisteredKeyAsync(resolvedParams.id);
   if (!key) {
     return NextResponse.json({ error: "Key not found" }, { status: 404 });
   }
@@ -26,7 +26,7 @@ export async function DELETE(request: Request, { params }: { params: Promise<{ i
   }
 
   const resolvedParams = await params;
-  const revoked = revokeRegisteredKey(resolvedParams.id);
+  const revoked = await revokeRegisteredKeyAsync(resolvedParams.id);
   if (!revoked) {
     return NextResponse.json({ error: "Key not found or already revoked" }, { status: 404 });
   }

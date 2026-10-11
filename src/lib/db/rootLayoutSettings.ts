@@ -1,4 +1,7 @@
 import { getExistingDbInstance } from "./singleton";
+import { getSelectedPostgresDatabase } from "./controlPlaneContext";
+import { catalogNamespaceRows, hasPostgresCatalogSnapshot } from "./postgres/catalogSnapshot";
+import { listPostgresKeyValueNamespace } from "./postgres/keyValueRepository";
 
 export interface RootLayoutSettings {
   instanceName: string;
@@ -39,15 +42,22 @@ function parseStoredString(value: unknown): string | null {
 
 /** Read only the settings needed while compiling and rendering the root layout. */
 export async function getRootLayoutSettings(): Promise<RootLayoutSettings> {
-  const db = getExistingDbInstance();
-  if (!db) return { ...DEFAULT_ROOT_LAYOUT_SETTINGS };
-
-  const rows = db
-    .prepare(
-      `SELECT key, value FROM key_value
-       WHERE namespace = 'settings' AND key IN (?, ?, ?)`
-    )
-    .all(...ROOT_LAYOUT_SETTING_KEYS) as SettingsRow[];
+  const postgres = getSelectedPostgresDatabase();
+  let rows: SettingsRow[];
+  if (postgres) {
+    rows = hasPostgresCatalogSnapshot(postgres)
+      ? catalogNamespaceRows("settings")
+      : await listPostgresKeyValueNamespace(postgres, "settings");
+  } else {
+    const db = getExistingDbInstance();
+    if (!db) return { ...DEFAULT_ROOT_LAYOUT_SETTINGS };
+    rows = db
+      .prepare(
+        `SELECT key, value FROM key_value
+         WHERE namespace = 'settings' AND key IN (?, ?, ?)`
+      )
+      .all(...ROOT_LAYOUT_SETTING_KEYS) as SettingsRow[];
+  }
   const settings = { ...DEFAULT_ROOT_LAYOUT_SETTINGS };
 
   for (const row of rows) {

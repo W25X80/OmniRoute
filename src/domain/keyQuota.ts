@@ -23,6 +23,10 @@ import {
   incrementKeyQuotaCounter,
   type KeyQuotaStatus,
 } from "@/lib/db/keyQuota";
+import {
+  getKeyQuotaStatusAsync,
+  recordKeyQuotaUsageAsync as persistKeyQuotaUsage,
+} from "@/lib/db/keyQuota";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -106,3 +110,35 @@ export function recordKeyQuotaUsage(
 }
 
 export type { KeyQuotaStatus };
+
+/** Asynchronous gate preserves the documented B16 infrastructure fail-open rule. */
+export async function checkKeyQuotaAsync(
+  apiKeyId: string | null | undefined,
+  deps: CheckKeyQuotaDeps = {}
+): Promise<KeyQuotaVerdict> {
+  if (!apiKeyId) return { allowed: true, reason: null, dimension: null };
+  try {
+    const status = await getKeyQuotaStatusAsync(apiKeyId, deps);
+    if (!status.enabled) return { allowed: true, reason: null, dimension: null, status };
+    if (status.tpmExceeded) return verdict(false, "tpm", status);
+    if (status.rpmExceeded) return verdict(false, "rpm", status);
+    if (status.monthlyExceeded) return verdict(false, "monthly", status);
+    return verdict(true, null, status);
+  } catch {
+    return { allowed: true, reason: null, dimension: null };
+  }
+}
+
+/** Asynchronous recorder preserves B29, without leaving an unhandled Promise. */
+export async function recordKeyQuotaUsageAsync(
+  id: string | null | undefined,
+  tokens: number,
+  deps: RecordKeyQuotaDeps = {}
+): Promise<void> {
+  if (!id) return;
+  try {
+    await persistKeyQuotaUsage(id, tokens, (deps.now ?? Date.now)());
+  } catch {
+    /* B29: accounting remains non-fatal. */
+  }
+}

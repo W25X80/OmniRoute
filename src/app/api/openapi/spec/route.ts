@@ -5,8 +5,11 @@
 
 import { NextResponse } from "next/server";
 import fs from "fs";
+import fsp from "node:fs/promises";
+import { setImmediate as yieldToEventLoop } from "node:timers/promises";
 import path from "path";
 import * as yaml from "js-yaml";
+import { parseDatabaseBackend } from "@/lib/db/backendSelection";
 import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
 
 let cachedSpec: { data: any; mtime: number } | null = null;
@@ -112,11 +115,33 @@ export function generateExampleFromSchema(
   }
 }
 
+let nativeSpecRead: Promise<NextResponse> | undefined;
+let nativeCachedPath: string | undefined;
+
 export async function GET() {
+  if (parseDatabaseBackend() !== "postgres") return readOpenApiSpec();
+  if (nativeSpecRead) return (await nativeSpecRead).clone();
+  const reading = readOpenApiSpec();
+  nativeSpecRead = reading;
+  try {
+    return (await reading).clone();
+  } finally {
+    if (nativeSpecRead === reading) nativeSpecRead = undefined;
+  }
+}
+
+async function readOpenApiSpec() {
   try {
     let specPath = "";
     for (const p of OPENAPI_SPEC_CANDIDATES) {
-      if (fs.existsSync(p)) {
+      const present =
+        parseDatabaseBackend() === "postgres"
+          ? await fsp.access(p).then(
+              () => true,
+              () => false
+            )
+          : fs.existsSync(p);
+      if (present) {
         specPath = p;
         break;
       }
@@ -126,15 +151,23 @@ export async function GET() {
       return NextResponse.json({ error: "openapi.yaml not found" }, { status: 404 });
     }
 
-    const stat = fs.statSync(specPath);
+    const stat =
+      parseDatabaseBackend() === "postgres" ? await fsp.stat(specPath) : fs.statSync(specPath);
     const mtime = stat.mtimeMs;
 
     // Use cache if file hasn't changed
-    if (cachedSpec && cachedSpec.mtime === mtime) {
+    if (
+      cachedSpec &&
+      cachedSpec.mtime === mtime &&
+      (parseDatabaseBackend() !== "postgres" || nativeCachedPath === specPath)
+    ) {
       return NextResponse.json(cachedSpec.data);
     }
 
-    const content = fs.readFileSync(specPath, "utf-8");
+    const content =
+      parseDatabaseBackend() === "postgres"
+        ? await fsp.readFile(specPath, "utf-8")
+        : fs.readFileSync(specPath, "utf-8");
     const raw: any = yaml.load(content);
 
     // Build a structured catalog
@@ -148,7 +181,10 @@ export async function GET() {
 
     // Parse paths into flat endpoint list
     const paths = raw.paths || {};
+    let processedPaths = 0;
     for (const [pathStr, methods] of Object.entries(paths as Record<string, any>)) {
+      if (parseDatabaseBackend() === "postgres" && ++processedPaths % 32 === 0)
+        await yieldToEventLoop();
       if (!methods || typeof methods !== "object") continue;
       for (const [method, spec] of Object.entries(methods as Record<string, any>)) {
         if (["get", "post", "put", "patch", "delete"].includes(method) && spec) {
@@ -184,6 +220,7 @@ export async function GET() {
     }
 
     cachedSpec = { data: catalog, mtime };
+    if (parseDatabaseBackend() === "postgres") nativeCachedPath = specPath;
 
     return NextResponse.json(catalog);
   } catch (error: any) {

@@ -1,3 +1,5 @@
+import { validateQuotaEventTimeMs } from "@/lib/quota/eventTime";
+
 /**
  * chatCore quota-share consumption POST-hook (Quality Gate v2 / Fase 9 — chatCore god-file
  * decomposition, #3501).
@@ -36,5 +38,40 @@ export async function scheduleQuotaShareConsumption(args: {
     );
   } catch (_) {
     // Outer fail-open — never throws to caller
+  }
+}
+
+export async function scheduleQuotaShareConsumptionAsync(
+  args: Parameters<typeof scheduleQuotaShareConsumption>[0] & { completedAtMs?: number }
+): Promise<void> {
+  if (!args.apiKeyId || !args.connectionId) return;
+  try {
+    const eventTimeMs = validateQuotaEventTimeMs(
+      args.completedAtMs === undefined ? Date.now() : args.completedAtMs
+    );
+    const { apiKeyId, connectionId, provider, model, estimatedCost } = args;
+    const tokenUsage =
+      args.usage && typeof args.usage === "object"
+        ? {
+            prompt_tokens: (args.usage as Record<string, unknown>).prompt_tokens,
+            completion_tokens: (args.usage as Record<string, unknown>).completion_tokens,
+          }
+        : null;
+    const [{ buildConsumptionCost }, { recordConsumption }] = await Promise.all([
+      import("@/lib/quota/spendRecorder"),
+      import("@/lib/quota/enforce"),
+    ]);
+    await recordConsumption(
+      {
+        apiKeyId,
+        connectionId,
+        provider: provider ?? "unknown",
+        model: model ?? undefined,
+        cost: buildConsumptionCost(tokenUsage, estimatedCost),
+      },
+      eventTimeMs
+    );
+  } catch {
+    // Preserve the source POST-hook's outer fail-open contract.
   }
 }

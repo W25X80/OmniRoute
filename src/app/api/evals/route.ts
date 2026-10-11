@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { NextResponse } from "next/server";
-import { getEvalScorecard, listEvalRuns } from "@/lib/db/evals";
+import { getEvalScorecardAsync, listEvalRunsAsync } from "@/lib/db/evals";
 import { getApiKeys } from "@/lib/db/apiKeys";
-import { listSuites, runSuite, createScorecard } from "@/lib/evals/evalRunner";
+import { listSuitesAsync, runSuiteAsync, createScorecard } from "@/lib/evals/evalRunner";
 import { buildEvalTargetOptions, runEvalSuiteAgainstTarget } from "@/lib/evals/runtime";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 import { evalRunSuiteSchema } from "@/shared/validation/schemas";
@@ -14,13 +14,11 @@ export async function GET(request: Request) {
   if (authError) return authError;
 
   try {
-    const [suites, recentRuns, scorecard, targets, apiKeys] = await Promise.all([
-      Promise.resolve(listSuites()),
-      Promise.resolve(listEvalRuns({ limit: 20 })),
-      Promise.resolve(getEvalScorecard({ limit: 50 })),
-      buildEvalTargetOptions(),
-      getApiKeys(),
-    ]);
+    const suites = await listSuitesAsync();
+    const recentRuns = await listEvalRunsAsync({ limit: 20 });
+    const scorecard = await getEvalScorecardAsync({ limit: 50 });
+    const targets = await buildEvalTargetOptions();
+    const apiKeys = await getApiKeys();
 
     return NextResponse.json({
       suites,
@@ -66,7 +64,7 @@ export async function POST(request: Request) {
     const { suiteId, outputs, target, compareTarget, apiKeyId } = validation.data;
 
     if (outputs && Object.keys(outputs).length > 0) {
-      const result = runSuite(suiteId, outputs);
+      const result = await runSuiteAsync(suiteId, outputs);
       return NextResponse.json(result);
     }
 
@@ -104,8 +102,8 @@ export async function POST(request: Request) {
       runGroupId,
       runs,
       scorecard,
-      recentRuns: listEvalRuns({ limit: 20 }),
-      historyScorecard: getEvalScorecard({ limit: 50 }),
+      recentRuns: await listEvalRunsAsync({ limit: 20 }),
+      historyScorecard: await getEvalScorecardAsync({ limit: 50 }),
     });
   } catch (error: unknown) {
     return NextResponse.json({ error: sanitizeErrorMessage(error) }, { status: 500 });

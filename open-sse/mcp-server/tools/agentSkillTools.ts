@@ -1,9 +1,11 @@
 import { z } from "zod";
+import { parseDatabaseBackend } from "@/lib/db/backendSelection";
 import {
   getCatalog,
   getSkillById,
   filterCatalog,
   computeCoverage,
+  computeCoverageAsync,
   fetchSkillMarkdown,
 } from "@/lib/agentSkills/catalog";
 import type { AgentSkill, SkillCoverage } from "@/lib/agentSkills/types";
@@ -55,7 +57,8 @@ export const agentSkillTools = {
           githubUrl: s.githubUrl,
         })),
         count: skills.length,
-        coverage: computeCoverage(),
+        coverage:
+          parseDatabaseBackend() === "postgres" ? await computeCoverageAsync() : computeCoverage(),
       };
     },
   },
@@ -88,7 +91,8 @@ export const agentSkillTools = {
     inputSchema: AgentSkillsCoverageSchema,
     scopes: ["read:catalog"],
     handler: async (_args: z.infer<typeof AgentSkillsCoverageSchema>) => {
-      const coverage: SkillCoverage = computeCoverage();
+      const coverage: SkillCoverage =
+        parseDatabaseBackend() === "postgres" ? await computeCoverageAsync() : computeCoverage();
       return coverage;
     },
   },

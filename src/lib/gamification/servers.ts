@@ -1,3 +1,11 @@
+import { parseDatabaseBackend } from "@/lib/db/backendSelection";
+import { getSelectedPostgresDatabase } from "@/lib/db/controlPlaneContext";
+import { deriveFederationTokenHashAsync } from "@/lib/gamification/federationTokenDerivation";
+import {
+  getServerEndpointAsync,
+  applyRemoteScoresAsync,
+  setServerSyncErrorAsync,
+} from "../db/gamificationRuntime";
 /**
  * Community server federation — connect, sync, and manage servers.
  *
@@ -24,30 +32,40 @@ export async function connectServer(
   apiKey: string
 ): Promise<ServerConnection> {
   const id = crypto.randomUUID();
-  const apiKeyHash = crypto
-    .pbkdf2Sync(apiKey, "omniroute-federation-salt", 120000, 32, "sha256")
-    .toString("hex");
+  const apiKeyHash =
+    parseDatabaseBackend() === "postgres" || getSelectedPostgresDatabase()
+      ? await deriveFederationTokenHashAsync(apiKey)
+      : crypto
+          .pbkdf2Sync(apiKey, "omniroute-federation-salt", 120000, 32, "sha256")
+          .toString("hex");
 
-  const { connectServer: dbConnect } = await import("../db/gamification");
-  dbConnect(id, name, url, apiKeyHash);
+  const { connectServerAsync: dbConnect } = await import("../db/gamification");
+  await dbConnect(id, name, url, apiKeyHash);
 
-  return { id, name, url, status: "connected", lastSyncAt: null, errorMessage: null };
+  return {
+    id,
+    name,
+    url,
+    status: "connected",
+    lastSyncAt: null,
+    errorMessage: null,
+  };
 }
 
 /**
  * Disconnect from a community server.
  */
 export async function disconnectServer(serverId: string): Promise<void> {
-  const { disconnectServer: dbDisconnect } = await import("../db/gamification");
-  dbDisconnect(serverId);
+  const { disconnectServerAsync: dbDisconnect } = await import("../db/gamification");
+  await dbDisconnect(serverId);
 }
 
 /**
  * List all connected servers.
  */
 export async function listServers(): Promise<ServerConnection[]> {
-  const { listServers: dbList } = await import("../db/gamification");
-  return dbList() as ServerConnection[];
+  const { listServersAsync: dbList } = await import("../db/gamification");
+  return (await dbList()) as ServerConnection[];
 }
 
 /**
@@ -57,13 +75,7 @@ export async function listServers(): Promise<ServerConnection[]> {
 export async function syncLeaderboard(
   serverId: string
 ): Promise<{ synced: number; errors: string[] }> {
-  const db = (await import("../db/core")).getDbInstance();
-
-  const server = db
-    .prepare(
-      "SELECT url, api_key_hash FROM community_servers WHERE id = ? AND status = 'connected'"
-    )
-    .get(serverId) as { url: string; api_key_hash: string } | undefined;
+  const server = await getServerEndpointAsync(serverId, true);
 
   if (!server) {
     return { synced: 0, errors: ["Server not found or not connected"] };
@@ -72,7 +84,7 @@ export async function syncLeaderboard(
   try {
     // Fetch remote leaderboard
     const response = await fetch(`${server.url}/api/gamification/federation/leaderboard`, {
-      headers: { Authorization: `Bearer ${server.api_key_hash}` },
+      headers: { Authorization: `Bearer ${server.apiKeyHash}` },
       signal: AbortSignal.timeout(10000),
     });
 
@@ -84,29 +96,11 @@ export async function syncLeaderboard(
       entries: Array<{ apiKeyId: string; score: number }>;
     };
 
-    // Overwrite local scores with remote scores (not additive)
-    const db2 = (await import("../db/core")).getDbInstance();
-    for (const entry of data.entries) {
-      db2
-        .prepare(
-          `INSERT INTO leaderboard (api_key_id, scope, score, updated_at)
-         VALUES (?, 'global', ?, datetime('now'))
-         ON CONFLICT(api_key_id, scope) DO UPDATE SET score = excluded.score, updated_at = excluded.updated_at`
-        )
-        .run(entry.apiKeyId, entry.score);
-    }
-
-    // Update last sync time
-    db.prepare(
-      "UPDATE community_servers SET last_sync_at = datetime('now'), error_message = NULL WHERE id = ?"
-    ).run(serverId);
+    await applyRemoteScoresAsync(serverId, data.entries);
 
     return { synced: data.entries.length, errors: [] };
   } catch (err: any) {
-    db.prepare("UPDATE community_servers SET status = 'error', error_message = ? WHERE id = ?").run(
-      err.message,
-      serverId
-    );
+    await setServerSyncErrorAsync(serverId, err instanceof Error ? err.message : String(err));
 
     return { synced: 0, errors: [err.message] };
   }
@@ -120,13 +114,7 @@ export async function pushScore(
   apiKeyId: string,
   score: number
 ): Promise<{ success: boolean; error?: string }> {
-  const db = (await import("../db/core")).getDbInstance();
-
-  const server = db
-    .prepare(
-      "SELECT url, api_key_hash FROM community_servers WHERE id = ? AND status = 'connected'"
-    )
-    .get(serverId) as { url: string; api_key_hash: string } | undefined;
+  const server = await getServerEndpointAsync(serverId, true);
 
   if (!server) {
     return { success: false, error: "Server not found or not connected" };
@@ -136,7 +124,7 @@ export async function pushScore(
     const response = await fetch(`${server.url}/api/gamification/federation/score`, {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${server.api_key_hash}`,
+        Authorization: `Bearer ${server.apiKeyHash}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({ apiKeyId, score }),
@@ -159,11 +147,7 @@ export async function pushScore(
 export async function healthCheck(
   serverId: string
 ): Promise<{ healthy: boolean; latencyMs: number }> {
-  const db = (await import("../db/core")).getDbInstance();
-
-  const server = db.prepare("SELECT url FROM community_servers WHERE id = ?").get(serverId) as
-    | { url: string }
-    | undefined;
+  const server = await getServerEndpointAsync(serverId, false);
 
   if (!server) return { healthy: false, latencyMs: 0 };
 

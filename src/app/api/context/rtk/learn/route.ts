@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import {
   suggestFilter,
   commandToId,
-  listRtkCommandSamples,
+  listRtkCommandSamplesAsync as listRtkCommandSamples,
 } from "@omniroute/open-sse/services/compression/engines/rtk";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 
@@ -28,14 +28,19 @@ export async function GET(request: Request) {
   const command = (url.searchParams.get("command") || "").trim();
   if (!command) {
     return NextResponse.json(
-      { error: { message: "The 'command' query parameter is required.", type: "invalid_request" } },
+      {
+        error: {
+          message: "The 'command' query parameter is required.",
+          type: "invalid_request",
+        },
+      },
       { status: 400 }
     );
   }
 
   const limit = parseLimit(url.searchParams.get("limit"));
   const targetId = commandToId(command);
-  const matching = listRtkCommandSamples({ limit }).filter(
+  const matching = (await listRtkCommandSamples({ limit })).filter(
     (sample) => commandToId(sample.command) === targetId
   );
   const filter = suggestFilter(command, matching);

@@ -10,10 +10,11 @@
  * Response: { skills: AgentSkill[], count: number, coverage: SkillCoverage }
  */
 import { NextResponse } from "next/server";
+import { parseDatabaseBackend } from "@/lib/db/backendSelection";
 
 import { buildErrorBody } from "@omniroute/open-sse/utils/error.ts";
 import { ListQuerySchema } from "@/lib/agentSkills/schemas";
-import { filterCatalog, computeCoverage } from "@/lib/agentSkills/catalog";
+import { filterCatalog, computeCoverage, computeCoverageAsync } from "@/lib/agentSkills/catalog";
 
 // Catalog reads filesystem on demand — disable static caching
 export const dynamic = "force-dynamic";
@@ -30,12 +31,13 @@ export async function GET(request: Request) {
     if (!parsed.success) {
       return NextResponse.json(
         buildErrorBody(400, parsed.error.issues[0]?.message ?? "Invalid query parameters"),
-        { status: 400 },
+        { status: 400 }
       );
     }
 
     const skills = filterCatalog(parsed.data);
-    const coverage = computeCoverage();
+    const coverage =
+      parseDatabaseBackend() === "postgres" ? await computeCoverageAsync() : computeCoverage();
 
     return NextResponse.json({ skills, count: skills.length, coverage });
   } catch (error) {

@@ -1,9 +1,10 @@
+import { runPersistenceBackgroundWork } from "@/lib/db/persistenceRuntime";
 import { NextResponse } from "next/server";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 import { validateBody, isValidationFailure } from "@/shared/validation/helpers";
 import { MemoryReindexSchema } from "@/shared/schemas/memory";
-import { runReindexBatch, getReindexPending } from "@/lib/memory/reindex";
-import { markAllMemoriesNeedReindex } from "@/lib/db/memoryVec";
+import { runReindexBatch, getReindexPendingAsync } from "@/lib/memory/reindex";
+import { markAllMemoriesNeedReindexAsync } from "@/lib/db/memoryVec";
 import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error.ts";
 import { logger } from "@omniroute/open-sse/utils/logger.ts";
 
@@ -32,14 +33,14 @@ export async function POST(request: Request) {
 
   try {
     if (force) {
-      markAllMemoriesNeedReindex();
+      await markAllMemoriesNeedReindexAsync();
     }
 
-    const pending = getReindexPending();
+    const pending = await getReindexPendingAsync();
 
     // Dispatch batch in background — do NOT await (returns immediate response).
     setImmediate(() => {
-      runReindexBatch(100).catch((err: unknown) => {
+      runPersistenceBackgroundWork(() => runReindexBatch(100)).catch((err: unknown) => {
         log.error("memory.reindex.background.fail", {
           error: sanitizeErrorMessage(err instanceof Error ? err.message : String(err)),
         });

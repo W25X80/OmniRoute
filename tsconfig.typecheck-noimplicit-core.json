@@ -14,6 +14,11 @@
     "src/lib/db/apiKeys.ts",
     "src/lib/db/cliToolState.ts",
     "src/lib/db/encryption.ts",
+    "src/lib/db/postgres/connect.ts",
+    "src/lib/db/postgres/migrations.ts",
+    "src/lib/db/postgres/routingImport.ts",
+    "src/lib/db/postgres/comboRepository.ts",
+    "src/lib/db/postgres/modelComboMappingRepository.ts",
     "src/lib/db/prompts.ts",
     "src/lib/db/providers.ts",
     "src/lib/db/settings.ts",
@@ -28,7 +33,9 @@
     "src/shared/validation/providerSchema.ts",
     "src/shared/validation/schemas.ts",
     "open-sse/handlers/responseSanitizer.ts",
-    "open-sse/handlers/responseTranslator.ts"
+    "open-sse/handlers/responseTranslator.ts",
+    "src/lib/db/postgres/controlPlane.ts",
+    "src/lib/db/postgres/secretRepository.ts"
   ],
   "exclude": ["node_modules", ".next", "app.__qa_backup", "vscode-extension"]
 }

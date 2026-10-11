@@ -1,3 +1,4 @@
+import { saveServiceModelsAsync } from "@/lib/db/serviceModels";
 /**
  * Model sync job for embedded services.
  *
@@ -9,9 +10,16 @@
  * SYNC_INTERVAL_MS. Stops automatically when the service stops.
  */
 
+import { parseDatabaseBackend } from "@/lib/db/backendSelection";
 import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
-import { getServiceModels, saveServiceModels, type ServiceModel } from "@/lib/db/serviceModels";
+import { getServiceModels, type ServiceModel } from "@/lib/db/serviceModels";
 import { updateVersionManagerTool } from "@/lib/db/versionManager";
+import {
+  captureNativeEmbeddedServices,
+  getNativeEmbeddedServices,
+  assertNativeServiceActivation,
+  runNativeServiceWork,
+} from "./nativeLifecycle";
 
 const SYNC_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 const FETCH_TIMEOUT_MS = 10_000;
@@ -54,7 +62,7 @@ export async function syncServiceModels(
         id: m.id.startsWith(`${tool}/`) ? m.id : `${tool}/${m.id}`,
       }));
 
-    saveServiceModels(tool, models);
+    await saveServiceModelsAsync(tool, models);
     await updateVersionManagerTool(tool, { lastSyncAt: new Date().toISOString() });
 
     console.log(`[ModelSync:${tool}] synced ${models.length} model(s)`);
@@ -76,6 +84,35 @@ export function scheduleServiceModelSync(
   apiKey: string,
   intervalMs = SYNC_INTERVAL_MS
 ): void {
+  if (parseDatabaseBackend() === "postgres") {
+    const owner = captureNativeEmbeddedServices()!;
+    assertNativeServiceActivation(owner);
+    if (owner.modelTimers.has(tool)) return;
+    const dispatch = () => {
+      if (owner.closing) return;
+      const work = runNativeServiceWork(owner, async () => {
+        await syncServiceModels(tool, baseUrl, apiKey);
+      });
+      const runs = owner.modelRuns.get(tool) ?? new Set<Promise<void>>();
+      owner.modelRuns.set(tool, runs);
+      runs.add(work);
+      void work.then(
+        () => runs.delete(work),
+        () => runs.delete(work)
+      );
+      void work.catch((error: unknown) =>
+        console.warn(
+          `[ModelSync:${tool}] background work failed: ${sanitizeErrorMessage(error instanceof Error ? error.message : String(error))}`
+        )
+      );
+    };
+    dispatch();
+    const timer = setInterval(dispatch, intervalMs);
+    timer.unref?.();
+    owner.modelTimers.set(tool, timer);
+    console.log(`[ModelSync:${tool}] scheduler started (interval ${intervalMs / 1000}s)`);
+    return;
+  }
   if (activeTimers.has(tool)) return;
 
   // First sync immediately (non-blocking)
@@ -94,6 +131,15 @@ export function scheduleServiceModelSync(
  * Stop the periodic sync for a service.
  */
 export function stopServiceModelSync(tool: string): void {
+  if (parseDatabaseBackend() === "postgres") {
+    const owner = getNativeEmbeddedServices();
+    const timer = owner?.modelTimers.get(tool);
+    if (!timer) return;
+    clearInterval(timer);
+    owner!.modelTimers.delete(tool);
+    console.log(`[ModelSync:${tool}] scheduler stopped`);
+    return;
+  }
   const timer = activeTimers.get(tool);
   if (!timer) return;
   clearInterval(timer);
@@ -103,3 +149,11 @@ export function stopServiceModelSync(tool: string): void {
 
 /** Re-export read path so consumers don't need to import two modules. */
 export { getServiceModels };
+
+/** Wait for model writes already accepted by this service's scheduler. */
+export async function stopServiceModelSyncAsync(tool: string): Promise<void> {
+  stopServiceModelSync(tool);
+  if (parseDatabaseBackend() !== "postgres") return;
+  const runs = getNativeEmbeddedServices()?.modelRuns.get(tool);
+  while (runs?.size) await Promise.allSettled(Array.from(runs));
+}

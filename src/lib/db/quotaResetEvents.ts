@@ -1,4 +1,5 @@
 import { getDbInstance } from "./core";
+import { getSelectedPostgresDatabase } from "./controlPlaneContext";
 
 interface StatementLike<TRow = unknown> {
   all: (...params: unknown[]) => TRow[];
@@ -331,4 +332,134 @@ export function getProviderQuotaWindowStartIso(
   nowMs = Date.now()
 ): string | null {
   return getProviderQuotaWindowStart(connectionId, targetResetAtIso, nowMs)?.windowStartIso ?? null;
+}
+
+export async function recordProviderQuotaResetEventIfChangedAsync(
+  input: ResetEventInput
+): Promise<void> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return recordProviderQuotaResetEventIfChanged(input);
+  if (!input.connectionId || !input.windowKey || !isPrimaryWeeklyWindow(input.windowKey)) return;
+  const currentResetIso = parseResetIso(input.currentResetAt);
+  if (!currentResetIso) return;
+  await database.transaction(async (tx) => {
+    await tx.query("SELECT pg_advisory_xact_lock(18765,8)");
+    const row = input.previousObservation
+      ? null
+      : (
+          await tx.query(
+            `SELECT next_reset_at,remaining_percentage FROM omniroute.quota_snapshots
+      WHERE connection_id=$1 AND LOWER(window_key)=LOWER($2) AND next_reset_at IS NOT NULL
+      ORDER BY created_at DESC,id DESC LIMIT 1`,
+            [input.connectionId, input.windowKey]
+          )
+        ).rows[0];
+    const previous =
+      input.previousObservation ??
+      (row
+        ? {
+            resetAt: String(row.next_reset_at),
+            remainingPercentage: toNumberOrNull(row.remaining_percentage),
+          }
+        : null);
+    const previousResetIso = parseResetIso(previous?.resetAt ?? null);
+    if (!previousResetIso) return;
+    const previousRemaining = clampPercent(toNumberOrNull(previous?.remainingPercentage)),
+      currentRemaining = clampPercent(toNumberOrNull(input.currentRemainingPercentage));
+    const previousUsed = usedPercent(previousRemaining),
+      currentUsed = usedPercent(currentRemaining);
+    const observedAt = parseResetIso(input.observedAt ?? null) ?? new Date().toISOString();
+    const forward =
+      Date.parse(currentResetIso) > Date.parse(previousResetIso) &&
+      resetDay(previousResetIso) !== resetDay(currentResetIso);
+    const drop =
+      resetDay(previousResetIso) === resetDay(currentResetIso) &&
+      currentUsed !== null &&
+      isResetDrop(previousUsed, currentUsed);
+    if (!forward && !drop) return;
+    await tx.query(
+      `INSERT INTO omniroute.provider_quota_reset_events
+      (provider,connection_id,window_key,window_started_at,window_resets_at,observed_at,previous_remaining_percentage,
+       new_remaining_percentage,previous_used_percentage,new_used_percentage,raw_data,created_at)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NULL,$6)
+      ON CONFLICT(connection_id,window_key,window_started_at,window_resets_at) DO NOTHING`,
+      [
+        input.provider,
+        input.connectionId,
+        input.windowKey,
+        forward ? previousResetIso : observedAt,
+        currentResetIso,
+        observedAt,
+        previousRemaining,
+        currentRemaining,
+        previousUsed,
+        currentUsed,
+      ]
+    );
+  });
+}
+
+export async function getProviderQuotaWindowStartAsync(
+  connectionId: string,
+  targetResetAtIso: string,
+  nowMs = Date.now()
+): Promise<ProviderQuotaWindowStart | null> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return getProviderQuotaWindowStart(connectionId, targetResetAtIso, nowMs);
+  const target = resetDay(targetResetAtIso);
+  if (!connectionId || !target) return null;
+  return database.transaction(async (tx) => {
+    const nowIso = new Date(nowMs).toISOString();
+    const recordedRows = (
+      await tx.query(
+        `SELECT window_started_at,window_resets_at FROM omniroute.provider_quota_reset_events
+      WHERE connection_id=$1 AND LOWER(window_key) LIKE '%weekly%' AND LOWER(window_key) NOT LIKE '%sonnet%'
+      AND observed_at <= $2 ORDER BY observed_at DESC,id DESC`,
+        [connectionId, nowIso]
+      )
+    ).rows;
+    const recorded = recordedRows.find((r) => resetDay(String(r.window_resets_at)) === target);
+    const recordedIso = recorded ? parseResetIso(String(recorded.window_started_at)) : null;
+    const rows = (
+      await tx.query(
+        `SELECT next_reset_at,remaining_percentage,created_at FROM omniroute.quota_snapshots
+      WHERE connection_id=$1 AND LOWER(window_key) LIKE '%weekly%' AND LOWER(window_key) NOT LIKE '%sonnet%'
+      AND created_at <= $2 ORDER BY created_at ASC,id ASC`,
+        [connectionId, nowIso]
+      )
+    ).rows;
+    let first: string | null = null,
+      drop: string | null = null,
+      prior: number | null = null;
+    for (const row of rows) {
+      const created = parseResetIso(String(row.created_at));
+      if (
+        !created ||
+        resetDay(row.next_reset_at === null ? null : String(row.next_reset_at)) !== target
+      )
+        continue;
+      first ??= created;
+      const current = usedPercent(clampPercent(toNumberOrNull(row.remaining_percentage)));
+      if (current !== null) {
+        if (isResetDrop(prior, current)) drop = created;
+        prior = current;
+      }
+    }
+    const observed = drop || first;
+    if (!recordedIso && !observed) return null;
+    if (observed && (!recordedIso || (drop && Date.parse(drop) > Date.parse(recordedIso))))
+      return { windowStartIso: observed, source: "observed_snapshot_reset" };
+    return { windowStartIso: recordedIso!, source: "recorded_reset_event" };
+  });
+}
+
+export async function getProviderQuotaWindowStartIsoAsync(
+  connectionId: string,
+  targetResetAtIso: string,
+  nowMs = Date.now()
+): Promise<string | null> {
+  return (
+    (await getProviderQuotaWindowStartAsync(connectionId, targetResetAtIso, nowMs))
+      ?.windowStartIso ?? null
+  );
 }

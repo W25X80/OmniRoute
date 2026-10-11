@@ -1,6 +1,7 @@
+import { markAllUnavailableAsync } from "@/lib/db/serviceModels";
 import { getVersionManagerTool } from "@/lib/db/versionManager";
 import { getSettings } from "@/lib/db/settings";
-import { markAllUnavailable } from "@/lib/db/serviceModels";
+
 import { resolveDedicatedCliproxyapiApiKey } from "@omniroute/open-sse/handlers/chatCore/cliproxyapiCredentials";
 import { registerSupervisor, getSupervisor } from "./registry";
 import { ServiceSupervisor } from "./ServiceSupervisor";
@@ -18,7 +19,16 @@ import {
   LLMLINGUA_DEFAULT_PORT,
 } from "./installers/llmlingua";
 import { getOrCreateApiKey } from "./apiKey";
-import { scheduleServiceModelSync, stopServiceModelSync } from "./modelSync";
+import {
+  captureNativeEmbeddedServices,
+  assertNativeServiceActivation,
+  observeNativeServiceWork,
+} from "./nativeLifecycle";
+import {
+  scheduleServiceModelSync,
+  stopServiceModelSync,
+  stopServiceModelSyncAsync,
+} from "./modelSync";
 import type { ServiceStatus } from "./types";
 import { getServiceProviderPlugin } from "./providerPlugins/registry";
 
@@ -188,6 +198,12 @@ export async function bootstrapEmbeddedServices(): Promise<void> {
         ? (resolveDedicatedCliproxyapiApiKey(await getSettings()) ?? "")
         : apiKey;
 
+    const nativeOwner = captureNativeEmbeddedServices();
+    if (nativeOwner) {
+      assertNativeServiceActivation(nativeOwner);
+      // Another bundle may have registered this tool while its rows/keys were loading.
+      if (getSupervisor(cfg.tool)) continue;
+    }
     const supervisor = new ServiceSupervisor({
       tool: cfg.tool,
       port: cfg.port,
@@ -205,16 +221,35 @@ export async function bootstrapEmbeddedServices(): Promise<void> {
     registerSupervisor(supervisor);
 
     const baseUrl = `http://127.0.0.1:${cfg.port}`;
-    supervisor.on("stateChange", (status: ServiceStatus) => {
-      if (status.state === "running") {
-        scheduleServiceModelSync(cfg.tool, baseUrl, modelSyncApiKey);
-      } else if (status.state === "stopped" || status.state === "error") {
-        stopServiceModelSync(cfg.tool);
-        markAllUnavailable(cfg.tool);
-      }
-    });
+    if (nativeOwner) {
+      supervisor.on("stateChange", (status: ServiceStatus) => {
+        // The original listener stops its producer at the emitted transition.
+        if (status.state === "stopped" || status.state === "error") stopServiceModelSync(cfg.tool);
+        observeNativeServiceWork(nativeOwner, async () => {
+          if (supervisor.getStatus().state !== status.state) return;
+          if (status.state === "running") {
+            assertNativeServiceActivation(nativeOwner);
+            scheduleServiceModelSync(cfg.tool, baseUrl, modelSyncApiKey);
+          } else if (status.state === "stopped" || status.state === "error") {
+            await stopServiceModelSyncAsync(cfg.tool);
+            if (supervisor.getStatus().state !== status.state) return;
+            await markAllUnavailableAsync(cfg.tool);
+          }
+        });
+      });
+    } else {
+      supervisor.on("stateChange", async (status: ServiceStatus) => {
+        if (status.state === "running") {
+          scheduleServiceModelSync(cfg.tool, baseUrl, modelSyncApiKey);
+        } else if (status.state === "stopped" || status.state === "error") {
+          stopServiceModelSync(cfg.tool);
+          await markAllUnavailableAsync(cfg.tool);
+        }
+      });
+    }
 
     if (row.autoStart) {
+      if (nativeOwner) assertNativeServiceActivation(nativeOwner);
       supervisor.start().catch((err: unknown) => {
         const msg = err instanceof Error ? err.message : String(err);
         console.warn(`[Services] Auto-start failed for ${cfg.tool}: ${msg}`);

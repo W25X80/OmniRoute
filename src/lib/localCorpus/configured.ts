@@ -1,5 +1,5 @@
 import path from "path";
-import { getLocalCorpusRoot } from "../db/localCorpus";
+import { getLocalCorpusRoot, getLocalCorpusRootAsync } from "../db/localCorpus";
 import { getDefaultLocalCorpusStatus, LocalCorpusIndex } from "./index";
 
 const indexCache = new Map<string, LocalCorpusIndex>();
@@ -8,8 +8,7 @@ export function resetLocalCorpusIndex(): void {
   indexCache.clear();
 }
 
-function getConfiguredIndex(dynamicRoot?: string): LocalCorpusIndex {
-  const dbRoot = getLocalCorpusRoot();
+function getIndexForRoot(dbRoot: string | null, dynamicRoot?: string): LocalCorpusIndex {
   const finalRoot = dynamicRoot || dbRoot;
   if (!finalRoot) {
     throw new Error(
@@ -53,6 +52,13 @@ function getConfiguredIndex(dynamicRoot?: string): LocalCorpusIndex {
   return newIndex;
 }
 
+function getConfiguredIndex(dynamicRoot?: string): LocalCorpusIndex {
+  return getIndexForRoot(getLocalCorpusRoot(), dynamicRoot);
+}
+async function getConfiguredIndexAsync(dynamicRoot?: string): Promise<LocalCorpusIndex> {
+  return getIndexForRoot(await getLocalCorpusRootAsync(), dynamicRoot);
+}
+
 export function getConfiguredLocalCorpusStatus(dynamicRoot?: string) {
   const root = dynamicRoot || getLocalCorpusRoot();
   return root ? getConfiguredIndex(dynamicRoot).getStatus() : getDefaultLocalCorpusStatus();
@@ -60,16 +66,33 @@ export function getConfiguredLocalCorpusStatus(dynamicRoot?: string) {
 
 export async function searchConfiguredLocalCorpus(
   query: string,
-  options: { limit?: number; refresh?: boolean; absoluteRootPath?: string; rootPath?: string } = {}
+  options: {
+    limit?: number;
+    refresh?: boolean;
+    absoluteRootPath?: string;
+    rootPath?: string;
+  } = {}
 ) {
   const root = options.absoluteRootPath || options.rootPath;
-  return getConfiguredIndex(root).search(query, options);
+  return (await getConfiguredIndexAsync(root)).search(query, options);
 }
 
 export async function readConfiguredLocalCorpus(
   relativePath: string,
-  options: { startLine?: number; endLine?: number; absoluteRootPath?: string; rootPath?: string } = {}
+  options: {
+    startLine?: number;
+    endLine?: number;
+    absoluteRootPath?: string;
+    rootPath?: string;
+  } = {}
 ) {
   const root = options.absoluteRootPath || options.rootPath;
-  return getConfiguredIndex(root).read(relativePath, options);
+  return (await getConfiguredIndexAsync(root)).read(relativePath, options);
+}
+
+export async function getConfiguredLocalCorpusStatusAsync(dynamicRoot?: string) {
+  const dbRoot = await getLocalCorpusRootAsync();
+  return dynamicRoot || dbRoot
+    ? getIndexForRoot(dbRoot, dynamicRoot).getStatus()
+    : getDefaultLocalCorpusStatus();
 }

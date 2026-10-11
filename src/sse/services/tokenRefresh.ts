@@ -2,7 +2,7 @@
 import * as log from "../utils/logger";
 import { updateProviderConnection } from "@/lib/db/providers";
 import { resolveProxyForConnection } from "@/lib/db/settings";
-import { resolveProxyForProvider, hasBlockingProxyAssignment } from "@/lib/db/proxies";
+import { resolveProxyForProvider, hasBlockingProxyAssignmentAsync } from "@/lib/db/proxies";
 import {
   TOKEN_EXPIRY_BUFFER_MS as BUFFER_MS,
   getRefreshLeadMs as _getRefreshLeadMs,
@@ -62,7 +62,7 @@ export async function resolveProxyForCredentials(provider: string, credentials?:
     if (resolved?.proxy) {
       return resolved.proxy;
     }
-    if (hasBlockingProxyAssignment(credentials.connectionId, provider)) {
+    if (await hasBlockingProxyAssignmentAsync(credentials.connectionId, provider)) {
       return decideTokenRefreshProxyFailure(
         Object.assign(
           new Error(

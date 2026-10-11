@@ -1,3 +1,5 @@
+import { getSelectedPostgresDatabase } from "./controlPlaneContext";
+import { createPostgresAgentMetadataRepository } from "./postgres/agentMetadataRepository";
 /**
  * Database module: AgentBridgeBypass
  * CRUD + seed for agent_bridge_bypass table.
@@ -78,4 +80,40 @@ export function seedDefaultBypassPatterns(defaults: string[]): void {
   });
 
   runTransaction();
+}
+
+export async function getAllBypassPatternsAsync(
+  ...args: Parameters<typeof getAllBypassPatterns>
+): Promise<Awaited<ReturnType<typeof getAllBypassPatterns>>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresAgentMetadataRepository(database).getAllBypassPatterns(...args)
+    : getAllBypassPatterns(...args);
+}
+
+export async function getUserBypassPatternsAsync(
+  ...args: Parameters<typeof getUserBypassPatterns>
+): Promise<Awaited<ReturnType<typeof getUserBypassPatterns>>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresAgentMetadataRepository(database).getUserBypassPatterns(...args)
+    : getUserBypassPatterns(...args);
+}
+
+export async function replaceUserBypassPatternsAsync(
+  ...args: Parameters<typeof replaceUserBypassPatterns>
+): Promise<Awaited<ReturnType<typeof replaceUserBypassPatterns>>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresAgentMetadataRepository(database).replaceUserBypassPatterns(...args)
+    : replaceUserBypassPatterns(...args);
+}
+
+export async function seedDefaultBypassPatternsAsync(
+  ...args: Parameters<typeof seedDefaultBypassPatterns>
+): Promise<Awaited<ReturnType<typeof seedDefaultBypassPatterns>>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresAgentMetadataRepository(database).seedDefaultBypassPatterns(...args)
+    : seedDefaultBypassPatterns(...args);
 }

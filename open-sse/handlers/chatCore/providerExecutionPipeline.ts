@@ -70,7 +70,7 @@ export interface PipelineConnectionContext {
   getCredentials: () => Record<string, unknown>;
   replaceCredentials: (next: Record<string, unknown>) => void;
   onCredentialsRefreshed: (next: Record<string, unknown>) => void | Promise<void>;
-  assertManagedLeaseFence: (connectionId: string) => void;
+  assertManagedLeaseFence: (connectionId: string) => void | Promise<void>;
   getProviderCredentials: typeof getProviderCredentials;
   refreshCredentials?: (
     credentials: Record<string, unknown>
@@ -354,6 +354,7 @@ export async function runProviderExecutionPipeline(
     const before = assertLease(policy, connection, wire.currentModel);
     if (before) return before;
 
+    await connection.assertManagedLeaseFence(currentConnectionId(connection));
     const attempt = await sendProviderAttempt(wire.currentModel, attempts === 0);
     lastAttempt = attempt;
 
@@ -506,6 +507,7 @@ export async function runProviderExecutionPipeline(
             if (recoveryBody && typeof recoveryBody === "object" && !Array.isArray(recoveryBody)) {
               wire.setBodyAndModel(recoveryBody as Record<string, unknown>, wire.currentModel);
             }
+            await connection.assertManagedLeaseFence(currentConnectionId(connection));
             return sendProviderAttempt(wire.currentModel, false);
           },
           parseError: async (response) => {

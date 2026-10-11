@@ -32,7 +32,11 @@
  */
 
 import { getDbInstance } from "./core";
-import { readCallArtifact } from "../usage/callLogArtifacts";
+import { cloneLogPayload } from "../logPayloads";
+import { isExplicitNoLogApiKey } from "../compliance/noLog";
+import { withSelectedContinuationPrivacy } from "./postgres/continuationPrivacy";
+import { readCallArtifact, readCallArtifactAsync } from "../usage/callLogArtifacts";
+import { getSelectedPostgresDatabase, getSelectedPersistenceIdentity } from "./controlPlaneContext";
 
 export type ResponsesContinuationState = {
   input: unknown[];
@@ -149,7 +153,16 @@ function extractContinuationState(
   return { input, output };
 }
 
+export interface PendingContinuationSeed {
+  readonly responseId: string;
+  readonly apiKeyId: string | null;
+  readonly persistenceAuthority: object | undefined;
+  readonly nonce: object;
+}
+
 type PendingContinuationEntry = {
+  nonce: object;
+  persistenceAuthority?: object;
   apiKeyId: string | null;
   state: ResponsesContinuationState;
   expiresAt: number;
@@ -161,7 +174,36 @@ type PendingContinuationEntry = {
 // which never reaches "ready" (e.g. detailState becomes "missing") falls back
 // to the same permanent not-found the durable path already gives today.
 const PENDING_CONTINUATION_TTL_MS = 60_000;
-const pendingContinuationStates = new Map<string, PendingContinuationEntry>();
+const sqlitePendingContinuationStates = new Map<string, PendingContinuationEntry>();
+const NATIVE_PENDING_CONTINUATIONS = Symbol.for("omniroute.postgres.pending-continuations.v1");
+type PendingStates = Map<string, PendingContinuationEntry>;
+type NativePendingOwners = WeakMap<object, PendingStates>;
+
+function nativePendingOwners(): NativePendingOwners {
+  const globals = globalThis as typeof globalThis & { [key: symbol]: unknown };
+  return (globals[NATIVE_PENDING_CONTINUATIONS] ??= new WeakMap<
+    object,
+    PendingStates
+  >()) as NativePendingOwners;
+}
+
+function selectedPendingStates(): PendingStates {
+  const identity = getSelectedPersistenceIdentity();
+  if (!identity) return sqlitePendingContinuationStates;
+  const owners = nativePendingOwners();
+  let states = owners.get(identity);
+  if (!states) {
+    states = new Map();
+    owners.set(identity, states);
+  }
+  return states;
+}
+
+function ownedPendingStates(seed: PendingContinuationSeed): PendingStates | undefined {
+  return seed.persistenceAuthority
+    ? nativePendingOwners().get(seed.persistenceAuthority)
+    : sqlitePendingContinuationStates;
+}
 
 /**
  * Called from callLogs.ts the moment a response id and its pipeline payload
@@ -176,31 +218,80 @@ export function seedPendingContinuationState(
   pipeline: ContinuationPipeline | null | undefined,
   videoContentRemoved: boolean
 ): void {
-  if (!responseId) return;
+  seedOwnedPendingContinuationState(responseId, apiKeyId, pipeline, videoContentRemoved);
+}
+
+/** Native pre-terminal cancellation owns the exact identity/key/nonce it prepared. */
+export function seedOwnedPendingContinuationState(
+  responseId: string,
+  apiKeyId: string | null,
+  pipeline: ContinuationPipeline | null | undefined,
+  videoContentRemoved: boolean
+): PendingContinuationSeed | undefined {
+  if (!responseId) return undefined;
   const state = extractContinuationState(pipeline, videoContentRemoved);
-  if (!state) return;
-  pendingContinuationStates.set(responseId, {
+  if (!state) return undefined;
+  const seed: PendingContinuationSeed = {
+    responseId,
+    persistenceAuthority: getSelectedPersistenceIdentity(),
+    apiKeyId,
+    nonce: {},
+  };
+  selectedPendingStates().set(responseId, {
+    nonce: seed.nonce,
+    persistenceAuthority: seed.persistenceAuthority,
     apiKeyId,
     state,
     expiresAt: Date.now() + PENDING_CONTINUATION_TTL_MS,
   });
+  return seed;
+}
+
+/** A delayed cancellation may remove only the exact seed it prepared. */
+export function clearOwnedPendingContinuationState(seed: PendingContinuationSeed): void {
+  const states = ownedPendingStates(seed);
+  const entry = states?.get(seed.responseId);
+  if (
+    entry?.nonce === seed.nonce &&
+    entry.apiKeyId === seed.apiKeyId &&
+    entry.persistenceAuthority === seed.persistenceAuthority
+  )
+    states!.delete(seed.responseId);
+}
+
+function selectedPendingSeed(
+  responseId: string,
+  apiKeyId: string
+): PendingContinuationSeed | undefined {
+  const entry = selectedPendingStates().get(responseId);
+  if (
+    entry?.apiKeyId !== apiKeyId ||
+    entry.persistenceAuthority !== getSelectedPersistenceIdentity()
+  )
+    return undefined;
+  return {
+    responseId,
+    apiKeyId,
+    persistenceAuthority: entry.persistenceAuthority,
+    nonce: entry.nonce,
+  };
 }
 
 /** Called from callLogs.ts once the durable row lands -- the DB is now
  * authoritative and the bridge entry would otherwise just idle until its TTL. */
 export function clearPendingContinuationState(responseId: string): void {
   if (!responseId) return;
-  pendingContinuationStates.delete(responseId);
+  selectedPendingStates().delete(responseId);
 }
 
 function resolvePendingContinuationState(
   responseId: string,
   apiKeyId: string | null | undefined
 ): ResponsesContinuationState | null {
-  const entry = pendingContinuationStates.get(responseId);
-  if (!entry) return null;
+  const entry = selectedPendingStates().get(responseId);
+  if (!entry || entry.persistenceAuthority !== getSelectedPersistenceIdentity()) return null;
   if (Date.now() > entry.expiresAt) {
-    pendingContinuationStates.delete(responseId);
+    selectedPendingStates().delete(responseId);
     return null;
   }
   // Same tenant-isolation rule as the durable lookup below: a response id is
@@ -404,34 +495,7 @@ export function resolveTurnCompletionState(
     return cacheTurnCompletion(artifactRelPath, "unknown");
   }
 
-  const clientResponse = artifact.pipeline.clientResponse as
-    | { _truncated?: unknown; output?: unknown; summary?: { status?: unknown; output?: unknown } }
-    | undefined;
-  if (clientResponse?._truncated === true) {
-    return cacheTurnCompletion(artifactRelPath, "incomplete");
-  }
-
-  // Same dual-shape concern as resolvePreviousResponseState above: a
-  // streaming reply nests status/output under `.summary`, a non-streaming
-  // one carries them at the top level.
-  const status = clientResponse?.summary?.status ?? (clientResponse as { status?: unknown })?.status;
-  if (typeof status === "string" && status !== "completed") {
-    return cacheTurnCompletion(artifactRelPath, "incomplete");
-  }
-
-  const output = Array.isArray(clientResponse?.summary?.output)
-    ? clientResponse.summary.output
-    : Array.isArray(clientResponse?.output)
-      ? clientResponse.output
-      : undefined;
-  if (!Array.isArray(output) || output.length === 0) {
-    return cacheTurnCompletion(artifactRelPath, "incomplete");
-  }
-
-  const hasPendingFunctionCall = output.some(
-    (item) => isPlainRecord(item) && item.type === "function_call"
-  );
-  return cacheTurnCompletion(artifactRelPath, hasPendingFunctionCall ? "tool_call_pending" : "stop");
+  return cacheTurnCompletion(artifactRelPath, classifyTurnCompletion(artifact.pipeline));
 }
 
 /** Grace period before a still-unanswered tool call counts as a stall, not a
@@ -461,4 +525,146 @@ export function resolveConversationStalledState(params: {
   if (!Number.isFinite(lastSeenAtMs)) return false;
   const now = params.now ?? Date.now();
   return now - lastSeenAtMs > CONVERSATION_STALL_GRACE_MS;
+}
+
+function classifyTurnCompletion(pipeline: Record<string, unknown>): TurnCompletionState {
+  const clientResponse = pipeline.clientResponse as
+    | { _truncated?: unknown; output?: unknown; summary?: { status?: unknown; output?: unknown } }
+    | undefined;
+  if (clientResponse?._truncated === true) {
+    return "incomplete";
+  }
+
+  // Same dual-shape concern as resolvePreviousResponseState above: a
+  // streaming reply nests status/output under `.summary`, a non-streaming
+  // one carries them at the top level.
+  const status =
+    clientResponse?.summary?.status ?? (clientResponse as { status?: unknown })?.status;
+  if (typeof status === "string" && status !== "completed") {
+    return "incomplete";
+  }
+
+  const output = Array.isArray(clientResponse?.summary?.output)
+    ? clientResponse.summary.output
+    : Array.isArray(clientResponse?.output)
+      ? clientResponse.output
+      : undefined;
+  if (!Array.isArray(output) || output.length === 0) {
+    return "incomplete";
+  }
+
+  const hasPendingFunctionCall = output.some(
+    (item) => isPlainRecord(item) && item.type === "function_call"
+  );
+  return hasPendingFunctionCall ? "tool_call_pending" : "stop";
+}
+
+export async function resolvePreviousResponseStateAsync(
+  responseId: string,
+  apiKeyId: string | null | undefined
+): Promise<ResponsesContinuationState | null> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return resolvePreviousResponseState(responseId, apiKeyId);
+  if (!responseId || !apiKeyId) return null;
+  if (isExplicitNoLogApiKey(apiKeyId)) {
+    const seed = selectedPendingSeed(responseId, apiKeyId);
+    if (seed) clearOwnedPendingContinuationState(seed);
+    return null;
+  }
+  const row = await database.transaction(
+    async (transaction) =>
+      (
+        await transaction.query<{
+          artifact_relpath: string | null;
+          api_key_id: string | null;
+          video_content_removed: number;
+        }>(
+          `SELECT artifact_relpath,api_key_id,video_content_removed FROM omniroute.call_logs
+       WHERE response_id=$1 AND detail_state='ready' ORDER BY timestamp DESC LIMIT 1`,
+          [responseId]
+        )
+      ).rows[0]
+  );
+  const pendingSeed = selectedPendingSeed(responseId, apiKeyId);
+  let state: ResponsesContinuationState | null = null;
+  if (row) {
+    if (row.api_key_id !== apiKeyId || !row.artifact_relpath) return null;
+    const artifact = await readCallArtifactAsync(row.artifact_relpath);
+    state =
+      artifact.state === "ready" && artifact.artifact?.pipeline
+        ? extractContinuationState(
+            artifact.artifact.pipeline as ContinuationPipeline,
+            row.video_content_removed === 1
+          )
+        : null;
+  }
+  const authorized = await withSelectedContinuationPrivacy(apiKeyId, () => {
+    if (row) return state;
+    // A cancellation while policy I/O is pending must invalidate this reader's seed.
+    const currentSeed = selectedPendingSeed(responseId, apiKeyId);
+    if (!pendingSeed || currentSeed?.nonce !== pendingSeed.nonce) return null;
+    const pending = resolvePendingContinuationState(responseId, apiKeyId);
+    return pending ? cloneLogPayload(pending) : null;
+  });
+  if (!authorized && pendingSeed) clearOwnedPendingContinuationState(pendingSeed);
+  return authorized;
+}
+
+export async function resolveCallLogIdByResponseIdAsync(
+  responseId: string,
+  apiKeyId: string | null | undefined
+): Promise<string | null> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return resolveCallLogIdByResponseId(responseId, apiKeyId);
+  if (!responseId || !apiKeyId) return null;
+  return database.transaction(
+    async (transaction) =>
+      (
+        await transaction.query<{ id: string }>(
+          `SELECT id FROM omniroute.call_logs WHERE response_id=$1 AND api_key_id=$2 ORDER BY timestamp DESC LIMIT 1`,
+          [responseId, apiKeyId]
+        )
+      ).rows[0]?.id ?? null
+  );
+}
+
+export async function isGenuineContinuationTurnAsync(
+  artifactRelPath: string | null | undefined,
+  apiKeyId: string | null | undefined
+): Promise<boolean> {
+  if (!getSelectedPostgresDatabase()) return isGenuineContinuationTurn(artifactRelPath, apiKeyId);
+  if (!artifactRelPath || !apiKeyId) return false;
+  // Tenant and database authority are checked on every lookup; an artifact-only cache
+  // cannot authorize a different caller or another restored database.
+  const { artifact, state } = await readCallArtifactAsync(artifactRelPath);
+  if (state !== "ready" || !artifact?.pipeline) return false;
+  const previousId = extractPreviousResponseId(artifact.pipeline as Record<string, unknown>);
+  return (
+    previousId !== null && (await resolveCallLogIdByResponseIdAsync(previousId, apiKeyId)) !== null
+  );
+}
+
+export async function resolveTurnCompletionStateAsync(
+  artifactRelPath: string | null | undefined
+): Promise<TurnCompletionState> {
+  if (!getSelectedPostgresDatabase()) return resolveTurnCompletionState(artifactRelPath);
+  if (!artifactRelPath) return "unknown";
+  const { artifact, state } = await readCallArtifactAsync(artifactRelPath);
+  return state === "ready" && artifact?.pipeline
+    ? classifyTurnCompletion(artifact.pipeline as Record<string, unknown>)
+    : "unknown";
+}
+
+export async function resolveConversationStalledStateAsync(
+  params: Parameters<typeof resolveConversationStalledState>[0]
+): Promise<boolean> {
+  if (!getSelectedPostgresDatabase()) return resolveConversationStalledState(params);
+  if (params.isActive) return false;
+  const completion = await resolveTurnCompletionStateAsync(params.artifactRelPath);
+  if (completion !== "incomplete" && completion !== "tool_call_pending") return false;
+  const lastSeenAt = Date.parse(params.lastSeenAt);
+  return (
+    Number.isFinite(lastSeenAt) &&
+    (params.now ?? Date.now()) - lastSeenAt > CONVERSATION_STALL_GRACE_MS
+  );
 }

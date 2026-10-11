@@ -1,3 +1,5 @@
+import { setCachedResponseAsync } from "@/lib/semanticCache";
+import { getSelectedSemanticCacheRepository } from "@/lib/db/semanticCache";
 /**
  * chatCore streaming semantic-cache store (Quality Gate v2 / Fase 9 — chatCore god-file
  * decomposition, #3501).
@@ -17,7 +19,10 @@ import {
   isTruncatedStreamBody as defaultIsTruncatedStreamBody,
 } from "@/lib/semanticCache";
 import { isSmallEnoughForSemanticCache as defaultIsSmallEnough } from "../../utils/estimateSize.ts";
-import { getSemanticCacheManager } from "../../services/cache/semanticCacheManager.ts";
+import {
+  getSemanticCacheManager,
+  getSemanticCacheManagerAsync,
+} from "../../services/cache/semanticCacheManager.ts";
 
 type LoggerLike = { debug?: (...args: unknown[]) => void } | null | undefined;
 
@@ -119,4 +124,46 @@ export function storeStreamingSemanticCacheResponse(
     return;
   }
   writeStreamingCacheEntry(args, deps);
+}
+
+export async function storeStreamingSemanticCacheResponseAsync(
+  args: StreamingCacheArgs
+): Promise<void> {
+  if (!getSelectedSemanticCacheRepository()) return storeStreamingSemanticCacheResponse(args);
+  if (
+    args.videoTranscriptSensitive ||
+    !args.enabled ||
+    args.streamStatus !== 200 ||
+    !args.streamResponseBody ||
+    !defaultIsCacheableForWrite(args.body, args.headers) ||
+    defaultIsTruncatedStreamBody(args.streamResponseBody)
+  )
+    return;
+  const clean = { ...args.streamResponseBody };
+  delete clean._streamed;
+  if (!defaultIsSmallEnough(clean)) return;
+  const signature = defaultGenerateSignature(
+    args.model,
+    args.body.messages ?? args.body.input,
+    args.body.temperature,
+    args.body.top_p,
+    args.apiKeyId,
+    outputContractOf(args.body)
+  );
+  const tokensSaved = streamTokensSaved(args.streamUsage);
+  await setCachedResponseAsync(signature, args.model, clean, tokensSaved);
+  await (
+    await getSemanticCacheManagerAsync()
+  )
+    .store({
+      body: args.body as Record<string, unknown>,
+      headers: args.headers,
+      response: clean,
+      model: args.model,
+      provider: args.provider || "",
+      apiKeyId: args.apiKeyId,
+      signature,
+      tokensSaved,
+    })
+    .catch(() => {});
 }

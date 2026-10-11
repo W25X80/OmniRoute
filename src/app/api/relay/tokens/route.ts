@@ -1,8 +1,7 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
-import { getRelayTokens, createRelayToken } from "@/lib/db/relayProxies";
+import { getRelayTokensAsync, createRelayTokenAsync } from "@/lib/db/relayProxies";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
-
 const relayTokenInputSchema = z.object({
   name: z.string().trim().min(1, "name is required"),
   description: z.string().optional(),
@@ -17,7 +16,7 @@ const relayTokenInputSchema = z.object({
 });
 
 export async function GET() {
-  const tokens = getRelayTokens();
+  const tokens = await getRelayTokensAsync();
   // Strip hash from response
   const safe = tokens.map((t) => ({
     id: t.id,
@@ -46,7 +45,7 @@ export async function POST(request: Request) {
     if (isValidationFailure(validation)) {
       return NextResponse.json({ error: validation.error }, { status: 400 });
     }
-    const token = createRelayToken(validation.data);
+    const token = await createRelayTokenAsync(validation.data);
 
     return NextResponse.json({
       id: token.id,

@@ -1,3 +1,4 @@
+import { assertValidationSnapshotAsync } from "../db/validatedModels";
 import { handleChatCore } from "../../../open-sse/handlers/chatCore.ts";
 import { getExecutor } from "../../../open-sse/executors/index.ts";
 import { getProviderCredentials } from "../../sse/services/auth";
@@ -5,10 +6,10 @@ import { checkPipelineGates } from "../../sse/handlers/chatHelpers";
 import * as log from "../../sse/utils/logger";
 import { getSettings } from "../db/settings";
 import { getProviderConnectionById } from "../db/providers";
-import { assertValidationSnapshot, type ValidationSnapshot } from "../db/validatedModels";
+import { type ValidationSnapshot } from "../db/validatedModels";
 import { createValidationDispatchFence } from "./dispatchFence";
 import { assertSelectedCredentialsCurrent } from "./credentials";
-import { assertRequestPluginsIdle } from "../plugins/executionGuard";
+import { assertRequestPluginsIdleAsync } from "../plugins/executionGuard";
 import { isConnectionUnavailableToAuxiliaryActivity } from "../exclusiveLeaseIsolation";
 import { ModelValidationError, type ValidationInput } from "./http";
 import { abortable, readProof, proofFailed, deadline } from "./proofs";
@@ -88,7 +89,7 @@ export async function createProofRunner(
     const stage = deadline(signal, 20_000);
     const stageSignal = stage.signal;
     try {
-      assertValidationSnapshot(snapshot);
+      await assertValidationSnapshotAsync(snapshot);
       const credentials = await abortable(
         selectStrictCredentials(input, selectCredentials),
         stageSignal
@@ -98,9 +99,9 @@ export async function createProofRunner(
         signal: stageSignal,
         expectedExecutor,
         expectedCredentials: credentials,
-        assertFresh: () => {
-          assertRequestPluginsIdle();
-          assertValidationSnapshot(snapshot);
+        assertFresh: async () => {
+          await assertRequestPluginsIdleAsync();
+          await assertValidationSnapshotAsync(snapshot);
         },
       });
       const body = {
@@ -136,9 +137,9 @@ export async function createProofRunner(
         }),
         stageSignal
       );
-      fence.assertDispatched();
+      await fence.assertDispatched();
       const proof = await readProof(requireProofResponse(result), stageSignal, stream);
-      fence.assertDispatched();
+      await fence.assertDispatched();
       return proof;
     } finally {
       stage.clear();

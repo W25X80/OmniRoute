@@ -1,3 +1,4 @@
+import { markVerifiedAsync } from "@/lib/db/discoveryResults";
 /**
  * Discovery verify — POST /api/discovery/verify/:id
  *
@@ -8,7 +9,6 @@
 
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 import { createErrorResponse, createErrorResponseFromUnknown } from "@/lib/api/errorResponse";
-import { markVerified } from "@/lib/db/discoveryResults";
 
 export async function POST(
   request: Request,
@@ -24,7 +24,7 @@ export async function POST(
   }
 
   try {
-    const result = markVerified(id);
+    const result = await markVerifiedAsync(id);
     if (!result) {
       return createErrorResponse({ status: 404, message: "Discovery result not found" });
     }

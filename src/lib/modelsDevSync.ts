@@ -1,3 +1,17 @@
+import { parseDatabaseBackend } from "@/lib/db/backendSelection";
+import { getSelectedPersistenceIdentity } from "@/lib/db/controlPlaneContext";
+import { createPersistencePoller, type PersistencePoller } from "@/lib/config/persistencePoller";
+import { runPersistenceBackgroundWork } from "@/lib/db/persistenceRuntime";
+import { assertSqliteBackendAllowed } from "./db/controlPlaneContext";
+import { getSelectedPostgresDatabase } from "./db/controlPlaneContext";
+import {
+  catalogTableRows,
+  catalogNamespaceRows,
+  requirePostgresCatalogSnapshot,
+  mutatePostgresCatalog,
+  writePostgresCatalog,
+  afterPostgresCatalogCommit,
+} from "./db/postgres/catalogSnapshot";
 /**
  * modelsDevSync.ts — Fetch model specs, pricing, and capabilities from models.dev
  *
@@ -251,6 +265,20 @@ let pricingMemoVersion = -1; // -1: never equals a real cacheVersion (starts at 
  * Results are memoized until `saveModelsDevPricing` / `clearModelsDevPricing`.
  */
 export function getModelsDevPricing(): PricingByProvider {
+  if (getSelectedPostgresDatabase() && isModelsDevSyncEnvDisabled()) return {};
+  if (getSelectedPostgresDatabase()) {
+    requirePostgresCatalogSnapshot();
+    const synced: PricingByProvider = {};
+    for (const row of catalogNamespaceRows("models_dev_pricing")) {
+      try {
+        synced[row.key] = JSON.parse(row.value) as PricingModels;
+      } catch {
+        console.warn(`[PRICING_SYNC] Corrupted data for provider "${row.key}", skipping`);
+      }
+    }
+    return synced;
+  }
+
   // Kill switch: skip the SQL + JSON.parse scan entirely so a leftover
   // models_dev_pricing namespace cannot pin the event loop (#9685 / #10052).
   if (isModelsDevSyncEnvDisabled()) {
@@ -286,7 +314,25 @@ export function getModelsDevPricing(): PricingByProvider {
 /**
  * Save synced pricing to `models_dev_pricing` namespace (full replace).
  */
-export function saveModelsDevPricing(data: PricingByProvider): void {
+export async function saveModelsDevPricingAsync(data: PricingByProvider): Promise<void> {
+  const catalogDatabase = getSelectedPostgresDatabase();
+  if (catalogDatabase)
+    return mutatePostgresCatalog(catalogDatabase, async () => {
+      await writePostgresCatalog("DELETE FROM omniroute.key_value WHERE namespace=$1", [
+        "models_dev_pricing",
+      ]);
+      const rows = Object.entries(data).map(([key, models]) => ({
+        key,
+        value: JSON.stringify(models),
+      }));
+      if (rows.length)
+        await writePostgresCatalog(
+          "INSERT INTO omniroute.key_value(namespace,key,value) SELECT $1, key,value FROM json_to_recordset($2::json) AS data(key text,value text)",
+          ["models_dev_pricing", JSON.stringify(rows)]
+        );
+      afterPostgresCatalogCommit(() => invalidateDbCache("pricing"));
+    });
+
   const db = getDbInstance();
   const del = db.prepare("DELETE FROM key_value WHERE namespace = 'models_dev_pricing'");
   const insert = db.prepare(
@@ -306,7 +352,16 @@ export function saveModelsDevPricing(data: PricingByProvider): void {
 /**
  * Clear all models.dev synced pricing data.
  */
-export function clearModelsDevPricing(): void {
+export async function clearModelsDevPricingAsync(): Promise<void> {
+  const catalogDatabase = getSelectedPostgresDatabase();
+  if (catalogDatabase)
+    return mutatePostgresCatalog(catalogDatabase, async () => {
+      await writePostgresCatalog("DELETE FROM omniroute.key_value WHERE namespace=$1", [
+        "models_dev_pricing",
+      ]);
+      afterPostgresCatalogCommit(() => invalidateDbCache("pricing"));
+    });
+
   const db = getDbInstance();
   db.prepare("DELETE FROM key_value WHERE namespace = 'models_dev_pricing'").run();
   backupDbFile("pre-write");
@@ -320,6 +375,8 @@ export function clearModelsDevPricing(): void {
  * Call this before any capability operations.
  */
 export function ensureCapabilitiesTable(): void {
+  if (getSelectedPostgresDatabase()) return;
+
   const db = getDbInstance();
   db.exec(`
     CREATE TABLE IF NOT EXISTS model_capabilities (
@@ -386,6 +443,11 @@ function capabilitiesFromRows(rows: unknown[]): CapabilitiesByProvider {
  * `cachedCapabilities` / `cachedCapabilitiesLoadedAll` runtime cache.
  */
 export function loadAllSyncedCapabilitiesUncached(): CapabilitiesByProvider {
+  if (getSelectedPostgresDatabase()) {
+    requirePostgresCatalogSnapshot();
+    return capabilitiesFromRows(catalogTableRows("model_capabilities"));
+  }
+
   const db = getDbInstance();
   ensureCapabilitiesTable();
   const rows = db.prepare("SELECT * FROM model_capabilities").all();
@@ -398,6 +460,11 @@ export function loadAllSyncedCapabilitiesUncached(): CapabilitiesByProvider {
  * and runs migrations.
  */
 export function peekCachedReasoningEfforts(provider: string, modelId: string): string[] | null {
+  if (getSelectedPostgresDatabase()) {
+    const efforts = getSyncedCapability(provider, modelId)?.reasoning_efforts;
+    return efforts && efforts.length > 0 ? [...efforts] : null;
+  }
+
   if (!cachedCapabilitiesLoadedAll || !cachedCapabilities) return null;
   const efforts = cachedCapabilities[provider]?.[modelId]?.reasoning_efforts;
   return efforts && efforts.length > 0 ? [...efforts] : null;
@@ -407,6 +474,15 @@ export function peekCachedReasoningEfforts(provider: string, modelId: string): s
  * Read synced capabilities from `model_capabilities` table.
  */
 export function getSyncedCapabilities(provider?: string, modelId?: string): CapabilitiesByProvider {
+  if (getSelectedPostgresDatabase()) {
+    requirePostgresCatalogSnapshot();
+    return capabilitiesFromRows(
+      catalogTableRows("model_capabilities").filter(
+        (row) => !provider || (row.provider === provider && (!modelId || row.model_id === modelId))
+      )
+    );
+  }
+
   if (cachedCapabilitiesLoadedAll) {
     if (!provider) {
       return cachedCapabilities || {};
@@ -482,6 +558,18 @@ export function getSyncedCapability(
   modelId: string,
   bulk?: CapabilitiesByProvider | null
 ): ModelCapabilityEntry | null {
+  if (getSelectedPostgresDatabase()) {
+    if (!provider || !modelId) return null;
+    if (bulk)
+      return lookupSyncedCapabilityWithFallbacks(provider, (p) => bulk[p]?.[modelId] ?? null);
+    requirePostgresCatalogSnapshot();
+    const rows = catalogTableRows("model_capabilities");
+    return lookupSyncedCapabilityWithFallbacks(provider, (p) => {
+      const row = rows.find((row) => row.provider === p && row.model_id === modelId);
+      return row ? mapCapabilityRecord(row) : null;
+    });
+  }
+
   if (!provider || !modelId) return null;
 
   if (bulk) {
@@ -512,7 +600,15 @@ export function getSyncedCapability(
 /**
  * Save synced capabilities to `model_capabilities` table (full replace).
  */
-export function saveModelsDevCapabilities(data: CapabilitiesByProvider): void {
+export async function saveModelsDevCapabilitiesAsync(data: CapabilitiesByProvider): Promise<void> {
+  const catalogDatabase = getSelectedPostgresDatabase();
+  if (catalogDatabase)
+    return mutatePostgresCatalog(catalogDatabase, async () => {
+      await writePostgresCatalog("DELETE FROM omniroute.model_capabilities");
+      await insertNativeCapabilityRows(data, false);
+      afterPostgresCatalogCommit(() => invalidateDbCache("model-capabilities"));
+    });
+
   const db = getDbInstance();
   ensureCapabilitiesTable();
 
@@ -571,10 +667,19 @@ export function saveModelsDevCapabilities(data: CapabilitiesByProvider): void {
  * Used by the OpenRouter live catalog walk so architecture.input_modalities
  * survive into the next combo LCD (#12613).
  */
-export function upsertSyncedCapabilities(
+export async function upsertSyncedCapabilitiesAsync(
   provider: string,
   models: Record<string, ModelCapabilityEntry>
-): void {
+): Promise<void> {
+  const catalogDatabase = getSelectedPostgresDatabase();
+  if (catalogDatabase) {
+    if (!provider || Object.keys(models).length === 0) return;
+    return mutatePostgresCatalog(catalogDatabase, async () => {
+      await insertNativeCapabilityRows({ [provider]: models }, true);
+      afterPostgresCatalogCommit(() => invalidateDbCache("model-capabilities"));
+    });
+  }
+
   if (!provider || Object.keys(models).length === 0) return;
   const db = getDbInstance();
   ensureCapabilitiesTable();
@@ -649,7 +754,14 @@ export function upsertSyncedCapabilities(
 /**
  * Clear all synced capability data.
  */
-export function clearModelsDevCapabilities(): void {
+export async function clearModelsDevCapabilitiesAsync(): Promise<void> {
+  const catalogDatabase = getSelectedPostgresDatabase();
+  if (catalogDatabase)
+    return mutatePostgresCatalog(catalogDatabase, async () => {
+      await writePostgresCatalog("DELETE FROM omniroute.model_capabilities");
+      afterPostgresCatalogCommit(() => invalidateDbCache("model-capabilities"));
+    });
+
   const db = getDbInstance();
   ensureCapabilitiesTable();
   const info = db.prepare("DELETE FROM model_capabilities").run();
@@ -701,10 +813,10 @@ export async function syncModelsDev(opts?: {
       }
 
       if (!dryRun) {
-        saveModelsDevPricing(pricing);
+        await saveModelsDevPricingAsync(pricing);
         if (syncCapabilities) {
           ensureCapabilitiesTable();
-          saveModelsDevCapabilities(capabilities);
+          await saveModelsDevCapabilitiesAsync(capabilities);
         }
         lastSyncTime = new Date().toISOString();
         lastSyncModelCount = modelCount;
@@ -761,7 +873,76 @@ export async function syncModelsDev(opts?: {
 /**
  * Start periodic models.dev sync (non-blocking).
  */
+interface NativeSchedulerOwner {
+  readonly identity: object;
+  readonly poller: PersistencePoller;
+  stopping?: Promise<void>;
+  controller?: AbortController;
+}
+const NATIVE_SCHEDULER = Symbol.for("omniroute.modelsDevSync.postgresScheduler");
+const nativeGlobals = globalThis as typeof globalThis & {
+  [NATIVE_SCHEDULER]?: NativeSchedulerOwner;
+};
+
+function isNativeSchedulerRunning(): boolean {
+  const owner = nativeGlobals[NATIVE_SCHEDULER];
+  return Boolean(owner && !owner.stopping);
+}
+
+function stopNativePoller(): Promise<void> {
+  const owner = nativeGlobals[NATIVE_SCHEDULER];
+  if (!owner) return Promise.resolve();
+  owner.controller?.abort();
+  owner.stopping ??= owner.poller.stop().finally(() => {
+    if (nativeGlobals[NATIVE_SCHEDULER] === owner) nativeGlobals[NATIVE_SCHEDULER] = undefined;
+  });
+  return owner.stopping;
+}
+
 export function startPeriodicSync(intervalMs?: number): void {
+  if (parseDatabaseBackend() === "postgres") {
+    const identity = getSelectedPersistenceIdentity();
+    if (!identity) throw new Error("Native scheduler requires selected PostgreSQL persistence");
+    const existing = nativeGlobals[NATIVE_SCHEDULER];
+    if (existing) {
+      if (existing.identity !== identity || existing.stopping)
+        throw new Error("Native scheduler authority changed or is draining");
+      return;
+    }
+
+    const interval = intervalMs ?? SYNC_INTERVAL_MS;
+    activeSyncIntervalMs = interval;
+    const owner: NativeSchedulerOwner = {
+      identity,
+      poller: createPersistencePoller({
+        intervalMs: interval,
+        initialDelayMs: 0,
+        check: async (phase) => {
+          await runPersistenceBackgroundWork(async () => {
+            if (getSelectedPersistenceIdentity() !== identity)
+              throw new Error("Native model-spec scheduler persistence identity changed");
+            const controller = new AbortController();
+            owner.controller = controller;
+            try {
+              const result = await syncModelsDev({ signal: controller.signal });
+              if (result.success)
+                console.log(
+                  `[MODELS_DEV] ${phase === "start" ? "Initial" : "Periodic"} sync complete: ${result.modelCount} pricing entries`
+                );
+            } finally {
+              if (owner.controller === controller) owner.controller = undefined;
+            }
+          });
+        },
+        onFailure: () => {
+          console.warn("[MODELS_DEV] Native periodic sync failed");
+        },
+      }),
+    };
+    nativeGlobals[NATIVE_SCHEDULER] = owner;
+    owner.poller.start();
+    return;
+  }
   if (syncTimer) return; // Already running
 
   const interval = intervalMs ?? SYNC_INTERVAL_MS;
@@ -770,7 +951,7 @@ export function startPeriodicSync(intervalMs?: number): void {
   activePeriodicSyncToken = syncToken;
   console.log(`[MODELS_DEV] Starting periodic sync every ${interval / 1000}s`);
 
-  const launchSync = () => {
+  const launchSync = async () => {
     if (syncToken.stopped) {
       return Promise.resolve(createAbortedSyncResult(false));
     }
@@ -825,6 +1006,10 @@ export function startPeriodicSync(intervalMs?: number): void {
  * Stop periodic sync and cleanup timer.
  */
 export function stopPeriodicSync(): void {
+  if (parseDatabaseBackend() === "postgres") {
+    void stopNativePoller().catch(() => {});
+    return;
+  }
   if (activePeriodicSyncToken) {
     activePeriodicSyncToken.stopped = true;
     activePeriodicSyncToken = null;
@@ -847,14 +1032,14 @@ export function stopPeriodicSync(): void {
  */
 export function getSyncStatus(): SyncStatus {
   // If the sync timer is active, it's enabled.
-  const enabled = syncTimer !== null;
+  const enabled = isNativeSchedulerRunning() || syncTimer !== null;
   return {
     enabled,
     lastSync: lastSyncTime,
     lastSyncModelCount,
     lastSyncCapabilityCount,
     nextSync:
-      syncTimer && lastSyncTime
+      (isNativeSchedulerRunning() || syncTimer) && lastSyncTime
         ? new Date(new Date(lastSyncTime).getTime() + activeSyncIntervalMs).toISOString()
         : null,
     intervalMs: activeSyncIntervalMs,
@@ -881,5 +1066,276 @@ export async function initModelsDevSync(): Promise<void> {
   }
 
   const interval = settings.modelsDevSyncInterval as number | undefined;
-  startPeriodicSync(interval);
+  await startPeriodicSync(interval);
+}
+
+const NATIVE_CAPABILITY_COLUMNS = [
+  "provider",
+  "model_id",
+  "tool_call",
+  "reasoning",
+  "attachment",
+  "structured_output",
+  "temperature",
+  "modalities_input",
+  "modalities_output",
+  "knowledge_cutoff",
+  "release_date",
+  "last_updated",
+  "status",
+  "family",
+  "open_weights",
+  "limit_context",
+  "limit_input",
+  "limit_output",
+  "interleaved_field",
+  "reasoning_efforts",
+  "last_synced",
+] as const;
+async function insertNativeCapabilityRows(
+  data: CapabilitiesByProvider,
+  upsert: boolean
+): Promise<void> {
+  const now = new Date().toISOString();
+  const rows = Object.entries(data).flatMap(([provider, models]) =>
+    Object.entries(models).map(([model_id, cap]) => ({
+      provider,
+      model_id,
+      ...Object.fromEntries(
+        (
+          [
+            "tool_call",
+            "reasoning",
+            "attachment",
+            "structured_output",
+            "temperature",
+            "open_weights",
+          ] as const
+        ).map((key) => [key, cap[key] === null ? null : cap[key] ? 1 : 0])
+      ),
+      modalities_input: cap.modalities_input,
+      modalities_output: cap.modalities_output,
+      knowledge_cutoff: cap.knowledge_cutoff,
+      release_date: cap.release_date,
+      last_updated: cap.last_updated,
+      status: cap.status,
+      family: cap.family,
+      limit_context: cap.limit_context,
+      limit_input: cap.limit_input,
+      limit_output: cap.limit_output,
+      interleaved_field: cap.interleaved_field,
+      reasoning_efforts: cap.reasoning_efforts ? JSON.stringify(cap.reasoning_efforts) : null,
+      last_synced: now,
+    }))
+  );
+  if (!rows.length) return;
+  const columns = NATIVE_CAPABILITY_COLUMNS.join(",");
+  const definitions = NATIVE_CAPABILITY_COLUMNS.map(
+    (column) =>
+      column +
+      " " +
+      ([
+        "tool_call",
+        "reasoning",
+        "attachment",
+        "structured_output",
+        "temperature",
+        "open_weights",
+      ].includes(column)
+        ? "integer"
+        : ["limit_context", "limit_input", "limit_output"].includes(column)
+          ? "double precision"
+          : "text")
+  ).join(",");
+  const conflict = upsert
+    ? " ON CONFLICT(provider,model_id) DO UPDATE SET " +
+      NATIVE_CAPABILITY_COLUMNS.filter((column) => column !== "provider" && column !== "model_id")
+        .map((column) => column + "=EXCLUDED." + column)
+        .join(",")
+    : "";
+  await writePostgresCatalog(
+    "INSERT INTO omniroute.model_capabilities(" +
+      columns +
+      ") SELECT " +
+      columns +
+      " FROM json_to_recordset($1::json) AS data(" +
+      definitions +
+      ")" +
+      conflict,
+    [JSON.stringify(rows)]
+  );
+}
+
+export function saveModelsDevPricing(data: PricingByProvider): void {
+  assertSqliteBackendAllowed();
+  const db = getDbInstance();
+  const del = db.prepare("DELETE FROM key_value WHERE namespace = 'models_dev_pricing'");
+  const insert = db.prepare(
+    "INSERT INTO key_value (namespace, key, value) VALUES ('models_dev_pricing', ?, ?)"
+  );
+  const tx = db.transaction(() => {
+    del.run();
+    for (const [provider, models] of Object.entries(data)) {
+      insert.run(provider, JSON.stringify(models));
+    }
+  });
+  tx();
+  backupDbFile("pre-write");
+  invalidateDbCache("pricing");
+}
+
+export function clearModelsDevPricing(): void {
+  assertSqliteBackendAllowed();
+  const db = getDbInstance();
+  db.prepare("DELETE FROM key_value WHERE namespace = 'models_dev_pricing'").run();
+  backupDbFile("pre-write");
+  invalidateDbCache("pricing");
+}
+
+export function saveModelsDevCapabilities(data: CapabilitiesByProvider): void {
+  assertSqliteBackendAllowed();
+  const db = getDbInstance();
+  ensureCapabilitiesTable();
+
+  const del = db.prepare("DELETE FROM model_capabilities");
+  const insert = db.prepare(`
+    INSERT INTO model_capabilities (
+      provider, model_id, tool_call, reasoning, attachment, structured_output,
+      temperature, modalities_input, modalities_output, knowledge_cutoff,
+      release_date, last_updated, status, family, open_weights,
+      limit_context, limit_input, limit_output, interleaved_field, reasoning_efforts, last_synced
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  const now = new Date().toISOString();
+  let changed = false;
+  const tx = db.transaction(() => {
+    if (del.run().changes > 0) changed = true;
+    for (const [provider, models] of Object.entries(data)) {
+      for (const [modelId, cap] of Object.entries(models)) {
+        const info = insert.run(
+          provider,
+          modelId,
+          cap.tool_call === null ? null : cap.tool_call ? 1 : 0,
+          cap.reasoning === null ? null : cap.reasoning ? 1 : 0,
+          cap.attachment === null ? null : cap.attachment ? 1 : 0,
+          cap.structured_output === null ? null : cap.structured_output ? 1 : 0,
+          cap.temperature === null ? null : cap.temperature ? 1 : 0,
+          cap.modalities_input,
+          cap.modalities_output,
+          cap.knowledge_cutoff,
+          cap.release_date,
+          cap.last_updated,
+          cap.status,
+          cap.family,
+          cap.open_weights === null ? null : cap.open_weights ? 1 : 0,
+          cap.limit_context,
+          cap.limit_input,
+          cap.limit_output,
+          cap.interleaved_field,
+          cap.reasoning_efforts ? JSON.stringify(cap.reasoning_efforts) : null,
+          now
+        );
+        if (info.changes > 0) changed = true;
+      }
+    }
+  });
+  tx();
+  backupDbFile("pre-write");
+  cachedCapabilities = data;
+  cachedCapabilitiesLoadedAll = true;
+  if (changed) invalidateDbCache("model-capabilities");
+}
+
+export function upsertSyncedCapabilities(
+  provider: string,
+  models: Record<string, ModelCapabilityEntry>
+): void {
+  assertSqliteBackendAllowed();
+  if (!provider || Object.keys(models).length === 0) return;
+  const db = getDbInstance();
+  ensureCapabilitiesTable();
+  const insert = db.prepare(`
+    INSERT INTO model_capabilities (
+      provider, model_id, tool_call, reasoning, attachment, structured_output,
+      temperature, modalities_input, modalities_output, knowledge_cutoff,
+      release_date, last_updated, status, family, open_weights,
+      limit_context, limit_input, limit_output, interleaved_field, reasoning_efforts, last_synced
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(provider, model_id) DO UPDATE SET
+      tool_call=excluded.tool_call,
+      reasoning=excluded.reasoning,
+      attachment=excluded.attachment,
+      structured_output=excluded.structured_output,
+      temperature=excluded.temperature,
+      modalities_input=excluded.modalities_input,
+      modalities_output=excluded.modalities_output,
+      knowledge_cutoff=excluded.knowledge_cutoff,
+      release_date=excluded.release_date,
+      last_updated=excluded.last_updated,
+      status=excluded.status,
+      family=excluded.family,
+      open_weights=excluded.open_weights,
+      limit_context=excluded.limit_context,
+      limit_input=excluded.limit_input,
+      limit_output=excluded.limit_output,
+      interleaved_field=excluded.interleaved_field,
+      reasoning_efforts=excluded.reasoning_efforts,
+      last_synced=excluded.last_synced
+  `);
+  const now = new Date().toISOString();
+  let changed = false;
+  const tx = db.transaction(() => {
+    for (const [modelId, cap] of Object.entries(models)) {
+      const info = insert.run(
+        provider,
+        modelId,
+        cap.tool_call === null ? null : cap.tool_call ? 1 : 0,
+        cap.reasoning === null ? null : cap.reasoning ? 1 : 0,
+        cap.attachment === null ? null : cap.attachment ? 1 : 0,
+        cap.structured_output === null ? null : cap.structured_output ? 1 : 0,
+        cap.temperature === null ? null : cap.temperature ? 1 : 0,
+        cap.modalities_input,
+        cap.modalities_output,
+        cap.knowledge_cutoff,
+        cap.release_date,
+        cap.last_updated,
+        cap.status,
+        cap.family,
+        cap.open_weights === null ? null : cap.open_weights ? 1 : 0,
+        cap.limit_context,
+        cap.limit_input,
+        cap.limit_output,
+        cap.interleaved_field,
+        cap.reasoning_efforts ? JSON.stringify(cap.reasoning_efforts) : null,
+        now
+      );
+      if (info.changes > 0) changed = true;
+    }
+  });
+  tx();
+  if (cachedCapabilities) {
+    cachedCapabilities[provider] = {
+      ...(cachedCapabilities[provider] || {}),
+      ...models,
+    };
+  }
+  if (changed) invalidateDbCache("model-capabilities");
+}
+
+export function clearModelsDevCapabilities(): void {
+  assertSqliteBackendAllowed();
+  const db = getDbInstance();
+  ensureCapabilitiesTable();
+  const info = db.prepare("DELETE FROM model_capabilities").run();
+  backupDbFile("pre-write");
+  cachedCapabilities = {};
+  cachedCapabilitiesLoadedAll = true;
+  if (info.changes > 0) invalidateDbCache("model-capabilities");
+}
+
+/** Keep the existing abort behavior, then await the accepted sync's actual completion. */
+export async function stopPeriodicSyncAsync(): Promise<void> {
+  if (parseDatabaseBackend() !== "postgres") return stopPeriodicSync();
+  await stopNativePoller();
 }

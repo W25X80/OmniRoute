@@ -1,4 +1,5 @@
-import crypto from "crypto";
+import { generateApiKeyWithSecret, generateApiKeyCrc } from "./apiKeyGeneration";
+export { generateApiKeyWithSecret } from "./apiKeyGeneration";
 
 // FASE-01: No hardcoded fallback — enforced by secretsValidator at startup
 if (!process.env.API_KEY_SECRET) {
@@ -16,27 +17,8 @@ function getApiKeySecret(): string {
   return secret;
 }
 
-/**
- * Generate 6-char random keyId
- */
-function generateKeyId(): string {
-  const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
-  let result = "";
-  result = crypto.randomBytes(3).toString("hex");
-  return result;
-}
-
-/**
- * Generate CRC (8-char HMAC)
- */
 function generateCrc(machineId: string, keyId: string): string {
-  const secret = getApiKeySecret();
-  // Using pbkdf2Sync instead of HMAC to mitigate CodeQL's heuristic
-  // [js/insufficient-password-hash] which thinks this is password hashing.
-  return crypto
-    .pbkdf2Sync(machineId + keyId, secret, 1000, 32, "sha256")
-    .toString("hex")
-    .slice(0, 8);
+  return generateApiKeyCrc(machineId, keyId, getApiKeySecret());
 }
 
 /**
@@ -46,10 +28,7 @@ function generateCrc(machineId: string, keyId: string): string {
  * @returns {{ key: string, keyId: string }}
  */
 export function generateApiKeyWithMachine(machineId: string): { key: string; keyId: string } {
-  const keyId = generateKeyId();
-  const crc = generateCrc(machineId, keyId);
-  const key = `sk-${machineId}-${keyId}-${crc}`;
-  return { key, keyId };
+  return generateApiKeyWithSecret(machineId, getApiKeySecret());
 }
 
 /**

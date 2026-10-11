@@ -1,6 +1,12 @@
 import { timingSafeEqual } from "node:crypto";
 
-import { getLegacyCliTokenSync, getMachineTokenSync } from "../../lib/machineToken";
+import {
+  getLegacyCliTokenSync,
+  getMachineTokenSync,
+  getLegacyCliTokenAsync,
+  getMachineTokenAsync,
+} from "../../lib/machineToken";
+import { parseDatabaseBackend } from "../../lib/db/backendSelection";
 import type { PolicyContext } from "./context";
 import { CLI_TOKEN_HEADER, PEER_IP_HEADER, VIA_PROXY_HEADER } from "./headers";
 import { resolveStampedPeer, resolveStampedViaProxy } from "./peerStamp";
@@ -73,6 +79,22 @@ export function hasValidLoopbackCliToken(ctx: PolicyContext): boolean {
   const provided = headers.get(CLI_TOKEN_HEADER);
   if (!provided) return false;
   const expectedTokens = [getMachineTokenSync(), getLegacyCliTokenSync()].filter(Boolean);
+  return expectedTokens.some((expected) => {
+    if (provided.length !== expected.length) return false;
+    return timingSafeEqual(Buffer.from(provided), Buffer.from(expected));
+  });
+}
+
+/** Same locality and comparison gate with per-check asynchronous native identity lookup. */
+export async function hasValidLoopbackCliTokenAsync(ctx: PolicyContext): Promise<boolean> {
+  if (parseDatabaseBackend() !== "postgres") return hasValidLoopbackCliToken(ctx);
+  if (process.env.OMNIROUTE_DISABLE_CLI_TOKEN === "true") return false;
+  if (!isLoopbackRequest(ctx)) return false;
+  const provided = ctx.request.headers.get(CLI_TOKEN_HEADER);
+  if (!provided) return false;
+  const expectedTokens = [await getMachineTokenAsync(), await getLegacyCliTokenAsync()].filter(
+    Boolean
+  );
   return expectedTokens.some((expected) => {
     if (provided.length !== expected.length) return false;
     return timingSafeEqual(Buffer.from(provided), Buffer.from(expected));

@@ -1,9 +1,7 @@
+import { setParamFilterConfigAsync } from "@/lib/db/paramFilters";
+import { deleteParamFilterConfigAsync } from "@/lib/db/paramFilters";
 import { NextResponse } from "next/server";
-import {
-  getParamFilterConfig,
-  setParamFilterConfig,
-  deleteParamFilterConfig,
-} from "@/lib/db/paramFilters";
+import { getParamFilterConfig } from "@/lib/db/paramFilters";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 import { updateParamFilterConfigSchema } from "@/shared/validation/schemas";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
@@ -50,7 +48,7 @@ export async function PUT(request: Request, { params }: { params: Promise<{ id: 
     }
     const { block, allow, models, autoLearn } = validation.data;
 
-    setParamFilterConfig(id, {
+    await setParamFilterConfigAsync(id, {
       block: block ?? [],
       allow: allow ?? [],
       models,
@@ -72,7 +70,7 @@ export async function DELETE(request: Request, { params }: { params: Promise<{ i
 
   try {
     const { id } = await params;
-    deleteParamFilterConfig(id);
+    await deleteParamFilterConfigAsync(id);
     return NextResponse.json({ success: true });
   } catch (error) {
     return NextResponse.json(buildErrorBody(500, sanitizeErrorMessage(error)), { status: 500 });

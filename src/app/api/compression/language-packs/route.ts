@@ -1,3 +1,5 @@
+import { parseDatabaseBackend } from "@/lib/db/backendSelection";
+import { listCavemanRulePacksAsync } from "@omniroute/open-sse/services/compression/ruleLoader";
 import { NextResponse } from "next/server";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 import {
@@ -11,6 +13,9 @@ export async function GET(req: Request) {
 
   return NextResponse.json({
     languages: listSupportedCompressionLanguages(),
-    packs: listCavemanRulePacks(),
+    packs:
+      parseDatabaseBackend() === "postgres"
+        ? await listCavemanRulePacksAsync()
+        : listCavemanRulePacks(),
   });
 }

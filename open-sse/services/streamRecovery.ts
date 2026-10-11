@@ -12,6 +12,7 @@
  */
 import { STREAM_RECOVERY } from "../config/constants.ts";
 import { isFeatureFlagEnabled } from "@/shared/utils/featureFlags";
+import { getSelectedPersistenceIdentity } from "@/lib/db/controlPlaneContext";
 import {
   createThroughputWatchdog,
   ThroughputWatchdogError,
@@ -655,9 +656,10 @@ export function createRecoverableStream(
   let emittedToolCallFinish = false; // any finish_reason "tool_calls" seen
   let emittedParsedOpenAi = false;
   let emittedParsedResponses = false;
-  // STREAM_RECOVERY_TOOLCALL_ORDER_FIX, resolved lazily at most once per stream and only
-  // on a recovery decision, so the flag costs nothing on streams that end cleanly.
-  let toolCallOrderFix: boolean | undefined;
+  // Native recovery can outlive the HTTP owner during a completed tool handoff. Capture its
+  // prepared request operand now; SQLite retains the original lazy recovery-only resolution.
+  let toolCallOrderFix: boolean | undefined =
+    continueEnabled && getSelectedPersistenceIdentity() ? isToolcallOrderFixEnabled() : undefined;
   const isToolCallOrderFixOn = () => (toolCallOrderFix ??= isToolcallOrderFixEnabled());
 
   // Enqueue to the client and, when continuation is enabled, fold the chunk into the

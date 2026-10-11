@@ -17,7 +17,7 @@
 import { NextResponse } from "next/server";
 import { buildErrorBody } from "@omniroute/open-sse/utils/error";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
-import { listPlans as listProviderPlans } from "@/lib/db/providerPlans";
+import { listPlansAsync as listProviderPlans } from "@/lib/db/providerPlans";
 import { knownProviders, getKnownPlan } from "@/lib/quota/planRegistry";
 
 export const dynamic = "force-dynamic";
@@ -39,7 +39,7 @@ export async function GET(request: Request): Promise<Response> {
     });
 
     // 2. Manual DB overrides — may overlap with catalog providers (override wins)
-    const dbPlans = listProviderPlans();
+    const dbPlans = await listProviderPlans();
 
     // 3. Merge: DB plans by provider key override catalog entries
     const dbByProvider = new Map(dbPlans.map((p) => [p.provider, p]));

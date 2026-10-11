@@ -1,14 +1,24 @@
+import { parseDatabaseBackend } from "@/lib/db/backendSelection";
 import initializeCloudSync from "@/shared/services/initializeCloudSync";
 import { startModelSyncScheduler } from "@/shared/services/modelSyncScheduler";
 import { isAutomatedTestProcess } from "@/shared/utils/testProcess";
 import { getJobRegistry } from "@/lib/jobRegistry";
-import { registerBudgetResetJob } from "@/lib/jobs/budgetResetJob";
-import { registerTokenHealthCheck } from "@/lib/jobs/tokenHealthCheckJob";
-import { registerLogExportJob } from "@/lib/jobs/logExportJob";
+import { registerBudgetResetJob, registerBudgetResetJobAsync } from "@/lib/jobs/budgetResetJob";
+import {
+  registerTokenHealthCheck,
+  registerTokenHealthCheckAsync,
+} from "@/lib/jobs/tokenHealthCheckJob";
+import { registerLogExportJob, registerLogExportJobAsync } from "@/lib/jobs/logExportJob";
 import { backfillVolcPlanAutoSync } from "@/lib/providers/volcPlanAutoSyncBackfill";
 
 // Initialize runtime background sync services once per server process.
-let initialized = false;
+declare global {
+  var __omnirouteBackgroundSyncInitialization:
+    { initialized: boolean; pending?: Promise<boolean> } | undefined;
+}
+const initialization = (globalThis.__omnirouteBackgroundSyncInitialization ??= {
+  initialized: false,
+});
 
 export function shouldSkipCloudSyncInitialization(
   env: NodeJS.ProcessEnv = process.env,
@@ -26,33 +36,40 @@ export function shouldSkipCloudSyncInitialization(
   return isAutomatedTestProcess(argv, env) && env.OMNIROUTE_ENABLE_RUNTIME_BACKGROUND_TASKS !== "1";
 }
 
-export async function ensureCloudSyncInitialized() {
-  if (shouldSkipCloudSyncInitialization()) {
-    return false;
-  }
-  if (!initialized) {
+export async function ensureCloudSyncInitialized(): Promise<boolean> {
+  if (shouldSkipCloudSyncInitialization()) return false;
+  if (initialization.initialized) return true;
+  if (initialization.pending) return initialization.pending;
+  const native = parseDatabaseBackend() === "postgres";
+  initialization.pending = (async () => {
     try {
       await initializeCloudSync();
       await backfillVolcPlanAutoSync();
       startModelSyncScheduler();
-
-      // startAll() runs each interval job's first tick synchronously, so it has to
-      // come after initializeCloudSync(). The old wiring got that ordering two
-      // different ways: the budget reset was started right here, and the health
-      // check's first sweep sat behind a 10s timer. Awaiting the init is a firmer
-      // guarantee than the timer was.
       const registry = getJobRegistry();
-      registerBudgetResetJob(registry);
-      registerTokenHealthCheck(registry);
-      registerLogExportJob(registry);
+      if (native) {
+        await registerBudgetResetJobAsync(registry);
+        await registerTokenHealthCheckAsync(registry);
+        await registerLogExportJobAsync(registry);
+      } else {
+        registerBudgetResetJob(registry);
+        registerTokenHealthCheck(registry);
+        registerLogExportJob(registry);
+      }
       await registry.startAll();
-
-      initialized = true;
+      initialization.initialized = true;
+      return true;
     } catch (error) {
       console.error("[ServerInit] Error initializing background sync services:", error);
+      if (native) throw error;
+      return false;
     }
+  })();
+  try {
+    return await initialization.pending;
+  } finally {
+    initialization.pending = undefined;
   }
-  return initialized;
 }
 
 export default ensureCloudSyncInitialized;

@@ -2,7 +2,7 @@ import { buildErrorBody } from "@omniroute/open-sse/utils/error";
 import { type NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
-import { getPluginByName, updatePluginConfig } from "@/lib/db/plugins";
+import { getPluginByNameAsync, updatePluginConfigAsync } from "@/lib/db/plugins";
 import { CORS_HEADERS, handleCorsOptions } from "@/shared/utils/cors";
 
 export async function OPTIONS() {
@@ -16,7 +16,7 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
   const authError = await requireManagementAuth(request);
   if (authError) return authError;
   const { name } = await params;
-  const plugin = getPluginByName(name);
+  const plugin = await getPluginByNameAsync(name);
 
   if (!plugin) {
     return NextResponse.json(buildErrorBody(404, `Plugin '${name}' not found`), {
@@ -64,7 +64,7 @@ export async function PUT(request: NextRequest, { params }: { params: Promise<{ 
     });
   }
 
-  const plugin = getPluginByName(name);
+  const plugin = await getPluginByNameAsync(name);
   if (!plugin) {
     return NextResponse.json(buildErrorBody(404, `Plugin '${name}' not found`), {
       status: 404,
@@ -101,7 +101,7 @@ export async function PUT(request: NextRequest, { params }: { params: Promise<{ 
     }
   }
 
-  updatePluginConfig(name, parsed.data.config);
+  await updatePluginConfigAsync(name, parsed.data.config);
 
   return NextResponse.json(
     { success: true, config: parsed.data.config },

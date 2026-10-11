@@ -1,3 +1,4 @@
+import { parseDatabaseBackend } from "@/lib/db/backendSelection";
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
@@ -205,7 +206,7 @@ async function dispatchCompression(
     });
   }
   const q = quantumExtras(opts.quantumLock);
-  return applyCompression(requestBody, opts.effectiveMode, {
+  const compressionOptions = {
     config: {
       ...(opts.config as CompressionConfig | undefined),
       ...(opts.fidelityGate ? { fidelityGate: opts.fidelityGate } : {}),
@@ -213,7 +214,10 @@ async function dispatchCompression(
       ...q.configPatch,
     } as CompressionConfig | undefined,
     ...q.applyOpts,
-  });
+  };
+  return parseDatabaseBackend() === "postgres"
+    ? applyCompressionAsync(requestBody, opts.effectiveMode, compressionOptions)
+    : applyCompression(requestBody, opts.effectiveMode, compressionOptions);
 }
 
 export async function POST(req: Request) {

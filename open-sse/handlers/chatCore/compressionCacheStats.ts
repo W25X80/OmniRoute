@@ -1,3 +1,4 @@
+import { runPersistenceBackgroundWork } from "@/lib/db/persistenceRuntime";
 /**
  * chatCore compression cache-stats hook (Quality Gate v2 / Fase 9 — chatCore god-file
  * decomposition, #3501).
@@ -22,10 +23,10 @@ export function recordCompressionCacheStats(args: {
   connectionCacheOverride?: ConnectionCacheOverride | null;
   log?: LoggerLike;
 }): void {
-  void (async () => {
+  void runPersistenceBackgroundWork(async () => {
     try {
       const { detectCachingContext } = await import("../../services/compression/cachingAware.ts");
-      const { recordCacheStats } = await import("@/lib/db/compressionCacheStats");
+      const { recordCacheStatsAsync } = await import("@/lib/db/compressionCacheStats");
       const cacheContext = detectCachingContext(args.compressionInputBody, {
         provider: args.provider,
         targetFormat: args.targetFormat,
@@ -36,7 +37,7 @@ export function recordCompressionCacheStats(args: {
         0,
         args.stats.originalTokens - args.stats.compressedTokens
       );
-      recordCacheStats({
+      await recordCacheStatsAsync({
         provider: cacheContext.provider ?? args.provider ?? "unknown",
         model: args.effectiveModel ?? "",
         compressionMode: args.mode,
@@ -53,5 +54,5 @@ export function recordCompressionCacheStats(args: {
           (err instanceof Error ? err.message : String(err))
       );
     }
-  })();
+  }).catch(() => {});
 }

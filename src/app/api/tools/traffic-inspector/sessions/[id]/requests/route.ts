@@ -13,7 +13,7 @@
 
 import { buildErrorBody, sanitizeErrorMessage } from "@omniroute/open-sse/utils/error.ts";
 import { InspectorSessionRequestAppendSchema } from "@/shared/schemas/inspector";
-import { getSession, appendSessionRequest } from "@/lib/db/inspectorSessions";
+import { getSessionAsync, appendSessionRequestAsync } from "@/lib/db/inspectorSessions";
 
 interface Params {
   params: Promise<{ id: string }>;
@@ -23,7 +23,7 @@ export async function POST(request: Request, { params }: Params): Promise<Respon
   const { id } = await params;
 
   // Verify session exists before attempting to append
-  const session = getSession(id);
+  const session = await getSessionAsync(id);
   if (!session) {
     return new Response(JSON.stringify(buildErrorBody(404, "Session not found")), {
       status: 404,
@@ -50,7 +50,7 @@ export async function POST(request: Request, { params }: Params): Promise<Respon
   }
 
   try {
-    const seq = appendSessionRequest(id, parsed.data.payload);
+    const seq = await appendSessionRequestAsync(id, parsed.data.payload);
     return Response.json({ seq }, { status: 201 });
   } catch (err) {
     const msg = sanitizeErrorMessage(err);

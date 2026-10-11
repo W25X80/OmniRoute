@@ -6,7 +6,7 @@ type RequestTranslator = (
 ) => unknown;
 
 type ResponseTranslator = (
-  chunk: Record<string, unknown>,
+  chunk: Record<string, unknown> | null,
   state: Record<string, unknown>
 ) => unknown;
 

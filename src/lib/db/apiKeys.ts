@@ -1,3 +1,9 @@
+import { getSelectedControlPlane } from "./controlPlaneContext";
+import {
+  assertExclusiveLeaseKeyPolicy,
+  hydrateApiKeyMetadata,
+} from "./apiKeys/persistenceSemantics";
+export { ApiKeyPolicyInvariantError } from "./apiKeys/persistenceSemantics";
 /**
  * db/apiKeys.js — API key management.
  */
@@ -55,7 +61,6 @@ import {
   parseAllowedConnections,
   parseAllowedQuotas,
   parseStringList,
-  parseNullableTimestamp,
   parseIsBanned,
   parseStreamDefaultMode,
   parseCacheDefaultMode,
@@ -257,19 +262,6 @@ const LAST_USED_UPDATE_TTL = 5 * 60 * 1000;
 const MAX_CACHE_SIZE = 1000;
 const EXCLUSIVE_LEASE_SCOPE = "lease:exclusive";
 
-export class ApiKeyPolicyInvariantError extends Error {
-  readonly code = "LEASE_KEY_POLICY_INVALID";
-}
-
-function assertExclusiveLeaseKeyPolicy(
-  scopes: readonly string[],
-  allowedConnections: readonly string[]
-): void {
-  if (scopes.includes(EXCLUSIVE_LEASE_SCOPE) && allowedConnections.length === 0) {
-    throw new ApiKeyPolicyInvariantError("lease:exclusive requires explicit allowedConnections");
-  }
-}
-
 // Prepared statements cache
 let _stmtGetAllKeys: ApiKeysStatements["getAllKeys"] | null = null;
 let _stmtGetKeyById: ApiKeysStatements["getKeyById"] | null = null;
@@ -314,7 +306,7 @@ async function deleteRedisAuthCacheEntry(keyHash: unknown): Promise<void> {
   }
 }
 
-async function deleteRedisAuthCacheEntries(...keyHashes: unknown[]): Promise<void> {
+export async function deleteRedisAuthCacheEntries(...keyHashes: unknown[]): Promise<void> {
   await Promise.all(keyHashes.map((keyHash) => deleteRedisAuthCacheEntry(keyHash)));
 }
 
@@ -394,6 +386,9 @@ export async function isModelBlockedByPatterns(
   blockedModels: string[] | null | undefined,
   modelId: string
 ): Promise<boolean> {
+  const selected = getSelectedControlPlane();
+  if (selected) return selected.apiKeys.isModelBlockedByPatterns(blockedModels, modelId);
+
   if (!blockedModels?.length) return false;
   const candidates = await getModelPermissionCandidates(modelId);
   return blockedModels.some((pattern) => modelPatternMatches(pattern, candidates));
@@ -502,6 +497,9 @@ function getPreparedStatements(db: ApiKeysDbLike): ApiKeysStatements {
 }
 
 export async function getApiKeys(limit?: number, offset?: number) {
+  const selected = getSelectedControlPlane();
+  if (selected) return selected.apiKeys.getApiKeys(limit, offset);
+
   const db = getDbInstance() as ApiKeysDbLike;
   let rows: ApiKeyRow[];
   if (limit !== undefined) {
@@ -561,6 +559,9 @@ export function getApiKeysCount(): number {
 
 /** Derived lease-only membership from existing key policy, not a second pool store. */
 export async function getExclusiveLeaseConnectionIds(): Promise<Set<string>> {
+  const selected = getSelectedControlPlane();
+  if (selected) return selected.apiKeys.getExclusiveLeaseConnectionIds();
+
   ensureApiKeysColumns(getDbInstance() as ApiKeysDbLike);
   const rows = (getDbInstance() as ApiKeysDbLike)
     .prepare<ApiKeyRow>(
@@ -599,6 +600,9 @@ export async function getExclusiveLeaseConnectionIds(): Promise<Set<string>> {
 export async function pickApiKeyForInternalUse(
   purpose: "combo-health-check" | "cloud-sync-verify" | "internal-probe" = "internal-probe"
 ): Promise<string | null> {
+  const selected = getSelectedControlPlane();
+  if (selected) return selected.apiKeys.pickApiKeyForInternalUse(purpose);
+
   try {
     const keys = (await getApiKeys()) as Array<{
       key?: string;
@@ -653,6 +657,9 @@ export async function pickApiKeyForInternalUse(
 }
 
 export async function getApiKeyById(id: string) {
+  const selected = getSelectedControlPlane();
+  if (selected) return selected.apiKeys.getApiKeyById(id);
+
   const db = getDbInstance() as ApiKeysDbLike;
   const stmt = getPreparedStatements(db);
   const row = stmt.getKeyById.get(id);
@@ -710,6 +717,9 @@ export async function createApiKey(
   scopes: string[] = [],
   options: CreateApiKeyOptions = {}
 ) {
+  const selected = getSelectedControlPlane();
+  if (selected) return selected.apiKeys.createApiKey(name, machineId, scopes, options);
+
   if (!machineId) {
     throw new Error("machineId is required");
   }
@@ -769,6 +779,9 @@ export async function createApiKey(
 }
 
 export async function regenerateApiKey(id: string) {
+  const selected = getSelectedControlPlane();
+  if (selected) return selected.apiKeys.regenerateApiKey(id);
+
   const db = getDbInstance() as ApiKeysDbLike;
   const stmt = getPreparedStatements(db);
   const row = stmt.getKeyById.get(id) as ApiKeyRow | undefined;
@@ -805,6 +818,9 @@ export async function updateApiKeyPermissions(
   id: string,
   update: string[] | ApiKeyPermissionsUpdate
 ) {
+  const selected = getSelectedControlPlane();
+  if (selected) return selected.apiKeys.updateApiKeyPermissions(id, update);
+
   const db = getDbInstance() as ApiKeysDbLike;
   getPreparedStatements(db);
 
@@ -1211,6 +1227,9 @@ export async function updateApiKeyPermissions(
 }
 
 export async function deleteApiKey(id: string) {
+  const selected = getSelectedControlPlane();
+  if (selected) return selected.apiKeys.deleteApiKey(id);
+
   const db = getDbInstance() as ApiKeysDbLike;
   const stmt = getPreparedStatements(db);
   const row = stmt.getKeyById.get(id) as ApiKeyRow | undefined;
@@ -1237,6 +1256,9 @@ export async function deleteApiKey(id: string) {
  * (or sooner because invalidateCaches() runs here).
  */
 export async function revokeApiKey(id: string): Promise<boolean> {
+  const selected = getSelectedControlPlane();
+  if (selected) return selected.apiKeys.revokeApiKey(id);
+
   const db = getDbInstance() as ApiKeysDbLike;
   getPreparedStatements(db);
 
@@ -1258,6 +1280,9 @@ export async function revokeApiKey(id: string): Promise<boolean> {
  * Set or clear the expiry of an API key. Pass null to remove the expiry.
  */
 export async function setApiKeyExpiry(id: string, expiresAt: string | null): Promise<boolean> {
+  const selected = getSelectedControlPlane();
+  if (selected) return selected.apiKeys.setApiKeyExpiry(id, expiresAt);
+
   const db = getDbInstance() as ApiKeysDbLike;
   getPreparedStatements(db);
 
@@ -1288,6 +1313,9 @@ export async function setApiKeyExpiry(id: string, expiresAt: string | null): Pro
  * caller.
  */
 export async function validateApiKey(key: string | null | undefined) {
+  const selected = getSelectedControlPlane();
+  if (selected) return selected.apiKeys.validateApiKey(key);
+
   if (!key || typeof key !== "string") return false;
 
   if (isConfiguredEnvApiKey(key) || isSelfLoopBearer(key)) return true;
@@ -1366,6 +1394,9 @@ export async function validateApiKey(key: string | null | undefined) {
 export async function getApiKeyMetadata(
   key: string | null | undefined
 ): Promise<ApiKeyMetadata | null> {
+  const selected = getSelectedControlPlane();
+  if (selected) return selected.apiKeys.getApiKeyMetadata(key);
+
   if (!key || typeof key !== "string") return null;
 
   const now = Date.now();
@@ -1451,87 +1482,7 @@ export async function getApiKeyMetadata(
   if (!row) return null;
 
   const record = toRecord(row) as ApiKeyRow;
-  const metadataId = typeof record.id === "string" ? record.id : "";
-  const metadataName = typeof record.name === "string" ? record.name : "";
-  const machineIdRaw = record.machine_id ?? record.machineId;
-  const metadataMachineId = typeof machineIdRaw === "string" ? machineIdRaw : null;
-
-  const rawMaxRPD = record.max_requests_per_day ?? record.maxRequestsPerDay;
-  const rawMaxRPM = record.max_requests_per_minute ?? record.maxRequestsPerMinute;
-  const rawThrottleDelayMs = record.throttle_delay_ms ?? (record as JsonRecord).throttleDelayMs;
-
-  const rawMaxSessions = record.max_sessions ?? record.maxSessions;
-
-  const rawAllowedModels = record.allowed_models ?? record.allowedModels;
-  const metadata: ApiKeyMetadata = {
-    id: metadataId,
-    name: metadataName,
-    machineId: metadataMachineId,
-    modelAccessMode: parseModelAccessMode(
-      record.model_access_mode ?? record.modelAccessMode,
-      rawAllowedModels
-    ),
-    allowedModels: parseAllowedModels(rawAllowedModels),
-    blockedModels: parseAllowedModels(record.blocked_models ?? record.blockedModels),
-    allowedCombos: parseAllowedCombos(record.allowed_combos ?? record.allowedCombos),
-    allowedConnections: parseAllowedConnections(
-      record.allowed_connections ?? record.allowedConnections
-    ),
-    allowedQuotas: parseAllowedQuotas(
-      (record as JsonRecord).allowed_quotas ?? (record as JsonRecord).allowedQuotas
-    ),
-    noLog: parseNoLog(record.no_log ?? record.noLog),
-    autoResolve: parseAutoResolve(record.auto_resolve ?? record.autoResolve),
-    isActive: parseIsActive(record.is_active ?? record.isActive),
-    accessSchedule: parseAccessSchedule(record.access_schedule ?? record.accessSchedule),
-    rateLimits: parseRateLimits(record.rate_limits ?? (record as JsonRecord).rateLimits),
-    maxRequestsPerDay: typeof rawMaxRPD === "number" && rawMaxRPD > 0 ? rawMaxRPD : null,
-    maxRequestsPerMinute: typeof rawMaxRPM === "number" && rawMaxRPM > 0 ? rawMaxRPM : null,
-    throttleDelayMs:
-      typeof rawThrottleDelayMs === "number" && rawThrottleDelayMs > 0 ? rawThrottleDelayMs : null,
-    // T08: max concurrent sessions; 0 = unlimited (default & backward-compatible)
-    maxSessions: typeof rawMaxSessions === "number" && rawMaxSessions > 0 ? rawMaxSessions : 0,
-    revokedAt: parseNullableTimestamp(record.revoked_at ?? (record as JsonRecord).revokedAt),
-    expiresAt: parseNullableTimestamp(record.expires_at ?? (record as JsonRecord).expiresAt),
-    ipAllowlist: parseStringList(record.ip_allowlist ?? (record as JsonRecord).ipAllowlist),
-    scopes: parseStringList((record as JsonRecord).scopes),
-    isBanned: parseIsBanned(record.is_banned ?? (record as JsonRecord).isBanned),
-    keyHash: (record.key_hash ?? (record as JsonRecord).keyHash) as string | null,
-    proxyId:
-      typeof record.proxy_id === "string" && record.proxy_id.trim() !== "" ? record.proxy_id : null,
-    allowedEndpoints: parseStringList(
-      (record as JsonRecord).allowed_endpoints ?? (record as JsonRecord).allowedEndpoints
-    ),
-    streamDefaultMode: parseStreamDefaultMode(
-      (record as JsonRecord).stream_default_mode ?? (record as JsonRecord).streamDefaultMode
-    ),
-    codexServiceMode: parseApiKeyCodexServiceMode(
-      record.codex_service_mode ?? record.codexServiceMode
-    ),
-    cacheDefaultMode: parseCacheDefaultMode(
-      (record as JsonRecord).cache_default_mode ?? (record as JsonRecord).cacheDefaultMode
-    ),
-    disableNonPublicModels: parseDisableNonPublicModels(
-      (record as JsonRecord).disable_non_public_models ??
-        (record as JsonRecord).disableNonPublicModels
-    ),
-    allowUsageCommand: parseAllowUsageCommand(
-      (record as JsonRecord).allow_usage_command ?? (record as JsonRecord).allowUsageCommand
-    ),
-    chaosModeEnabled: parseChaosModeEnabled(
-      (record as JsonRecord).chaos_mode_enabled ?? (record as JsonRecord).chaosModeEnabled
-    ),
-    compressionEnabled: parseCompressionEnabled(
-      (record as JsonRecord).compression_enabled ?? (record as JsonRecord).compressionEnabled
-    ),
-    allowAutoCombos: parseAllowAutoCombos(
-      (record as JsonRecord).allow_auto_combos ?? (record as JsonRecord).allowAutoCombos
-    ),
-    catalogScope: parseCatalogScope(
-      (record as JsonRecord).catalog_scope ?? (record as JsonRecord).catalogScope
-    ),
-    ...parseApiKeyUsageLimitFields(record as JsonRecord),
-  };
+  const metadata = hydrateApiKeyMetadata(record as JsonRecord);
 
   if (!metadata.id) {
     return null;
@@ -1557,6 +1508,9 @@ export async function isModelAllowedForKey(
   modelId: string | null | undefined,
   resolvedModelId?: string | null
 ): Promise<boolean> {
+  const selected = getSelectedControlPlane();
+  if (selected) return selected.apiKeys.isModelAllowedForKey(key, modelId, resolvedModelId);
+
   // If no key provided, allow (request may be using different auth method like JWT)
   // If no modelId provided, deny (invalid request)
   if (!key) return true;
@@ -1703,3 +1657,9 @@ export function resetApiKeyState() {
 }
 
 registerDbStateResetter(resetApiKeyState);
+
+/** Async count preserves the existing synchronous SQLite count contract. */
+export async function getApiKeysCountAsync(): Promise<number> {
+  const selected = getSelectedControlPlane();
+  return selected ? selected.apiKeys.getApiKeysCount() : getApiKeysCount();
+}

@@ -7,11 +7,11 @@
 
 import { buildErrorBody, sanitizeErrorMessage } from "@omniroute/open-sse/utils/error.ts";
 import { InspectorSessionStartSchema } from "@/shared/schemas/inspector";
-import { listSessions, createSession } from "@/lib/db/inspectorSessions";
+import { listSessionsAsync, createSessionAsync } from "@/lib/db/inspectorSessions";
 
 export async function GET(): Promise<Response> {
   try {
-    const sessions = listSessions();
+    const sessions = await listSessionsAsync();
     return Response.json({ sessions });
   } catch (err) {
     const msg = sanitizeErrorMessage(err);
@@ -40,7 +40,7 @@ export async function POST(request: Request): Promise<Response> {
   }
 
   try {
-    const session = createSession({ name: parsed.data.name });
+    const session = await createSessionAsync({ name: parsed.data.name });
     return Response.json(session, { status: 201 });
   } catch (err) {
     const msg = sanitizeErrorMessage(err);

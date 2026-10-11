@@ -5,11 +5,11 @@
 import { NextRequest, NextResponse } from "next/server";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 import {
-  getRequestDetailLogs,
-  getRequestDetailLogCount,
+  getRequestDetailLogsAsync as getRequestDetailLogs,
+  getRequestDetailLogCountAsync as getRequestDetailLogCount,
   isDetailedLoggingEnabled,
 } from "@/lib/db/detailedLogs";
-import { getUserDatabaseSettings, updateDatabaseSettings } from "@/lib/db/databaseSettings";
+import { getUserDatabaseSettings, updateDatabaseSettingsAsync } from "@/lib/db/databaseSettings";
 import { updateSettings } from "@/lib/db/settings";
 
 export const dynamic = "force-dynamic";
@@ -22,8 +22,8 @@ export async function GET(req: NextRequest) {
   const limit = Math.min(Number(url.searchParams.get("limit") ?? 50), 200);
   const offset = Number(url.searchParams.get("offset") ?? 0);
 
-  const logs = getRequestDetailLogs(limit, offset);
-  const total = getRequestDetailLogCount();
+  const logs = await getRequestDetailLogs(limit, offset);
+  const total = await getRequestDetailLogCount();
   const enabled = await isDetailedLoggingEnabled();
 
   return NextResponse.json({ enabled, total, logs });
@@ -38,7 +38,7 @@ export async function POST(req: NextRequest) {
 
   await updateSettings({ call_log_pipeline_enabled: enabled });
   const databaseSettings = getUserDatabaseSettings();
-  updateDatabaseSettings({
+  await updateDatabaseSettingsAsync({
     logs: {
       ...databaseSettings.logs,
       detailedLogsEnabled: enabled,

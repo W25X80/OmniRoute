@@ -1,3 +1,5 @@
+import { runPersistenceBackgroundWork } from "../db/persistenceRuntime";
+import { getSelectedMemoryRepository } from "../db/memory";
 /**
  * Memory store - CRUD operations with prepared statements and caching
  */
@@ -186,6 +188,17 @@ function scheduleVectorUpsert(id: string, content: string): void {
 export async function createMemory(
   memory: Omit<Memory, "id" | "createdAt" | "updatedAt" | "accessCount" | "lastAccessedAt">
 ): Promise<Memory> {
+  const selected = getSelectedMemoryRepository();
+  if (selected) {
+    const stored = await selected.create(memory);
+    // Optional embeddings preserve the non-blocking write path and participate in runtime drain.
+    void runPersistenceBackgroundWork(() => syncSelectedMemoryVector(stored)).catch((error) =>
+      log.warn("memory.vec.admission.fail", {
+        error: sanitizeErrorMessage(error instanceof Error ? error.message : String(error)),
+      })
+    );
+    return stored;
+  }
   const db = getDbInstance();
   const now = new Date().toISOString();
 
@@ -336,6 +349,9 @@ export async function createMemory(
 export async function getMemory(id: string): Promise<Memory | null> {
   if (!id || typeof id !== "string") return null;
 
+  const selected = getSelectedMemoryRepository();
+  if (selected) return selected.findById(id);
+
   // Check cache first
   const cached = _memoryCache.get(id);
   if (cached && Date.now() - cached.timestamp < MEMORY_CACHE_TTL) {
@@ -371,6 +387,20 @@ export async function updateMemory(
 ): Promise<boolean> {
   if (!id || typeof id !== "string") return false;
 
+  const selected = getSelectedMemoryRepository();
+  if (selected) {
+    const changed = await selected.update(id, updates);
+    if (changed && (updates.content !== undefined || updates.key !== undefined)) {
+      const memory = await selected.findById(id);
+      if (memory)
+        void runPersistenceBackgroundWork(() => syncSelectedMemoryVector(memory)).catch((error) =>
+          log.warn("memory.vec.admission.fail", {
+            error: sanitizeErrorMessage(error instanceof Error ? error.message : String(error)),
+          })
+        );
+    }
+    return changed;
+  }
   const db = getDbInstance();
   const now = new Date().toISOString();
 
@@ -459,6 +489,9 @@ export async function deleteMemory(id: string): Promise<boolean> {
     })
   );
 
+  const selected = getSelectedMemoryRepository();
+  if (selected) return selected.deleteById(id);
+
   // 3. Delete from SQLite
   const db = getDbInstance();
   const stmt = db.prepare("DELETE FROM memories WHERE id = ?");
@@ -489,6 +522,8 @@ export async function listMemories(filters: {
   offset?: number;
   page?: number;
 }): Promise<{ data: Memory[]; total: number; byType: Record<string, number> }> {
+  const selected = getSelectedMemoryRepository();
+  if (selected) return selected.list(filters);
   const db = getDbInstance();
 
   // Build dynamic query conditions
@@ -647,4 +682,57 @@ export function listMemoriesForDecay(filters: { apiKeyId?: string; limit: number
     createdAt: new Date(String(r.created_at)),
     lastAccessedAt: r.last_accessed_at ? new Date(String(r.last_accessed_at)) : null,
   }));
+}
+
+export async function syncSelectedMemoryVector(memory: Memory): Promise<void> {
+  try {
+    await upsertSemanticMemoryPoint({
+      id: memory.id,
+      apiKeyId: memory.apiKeyId,
+      sessionId: memory.sessionId,
+      key: memory.key,
+      content: memory.content,
+      metadata: memory.metadata,
+      createdAt: memory.createdAt.toISOString(),
+      expiresAt: memory.expiresAt?.toISOString() ?? null,
+    });
+    const settings = await getMemorySettings();
+    const resolution = resolveEmbeddingSource(settings);
+    if (!resolution.source) return;
+    const embedded = await embedWithRetry(memory.content, settings);
+    if (!("vector" in embedded)) return;
+    const store = getVectorStore();
+    if (!store) return;
+    const ready = await store.ensureReady(
+      withMeasuredDimensions(resolution, embedded.vector.length)
+    );
+    if (ready.ready) await store.upsertVector(memory.id, embedded.vector, memory.content);
+  } catch (error) {
+    log.warn("memory.vec.upsert.fail", {
+      id: memory.id,
+      error: sanitizeErrorMessage(error instanceof Error ? error.message : String(error)),
+    });
+  }
+}
+
+export async function getMemoryTokensUsedAsync(apiKeyId?: string): Promise<number> {
+  const selected = getSelectedMemoryRepository();
+  return selected ? selected.tokensUsed(apiKeyId) : getMemoryTokensUsed(apiKeyId);
+}
+
+export async function recordMemoryAccessAsync(ids: string[]): Promise<void> {
+  const selected = getSelectedMemoryRepository();
+  if (!selected) return recordMemoryAccess(ids);
+  const unique = [...new Set(ids.filter((id) => typeof id === "string" && id))];
+  if (!unique.length) return;
+  try {
+    await selected.recordAccess(unique);
+  } catch {
+    /* Optional access telemetry. */
+  }
+}
+
+export async function listMemoriesForDecayAsync(filters: { apiKeyId?: string; limit: number }) {
+  const selected = getSelectedMemoryRepository();
+  return selected ? selected.decayCandidates(filters) : listMemoriesForDecay(filters);
 }

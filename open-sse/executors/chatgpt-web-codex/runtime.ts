@@ -3,6 +3,7 @@ import { TurnBroker } from "../../vendor/codex-chatgpt-web/adapters/chatgpt-web/
 import { chatGptTurnSessions } from "../../vendor/codex-chatgpt-web/adapters/chatgpt-web/turn-execution.ts";
 import { connectionRuntimePaths } from "./storageState.ts";
 import { stopChatGptWebCodexTunnelRuntime } from "./tunnelClient.ts";
+import { closeResponseStateWorker } from "../../vendor/codex-chatgpt-web/responses/stateWorkerClient";
 
 const activeWorkers = new Set<ChatGptBrowserWorker>();
 const activeBrokers = new Set<TurnBroker>();
@@ -37,7 +38,11 @@ export async function stopChatGptWebCodexRuntime(): Promise<void> {
   activeBrokers.clear();
   await Promise.allSettled(workers.map((worker) => worker.close()));
   await Promise.allSettled(brokers.map((broker) => broker.close()));
-  await stopChatGptWebCodexTunnelRuntime();
+  try {
+    await stopChatGptWebCodexTunnelRuntime();
+  } finally {
+    await closeResponseStateWorker();
+  }
 }
 
 export function brokerSocketPathForConnection(connectionId: string): string {

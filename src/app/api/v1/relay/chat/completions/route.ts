@@ -11,12 +11,20 @@ import { stripSensitiveResponseHeaders } from "@omniroute/open-sse/utils/upstrea
 import { handleChat } from "@/sse/handlers/chat";
 import { withChatAdmission } from "@/shared/middleware/withChatAdmission";
 import { createInjectionGuard } from "@/middleware/promptInjectionGuard";
-import { getRelayTokenByHash, checkRateLimit, recordRelayUsage } from "@/lib/db/relayProxies";
+import {
+  getRelayTokenByHashAsync,
+  checkRateLimitAsync,
+  recordRelayUsageAsync,
+} from "@/lib/db/relayProxies";
 import {
   buildErrorBody,
   parseUpstreamError,
   sanitizeErrorMessage,
 } from "@omniroute/open-sse/utils/error";
+import { getProviderPluginManifestEntryForModel } from "@omniroute/open-sse/config/providerPluginManifestRegistry.ts";
+import { getProviderPluginManifestHeader } from "@omniroute/open-sse/config/providerPluginManifestUrl.ts";
+import { stripStaleEncodingHeaders } from "@omniroute/open-sse/utils/upstreamResponseHeaders.ts";
+import type { RelayToken } from "@/lib/db/relayProxies";
 import {
   checkIpRateLimit,
   extractToken,
@@ -32,18 +40,16 @@ import {
   shouldTryBifrostForRequest,
   type BifrostRoutingConfig,
 } from "./routingBackend";
-import { getProviderPluginManifestEntryForModel } from "@omniroute/open-sse/config/providerPluginManifestRegistry.ts";
-import { getProviderPluginManifestHeader } from "@omniroute/open-sse/config/providerPluginManifestUrl.ts";
 import { finalizeReadableStream } from "./streamFinalizer";
-import { stripStaleEncodingHeaders } from "@omniroute/open-sse/utils/upstreamResponseHeaders.ts";
 import {
   clearBifrostFailure,
   getActiveBifrostCooldown,
   recordBifrostFailure,
 } from "./bifrostCooldown";
-import type { RelayToken } from "@/lib/db/relayProxies";
-
-const JSON_CORS_HEADERS = { ...CORS_HEADERS, "Content-Type": "application/json" } as const;
+const JSON_CORS_HEADERS = {
+  ...CORS_HEADERS,
+  "Content-Type": "application/json",
+} as const;
 
 // `logger: null` — this relay forwards to handleChat, where the guardrail registry
 // re-evaluates the request with the pino logger (#11936 dedupe). The bifrost sibling
@@ -52,7 +58,7 @@ const injectionGuard = createInjectionGuard({ logger: null });
 
 type RelayUsageStatus = "success" | "error";
 
-function recordUsage(
+async function recordUsage(
   tokenId: string,
   request: Request,
   startTime: number,
@@ -61,13 +67,13 @@ function recordUsage(
   status: RelayUsageStatus,
   statusCode: number
 ) {
-  recordRelayUsage(tokenId, {
+  await recordRelayUsageAsync(tokenId, {
     requestId: request.headers.get("x-request-id") || undefined,
     status,
     statusCode,
     latencyMs: Date.now() - startTime,
     clientIp,
-    userAgent,
+    userAgent: userAgent ?? undefined,
   });
 }
 
@@ -139,7 +145,15 @@ async function forwardToBifrost(
         errorHeaders.set("Retry-After", String(Math.ceil(parsed.retryAfterMs / 1000)));
       }
       clearTimeout(tid);
-      recordUsage(token.id, request, startTime, clientIp, userAgent, "error", parsed.statusCode);
+      await recordUsage(
+        token.id,
+        request,
+        startTime,
+        clientIp,
+        userAgent,
+        "error",
+        parsed.statusCode
+      );
       return new Response(JSON.stringify(errorBody), {
         status: parsed.statusCode,
         headers: errorHeaders,
@@ -147,7 +161,7 @@ async function forwardToBifrost(
     }
 
     if (wantsStream && upstream.body) {
-      const stream = finalizeReadableStream(upstream.body, (error) => {
+      const stream = finalizeReadableStream(upstream.body, async (error) => {
         clearTimeout(tid);
         const statusCode = timedOut ? 504 : upstream.status;
         if (error && backend === "auto") {
@@ -158,7 +172,7 @@ async function forwardToBifrost(
               : "bifrost-stream-error"
           );
         }
-        recordUsage(
+        await recordUsage(
           token.id,
           request,
           startTime,
@@ -176,7 +190,7 @@ async function forwardToBifrost(
     }
 
     clearTimeout(tid);
-    recordUsage(
+    await recordUsage(
       token.id,
       request,
       startTime,
@@ -222,9 +236,9 @@ async function postHandler(request: Request) {
     }
 
     const tokenHash = hashToken(rawToken);
-    const token = getRelayTokenByHash(tokenHash);
+    const token = await getRelayTokenByHashAsync(tokenHash);
     if (!token) {
-      recordRelayUsage("unknown", {
+      await recordRelayUsageAsync("unknown", {
         requestId: request.headers.get("x-request-id") || undefined,
         status: "auth_failed",
         statusCode: 401,
@@ -249,7 +263,7 @@ async function postHandler(request: Request) {
     // 2a. Per-(token,IP) gate — bounds the blast radius of a leaked token.
     const ipCheck = checkIpRateLimit(token.id, clientIp);
     if (!ipCheck.allowed) {
-      recordRelayUsage(token.id, {
+      await recordRelayUsageAsync(token.id, {
         requestId: request.headers.get("x-request-id") || undefined,
         status: "rate_limited",
         statusCode: 429,
@@ -268,9 +282,9 @@ async function postHandler(request: Request) {
     }
 
     // 2b. Per-token rate limit check
-    const rateCheck = checkRateLimit(token.id, token);
+    const rateCheck = await checkRateLimitAsync(token.id, token);
     if (!rateCheck.allowed) {
-      recordRelayUsage(token.id, {
+      await recordRelayUsageAsync(token.id, {
         requestId: request.headers.get("x-request-id") || undefined,
         status: "rate_limited",
         statusCode: 429,
@@ -299,7 +313,7 @@ async function postHandler(request: Request) {
       if (parsedBody) {
         const { blocked, result } = injectionGuard(parsedBody);
         if (blocked) {
-          recordRelayUsage(token.id, {
+          await recordRelayUsageAsync(token.id, {
             requestId: request.headers.get("x-request-id") || undefined,
             status: "error",
             statusCode: 400,
@@ -355,7 +369,7 @@ async function postHandler(request: Request) {
     if (bifrostDecision.fallbackReason) {
       bifrostFallbackReason = bifrostDecision.fallbackReason;
     }
-    if (bifrostDecision.tryBifrost) {
+    if (bifrostDecision.tryBifrost && bifrostConfig) {
       const cooldown = backend === "auto" ? getActiveBifrostCooldown(bifrostConfig.baseUrl) : null;
       if (cooldown) {
         bifrostFallbackReason = `bifrost-cooldown; remaining=${cooldown.remainingMs}`;
@@ -376,7 +390,7 @@ async function postHandler(request: Request) {
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
           if (backend === "bifrost") {
-            recordUsage(token.id, request, startTime, clientIp, userAgent, "error", 502);
+            await recordUsage(token.id, request, startTime, clientIp, userAgent, "error", 502);
             return new Response(JSON.stringify(buildErrorBody(502, message)), {
               status: 502,
               headers: {
@@ -398,9 +412,9 @@ async function postHandler(request: Request) {
     );
     const response = await handleChat(originalRequest);
 
-    // 5. Record usage (async, don't block response)
+    // 5. Persist usage before returning the response.
     const latencyMs = Date.now() - startTime;
-    recordRelayUsage(token.id, {
+    await recordRelayUsageAsync(token.id, {
       requestId: request.headers.get("x-request-id") || undefined,
       status: response.status < 500 ? "success" : "error",
       statusCode: response.status,

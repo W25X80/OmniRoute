@@ -1,5 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { rmSync } from "node:fs";
+import { rm } from "node:fs/promises";
+import { parseDatabaseBackend } from "@/lib/db/backendSelection";
 
 import { CHATGPT_WEB_CODEX_CONNECTOR_NAME } from "@/shared/constants/chatgptWebCodex";
 import { inspectBrowserLoginCapabilities } from "@omniroute/open-sse/vendor/codex-chatgpt-web/browser-login.ts";
@@ -7,7 +9,9 @@ import { decodeChatGptWebCodexSecrets } from "@omniroute/open-sse/executors/chat
 import {
   connectionRuntimePaths,
   ensureConnectionStorageState,
+  ensureConnectionStorageStateAsync,
   ensureConnectionStorageStateFromCredential,
+  ensureConnectionStorageStateFromCredentialAsync,
 } from "@omniroute/open-sse/executors/chatgpt-web-codex/storageState.ts";
 import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error.ts";
 
@@ -29,6 +33,7 @@ export async function validateChatGptWebCodexProvider({
   providerSpecificData?: Record<string, unknown>;
 }) {
   try {
+    const native = parseDatabaseBackend() === "postgres";
     const secrets = decodeChatGptWebCodexSecrets(String(apiKey || ""));
     if (!secrets.cookie && !secrets.storageState) {
       return {
@@ -63,13 +68,15 @@ export async function validateChatGptWebCodexProvider({
       };
     }
     const cdpEndpoint = process.env.CHATGPT_WEB_CODEX_CDP_URL?.trim();
-    const { detectChromeExecutable } =
+    const { detectChromeExecutable, detectChromeExecutableAsync } =
       await import("@omniroute/open-sse/executors/chatgpt-web-codex.ts");
-    const chromeExecutablePath = detectChromeExecutable(
+    const explicitChrome =
       typeof providerSpecificData.chromeExecutablePath === "string"
         ? providerSpecificData.chromeExecutablePath
-        : undefined
-    );
+        : undefined;
+    const chromeExecutablePath = native
+      ? await detectChromeExecutableAsync(explicitChrome)
+      : detectChromeExecutable(explicitChrome);
     if (!chromeExecutablePath && !cdpEndpoint) {
       return {
         valid: false,
@@ -80,7 +87,10 @@ export async function validateChatGptWebCodexProvider({
     const validationId = `validation-${randomBytes(12).toString("hex")}`;
     const paths = connectionRuntimePaths(validationId);
     const freshCookie = Boolean(secrets.cookie);
-    if (secrets.cookie) ensureConnectionStorageState(validationId, secrets.cookie);
+    if (native) {
+      if (secrets.cookie) await ensureConnectionStorageStateAsync(validationId, secrets.cookie);
+      else await ensureConnectionStorageStateFromCredentialAsync(validationId, secrets);
+    } else if (secrets.cookie) ensureConnectionStorageState(validationId, secrets.cookie);
     else ensureConnectionStorageStateFromCredential(validationId, secrets);
     let capabilities;
     try {
@@ -94,10 +104,14 @@ export async function validateChatGptWebCodexProvider({
         autoApproveToolCalls: false,
       });
     } catch (error) {
-      rmSync(paths.root, { recursive: true, force: true });
+      if (native) await rm(paths.root, { recursive: true, force: true });
+      else rmSync(paths.root, { recursive: true, force: true });
       throw error;
     }
-    if (!freshCookie) rmSync(paths.root, { recursive: true, force: true });
+    if (!freshCookie) {
+      if (native) await rm(paths.root, { recursive: true, force: true });
+      else rmSync(paths.root, { recursive: true, force: true });
+    }
     return {
       valid: true,
       error: null,

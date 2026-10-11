@@ -1,3 +1,5 @@
+import { withComboFailureFence } from "./combo/failureTracker.ts";
+import { deriveComboSessionKey } from "./combo/autoStrategy.ts";
 /**
  * Shared combo (model combo) handling with fallback support
  * Supports: priority, weighted, round-robin, random, least-used, cost-optimized,
@@ -7,7 +9,7 @@
 
 import { errorResponse, errorResponseWithComboDiagnostics } from "../utils/error.ts";
 
-import { recordComboFailure } from "./combo/failureTracker.ts";
+import { recordComboFailureAsync } from "./combo/failureTracker.ts";
 import { buildRecoveryHint } from "./combo/pinRecovery.ts";
 import { buildTargetTimeoutRunner } from "./combo/targetTimeoutRunner.ts";
 import { costKey, resolvePoolCosts } from "./combo/candidateCost.ts";
@@ -28,7 +30,7 @@ import { getCircuitBreaker } from "../../src/shared/utils/circuitBreaker";
 import { parseModel } from "./model.ts";
 import { rejectRetiredAutoComboCandidates } from "./modelLifecycle.ts";
 import { createComboContext } from "./combo/context.ts";
-import { phaseComboSetup } from "./combo/comboSetup.ts";
+import { phaseComboSetupAsync } from "./combo/comboSetup.ts";
 
 import { projectAccountTier, type ProviderCandidate } from "./autoCombo/scoring.ts";
 
@@ -672,7 +674,12 @@ export async function handleComboChat(options: HandleComboChatOptions): Promise<
     (typeof comboInvocationId === "string" && comboInvocationId.length > 0
       ? comboInvocationId
       : createInvocationId());
-  const response = await handleComboChatInner({ ...options, invocationId: traceInvocationId });
+  const failureSessionId = options.combo.context_cache_protection
+    ? (options.relayOptions?.sessionId ?? deriveComboSessionKey(options.body))
+    : null;
+  const response = await withComboFailureFence(failureSessionId, options.combo.name, () =>
+    handleComboChatInner({ ...options, invocationId: traceInvocationId })
+  );
   response.headers.set("X-OmniRoute-Combo-Trace", traceInvocationId);
   const trace = getComboTrace(traceInvocationId);
   options.log.info(
@@ -716,7 +723,7 @@ async function handleComboChatInner({
     config,
     comboTargetTimeoutMs,
     reasoningTokenBufferEnabled,
-  } = phaseComboSetup(comboCtx);
+  } = await phaseComboSetupAsync(comboCtx);
   body = comboCtx.body;
 
   // #10681: opaque per-invocation decision trace (safe routing metadata only).
@@ -1041,7 +1048,7 @@ async function handleComboChatInner({
     // Surface a recovery hint + auto-clear the session pin after enough consecutive
     // no-target failures (silent-stop fix). Threshold of 3 prevents a one-off account
     // wipe from destroying the prompt-cache pin benefit on the next request.
-    recordComboFailure(effectiveSessionId, combo.name);
+    await recordComboFailureAsync(effectiveSessionId, combo.name);
     // #11371: same early-exit release as the pinned-turn path above.
     targetResolution.quotaShareRelease?.();
     return errorResponseWithComboDiagnostics(

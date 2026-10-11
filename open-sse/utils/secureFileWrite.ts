@@ -9,6 +9,7 @@
  */
 
 import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
+import { chmod, mkdir, writeFile } from "node:fs/promises";
 
 const SECURE_DIR_MODE = 0o700;
 const SECURE_FILE_MODE = 0o600;
@@ -22,4 +23,13 @@ export function ensureSecureDir(dir: string): void {
 /** Write `data` to `path` as utf8 with 0600 permissions. */
 export function writeSecureFile(path: string, data: string): void {
   writeFileSync(path, data, { encoding: "utf8", mode: SECURE_FILE_MODE });
+}
+
+export async function ensureSecureDirAsync(dir: string): Promise<void> {
+  await mkdir(dir, { recursive: true, mode: SECURE_DIR_MODE });
+  await chmod(dir, SECURE_DIR_MODE);
+}
+
+export async function writeSecureFileAsync(path: string, data: string): Promise<void> {
+  await writeFile(path, data, { encoding: "utf8", mode: SECURE_FILE_MODE });
 }

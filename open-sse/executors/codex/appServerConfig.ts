@@ -1,4 +1,6 @@
 import { readFileSync } from "node:fs";
+import { readFile } from "node:fs/promises";
+import { parseDatabaseBackend } from "@/lib/db/backendSelection";
 
 /**
  * Resolved connection config for the Codex app-server WS transport.
@@ -61,9 +63,9 @@ function firstStringWithSource(
  * same hex string that is presented as the bearer token. The source of the value
  * (psd vs env) is tracked for the credential/URL binding rule.
  */
-function resolveTokenWithSource(
+function* resolveTokenWithSource(
   psd: ProviderSpecificData
-): { value: string; source: ConfigSource } | null {
+): Generator<string, { value: string; source: ConfigSource } | null, string | null> {
   const inlinePsd = firstString(psd?.codexAppServerToken);
   if (inlinePsd) return { value: inlinePsd, source: "psd" };
   const inlineEnv = firstString(process.env.OMNIROUTE_CODEX_APPSERVER_WS_TOKEN);
@@ -71,12 +73,12 @@ function resolveTokenWithSource(
 
   const filePsd = firstString(psd?.codexAppServerTokenFile);
   if (filePsd) {
-    const contents = readTokenFile(filePsd);
+    const contents = yield filePsd;
     if (contents) return { value: contents, source: "psd" };
   }
   const fileEnv = firstString(process.env.OMNIROUTE_CODEX_APPSERVER_WS_TOKEN_FILE);
   if (fileEnv) {
-    const contents = readTokenFile(fileEnv);
+    const contents = yield fileEnv;
     if (contents) return { value: contents, source: "env" };
   }
   return null;
@@ -155,11 +157,16 @@ export function isLocalAppServerHost(hostname: string): boolean {
  * able to write a connection could exfiltrate the env credential. A
  * psd-sourced token may go anywhere: whoever wrote the psd already knows it.
  */
-export function resolveAppServerConfig(psd: ProviderSpecificData): CodexAppServerConfig | null {
-  const urlRes = firstStringWithSource(psd?.codexAppServerUrl, process.env.OMNIROUTE_CODEX_APPSERVER_WS);
+function* resolveAppServerConfigSteps(
+  psd: ProviderSpecificData
+): Generator<string, CodexAppServerConfig | null, string | null> {
+  const urlRes = firstStringWithSource(
+    psd?.codexAppServerUrl,
+    process.env.OMNIROUTE_CODEX_APPSERVER_WS
+  );
   if (!urlRes || !isWebSocketUrl(urlRes.value)) return null;
 
-  const tokenRes = resolveTokenWithSource(psd);
+  const tokenRes = yield* resolveTokenWithSource(psd);
   if (!tokenRes) return null;
 
   if (tokenRes.source === "env" && urlRes.source === "psd") {
@@ -174,13 +181,46 @@ export function resolveAppServerConfig(psd: ProviderSpecificData): CodexAppServe
     firstString(psd?.codexAppServerCwd, process.env.OMNIROUTE_CODEX_APPSERVER_CWD) ?? "/tmp";
 
   const approvalPolicy =
-    firstString(psd?.codexAppServerApprovalPolicy, process.env.OMNIROUTE_CODEX_APPSERVER_APPROVAL) ??
-    undefined;
+    firstString(
+      psd?.codexAppServerApprovalPolicy,
+      process.env.OMNIROUTE_CODEX_APPSERVER_APPROVAL
+    ) ?? undefined;
   const sandbox =
     firstString(psd?.codexAppServerSandbox, process.env.OMNIROUTE_CODEX_APPSERVER_SANDBOX) ??
     undefined;
 
-  return { url, token, cwd, ...(approvalPolicy ? { approvalPolicy } : {}), ...(sandbox ? { sandbox } : {}) };
+  return {
+    url,
+    token,
+    cwd,
+    ...(approvalPolicy ? { approvalPolicy } : {}),
+    ...(sandbox ? { sandbox } : {}),
+  };
+}
+
+export function resolveAppServerConfig(psd: ProviderSpecificData): CodexAppServerConfig | null {
+  const steps = resolveAppServerConfigSteps(psd);
+  let step = steps.next();
+  while (step.done !== true) step = steps.next(readTokenFile(step.value));
+  return step.value;
+}
+
+export async function resolveAppServerConfigAsync(
+  psd: ProviderSpecificData
+): Promise<CodexAppServerConfig | null> {
+  if (parseDatabaseBackend() === "sqlite") return resolveAppServerConfig(psd);
+  const steps = resolveAppServerConfigSteps(psd);
+  let step = steps.next();
+  while (step.done !== true) {
+    let contents: string | null = null;
+    try {
+      contents = (await readFile(step.value, "utf8")).trim() || null;
+    } catch {
+      // Missing or unreadable files retain the source fallback order.
+    }
+    step = steps.next(contents);
+  }
+  return step.value;
 }
 
 /**

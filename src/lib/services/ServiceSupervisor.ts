@@ -5,6 +5,12 @@ import { spawn } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
 import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
 import { getServiceRow, updateServiceField, setToolStatus } from "@/lib/db/versionManager";
+import {
+  captureNativeEmbeddedServices,
+  assertNativeServiceActivation,
+  runNativeServiceWork,
+  observeNativeServiceWork,
+} from "./nativeLifecycle";
 import { RingBuffer } from "./ringBuffer";
 import { HealthChecker } from "./healthCheck";
 import {
@@ -52,6 +58,7 @@ export class ServiceSupervisor extends EventEmitter {
   private childProcess: ChildProcess | null = null;
   private adopted: boolean = false;
   private spawnFailed: boolean = false;
+  private readonly nativeOwner = captureNativeEmbeddedServices();
   private readonly buffer: RingBuffer;
   private readonly checker: HealthChecker;
   private operationLock: Promise<void> = Promise.resolve();
@@ -60,6 +67,7 @@ export class ServiceSupervisor extends EventEmitter {
     super();
     this.buffer = new RingBuffer(config.logsBufferBytes);
     this.checker = new HealthChecker(config.healthUrl, config.healthIntervalMs, (h) => {
+      if (this.nativeOwner) return this.handleNativeHealthChange(h);
       this.health = h;
       this.emit("stateChange", this.getStatus());
       // A service that fails FAILURE_THRESHOLD consecutive health probes will
@@ -96,12 +104,21 @@ export class ServiceSupervisor extends EventEmitter {
   }
 
   async start(): Promise<ServiceStatus> {
+    if (this.nativeOwner) {
+      assertNativeServiceActivation(this.nativeOwner);
+      return runNativeServiceWork(this.nativeOwner, () => this.startImpl());
+    }
+    return this.startImpl();
+  }
+
+  private async startImpl(): Promise<ServiceStatus> {
     return this.withLock(async () => {
       if (this.state === "running" || this.state === "starting") {
         return this.getStatus();
       }
 
       const row = await getServiceRow(this.config.tool);
+      this.assertNativeActivation();
       if (row && row.logsBufferPath) {
         this.buffer.setFlushPath(row.logsBufferPath);
       }
@@ -116,6 +133,7 @@ export class ServiceSupervisor extends EventEmitter {
       // Opt-in per ServiceConfig so the default spawn path is unchanged.
       if (this.config.probeBeforeSpawn) {
         const probe = await probeBeforeSpawn(this.config.healthUrl(), this.config.port);
+        this.assertNativeActivation();
         const decision = decidePreSpawn(probe, this.config.port, isAdoptExistingEnabled());
 
         if (decision.action === "adopt") {
@@ -126,6 +144,7 @@ export class ServiceSupervisor extends EventEmitter {
           // liveness checks that key off pid will only trust this instance
           // once a real pid is on record.
           const adoptedPid = await resolvePortPid(this.config.port);
+          this.assertNativeActivation();
 
           // Auto-restart-adopted (opt-in, default off): instead of keeping
           // the unsupervised process, kill it and fall through to a real
@@ -135,6 +154,7 @@ export class ServiceSupervisor extends EventEmitter {
           // never attaches a pipe because there's nothing to pipe from.
           if (row?.autoRestartAdopted && adoptedPid) {
             await this.killAdoptedPid(adoptedPid, this.config.stopTimeoutMs);
+            this.assertNativeActivation();
           } else {
             this.checker.start();
             this.startedAt = new Date().toISOString();
@@ -152,6 +172,7 @@ export class ServiceSupervisor extends EventEmitter {
         }
       }
 
+      this.assertNativeActivation();
       const { command, args, env, cwd } = this.config.spawnArgs();
 
       // spawn() can throw SYNCHRONOUSLY on Windows when the binary is not
@@ -175,9 +196,33 @@ export class ServiceSupervisor extends EventEmitter {
       this.childProcess = child;
       this.pid = child.pid ?? null;
 
-      if (this.pid) {
-        await setToolStatus(this.config.tool, "starting", this.pid);
+      const startingWrite =
+        this.nativeOwner && this.pid
+          ? setToolStatus(this.config.tool, "starting", this.pid)
+          : undefined;
+      if (this.nativeOwner) {
+        const spawnTime = Date.now();
+        child.once("exit", (code, signal) => {
+          const exitedAt = Date.now();
+          observeNativeServiceWork(this.nativeOwner!, async () => {
+            await startingWrite?.catch(() => {});
+            if (this.childProcess !== child) return;
+            await this.handleExit(code, signal, spawnTime, exitedAt);
+          });
+        });
+        child.once("error", (error) => {
+          observeNativeServiceWork(this.nativeOwner!, async () => {
+            await startingWrite?.catch(() => {});
+            if (this.childProcess !== child) return;
+            await this.handleNativeSpawnError(error, child);
+          });
+        });
       }
+      if (this.pid) {
+        if (this.nativeOwner) await startingWrite;
+        else await setToolStatus(this.config.tool, "starting", this.pid);
+      }
+      this.assertNativeActivation();
 
       const processLine = (stream: "stdout" | "stderr", raw: Buffer) => {
         const lines = raw.toString("utf8").split("\n");
@@ -193,22 +238,25 @@ export class ServiceSupervisor extends EventEmitter {
       child.stderr?.on("data", (chunk: Buffer) => processLine("stderr", chunk));
 
       const spawnTime = Date.now();
-      child.once("exit", (code, signal) => {
-        void this.handleExit(code, signal, spawnTime);
-      });
+      if (!this.nativeOwner)
+        child.once("exit", (code, signal) => {
+          void this.handleExit(code, signal, spawnTime);
+        });
       // Spawn failures (ENOENT, EACCES, or a non-executable binary such as an
       // ELF on Windows) surface via the child 'error' event — NOT 'exit'.
       // Without this handler the supervisor stays in "starting" forever and
       // the health poller hammers the dead port every healthIntervalMs.
-      child.once("error", (err) => {
-        this.checker.stop();
-        this.spawnFailed = true;
-        const msg = sanitizeErrorMessage(err instanceof Error ? err.message : String(err));
-        this.lastError = msg;
-        this.setState("error");
-        void setToolStatus(this.config.tool, "error", undefined, msg);
-      });
+      if (!this.nativeOwner)
+        child.once("error", (err) => {
+          this.checker.stop();
+          this.spawnFailed = true;
+          const msg = sanitizeErrorMessage(err instanceof Error ? err.message : String(err));
+          this.lastError = msg;
+          this.setState("error");
+          void setToolStatus(this.config.tool, "error", undefined, msg);
+        });
 
+      this.assertNativeActivation();
       this.startedAt = new Date().toISOString();
       this.checker.start();
 
@@ -220,6 +268,7 @@ export class ServiceSupervisor extends EventEmitter {
         return this.getStatus();
       }
 
+      this.assertNativeActivation();
       this.setState("running");
       await setToolStatus(this.config.tool, "running", this.pid ?? undefined);
 
@@ -228,13 +277,19 @@ export class ServiceSupervisor extends EventEmitter {
   }
 
   async stop(): Promise<ServiceStatus> {
+    if (this.nativeOwner) return runNativeServiceWork(this.nativeOwner, () => this.stopImpl());
+    return this.stopImpl();
+  }
+
+  private async stopImpl(): Promise<ServiceStatus> {
     return this.withLock(async () => {
       if (this.state === "stopped" || this.state === "stopping") {
         return this.getStatus();
       }
 
       this.setState("stopping");
-      this.checker.stop();
+      if (this.nativeOwner) await this.checker.stopAsync();
+      else this.checker.stop();
 
       await this.killChild();
 
@@ -273,6 +328,7 @@ export class ServiceSupervisor extends EventEmitter {
     const deadline = Date.now() + timeoutMs;
 
     while (Date.now() < deadline) {
+      this.assertNativeActivation();
       if (this.checker.getHealth() === "healthy") return;
       // A spawn failure (child 'error' event or sync throw) flips state to
       // "error" — stop polling and let start() surface the explicit error
@@ -303,6 +359,10 @@ export class ServiceSupervisor extends EventEmitter {
 
   private async killChild(): Promise<void> {
     const child = this.childProcess;
+    if (this.nativeOwner) {
+      if (child) await this.killNativeChild(child);
+      return;
+    }
     if (!child || child.killed) return;
 
     child.kill("SIGTERM");
@@ -318,6 +378,69 @@ export class ServiceSupervisor extends EventEmitter {
         resolve();
       });
     });
+  }
+
+  private async killNativeChild(child: ChildProcess): Promise<void> {
+    if (child.exitCode !== null || child.signalCode !== null || !child.pid) return;
+    await new Promise<void>((resolve, reject) => {
+      let timeout: ReturnType<typeof setTimeout>;
+      const exited = () => {
+        clearTimeout(timeout);
+        resolve();
+      };
+      // Register before signaling: a fast exit is still an acknowledged exit.
+      child.once("exit", exited);
+      timeout = setTimeout(() => {
+        if (child.exitCode === null && child.signalCode === null) {
+          try {
+            child.kill("SIGKILL");
+          } catch (error) {
+            child.off("exit", exited);
+            reject(error);
+          }
+        }
+      }, this.config.stopTimeoutMs);
+      try {
+        child.kill("SIGTERM");
+      } catch (error) {
+        clearTimeout(timeout);
+        child.off("exit", exited);
+        reject(error);
+      }
+    });
+  }
+
+  stopBackgroundProducers(): void {
+    if (!this.nativeOwner) return;
+    this.checker.stop();
+    this.buffer.stopFlushScheduling();
+  }
+
+  private assertNativeActivation(): void {
+    if (this.nativeOwner) assertNativeServiceActivation(this.nativeOwner);
+  }
+
+  private async handleNativeHealthChange(health: HealthState): Promise<void> {
+    this.health = health;
+    this.emit("stateChange", this.getStatus());
+    if (health === "unhealthy" && (this.state === "running" || this.state === "starting")) {
+      this.checker.stop();
+      this.lastError = sanitizeErrorMessage(
+        `Health probe failed for ${this.config.tool} (port ${this.config.port})`
+      );
+      this.setState("error");
+      await setToolStatus(this.config.tool, "error", undefined, this.lastError);
+    }
+  }
+
+  private async handleNativeSpawnError(error: Error, child: ChildProcess): Promise<void> {
+    this.checker.stop();
+    this.spawnFailed = true;
+    if (!child.pid) this.childProcess = null;
+    const message = sanitizeErrorMessage(error.message);
+    this.lastError = message;
+    this.setState("error");
+    await setToolStatus(this.config.tool, "error", undefined, message);
   }
 
   /**
@@ -355,7 +478,8 @@ export class ServiceSupervisor extends EventEmitter {
   private async handleExit(
     code: number | null,
     signal: NodeJS.Signals | null,
-    spawnTime: number
+    spawnTime: number,
+    exitedAt?: number
   ): Promise<void> {
     this.checker.stop();
     this.pid = null;
@@ -363,7 +487,9 @@ export class ServiceSupervisor extends EventEmitter {
 
     if (this.state === "stopping" || this.state === "stopped") return;
 
-    const fastCrash = Date.now() - spawnTime < CRASH_FAST_THRESHOLD_MS;
+    const fastCrash =
+      (this.nativeOwner ? (exitedAt ?? Date.now()) : Date.now()) - spawnTime <
+      CRASH_FAST_THRESHOLD_MS;
     const reason = signal ? `killed by signal ${signal}` : `exited with code ${code ?? "unknown"}`;
     const msg = fastCrash ? `Fast crash (${reason})` : reason;
 

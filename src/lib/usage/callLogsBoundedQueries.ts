@@ -1,3 +1,4 @@
+import { getSelectedCallLogRepository } from "../db/postgres/callLogRepository";
 import { getDbInstance } from "../db/core";
 
 // #5618 — node:sqlite's StatementSync.all() materializes the ENTIRE result set as
@@ -71,4 +72,13 @@ export function findReferencedArtifacts(relativePaths: string[]): Set<string> {
     )
     .all(...relativePaths, relativePaths.length) as Array<{ artifact_relpath: string }>;
   return new Set(rows.map((row) => row.artifact_relpath));
+}
+
+export async function collectReferencedArtifactsAsync(): Promise<Set<string>> {
+  const postgres = getSelectedCallLogRepository();
+  return postgres ? postgres.references() : collectReferencedArtifacts();
+}
+export async function findReferencedArtifactsAsync(paths: string[]): Promise<Set<string>> {
+  const postgres = getSelectedCallLogRepository();
+  return postgres ? postgres.findReferences(paths) : findReferencedArtifacts(paths);
 }

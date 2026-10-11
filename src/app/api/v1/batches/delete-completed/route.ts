@@ -1,5 +1,5 @@
 import { CORS_HEADERS, handleCorsOptions } from "@/shared/utils/cors";
-import { deleteCompletedBatches, type DeleteCompletedBatchesScope } from "@/lib/db/batches";
+import { deleteCompletedBatchesAsync, type DeleteCompletedBatchesScope } from "@/lib/db/batches";
 import { NextResponse } from "next/server";
 import { getApiKeyRequestScope, resolveEffectiveApiKeyId } from "@/app/api/v1/_helpers/apiKeyScope";
 import { enforceApiKeyPolicy } from "@/shared/utils/apiKeyPolicy";
@@ -92,9 +92,9 @@ export async function DELETE(request: Request) {
     });
   }
 
-  let result: ReturnType<typeof deleteCompletedBatches>;
+  let result: Awaited<ReturnType<typeof deleteCompletedBatchesAsync>>;
   try {
-    result = deleteCompletedBatches(sweepScope);
+    result = await deleteCompletedBatchesAsync(sweepScope);
   } catch (err) {
     log.error("BATCHES", "delete-completed sweep failed", {
       route: LOG_ROUTE,

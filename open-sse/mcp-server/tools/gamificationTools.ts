@@ -5,6 +5,7 @@
  */
 
 import { z } from "zod";
+import type { LeaderboardScope } from "../../../src/lib/gamification/leaderboard";
 
 export const gamificationTools = [
   {
@@ -15,9 +16,9 @@ export const gamificationTools = [
       scope: z.enum(["global", "weekly", "monthly", "tokens_shared"]).default("global"),
       limit: z.number().min(1).max(100).default(50),
     }),
-    handler: async (args: { scope: string; limit: number }) => {
+    handler: async (args: { scope: LeaderboardScope; limit: number }) => {
       const { getTopN } = await import("../../../src/lib/gamification/leaderboard");
-      const entries = await getTopN(args.scope as any, args.limit);
+      const entries = await getTopN(args.scope, args.limit);
       return { entries };
     },
   },
@@ -29,9 +30,9 @@ export const gamificationTools = [
       apiKeyId: z.string(),
       scope: z.enum(["global", "weekly", "monthly", "tokens_shared"]).default("global"),
     }),
-    handler: async (args: { apiKeyId: string; scope: string }) => {
+    handler: async (args: { apiKeyId: string; scope: LeaderboardScope }) => {
       const { getRank } = await import("../../../src/lib/gamification/leaderboard");
-      const rank = await getRank(args.apiKeyId, args.scope as any);
+      const rank = await getRank(args.apiKeyId, args.scope);
       return { rank };
     },
   },
@@ -43,13 +44,14 @@ export const gamificationTools = [
       apiKeyId: z.string(),
     }),
     handler: async (args: { apiKeyId: string }) => {
-      const { getXp, getBadges } = await import("../../../src/lib/db/gamification");
+      const { getXpAsync: getXp, getBadgesAsync: getBadges } =
+        await import("../../../src/lib/db/gamification");
       const { calculateLevel, getLevelTitle, getLevelTier } =
         await import("../../../src/lib/gamification/xp");
       const { getStreak } = await import("../../../src/lib/gamification/streaks");
 
-      const xp = getXp(args.apiKeyId);
-      const badges = getBadges(args.apiKeyId);
+      const xp = await getXp(args.apiKeyId);
+      const badges = await getBadges(args.apiKeyId);
       const streak = await getStreak(args.apiKeyId);
       const level = xp ? calculateLevel(xp.totalXp) : 1;
 
@@ -60,7 +62,10 @@ export const gamificationTools = [
         tier: getLevelTier(level),
         streak: streak.currentStreak,
         longestStreak: streak.longestStreak,
-        badges: badges.map((b) => ({ id: b.badgeId, unlockedAt: b.unlockedAt })),
+        badges: badges.map((b) => ({
+          id: b.badgeId,
+          unlockedAt: b.unlockedAt,
+        })),
       };
     },
   },
@@ -73,14 +78,15 @@ export const gamificationTools = [
       category: z.string().optional(),
     }),
     handler: async (args: { apiKeyId?: string; category?: string }) => {
-      const { getBadgeDefinitions, getBadges } = await import("../../../src/lib/db/gamification");
+      const { getBadgeDefinitionsAsync: getBadgeDefinitions, getBadgesAsync: getBadges } =
+        await import("../../../src/lib/db/gamification");
 
       if (args.apiKeyId) {
-        const badges = getBadges(args.apiKeyId);
+        const badges = await getBadges(args.apiKeyId);
         return { earned: badges };
       }
 
-      const definitions = getBadgeDefinitions(args.category);
+      const definitions = await getBadgeDefinitions(args.category);
       return { definitions };
     },
   },

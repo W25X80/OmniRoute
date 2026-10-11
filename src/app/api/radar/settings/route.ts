@@ -28,7 +28,7 @@ import { z } from "zod";
 import { CORS_HEADERS, handleCorsOptions } from "@/shared/utils/cors";
 import { isFeatureFlagEnabled } from "@/shared/utils/featureFlags";
 import { isAuthenticated } from "@/shared/utils/apiAuth";
-import { setRadarOptIn, setRadarKey, getRadarSettings } from "@/lib/db/radar";
+import { setRadarOptInAsync, setRadarKeyAsync, getRadarSettingsAsync } from "@/lib/db/radar";
 import { getContributorClaimUrl, getSupporterPlansUrl } from "@/lib/radar/links";
 import { SUPPORTER_KEY_REGEX } from "@/lib/radar/supporterKey";
 import { buildErrorBody } from "@omniroute/open-sse/utils/error";
@@ -76,7 +76,7 @@ export async function GET(request: Request) {
   }
 
   try {
-    const settings = getRadarSettings();
+    const settings = await getRadarSettingsAsync();
     return NextResponse.json(
       {
         optIn: settings.optIn,
@@ -142,7 +142,7 @@ export async function POST(request: Request) {
 
   try {
     if (optIn !== undefined) {
-      setRadarOptIn(optIn);
+      await setRadarOptInAsync(optIn);
       if (optIn) {
         // Opting in is the moment the daily background sync becomes wanted —
         // arm the scheduler lazily so a flag-off/opt-out install never even
@@ -156,7 +156,7 @@ export async function POST(request: Request) {
       }
     }
     if (supporterKey !== undefined) {
-      setRadarKey(supporterKey);
+      await setRadarKeyAsync(supporterKey);
     }
 
     return NextResponse.json(

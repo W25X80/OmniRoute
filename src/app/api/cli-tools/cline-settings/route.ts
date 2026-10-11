@@ -7,7 +7,10 @@ import os from "os";
 import { requireCliToolsAuth } from "@/lib/api/requireCliToolsAuth";
 import { ensureCliConfigWriteAllowed, getCliRuntimeStatus } from "@/shared/services/cliRuntime";
 import { createBackup } from "@/shared/services/backupService";
-import { saveCliToolLastConfigured, deleteCliToolLastConfigured } from "@/lib/db/cliToolState";
+import {
+  saveCliToolLastConfiguredAsync,
+  deleteCliToolLastConfiguredAsync,
+} from "@/lib/db/cliToolState";
 import { cliModelConfigSchema } from "@/shared/validation/schemas";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
 import { resolveApiKey } from "@/shared/services/apiKeyResolver";
@@ -171,7 +174,7 @@ export async function POST(request: Request) {
 
     // Persist last-configured timestamp
     try {
-      saveCliToolLastConfigured("cline");
+      await saveCliToolLastConfiguredAsync("cline");
     } catch {
       /* non-critical */
     }
@@ -240,7 +243,7 @@ export async function DELETE(request: Request) {
 
     // Clear last-configured timestamp
     try {
-      deleteCliToolLastConfigured("cline");
+      await deleteCliToolLastConfiguredAsync("cline");
     } catch {
       /* non-critical */
     }

@@ -38,6 +38,7 @@ import { isFlatRateProvider } from "./flatRateProviders";
 import { errorResponse } from "@omniroute/open-sse/utils/error.ts";
 import { HTTP_STATUS } from "@omniroute/open-sse/config/constants.ts";
 import * as log from "@/sse/utils/logger";
+import { checkBudgetAsync } from "@/domain/costRules";
 
 /**
  * Whether a call to this provider draws down the metered dollar allowance.
@@ -111,6 +112,33 @@ export function rejectIfMeteredBudgetExceeded(
   modelStr: string
 ): Response | null {
   const decision = checkMeteredBudgetForProvider(apiKeyId, providerId);
+  if (decision.allowed) return null;
+  log.info(
+    "BUDGET",
+    `Rejecting ${modelStr} — ${providerId} draws on the metered budget and it is exhausted`
+  );
+  return errorResponse(HTTP_STATUS.RATE_LIMITED, decision.reason || "Budget limit exceeded", {
+    code: "BUDGET_EXCEEDED",
+  });
+}
+
+export async function checkMeteredBudgetForProviderAsync(
+  apiKeyId: string | null | undefined,
+  providerId: string | null | undefined
+): Promise<MeteredBudgetDecision> {
+  if (!apiKeyId || !consumesMeteredBudget(providerId)) return ALLOWED;
+  const budget = await checkBudgetAsync(apiKeyId);
+  return budget.allowed
+    ? ALLOWED
+    : { allowed: false, reason: budget.reason || "Budget limit exceeded" };
+}
+
+export async function rejectIfMeteredBudgetExceededAsync(
+  apiKeyId: string | null | undefined,
+  providerId: string | null | undefined,
+  modelStr: string
+): Promise<Response | null> {
+  const decision = await checkMeteredBudgetForProviderAsync(apiKeyId, providerId);
   if (decision.allowed) return null;
   log.info(
     "BUDGET",

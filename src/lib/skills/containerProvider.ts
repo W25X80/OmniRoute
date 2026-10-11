@@ -17,6 +17,7 @@
 
 import { createRequire } from "module";
 import os from "os";
+import { probeNativeHostCapability, usesNativeHostProfile } from "../nativeHostProbes";
 
 const require = createRequire(import.meta.url);
 const childProcess = require("child_process") as typeof import("child_process");
@@ -45,12 +46,13 @@ export interface ContainerProvider {
   readonly displayName: string;
   /** Returns true when this runtime is installed and usable on the host. */
   detect(): boolean;
+  detectAsync?(): Promise<boolean>;
   /** Build a run command for the given image, command, and config. */
   buildRun(
     image: string,
     command: string[],
     sandboxId: string,
-    config: SandboxConfig,
+    config: SandboxConfig
   ): ResolvedContainerCommand;
   /** Build a kill/stop command for a running container. */
   killCommand: string;
@@ -69,8 +71,7 @@ const SANDBOX_NAME = (sandboxId: string) => `omniroute-${sandboxId}`;
  * test mocks on `spawn` (but not `spawnSync`) are not disturbed.
  */
 function probeCommand(binary: string): boolean {
-  const args =
-    process.platform === "win32" ? ["where", binary] : ["which", binary];
+  const args = process.platform === "win32" ? ["where", binary] : ["which", binary];
   const r = childProcess.spawnSync(args[0], args.slice(1), {
     encoding: "utf8",
     stdio: "ignore",
@@ -90,6 +91,20 @@ function probeVersion(binary: string, expects = "v"): boolean {
   return r.status === 0 && !!r.stdout?.trim()?.includes(expects);
 }
 
+async function probeCommandAsync(binary: string): Promise<boolean> {
+  const result = await probeNativeHostCapability(
+    process.platform === "win32" ? "where" : "which",
+    [binary],
+    { ignoreOutput: true }
+  );
+  return result.success;
+}
+
+async function probeVersionAsync(binary: string, expects: string): Promise<boolean> {
+  const result = await probeNativeHostCapability(binary, ["--version"]);
+  return result.success && result.stdout.trim().includes(expects);
+}
+
 // ----------------------------------------------------------------
 //  DockerProvider
 // ----------------------------------------------------------------
@@ -103,11 +118,15 @@ class DockerProvider implements ContainerProvider {
     return probeCommand("docker") && probeVersion("docker");
   }
 
+  async detectAsync(): Promise<boolean> {
+    return (await probeCommandAsync("docker")) && (await probeVersionAsync("docker", "v"));
+  }
+
   buildRun(
     image: string,
     command: string[],
     sandboxId: string,
-    config: SandboxConfig,
+    config: SandboxConfig
   ): ResolvedContainerCommand {
     const args = [
       "run",
@@ -160,11 +179,15 @@ class AppleContainerProvider implements ContainerProvider {
     return probeCommand("container") && probeVersion("container", "c");
   }
 
+  async detectAsync(): Promise<boolean> {
+    return (await probeCommandAsync("container")) && (await probeVersionAsync("container", "c"));
+  }
+
   buildRun(
     image: string,
     command: string[],
     sandboxId: string,
-    config: SandboxConfig,
+    config: SandboxConfig
   ): ResolvedContainerCommand {
     const args = [
       "run",
@@ -215,11 +238,15 @@ class WslContainerProvider implements ContainerProvider {
     return probeCommand("wslc") && probeVersion("wslc");
   }
 
+  async detectAsync(): Promise<boolean> {
+    return (await probeCommandAsync("wslc")) && (await probeVersionAsync("wslc", "v"));
+  }
+
   buildRun(
     image: string,
     command: string[],
     sandboxId: string,
-    config: SandboxConfig,
+    config: SandboxConfig
   ): ResolvedContainerCommand {
     const args = [
       "run",
@@ -266,11 +293,15 @@ class OrbStackProvider implements ContainerProvider {
     return probeCommand("orbstack") && probeVersion("orbstack");
   }
 
+  async detectAsync(): Promise<boolean> {
+    return (await probeCommandAsync("orbstack")) && (await probeVersionAsync("orbstack", "v"));
+  }
+
   buildRun(
     image: string,
     command: string[],
     sandboxId: string,
-    config: SandboxConfig,
+    config: SandboxConfig
   ): ResolvedContainerCommand {
     // OrbStack wraps Docker inside a Linux VM.  We invoke the `orbstack`
     // binary which shims `docker` transparently.
@@ -319,11 +350,15 @@ class PodmanProvider implements ContainerProvider {
     return probeCommand("podman") && probeVersion("podman");
   }
 
+  async detectAsync(): Promise<boolean> {
+    return (await probeCommandAsync("podman")) && (await probeVersionAsync("podman", "v"));
+  }
+
   buildRun(
     image: string,
     command: string[],
     sandboxId: string,
-    config: SandboxConfig,
+    config: SandboxConfig
   ): ResolvedContainerCommand {
     const args = [
       "run",
@@ -374,7 +409,7 @@ export const ALL_PROVIDERS: ContainerProvider[] = [
 ];
 
 export const PROVIDER_BY_ID = new Map<SandboxRuntimeId, ContainerProvider>(
-  ALL_PROVIDERS.map((p) => [p.id, p]),
+  ALL_PROVIDERS.map((p) => [p.id, p])
 );
 
 /** Priority order for auto-detection on each platform. */
@@ -403,23 +438,27 @@ function clearDetectionCache(): void {
   detectionCache.clear();
 }
 
-async function runDetection(): Promise<void> {
+function requireNativeDetection(provider: ContainerProvider): Promise<boolean> {
+  if (!provider.detectAsync) throw new Error("Container provider requires asynchronous detection");
+  return provider.detectAsync();
+}
+
+async function runDetection(native: boolean): Promise<void> {
   // Run all probes in parallel for speed
   await Promise.all(
     ALL_PROVIDERS.map(async (provider) => {
-      const ok = await Promise.resolve(provider.detect());
+      const ok = native
+        ? await requireNativeDetection(provider)
+        : await Promise.resolve(provider.detect());
       detectionCache.set(provider.id, ok);
-    }),
+    })
   );
 }
 
-function normaliseRuntimeOverride(
-  raw: string | undefined,
-): SandboxRuntimeId | null {
+function normaliseRuntimeOverride(raw: string | undefined): SandboxRuntimeId | null {
   if (!raw || raw === "auto") return null;
   const lowered = raw.toLowerCase().trim();
-  if (PROVIDER_BY_ID.has(lowered as SandboxRuntimeId))
-    return lowered as SandboxRuntimeId;
+  if (PROVIDER_BY_ID.has(lowered as SandboxRuntimeId)) return lowered as SandboxRuntimeId;
   return null;
 }
 
@@ -436,13 +475,11 @@ function normaliseRuntimeOverride(
  */
 export async function resolveProvider(): Promise<ContainerProvider> {
   if (!detectionInFlight) {
-    detectionInFlight = runDetection();
+    detectionInFlight = runDetection(usesNativeHostProfile());
   }
   await detectionInFlight;
 
-  const override = normaliseRuntimeOverride(
-    process.env.SKILLS_SANDBOX_RUNTIME,
-  );
+  const override = normaliseRuntimeOverride(process.env.SKILLS_SANDBOX_RUNTIME);
   if (override) {
     const provider = PROVIDER_BY_ID.get(override)!;
     if (detectionCache.get(provider.id)) return provider;
@@ -469,7 +506,7 @@ export function _resetProviderCacheForTests(): void {
  */
 export function buildKillCommand(
   provider: ContainerProvider,
-  sandboxId: string,
+  sandboxId: string
 ): { command: string; args: string[] } {
   const name = SANDBOX_NAME(sandboxId);
   return {

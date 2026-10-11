@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import { headers } from "next/headers";
 
-import { getLegacyCliTokenSync, getMachineTokenSync } from "@/lib/machineToken";
+import { getLegacyCliTokenAsync, getMachineTokenAsync } from "@/lib/machineToken";
 import { AUTHZ_HEADER_PEER_LOCALITY } from "@/server/authz/headers";
 
 const HEADER_NAME = "x-omniroute-cli-token";
@@ -79,7 +79,9 @@ export async function isCliTokenAuthValid(request: Request): Promise<boolean> {
 
   if (!(await isLocalCliRequest(request as RequestWithPeer))) return false;
 
-  const expectedTokens = [getMachineTokenSync(), getLegacyCliTokenSync()].filter(Boolean);
+  const expectedTokens = [await getMachineTokenAsync(), await getLegacyCliTokenAsync()].filter(
+    Boolean
+  );
   return expectedTokens.some((expected) => {
     if (token.length !== expected.length) return false;
     try {

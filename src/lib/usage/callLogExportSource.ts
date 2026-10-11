@@ -1,3 +1,4 @@
+import { getSelectedCallLogRepository } from "../db/postgres/callLogRepository";
 /**
  * Call-log source for the log-export pipeline.
  *
@@ -256,4 +257,25 @@ export function getCallLogsForExport(afterRowId: number, limit: number): LogExpo
     .all({ afterRowId, limit }) as ExportSourceRow[];
 
   return rows.map((row) => ({ rowId: Number(row.row_id), record: mapExportRow(row) }));
+}
+
+export async function getMaxCallLogRowIdAsync(): Promise<number> {
+  const postgres = getSelectedCallLogRepository();
+  return postgres ? postgres.maxCursor() : getMaxCallLogRowId();
+}
+export async function countCallLogsAfterRowIdAsync(cursor: number): Promise<number> {
+  const postgres = getSelectedCallLogRepository();
+  return postgres ? postgres.countAfter(cursor) : countCallLogsAfterRowId(cursor);
+}
+export async function getCallLogsForExportAsync(
+  cursor: number,
+  limit: number
+): Promise<LogExportSourceRow[]> {
+  const postgres = getSelectedCallLogRepository();
+  if (!postgres) return getCallLogsForExport(cursor, limit);
+  const rows = await postgres.exportAfter(cursor, limit);
+  return rows.map((row) => ({
+    rowId: Number(row.row_id),
+    record: mapExportRow(row as ExportSourceRow),
+  }));
 }

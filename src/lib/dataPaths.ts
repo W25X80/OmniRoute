@@ -1,6 +1,7 @@
 import path from "path";
 import os from "os";
 import fs from "fs";
+import { stat } from "node:fs/promises";
 
 export const APP_NAME = "omniroute";
 
@@ -68,6 +69,32 @@ export function resolveDataDir({ isCloud = false }: { isCloud?: boolean } = {}):
   if (configured) return configured;
 
   return getDefaultDataDir();
+}
+
+export async function getDefaultDataDirAsync(): Promise<string> {
+  const homeDir = safeHomeDir();
+  const legacyDir = getLegacyDotDataDir();
+  const fallback =
+    process.platform === "win32"
+      ? path.join(process.env.APPDATA || path.join(homeDir, "AppData", "Roaming"), APP_NAME)
+      : (() => {
+          const xdgConfigHome = normalizeConfiguredPath(process.env.XDG_CONFIG_HOME);
+          return xdgConfigHome ? path.join(xdgConfigHome, APP_NAME) : legacyDir;
+        })();
+  try {
+    if ((await stat(legacyDir)).isDirectory()) return legacyDir;
+  } catch {
+    // Preserve the source legacy-directory recovery before the platform fallback.
+  }
+  return fallback;
+}
+
+export async function resolveDataDirAsync({
+  isCloud = false,
+}: { isCloud?: boolean } = {}): Promise<string> {
+  if (isCloud) return "/tmp";
+  const configured = normalizeConfiguredPath(process.env.DATA_DIR);
+  return configured || getDefaultDataDirAsync();
 }
 
 /**

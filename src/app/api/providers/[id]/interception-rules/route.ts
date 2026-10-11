@@ -1,9 +1,7 @@
+import { setInterceptionRulesAsync } from "@/lib/db/interceptionRules";
+import { deleteInterceptionRulesAsync } from "@/lib/db/interceptionRules";
 import { NextResponse } from "next/server";
-import {
-  getInterceptionRules,
-  setInterceptionRules,
-  deleteInterceptionRules,
-} from "@/lib/db/interceptionRules";
+import { getInterceptionRules } from "@/lib/db/interceptionRules";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 import { updateInterceptionRulesSchema } from "@/shared/validation/schemas";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
@@ -50,7 +48,7 @@ export async function PUT(request: Request, { params }: { params: Promise<{ id: 
       return NextResponse.json({ error: validation.error }, { status: 400 });
     }
 
-    setInterceptionRules(id, validation.data);
+    await setInterceptionRulesAsync(id, validation.data);
     return NextResponse.json({ success: true });
   } catch (error) {
     return NextResponse.json(buildErrorBody(500, sanitizeErrorMessage(error)), { status: 500 });
@@ -67,7 +65,7 @@ export async function DELETE(request: Request, { params }: { params: Promise<{ i
 
   try {
     const { id } = await params;
-    deleteInterceptionRules(id);
+    await deleteInterceptionRulesAsync(id);
     return NextResponse.json({ success: true });
   } catch (error) {
     return NextResponse.json(buildErrorBody(500, sanitizeErrorMessage(error)), { status: 500 });

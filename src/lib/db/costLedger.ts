@@ -15,6 +15,8 @@
 
 import { getDbInstance } from "./core";
 import { toNumber } from "@/shared/utils/numeric";
+import { getSelectedPostgresDatabase } from "./controlPlaneContext";
+import type { PostgresTransaction } from "./postgres/database";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -320,4 +322,181 @@ export function getCostBySessionTag(sessionTag: string): RunCostRow[] {
       timestamp: typeof row.timestamp === "string" ? row.timestamp : "",
     } satisfies RunCostRow;
   });
+}
+
+async function insertLedger(tx: PostgresTransaction, entry: CostLedgerEntry): Promise<void> {
+  if (!entry?.apiKeyId) return;
+  await tx.query(
+    `INSERT INTO omniroute.request_cost_ledger
+    (api_key_id,provider,model,tokens_input,tokens_output,tokens_cache_read,tokens_cache_creation,
+     tokens_reasoning,unit_price_input,unit_price_output,amount_usd,service_tier,success,timestamp,request_id)
+    VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+    [
+      entry.apiKeyId,
+      entry.provider || "unknown",
+      entry.model || "unknown",
+      toNonNegative(entry.tokensInput),
+      toNonNegative(entry.tokensOutput),
+      toNonNegative(entry.tokensCacheRead),
+      toNonNegative(entry.tokensCacheCreation),
+      toNonNegative(entry.tokensReasoning),
+      toNonNegative(entry.unitPriceInput),
+      toNonNegative(entry.unitPriceOutput),
+      toNonNegative(entry.amountUsd),
+      entry.serviceTier || "standard",
+      entry.success === false ? 0 : 1,
+      entry.timestamp || new Date().toISOString(),
+      entry.requestId ?? null,
+    ]
+  );
+}
+
+export async function recordLedgerEntryAsync(entry: CostLedgerEntry): Promise<void> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return recordLedgerEntry(entry);
+  await database.transaction((tx) => insertLedger(tx, entry));
+}
+
+export async function recordLedgerEntrySafeAsync(entry: CostLedgerEntry): Promise<void> {
+  try {
+    await recordLedgerEntryAsync(entry);
+  } catch (error) {
+    console.error("[CostLedger] Failed to record ledger entry:", error);
+  }
+}
+
+export async function recordLedgerEntriesAsync(entries: CostLedgerEntry[]): Promise<void> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return recordLedgerEntries(entries);
+  if (!entries?.length) return;
+  await database.transaction(async (tx) => {
+    for (const entry of entries) await insertLedger(tx, entry);
+  });
+}
+
+export async function aggregateLedgerAsync(
+  apiKeyId: string,
+  sinceIso: string,
+  opts: { successOnly?: boolean } = {}
+): Promise<LedgerAggregate> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return aggregateLedger(apiKeyId, sinceIso, opts);
+  if (!apiKeyId) return { amountUsd: 0, requestCount: 0 };
+  return database.transaction(async (tx) =>
+    getAggRow(
+      (
+        await tx.query(
+          `SELECT COALESCE(SUM(amount_usd),0) AS amount_usd,
+    COUNT(*) AS request_count FROM omniroute.request_cost_ledger WHERE api_key_id=$1 AND timestamp >= $2
+    ${opts.successOnly === true ? "AND success=1" : ""}`,
+          [apiKeyId, sinceIso]
+        )
+      ).rows[0]
+    )
+  );
+}
+
+export async function aggregateLedgerThisMonthAsync(
+  apiKeyId: string,
+  nowIso?: string
+): Promise<LedgerAggregate> {
+  const now = nowIso ? new Date(nowIso) : new Date();
+  return aggregateLedgerAsync(
+    apiKeyId,
+    new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)).toISOString(),
+    { successOnly: true }
+  );
+}
+
+export async function sumSearchLedgerSpendSinceAsync(
+  apiKeyId: string,
+  sinceIso: string
+): Promise<number> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return sumSearchLedgerSpendSince(apiKeyId, sinceIso);
+  if (!apiKeyId) return 0;
+  return database.transaction(
+    async (tx) =>
+      getAggRow(
+        (
+          await tx.query(
+            `SELECT COALESCE(SUM(amount_usd),0) AS amount_usd
+    FROM omniroute.request_cost_ledger WHERE api_key_id=$1 AND timestamp >= $2 AND service_tier=$3`,
+            [apiKeyId, sinceIso, SEARCH_LEDGER_SERVICE_TIER]
+          )
+        ).rows[0]
+      ).amountUsd
+  );
+}
+
+function ledgerEntryFromRow(row: JsonRecord): CostLedgerEntry {
+  return {
+    apiKeyId: String(row.api_key_id),
+    provider: String(row.provider),
+    model: String(row.model),
+    tokensInput: toNumber(row.tokens_input),
+    tokensOutput: toNumber(row.tokens_output),
+    tokensCacheRead: toNumber(row.tokens_cache_read),
+    tokensCacheCreation: toNumber(row.tokens_cache_creation),
+    tokensReasoning: toNumber(row.tokens_reasoning),
+    unitPriceInput: toNumber(row.unit_price_input),
+    unitPriceOutput: toNumber(row.unit_price_output),
+    amountUsd: toNumber(row.amount_usd),
+    serviceTier: String(row.service_tier || "standard"),
+    success: toNumber(row.success) !== 0,
+    timestamp: String(row.timestamp),
+    requestId: typeof row.request_id === "string" ? row.request_id : null,
+  };
+}
+
+export async function listLedgerEntriesAsync(
+  apiKeyId: string,
+  opts: { sinceIso?: string; limit?: number } = {}
+): Promise<CostLedgerEntry[]> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return listLedgerEntries(apiKeyId, opts);
+  if (!apiKeyId) return [];
+  const params: unknown[] = [apiKeyId];
+  if (opts.sinceIso) params.push(opts.sinceIso);
+  params.push(Math.max(1, Math.min(opts.limit ?? 100, 500)));
+  return database.transaction(async (tx) =>
+    (
+      await tx.query(
+        `SELECT * FROM omniroute.request_cost_ledger
+    WHERE api_key_id=$1 ${opts.sinceIso ? "AND timestamp >= $2" : ""}
+    ORDER BY timestamp DESC,id DESC LIMIT $${params.length}`,
+        params
+      )
+    ).rows.map(ledgerEntryFromRow)
+  );
+}
+
+export async function getCostBySessionTagAsync(sessionTag: string): Promise<RunCostRow[]> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return getCostBySessionTag(sessionTag);
+  if (!sessionTag) return [];
+  return database.transaction(async (tx) =>
+    (
+      await tx.query(
+        `SELECT r.* FROM omniroute.call_logs c
+    JOIN omniroute.request_cost_ledger r ON r.request_id=c.correlation_id
+    WHERE c.session_tag=$1 ORDER BY r.timestamp DESC,r.id DESC`,
+        [sessionTag]
+      )
+    ).rows.map(
+      (row) =>
+        ({
+          provider: String(row.provider),
+          model: String(row.model),
+          tokensInput: toNumber(row.tokens_input),
+          tokensOutput: toNumber(row.tokens_output),
+          tokensCacheRead: toNumber(row.tokens_cache_read),
+          tokensCacheCreation: toNumber(row.tokens_cache_creation),
+          tokensReasoning: toNumber(row.tokens_reasoning),
+          amountUsd: toNumber(row.amount_usd),
+          requestId: String(row.request_id),
+          timestamp: String(row.timestamp),
+        }) satisfies RunCostRow
+    )
+  );
 }

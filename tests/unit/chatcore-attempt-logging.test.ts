@@ -277,3 +277,21 @@ test("combo attempts that share pendingRequestId both land, keyed independently 
   assert.equal(row2.correlationId, traceId2);
   assert.equal(row2.comboStepId, "my-combo-model-3");
 });
+
+test("persists terminal event timestamp and latency after a delayed accounting handoff", async () => {
+  const id = "attempt-terminal-clock";
+  const completedAt = Date.now() - 2000;
+  const timestamp = new Date(completedAt).toISOString();
+  await persistAttemptLogs(
+    {
+      status: 200,
+      tokens: { input: 1, output: 2 },
+      completionClock: { completedAt, timestamp, latencyMs: 1234 },
+    },
+    baseCtx({ pendingRequestId: id, startTime: completedAt - 1234 })
+  );
+  const row = await pollForCallLog(id);
+  assert.ok(row);
+  assert.equal(row.timestamp, timestamp);
+  assert.equal(row.duration, 1234);
+});

@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { isAuthenticated } from "@/shared/utils/apiAuth";
-import { revokeRegisteredKey } from "@/lib/db/registeredKeys";
+import { revokeRegisteredKeyAsync } from "@/lib/db/registeredKeys";
 
 /**
  * POST /api/v1/registered-keys/[id]/revoke
@@ -13,7 +13,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
   }
 
   const resolvedParams = await params;
-  const revoked = revokeRegisteredKey(resolvedParams.id);
+  const revoked = await revokeRegisteredKeyAsync(resolvedParams.id);
   if (!revoked) {
     return NextResponse.json({ error: "Key not found or already revoked" }, { status: 404 });
   }

@@ -1,4 +1,4 @@
-import { markCommandCodeAuthSessionReceived } from "@/lib/db/commandCodeAuth";
+import { markCommandCodeAuthSessionReceivedAsync } from "@/lib/db/commandCodeAuth";
 
 import {
   callbackCorsHeaders,
@@ -11,7 +11,10 @@ import {
 } from "../shared";
 
 export async function OPTIONS(request: Request) {
-  return new Response(null, { status: 204, headers: callbackCorsHeaders(request) });
+  return new Response(null, {
+    status: 204,
+    headers: callbackCorsHeaders(request),
+  });
 }
 
 export async function POST(request: Request) {
@@ -24,7 +27,10 @@ export async function POST(request: Request) {
   } catch (error) {
     const isTooLarge = error instanceof Error && error.message === "BODY_TOO_LARGE";
     return noStoreJson(
-      { success: false, error: isTooLarge ? "Request body too large" : "Invalid JSON body" },
+      {
+        success: false,
+        error: isTooLarge ? "Request body too large" : "Invalid JSON body",
+      },
       { status: isTooLarge ? 413 : 400, headers: callbackCorsHeaders(request) }
     );
   }
@@ -37,7 +43,7 @@ export async function POST(request: Request) {
     );
   }
 
-  const session = markCommandCodeAuthSessionReceived({
+  const session = await markCommandCodeAuthSessionReceivedAsync({
     stateHash: stateHashFromState(parsed.data.state),
     apiKey: parsed.data.apiKey,
     metadata: {

@@ -3,6 +3,17 @@
  */
 
 import { getDbInstance } from "../core";
+import { getSelectedPostgresDatabase } from "../controlPlaneContext";
+import { listPostgresKeyValues } from "../postgres/keyValueRepository";
+import {
+  hasPostgresCatalogSnapshot,
+  readPostgresCatalogNamespace,
+  mutatePostgresCatalog,
+  putCatalogValue,
+  deleteCatalogValue,
+  deleteCatalogMatchingKeys,
+  afterPostgresCatalogCommit,
+} from "../postgres/catalogSnapshot";
 import { backupDbFile } from "../backup";
 import { getCachedPricing, invalidateDbCache } from "../readCache";
 import { PROVIDER_ID_TO_ALIAS } from "@omniroute/open-sse/config/providerModels.ts";
@@ -30,6 +41,10 @@ function readPricingNamespace(
   namespace: string
 ): PricingByProvider {
   const rows = db.prepare("SELECT key, value FROM key_value WHERE namespace = ?").all(namespace);
+  return parsePricingRows(rows, true);
+}
+
+function parsePricingRows(rows: readonly unknown[], tolerateCorrupt: boolean): PricingByProvider {
   const pricing: PricingByProvider = {};
 
   for (const row of rows) {
@@ -40,7 +55,8 @@ function readPricingNamespace(
 
     try {
       pricing[key] = toRecord(JSON.parse(rawValue)) as PricingModels;
-    } catch {
+    } catch (error) {
+      if (!tolerateCorrupt) throw error;
       // Corrupted data — skip silently, fallback to lower layers
     }
   }
@@ -103,10 +119,27 @@ function buildPricingSourceMap(layers: {
 }
 
 async function getPricingLayers() {
-  const db = getDbInstance();
-
   // Layer 1: Hardcoded defaults (lowest priority)
   const { getDefaultPricing } = await import("@/shared/constants/pricing");
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const namespaces = ["pricing_synced", "models_dev_pricing", "pricing"] as const;
+    const rowsByNamespace = hasPostgresCatalogSnapshot(postgres)
+      ? namespaces.map((namespace) => readPostgresCatalogNamespace(namespace) ?? [])
+      : await postgres.transaction(async (transaction) => {
+          const rows: Awaited<ReturnType<typeof listPostgresKeyValues>>[] = [];
+          for (const namespace of namespaces)
+            rows.push(await listPostgresKeyValues(transaction, namespace));
+          return rows;
+        });
+    return {
+      defaults: getDefaultPricing(),
+      litellm: parsePricingRows(rowsByNamespace[0], true),
+      modelsDev: parsePricingRows(rowsByNamespace[1], true),
+      user: parsePricingRows(rowsByNamespace[2], true),
+    };
+  }
+  const db = getDbInstance();
   return {
     defaults: getDefaultPricing(),
     litellm: readPricingNamespace(db, "pricing_synced"),
@@ -185,6 +218,21 @@ export async function getPricingForModel(provider: string, model: string) {
 }
 
 export async function updatePricing(pricingData: PricingByProvider) {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    return mutatePostgresCatalog(postgres, async () => {
+      const existing = parsePricingRows(readPostgresCatalogNamespace("pricing") ?? [], false);
+      for (const [provider, models] of Object.entries(pricingData)) {
+        await putCatalogValue(
+          "pricing",
+          provider,
+          JSON.stringify({ ...(existing[provider] || {}), ...models })
+        );
+      }
+      afterPostgresCatalogCommit(touchPricing);
+      return parsePricingRows(readPostgresCatalogNamespace("pricing") ?? [], false);
+    });
+  }
   const db = getDbInstance();
   const insert = db.prepare(
     "INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES ('pricing', ?, ?)"
@@ -221,6 +269,31 @@ export async function updatePricing(pricingData: PricingByProvider) {
 }
 
 export async function resetPricing(provider: string, model?: string) {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    return mutatePostgresCatalog(postgres, async () => {
+      if (model) {
+        const row = (readPostgresCatalogNamespace("pricing") ?? []).find(
+          (entry) => entry.key === provider
+        );
+        if (row) {
+          const models = toRecord(JSON.parse(row.value));
+          delete models[model];
+          if (Object.keys(models).length === 0) await deleteCatalogValue("pricing", provider);
+          else await putCatalogValue("pricing", provider, JSON.stringify(models));
+        }
+      } else {
+        await deleteCatalogValue("pricing", provider);
+      }
+      afterPostgresCatalogCommit(touchPricing);
+      return Object.fromEntries(
+        (readPostgresCatalogNamespace("pricing") ?? []).map((row) => [
+          row.key,
+          JSON.parse(row.value),
+        ])
+      );
+    });
+  }
   const db = getDbInstance();
 
   if (model) {
@@ -260,6 +333,14 @@ export async function resetPricing(provider: string, model?: string) {
 }
 
 export async function resetAllPricing() {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    await mutatePostgresCatalog(postgres, async () => {
+      await deleteCatalogMatchingKeys("pricing", () => true);
+      afterPostgresCatalogCommit(touchPricing);
+    });
+    return {};
+  }
   const db = getDbInstance();
   db.prepare("DELETE FROM key_value WHERE namespace = 'pricing'").run();
   backupDbFile("pre-write");

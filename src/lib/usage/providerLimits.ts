@@ -1,3 +1,6 @@
+import { parseDatabaseBackend } from "@/lib/db/backendSelection";
+import { runPersistenceBackgroundWork } from "@/lib/db/persistenceRuntime";
+import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error.ts";
 import { syncCodexQuotaObservation } from "@/lib/db/providers/codexAccountRecovery";
 import {
   getProviderConnectionById,
@@ -7,13 +10,14 @@ import {
 import { getSettings, resolveProxyForConnection, updateSettings } from "@/lib/db/settings";
 import {
   getAllProviderLimitsCache,
-  getProviderLimitsCache,
-  setProviderLimitsCache,
-  setProviderLimitsCacheBatch,
+  getAllProviderLimitsCacheAsync,
+  getProviderLimitsCacheAsync,
+  setProviderLimitsCacheAsync,
+  setProviderLimitsCacheBatchAsync,
   type ProviderLimitsCacheEntry,
 } from "@/lib/db/providerLimits";
 import { syncToCloud } from "@/lib/cloudSync";
-import { setQuotaCache } from "@/domain/quotaCache";
+import { setQuotaCacheAsync } from "@/domain/quotaCache";
 import { buildClaudeExtraUsageConnectionUpdate } from "@/lib/providers/claudeExtraUsage";
 import { clearRecoveredProviderState } from "@/sse/services/auth";
 import { getMachineId } from "@/shared/utils/machine";
@@ -129,10 +133,18 @@ function scheduleProviderLimitsPostUsageRefresh(connectionId: string): void {
   pendingPostUsageRefreshes.add(connectionId);
   const timer = setTimeout(() => {
     pendingPostUsageRefreshes.delete(connectionId);
-    void fetchAndPersistProviderLimits(connectionId, "scheduled", {
-      allowRotatingRefresh: true,
-    }).catch((error) => {
-      const message = error instanceof Error ? error.message : String(error);
+    const nativePersistence = parseDatabaseBackend() === "postgres";
+    const refresh = () =>
+      fetchAndPersistProviderLimits(connectionId, "scheduled", {
+        allowRotatingRefresh: true,
+      });
+    const operation = nativePersistence ? runPersistenceBackgroundWork(refresh) : refresh();
+    void operation.catch((error) => {
+      const message = nativePersistence
+        ? sanitizeErrorMessage(error) || "Provider limits refresh failed"
+        : error instanceof Error
+          ? error.message
+          : String(error);
       console.warn(
         `[ProviderLimits] Post-usage refresh failed for connection ${connectionId}: ${message}`
       );
@@ -704,7 +716,7 @@ export function getCachedProviderLimitsMap(): Record<string, ProviderLimitsCache
 export async function getSanitizedCachedProviderLimitsMap(): Promise<
   Record<string, ProviderLimitsCacheEntry>
 > {
-  const caches = getAllProviderLimitsCache();
+  const caches = await getAllProviderLimitsCacheAsync();
   // Sanitization only rewrites Antigravity/agy quota keys; every other provider's cache
   // entry is returned untouched (see sanitizeProviderLimitsCacheForConnection). The
   // dashboard polls this on an auto-refresh interval, so avoid the unconditional
@@ -783,7 +795,7 @@ async function fetchLiveProviderLimitsWithOptions(
       await refreshLiveModelIds(connection.provider)
     );
     if (isRecord(usage.quotas)) {
-      setQuotaCache(
+      await setQuotaCacheAsync(
         connectionId,
         connection.provider,
         usage.quotas,
@@ -913,7 +925,7 @@ async function fetchLiveProviderLimitsWithOptions(
     if (data) connection = { ...connection, providerSpecificData: data };
   }
   if (isRecord(result.usage.quotas)) {
-    setQuotaCache(
+    await setQuotaCacheAsync(
       connectionId,
       connection.provider,
       result.usage.quotas,
@@ -946,7 +958,7 @@ export async function fetchAndPersistProviderLimits(
     allowRotatingRefresh: opts.allowRotatingRefresh,
   });
   const newCache = toProviderLimitsCacheEntry(usage, source);
-  const previous = getProviderLimitsCache(connectionId);
+  const previous = await getProviderLimitsCacheAsync(connectionId);
   const cache = mergeProviderLimitsCacheEntry(connection.provider, newCache, previous);
 
   // Don't persist error-only entries (429 etc.) — would wipe prior good cache.
@@ -972,7 +984,7 @@ export async function fetchAndPersistProviderLimits(
     ...usage,
     ...(cache.billing ? { billing: cache.billing } : {}),
   };
-  setProviderLimitsCache(connectionId, cache);
+  await setProviderLimitsCacheAsync(connectionId, cache);
   return { connection, usage: mergedUsage, cache };
 }
 
@@ -997,13 +1009,13 @@ export async function syncAllProviderLimits(
   const caches: Record<string, ProviderLimitsCacheEntry> = {};
   const errors: Record<string, string> = {};
 
-  const recordResult = (
+  const recordResult = async (
     connectionId: string,
     result: PromiseSettledResult<{ connectionId: string; cache: ProviderLimitsCacheEntry }>
   ) => {
     if (result.status === "fulfilled") {
       const { cache } = result.value;
-      const previous = getProviderLimitsCache(connectionId);
+      const previous = await getProviderLimitsCacheAsync(connectionId);
       if (cache === previous) {
         caches[connectionId] = cache;
         return;
@@ -1017,7 +1029,7 @@ export async function syncAllProviderLimits(
   };
 
   const fetchOne = async (connection: ProviderConnectionLike) => {
-    const existingCache = getProviderLimitsCache(connection.id);
+    const existingCache = await getProviderLimitsCacheAsync(connection.id);
     await refreshLiveModelIds(connection.provider);
     const forceRefresh =
       source === "manual" ||
@@ -1039,21 +1051,21 @@ export async function syncAllProviderLimits(
   const otherConnections = connections.filter((c) => c.authType !== "oauth");
   const spacingMs = getProviderLimitsSyncSpacingMs();
 
-  const recordChunk = (
+  const recordChunk = async (
     chunk: ProviderConnectionLike[],
     results: PromiseSettledResult<{ connectionId: string; cache: ProviderLimitsCacheEntry }>[]
   ) => {
-    results.forEach((result, index) => {
+    for (const [index, result] of results.entries()) {
       const connectionId = chunk[index]?.id;
-      if (connectionId) recordResult(connectionId, result);
-    });
+      if (connectionId) await recordResult(connectionId, result);
+    }
   };
 
   await syncInChunksWithSpacing(otherConnections, concurrency, spacingMs, fetchOne, recordChunk);
   await syncInChunksWithSpacing(oauthConnections, 1, spacingMs, fetchOne, recordChunk);
 
   if (cacheEntries.length > 0) {
-    setProviderLimitsCacheBatch(cacheEntries);
+    await setProviderLimitsCacheBatchAsync(cacheEntries);
   }
 
   if (source === "scheduled") {
@@ -1067,4 +1079,10 @@ export async function syncAllProviderLimits(
     caches,
     errors,
   };
+}
+
+export async function getCachedProviderLimitsMapAsync(): Promise<
+  Record<string, ProviderLimitsCacheEntry>
+> {
+  return getAllProviderLimitsCacheAsync();
 }

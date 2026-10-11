@@ -8,7 +8,7 @@
 import { NextRequest, NextResponse } from "next/server";
 
 import { CORS_HEADERS, handleCorsOptions } from "@/shared/utils/cors";
-import { getBadgeDefinitions } from "@/lib/db/gamification";
+import { getBadgeDefinitionsAsync as getBadgeDefinitions } from "@/lib/db/gamification";
 import { seedBuiltinBadges } from "@/lib/gamification/badges";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 
@@ -23,6 +23,6 @@ export async function GET(request: NextRequest) {
   await seedBuiltinBadges();
 
   const category = new URL(request.url).searchParams.get("category") || undefined;
-  const badges = getBadgeDefinitions(category);
+  const badges = await getBadgeDefinitions(category);
   return NextResponse.json({ badges }, { headers: CORS_HEADERS });
 }

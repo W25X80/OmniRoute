@@ -1,9 +1,9 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import {
-  getAssignmentsForCompressionCombo,
-  getCompressionCombo,
-  updateAssignments,
+  getAssignmentsForCompressionComboAsync,
+  getCompressionComboAsync,
+  updateAssignmentsAsync,
 } from "@/lib/db/compressionCombos";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
@@ -18,10 +18,10 @@ export async function GET(request: Request, { params }) {
   const authError = await requireManagementAuth(request);
   if (authError) return authError;
   const { id } = await params;
-  if (!getCompressionCombo(id)) {
+  if (!(await getCompressionComboAsync(id))) {
     return NextResponse.json({ error: "Compression combo not found" }, { status: 404 });
   }
-  return NextResponse.json({ assignments: getAssignmentsForCompressionCombo(id) });
+  return NextResponse.json({ assignments: await getAssignmentsForCompressionComboAsync(id) });
 }
 
 export async function PUT(request: Request, { params }) {
@@ -41,7 +41,7 @@ export async function PUT(request: Request, { params }) {
     return NextResponse.json({ error: validation.error }, { status: 400 });
   }
 
-  const updated = updateAssignments(id, validation.data.routingComboIds);
+  const updated = await updateAssignmentsAsync(id, validation.data.routingComboIds);
   if (!updated) return NextResponse.json({ error: "Compression combo not found" }, { status: 404 });
-  return NextResponse.json({ assignments: getAssignmentsForCompressionCombo(id) });
+  return NextResponse.json({ assignments: await getAssignmentsForCompressionComboAsync(id) });
 }

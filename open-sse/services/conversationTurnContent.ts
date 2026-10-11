@@ -1,3 +1,4 @@
+import { getConversationArtifactPaths } from "../../src/lib/db/conversationArtifacts.ts";
 /**
  * conversationTurnContent.ts — resolves a conversation_turn_nodes row's
  * actual display text/tool-call shape on demand, instead of storing it.
@@ -14,7 +15,7 @@
  */
 
 import { getDbInstance } from "../../src/lib/db/core.ts";
-import { readCallArtifact } from "../../src/lib/usage/callLogArtifacts.ts";
+import { readCallArtifact, readCallArtifactAsync } from "../../src/lib/usage/callLogArtifacts.ts";
 import { extractCanonicalTurns, hashTurnContent } from "./conversationTracker.ts";
 
 export type TurnDisplayContent = {
@@ -147,6 +148,28 @@ export function resolveTurnDisplayContent(
 
   for (const relPath of artifactPathByCorrelationId.values()) {
     const { artifact, state } = readCallArtifact(relPath);
+    if (state !== "ready") continue;
+    const pipeline = asRecord(artifact?.pipeline);
+    indexTurns(result, turnsFromBody(asRecord(pipeline?.clientRawRequest)?.body));
+    indexTurns(result, turnsFromClientResponse(pipeline?.clientResponse));
+    indexTurns(result, turnsFromProviderRequest(asRecord(pipeline?.providerRequest)?.body));
+  }
+  return result;
+}
+
+export async function resolveTurnDisplayContentAsync(
+  nodes: ReadonlyArray<{ lastCorrelationId: string | null }>
+): Promise<Map<string, TurnDisplayContent>> {
+  const result = new Map<string, TurnDisplayContent>();
+  const correlationIds = [
+    ...new Set(nodes.map((n) => n.lastCorrelationId).filter((v): v is string => !!v)),
+  ];
+  if (correlationIds.length === 0) return result;
+
+  const paths = await getConversationArtifactPaths(correlationIds);
+
+  for (const relPath of paths) {
+    const { artifact, state } = await readCallArtifactAsync(relPath);
     if (state !== "ready") continue;
     const pipeline = asRecord(artifact?.pipeline);
     indexTurns(result, turnsFromBody(asRecord(pipeline?.clientRawRequest)?.body));

@@ -10,7 +10,8 @@ declare const EdgeRuntime: string | undefined;
  * Wire format & schema details live in ../utils/cursorAgentProtobuf.ts.
  */
 
-import { BaseExecutor, mergeUpstreamExtraHeaders } from "./base.ts";
+import { BaseExecutor, mergeUpstreamExtraHeaders, type ProviderCredentials } from "./base.ts";
+import { parseDatabaseBackend } from "../../src/lib/db/backendSelection.ts";
 import { PROVIDERS, HTTP_STATUS } from "../config/constants.ts";
 import { getAccessToken } from "../services/tokenRefresh.ts";
 import { currentAppliedProxySink } from "../utils/proxyFetch.ts";
@@ -43,6 +44,7 @@ import {
 } from "../utils/usageTracking.ts";
 import {
   formatCursorAgentClientVersion,
+  getCursorAgentCliVersion,
   getCursorAgentCliVersionSync,
 } from "../utils/cursorAgentCliVersion.ts";
 import { sanitizeErrorMessage } from "../utils/error.ts";
@@ -1046,11 +1048,25 @@ export class CursorExecutor extends BaseExecutor {
   }
 
   buildHeaders(credentials) {
+    return this.buildHeadersForVersion(credentials, getCursorAgentCliVersionSync());
+  }
+
+  private async buildExecutionHeaders(
+    credentials: ProviderCredentials
+  ): Promise<Record<string, string>> {
+    if (parseDatabaseBackend() === "sqlite") return this.buildHeaders(credentials);
+    return this.buildHeadersForVersion(credentials, await getCursorAgentCliVersion());
+  }
+
+  private buildHeadersForVersion(
+    credentials: ProviderCredentials,
+    version: string
+  ): Record<string, string> {
     const ghostMode = credentials.providerSpecificData?.ghostMode !== false;
     const cleanToken = stripCursorOAuthTokenPrefix(credentials.accessToken ?? "");
     const requestId = crypto.randomUUID();
     const traceParent = `00-${crypto.randomBytes(16).toString("hex")}-${crypto.randomBytes(8).toString("hex")}-01`;
-    const clientVersion = formatCursorAgentClientVersion(getCursorAgentCliVersionSync());
+    const clientVersion = formatCursorAgentClientVersion(version);
 
     // Mirrors cursor-agent's actual headers for agent.v1.AgentService/Run.
     // Notably: no x-cursor-checksum, no machineId, no x-amzn-trace-id.
@@ -1277,7 +1293,7 @@ export class CursorExecutor extends BaseExecutor {
       url = await resolveCursorAgentUrl(executionCredentials, signal);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      const headers = this.buildHeaders(executionCredentials);
+      const headers = await this.buildExecutionHeaders(executionCredentials);
       return {
         response: new Response(
           JSON.stringify({
@@ -1297,7 +1313,7 @@ export class CursorExecutor extends BaseExecutor {
         transformedBody: body,
       };
     }
-    const headers = this.buildHeaders(executionCredentials);
+    const headers = await this.buildExecutionHeaders(executionCredentials);
     mergeUpstreamExtraHeaders(headers, upstreamExtraHeaders);
 
     const messages: ChatMessage[] = body.messages || [];

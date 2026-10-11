@@ -4,6 +4,7 @@
  * in GET /v1/models, same as the dashboard's merged pricing view.
  */
 import { getDbInstance } from "@/lib/db/core";
+import { readPreparedPostgresUserPricing } from "@/lib/db/postgres/pricingSnapshot";
 
 export type UserPricingByProvider = Record<string, Record<string, Record<string, unknown>>>;
 
@@ -20,6 +21,8 @@ export function invalidateUserPricingMemo(): void {
  * identity stable so findInsensitive's WeakMap index is reused across lookups.
  */
 export function readUserPricingMemoized(): UserPricingByProvider {
+  const native = readPreparedPostgresUserPricing();
+  if (native !== undefined) return native;
   const now = Date.now();
   if (memo && now - memo.at < MEMO_TTL_MS) return memo.value;
   const value = readUserPricingSync();
@@ -33,6 +36,8 @@ const PRICING_FIELDS = ["input", "output", "cached", "cache_creation"] as const;
 
 /** Bulk-load the user `pricing` namespace once (sync, no per-entry SQLite). */
 export function readUserPricingSync(): UserPricingByProvider {
+  const native = readPreparedPostgresUserPricing();
+  if (native !== undefined) return native;
   const out: UserPricingByProvider = {};
   try {
     const rows = getDbInstance()

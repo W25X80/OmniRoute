@@ -1,52 +1,22 @@
-import { getDbInstance, rowToCamel, objToSnake } from "./core";
+import {
+  parseBatchRow,
+  parseBatchItemCheckpoint,
+  INSTANCE_SWEEP_CHUNK,
+  MAX_CHUNKS_PER_REQUEST,
+} from "./batches/persistenceSemantics";
+export {
+  parseBatchRow,
+  parseBatchItemCheckpoint,
+  INSTANCE_SWEEP_CHUNK,
+  MAX_CHUNKS_PER_REQUEST,
+} from "./batches/persistenceSemantics";
+import { getSelectedPostgresDatabase } from "./controlPlaneContext";
+import { getDbInstance, objToSnake } from "./core";
 import { deleteFile, deleteFileOwnedBy } from "./files";
 import { v4 as uuidv4 } from "uuid";
 import { logger } from "../../../open-sse/utils/logger.ts";
 
 const log = logger("DB_BATCHES");
-
-function parseBatchRow(row: any): BatchRecord {
-  const camel = rowToCamel(row) as any;
-  if (camel.metadata && typeof camel.metadata === "string") {
-    try {
-      camel.metadata = JSON.parse(camel.metadata);
-    } catch {
-      camel.metadata = null;
-    }
-  }
-  if (camel.errors && typeof camel.errors === "string") {
-    try {
-      camel.errors = JSON.parse(camel.errors);
-    } catch {
-      camel.errors = null;
-    }
-  }
-  if (camel.usage && typeof camel.usage === "string") {
-    try {
-      camel.usage = JSON.parse(camel.usage);
-    } catch {
-      camel.usage = null;
-    }
-  }
-  // Normalize numeric date fields to ensure they are valid numbers
-  const coerceNum = (v: any): number | null => {
-    if (typeof v === "number" && Number.isFinite(v)) return v;
-    if (v == null) return null;
-    const n = Number(v);
-    return Number.isFinite(n) ? n : null;
-  };
-
-  camel.createdAt = coerceNum(camel.createdAt) ?? 0;
-  camel.inProgressAt = coerceNum(camel.inProgressAt);
-  camel.expiresAt = coerceNum(camel.expiresAt);
-  camel.finalizingAt = coerceNum(camel.finalizingAt);
-  camel.completedAt = coerceNum(camel.completedAt);
-  camel.failedAt = coerceNum(camel.failedAt);
-  camel.expiredAt = coerceNum(camel.expiredAt);
-  camel.cancellingAt = coerceNum(camel.cancellingAt);
-  camel.cancelledAt = coerceNum(camel.cancelledAt);
-  return camel as BatchRecord;
-}
 
 export interface BatchRecord {
   id: string;
@@ -96,29 +66,6 @@ export interface BatchItemCheckpoint {
   error: any | null;
   createdAt: number;
   updatedAt: number;
-}
-
-function parseJsonColumn(value: unknown): any | null {
-  if (value == null) return null;
-  if (typeof value !== "string") return value;
-  try {
-    return JSON.parse(value);
-  } catch {
-    return null;
-  }
-}
-
-function parseBatchItemCheckpoint(row: any): BatchItemCheckpoint {
-  return {
-    batchId: row.batch_id,
-    lineNumber: Number(row.line_number),
-    customId: row.custom_id ?? null,
-    status: row.status,
-    result: parseJsonColumn(row.result_json),
-    error: parseJsonColumn(row.error_json),
-    createdAt: Number(row.created_at),
-    updatedAt: Number(row.updated_at),
-  };
 }
 
 export function createBatch(
@@ -434,23 +381,6 @@ export function deleteBatch(id: string): boolean {
  */
 export type DeleteCompletedBatchesScope = { apiKeyId: string } | { allTenants: true };
 
-/** Both sweep modes commit in chunks of this many batches (SEC-D, LEDGER-4). */
-export const INSTANCE_SWEEP_CHUNK = 200;
-
-/**
- * Upper bound on the number of `INSTANCE_SWEEP_CHUNK`-sized chunks a single
- * `deleteCompletedBatches` call may run (#13680). `sweepLoop` is a synchronous
- * `for (;;)` over `better-sqlite3` — with no cap, one request could hold the
- * Node.js event loop for as long as it takes to sweep every completed batch on
- * the instance. 25 × 200 = 5000 batches/request is a judgment call, not a hard
- * constraint; any caller with more to sweep gets `hasMore: true` back and
- * resumes by calling again — resumption falls out naturally from rowid
- * ordering plus delete-as-you-go (already-swept rows are gone, so the next
- * SELECT picks up the next-lowest surviving rowid on its own; no cursor field
- * needed).
- */
-export const MAX_CHUNKS_PER_REQUEST = 25;
-
 /**
  * True when some batch OTHER than one of `excludeBatchIds` still references
  * `fileId` as its input/output/error file (#13681). Used before soft-deleting
@@ -711,4 +641,201 @@ export function deleteTerminalBatchesOlderThan(days: number): {
     [cutoffEpochSeconds],
     { allTenants: true }
   );
+}
+
+export async function createBatchAsync(
+  ...args: Parameters<typeof createBatch>
+): Promise<ReturnType<typeof createBatch>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceBatches");
+    return postgres.transaction((transaction) => native.createBatch(transaction, ...args));
+  }
+  return createBatch(...args);
+}
+
+export async function getBatchAsync(
+  ...args: Parameters<typeof getBatch>
+): Promise<ReturnType<typeof getBatch>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceBatches");
+    return postgres.transaction((transaction) => native.getBatch(transaction, ...args));
+  }
+  return getBatch(...args);
+}
+
+export async function updateBatchAsync(
+  ...args: Parameters<typeof updateBatch>
+): Promise<ReturnType<typeof updateBatch>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceBatches");
+    return postgres.transaction((transaction) => native.updateBatch(transaction, ...args));
+  }
+  return updateBatch(...args);
+}
+
+export async function ensureBatchItemCheckpointsAsync(
+  ...args: Parameters<typeof ensureBatchItemCheckpoints>
+): Promise<ReturnType<typeof ensureBatchItemCheckpoints>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceBatches");
+    return postgres.transaction((transaction) =>
+      native.ensureBatchItemCheckpoints(transaction, ...args)
+    );
+  }
+  return ensureBatchItemCheckpoints(...args);
+}
+
+export async function countBatchItemCheckpointsAsync(
+  ...args: Parameters<typeof countBatchItemCheckpoints>
+): Promise<ReturnType<typeof countBatchItemCheckpoints>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceBatches");
+    return postgres.transaction((transaction) =>
+      native.countBatchItemCheckpoints(transaction, ...args)
+    );
+  }
+  return countBatchItemCheckpoints(...args);
+}
+
+export async function listBatchItemCheckpointsAsync(
+  ...args: Parameters<typeof listBatchItemCheckpoints>
+): Promise<ReturnType<typeof listBatchItemCheckpoints>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceBatches");
+    return postgres.transaction((transaction) =>
+      native.listBatchItemCheckpoints(transaction, ...args)
+    );
+  }
+  return listBatchItemCheckpoints(...args);
+}
+
+export async function markBatchItemProcessingAsync(
+  ...args: Parameters<typeof markBatchItemProcessing>
+): Promise<ReturnType<typeof markBatchItemProcessing>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceBatches");
+    return postgres.transaction((transaction) =>
+      native.markBatchItemProcessing(transaction, ...args)
+    );
+  }
+  return markBatchItemProcessing(...args);
+}
+
+export async function markBatchItemResultAsync(
+  ...args: Parameters<typeof markBatchItemResult>
+): Promise<ReturnType<typeof markBatchItemResult>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceBatches");
+    return postgres.transaction((transaction) => native.markBatchItemResult(transaction, ...args));
+  }
+  return markBatchItemResult(...args);
+}
+
+export async function markBatchItemErrorAsync(
+  ...args: Parameters<typeof markBatchItemError>
+): Promise<ReturnType<typeof markBatchItemError>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceBatches");
+    return postgres.transaction((transaction) => native.markBatchItemError(transaction, ...args));
+  }
+  return markBatchItemError(...args);
+}
+
+export async function listBatchesAsync(
+  ...args: Parameters<typeof listBatches>
+): Promise<ReturnType<typeof listBatches>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceBatches");
+    return postgres.transaction((transaction) => native.listBatches(transaction, ...args));
+  }
+  return listBatches(...args);
+}
+
+export async function countBatchesAsync(
+  ...args: Parameters<typeof countBatches>
+): Promise<ReturnType<typeof countBatches>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceBatches");
+    return postgres.transaction((transaction) => native.countBatches(transaction, ...args));
+  }
+  return countBatches(...args);
+}
+
+export async function getPendingBatchesAsync(
+  ...args: Parameters<typeof getPendingBatches>
+): Promise<ReturnType<typeof getPendingBatches>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceBatches");
+    return postgres.transaction((transaction) => native.getPendingBatches(transaction, ...args));
+  }
+  return getPendingBatches(...args);
+}
+
+export async function getTerminalBatchesAsync(
+  ...args: Parameters<typeof getTerminalBatches>
+): Promise<ReturnType<typeof getTerminalBatches>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceBatches");
+    return postgres.transaction((transaction) => native.getTerminalBatches(transaction, ...args));
+  }
+  return getTerminalBatches(...args);
+}
+
+export async function deleteBatchAsync(
+  ...args: Parameters<typeof deleteBatch>
+): Promise<ReturnType<typeof deleteBatch>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceBatches");
+    return postgres.transaction((transaction) => native.deleteBatch(transaction, ...args));
+  }
+  return deleteBatch(...args);
+}
+
+export async function isFileReferencedByOtherBatchAsync(
+  ...args: Parameters<typeof isFileReferencedByOtherBatch>
+): Promise<ReturnType<typeof isFileReferencedByOtherBatch>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceBatches");
+    return postgres.transaction((transaction) =>
+      native.isFileReferencedByOtherBatch(transaction, ...args)
+    );
+  }
+  return isFileReferencedByOtherBatch(...args);
+}
+
+export async function deleteCompletedBatchesAsync(
+  ...args: Parameters<typeof deleteCompletedBatches>
+): Promise<ReturnType<typeof deleteCompletedBatches>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceBatches");
+    return native.deleteCompletedBatches(postgres, ...args);
+  }
+  return deleteCompletedBatches(...args);
+}
+
+export async function deleteTerminalBatchesOlderThanAsync(
+  ...args: Parameters<typeof deleteTerminalBatchesOlderThan>
+): Promise<ReturnType<typeof deleteTerminalBatchesOlderThan>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceBatches");
+    return native.deleteTerminalBatchesOlderThan(postgres, ...args);
+  }
+  return deleteTerminalBatchesOlderThan(...args);
 }

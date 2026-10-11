@@ -13,13 +13,11 @@ import { NextResponse } from "next/server";
 import { setTokenLimitSchema } from "@/shared/validation/schemas";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
 import { buildErrorBody, sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
-
 import {
-  TokenLimit,
-  listTokenLimits,
-  upsertTokenLimit,
-  deleteTokenLimit,
-  getWindowUsage,
+  listTokenLimitsAsync,
+  upsertTokenLimitAsync,
+  deleteTokenLimitAsync,
+  getWindowUsageAsync,
   resetWindowIfElapsed,
   TokenLimitConflictError,
   TokenLimitNotFoundError,
@@ -34,18 +32,19 @@ export async function GET(request: Request) {
         status: 400,
       });
     }
-    const limits = listTokenLimits(apiKeyId).map((limit: TokenLimit) => {
-      const usage = getWindowUsage(limit);
+    const limits = [];
+    for (const limit of await listTokenLimitsAsync(apiKeyId)) {
+      const usage = await getWindowUsageAsync(limit);
       const window = resetWindowIfElapsed(limit);
-      return {
+      limits.push({
         ...limit,
         tokensUsed: usage,
         windowStart: window.windowStart,
         periodStartAt: window.periodStartAt,
         nextResetAt: window.nextResetAt,
         remaining: Math.max(0, limit.tokenLimit - usage),
-      };
-    });
+      });
+    }
     return NextResponse.json({ apiKeyId, limits });
   } catch (error) {
     console.error("Error listing token limits:", error);
@@ -68,7 +67,7 @@ export async function POST(request: Request) {
     }
     const { id, apiKeyId, scopeType, scopeValue, tokenLimit, resetInterval, resetTime, enabled } =
       validation.data;
-    const limit = upsertTokenLimit({
+    const limit = await upsertTokenLimitAsync({
       id,
       apiKeyId,
       scopeType,
@@ -98,7 +97,7 @@ export async function DELETE(request: Request) {
     return NextResponse.json(buildErrorBody(400, "id query param is required"), { status: 400 });
   }
   try {
-    const deleted = deleteTokenLimit(id);
+    const deleted = await deleteTokenLimitAsync(id);
     return NextResponse.json({ success: deleted }, { status: deleted ? 200 : 404 });
   } catch (error) {
     console.error("Error deleting token limit:", error);

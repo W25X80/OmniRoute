@@ -4,8 +4,8 @@ import { resolveMitmDataDir } from "./dataDir.ts";
 import { removeDNSEntry, removeDNSEntries } from "./dns/dnsConfig.ts";
 import { uninstallCert } from "./cert/install.ts";
 import { ALL_TARGETS } from "./targets/index.ts";
-import { listCustomHosts } from "@/lib/db/inspectorCustomHosts.ts";
-import { getGheCopilotHosts } from "@/lib/db/providers.ts";
+import { listCustomHosts, listCustomHostsAsync } from "@/lib/db/inspectorCustomHosts.ts";
+import { getGheCopilotHosts, getGheCopilotHostsAsync } from "@/lib/db/providers.ts";
 import { createLogger } from "@/shared/utils/logger.ts";
 
 const log = createLogger("mitm-repair");
@@ -83,7 +83,7 @@ async function revertSystemProxyIfApplied(): Promise<boolean> {
  * unchanged from the original inline implementation. (Gap 7.)
  */
 export async function performRepairSteps(sudoPassword: string): Promise<string[]> {
-  const plan = buildRepairPlan();
+  const plan = await buildRepairPlanAsync();
   const repaired: string[] = [];
 
   // 1. DNS — remove every host we may have spoofed (idempotent, reads /etc/hosts).
@@ -116,4 +116,23 @@ export async function performRepairSteps(sudoPassword: string): Promise<string[]
   }
 
   return repaired;
+}
+
+/** Read the complete selected-backend host set before privileged teardown begins. */
+export async function collectManagedHostsAsync(): Promise<string[]> {
+  const hosts = new Set<string>();
+  for (const target of ALL_TARGETS) {
+    for (const host of target.hosts) hosts.add(host);
+    if (target.id === "ghe-copilot")
+      for (const host of await getGheCopilotHostsAsync()) hosts.add(host);
+  }
+  for (const host of await listCustomHostsAsync()) hosts.add(host.host);
+  return [...hosts];
+}
+export async function buildRepairPlanAsync(): Promise<RepairPlan> {
+  return {
+    dnsHostsToRemove: await collectManagedHostsAsync(),
+    removeCert: true,
+    revertSystemProxy: true,
+  };
 }

@@ -1,6 +1,8 @@
 /* Adapted from miuuyy/codex-chatgpt-web v4.0.7 commit b59d7dc51b84fb1f465ff1d00f5207f3b2b4a494 (MIT). */
 import { createHash, randomBytes } from "node:crypto";
-import { chmodSync, existsSync, lstatSync, mkdirSync, unlinkSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, unlinkSync, type Stats } from "node:fs";
+import { chmod, lstat, mkdir, unlink } from "node:fs/promises";
+import { parseDatabaseBackend } from "../../../../../src/lib/db/backendSelection.ts";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
 import { isWindowsPipeEndpoint } from "../../config";
@@ -205,6 +207,9 @@ export class TurnBroker implements TurnBrokerOwner {
   private acceptingExternalOwners = true;
   private server?: Server;
   private startPromise?: Promise<void>;
+  private nativeStartGeneration = 0;
+  private nativeSocketIdentity?: { dev: number; ino: number; uid: number };
+  private nativeStartup?: { server: Server; cancelConnections: () => void };
 
   private constructor(readonly socketPath: string) {}
 
@@ -424,12 +429,20 @@ export class TurnBroker implements TurnBrokerOwner {
   }
 
   async close(): Promise<void> {
+    const native = parseDatabaseBackend() === "postgres";
+    if (native) this.nativeStartGeneration++;
+    const ownedSocket = this.nativeSocketIdentity;
+    this.nativeSocketIdentity = undefined;
     this.compactionTransactions.close();
     for (const token of [...this.channels.keys()]) this.revoke(token);
     const server = this.server;
     this.server = undefined;
     this.startPromise = undefined;
     brokers.delete(this.socketPath);
+    if (native && this.nativeStartup && this.nativeStartup.server === server) {
+      this.nativeStartup.cancelConnections();
+      this.nativeStartup = undefined;
+    }
     if (server?.listening) {
       await new Promise<void>((resolveClose, rejectClose) =>
         server.close((error) => {
@@ -439,7 +452,14 @@ export class TurnBroker implements TurnBrokerOwner {
         })
       );
     }
-    if (
+    if (native) {
+      if (!isWindowsPipeEndpoint(this.socketPath) && ownedSocket) {
+        const current = await this.nativeSocketStat();
+        if (current?.isSocket() && this.sameNativeSocket(current, ownedSocket)) {
+          await unlink(this.socketPath);
+        }
+      }
+    } else if (
       !isWindowsPipeEndpoint(this.socketPath) &&
       existsSync(this.socketPath) &&
       lstatSync(this.socketPath).isSocket()
@@ -448,6 +468,7 @@ export class TurnBroker implements TurnBrokerOwner {
   }
 
   private start(): Promise<void> {
+    if (parseDatabaseBackend() === "postgres") return this.startWithAsyncMetadata();
     if (this.startPromise) return this.startPromise;
     this.startPromise = new Promise<void>((resolveStart, rejectStart) => {
       const windowsPipe = isWindowsPipeEndpoint(this.socketPath);
@@ -559,6 +580,221 @@ export class TurnBroker implements TurnBrokerOwner {
         });
       });
     });
+    return this.startPromise;
+  }
+
+  private async nativeSocketStat(): Promise<Stats | undefined> {
+    try {
+      return await lstat(this.socketPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+      throw error;
+    }
+  }
+
+  private sameNativeSocket(
+    current: { dev: number; ino: number; uid: number },
+    expected: { dev: number; ino: number; uid: number }
+  ): boolean {
+    return (
+      current.dev === expected.dev && current.ino === expected.ino && current.uid === expected.uid
+    );
+  }
+
+  private assertNativeSocketOwner(current: Stats, checkMode = true): void {
+    if (!current.isSocket()) {
+      throw new Error(`ChatGPT web broker path exists and is not a socket: ${this.socketPath}`);
+    }
+    const getuid = process.getuid;
+    if (typeof getuid === "function" && current.uid !== getuid()) {
+      throw new Error(
+        `ChatGPT web broker socket is not owned by the current user: ${this.socketPath}`
+      );
+    }
+    if (checkMode && (current.mode & 0o077) !== 0) {
+      throw new Error(`ChatGPT web broker socket has unsafe permissions: ${this.socketPath}`);
+    }
+  }
+
+  private startWithAsyncMetadata(): Promise<void> {
+    if (this.startPromise) return this.startPromise;
+    const generation = this.nativeStartGeneration;
+    const assertStarting = () => {
+      if (this.nativeStartGeneration !== generation) {
+        throw new Error("ChatGPT web broker closed before startup completed");
+      }
+    };
+    const alreadyOwned = () =>
+      new Error(
+        `ChatGPT web broker socket is already owned by another process: ${this.socketPath}`
+      );
+    this.startPromise = (async () => {
+      const windowsPipe = isWindowsPipeEndpoint(this.socketPath);
+      if (!windowsPipe) {
+        const encodedLength = Buffer.byteLength(this.socketPath);
+        if (encodedLength > MAX_UNIX_SOCKET_PATH_BYTES) {
+          throw new Error(
+            `ChatGPT web broker socket path is ${encodedLength} bytes, over the` +
+              ` ${MAX_UNIX_SOCKET_PATH_BYTES}-byte limit this platform allows for a Unix socket:` +
+              ` ${this.socketPath}. Choose a shorter runtime directory.`
+          );
+        }
+        await mkdir(dirname(this.socketPath), { recursive: true, mode: 0o700 });
+        assertStarting();
+        const existing = await this.nativeSocketStat();
+        assertStarting();
+        if (existing) {
+          this.assertNativeSocketOwner(existing);
+          await new Promise<void>((resolveProbe, rejectProbe) => {
+            const probe = createConnection(this.socketPath);
+            let settled = false;
+            const finish = (error?: Error) => {
+              if (settled) return;
+              settled = true;
+              probe.destroy();
+              if (error) rejectProbe(error);
+              else resolveProbe();
+            };
+            probe.setTimeout(2_000, () =>
+              finish(
+                new Error(
+                  `Timed out while checking existing ChatGPT web broker socket: ${this.socketPath}`
+                )
+              )
+            );
+            probe.once("connect", () => finish(alreadyOwned()));
+            probe.once("error", (error) => {
+              const code = (error as NodeJS.ErrnoException).code;
+              if (code === "ECONNREFUSED" || code === "ENOENT") finish();
+              else
+                finish(
+                  new Error(
+                    `Could not verify existing ChatGPT web broker socket ${this.socketPath}: ${error.message}`
+                  )
+                );
+            });
+          });
+          assertStarting();
+          const current = await this.nativeSocketStat();
+          assertStarting();
+          if (current) {
+            this.assertNativeSocketOwner(current);
+            if (!this.sameNativeSocket(current, existing)) throw alreadyOwned();
+            await unlink(this.socketPath);
+            assertStarting();
+          }
+        }
+        // An await may have let a different owner bind this path; never replace it.
+        if (await this.nativeSocketStat()) throw alreadyOwned();
+        assertStarting();
+      }
+      let capturedServer: Server | undefined;
+      let capturedSocket: { dev: number; ino: number; uid: number } | undefined;
+      const startupConnections = new Map<Socket, () => void>();
+      let trackingStartup = true;
+      const releaseConnections = (destroy: boolean) => {
+        trackingStartup = false;
+        for (const [socket, onClose] of startupConnections) {
+          socket.off("close", onClose);
+          if (destroy) socket.destroy();
+        }
+        startupConnections.clear();
+      };
+      let rejectServerError: ((error: Error) => void) | undefined;
+      const logServerError = (error: Error) => {
+        console.error(
+          `[chatgpt-web] turn broker server error at ${this.socketPath}: ${errorOf(error).message}`
+        );
+      };
+      try {
+        await new Promise<void>((resolveListen, rejectListen) => {
+          assertStarting();
+          const server = createServer((socket) => {
+            if (trackingStartup) {
+              const onClose = () => startupConnections.delete(socket);
+              startupConnections.set(socket, onClose);
+              socket.once("close", onClose);
+            }
+            this.handleSocket(socket);
+          });
+          capturedServer = server;
+          this.server = server;
+          this.nativeStartup = { server, cancelConnections: () => releaseConnections(true) };
+          rejectServerError = rejectListen;
+          server.once("error", rejectListen);
+          server.on("error", logServerError);
+          server.listen(this.socketPath, () => {
+            void (async () => {
+              assertStarting();
+              if (!windowsPipe) {
+                const created = await this.nativeSocketStat();
+                assertStarting();
+                if (!created) throw new Error("ChatGPT web broker socket disappeared after listen");
+                this.assertNativeSocketOwner(created, false);
+                const owned = { dev: created.dev, ino: created.ino, uid: created.uid };
+                capturedSocket = owned;
+                this.nativeSocketIdentity = owned;
+                await chmod(this.socketPath, 0o600);
+                assertStarting();
+                const current = await this.nativeSocketStat();
+                assertStarting();
+                if (!current || !this.sameNativeSocket(current, owned)) throw alreadyOwned();
+                this.assertNativeSocketOwner(current);
+              }
+              server.off("error", rejectListen);
+              if (this.nativeStartup?.server === server) this.nativeStartup = undefined;
+              releaseConnections(false);
+              resolveListen();
+            })().catch(rejectListen);
+          });
+        });
+      } catch (error) {
+        // Retire only this failed startup, even if close/new-start overtook a metadata await.
+        const server = capturedServer;
+        releaseConnections(true);
+        if (server) {
+          if (rejectServerError) server.off("error", rejectServerError);
+          if (this.nativeStartup?.server === server) this.nativeStartup = undefined;
+          if (this.server === server) this.server = undefined;
+          try {
+            if (server.listening) {
+              await new Promise<void>((resolveClose, rejectClose) =>
+                server.close((closeError) => {
+                  if (
+                    !closeError ||
+                    (closeError as NodeJS.ErrnoException).code === "ERR_SERVER_NOT_RUNNING"
+                  ) {
+                    resolveClose();
+                  } else rejectClose(closeError);
+                })
+              );
+            }
+            if (!windowsPipe && capturedSocket && this.nativeStartGeneration === generation) {
+              const current = await this.nativeSocketStat();
+              if (
+                this.nativeStartGeneration === generation &&
+                current?.isSocket() &&
+                this.sameNativeSocket(current, capturedSocket)
+              ) {
+                await unlink(this.socketPath);
+              }
+              if (
+                this.nativeSocketIdentity &&
+                this.sameNativeSocket(this.nativeSocketIdentity, capturedSocket)
+              ) {
+                this.nativeSocketIdentity = undefined;
+              }
+            }
+          } catch {
+            // Keep the startup error; do not expose cleanup paths or credentials in diagnostics.
+            console.error("[chatgpt-web] failed to retire rejected turn broker startup");
+          } finally {
+            server.off("error", logServerError);
+          }
+        }
+        throw error;
+      }
+    })();
     return this.startPromise;
   }
 

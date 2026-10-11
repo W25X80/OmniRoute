@@ -236,6 +236,21 @@ function tightenServerEnv(dataDir, serverEnvPath) {
   }
 }
 
+function bootstrapPostgresEnv(configured, dataDirOverride) {
+  const building =
+    configured.NEXT_PHASE === "phase-production-build" || configured.OMNIROUTE_BUILDING === "1";
+  if (!building && !configured.STORAGE_ENCRYPTION_KEY?.trim()) {
+    throw new Error("PostgreSQL requires a configured STORAGE_ENCRYPTION_KEY");
+  }
+  // Native startup restores/creates JWT/API secrets transactionally. Never read
+  // server.env or inspect SQLite, and never generate a local replacement key.
+  const env = Object.fromEntries(
+    Object.entries(configured).filter(([, value]) => typeof value === "string")
+  );
+  if (dataDirOverride?.trim()) env.DATA_DIR = resolve(dataDirOverride);
+  return env;
+}
+
 // ── Main bootstrap function ──────────────────────────────────────────────────
 /**
  * @param {{ dataDirOverride?: string; quiet?: boolean }} options
@@ -244,9 +259,29 @@ function tightenServerEnv(dataDir, serverEnvPath) {
 export function bootstrapEnv({ dataDirOverride, quiet = false } = {}) {
   const log = quiet ? () => {} : (msg) => process.stderr.write(`[bootstrap] ${msg}\n`);
 
+  const selectedBackend = process.env.OMNIROUTE_DATABASE_BACKEND;
+  if (
+    selectedBackend !== undefined &&
+    selectedBackend !== "sqlite" &&
+    selectedBackend !== "postgres"
+  ) {
+    throw new Error("OMNIROUTE_DATABASE_BACKEND must be sqlite or postgres");
+  }
+  if (selectedBackend === "postgres") return bootstrapPostgresEnv(process.env, dataDirOverride);
+
   const preferredEnvPath = getPreferredEnvFilePath(process.env);
   const preferredEnv = preferredEnvPath ? parseEnvFile(preferredEnvPath) : {};
-  const dataDir = resolveDataDir(dataDirOverride, { ...preferredEnv, ...process.env });
+  const configuredBackend = selectedBackend ?? preferredEnv.OMNIROUTE_DATABASE_BACKEND;
+  if (configuredBackend === "postgres") {
+    return bootstrapPostgresEnv({ ...preferredEnv, ...process.env }, dataDirOverride);
+  }
+  if (configuredBackend !== undefined && configuredBackend !== "sqlite") {
+    throw new Error("OMNIROUTE_DATABASE_BACKEND must be sqlite or postgres");
+  }
+  const dataDir = resolveDataDir(dataDirOverride, {
+    ...preferredEnv,
+    ...process.env,
+  });
   const serverEnvPath = join(dataDir, "server.env");
 
   // ── Layer 1: Load persisted server.env ────────────────────────────────────
@@ -270,7 +305,11 @@ export function bootstrapEnv({ dataDirOverride, quiet = false } = {}) {
   const processEnvFiltered = Object.fromEntries(
     Object.entries(process.env).filter(([, v]) => typeof v === "string" && v.length > 0)
   );
-  const merged = { ...persisted, ...preferredEnvFiltered, ...processEnvFiltered };
+  const merged = {
+    ...persisted,
+    ...preferredEnvFiltered,
+    ...processEnvFiltered,
+  };
 
   // ── Auto-generate required secrets ────────────────────────────────────────
   let needsPersist = false;

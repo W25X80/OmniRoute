@@ -1,3 +1,5 @@
+import { getSelectedPostgresDatabase } from "./controlPlaneContext";
+import { createPostgresAgentMetadataRepository } from "./postgres/agentMetadataRepository";
 /**
  * Plugin Metrics DB module — per-plugin hook execution tracking.
  *
@@ -68,7 +70,9 @@ export function getPluginMetrics(pluginName?: string): PluginMetricRow[] {
   try {
     const db = getDbInstance();
     const rows = pluginName
-      ? db.prepare("SELECT * FROM plugin_metrics WHERE plugin_name = ? ORDER BY event").all(pluginName)
+      ? db
+          .prepare("SELECT * FROM plugin_metrics WHERE plugin_name = ? ORDER BY event")
+          .all(pluginName)
       : db.prepare("SELECT * FROM plugin_metrics ORDER BY plugin_name, event").all();
     return (rows as Record<string, unknown>[]).map(rowToMetric);
   } catch {
@@ -85,4 +89,31 @@ export function clearPluginMetrics(pluginName?: string): number {
     ? db.prepare("DELETE FROM plugin_metrics WHERE plugin_name = ?").run(pluginName)
     : db.prepare("DELETE FROM plugin_metrics").run();
   return result.changes;
+}
+
+export async function recordPluginMetricAsync(
+  ...args: Parameters<typeof recordPluginMetric>
+): Promise<Awaited<ReturnType<typeof recordPluginMetric>>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresAgentMetadataRepository(database).recordPluginMetric(...args)
+    : recordPluginMetric(...args);
+}
+
+export async function getPluginMetricsAsync(
+  ...args: Parameters<typeof getPluginMetrics>
+): Promise<Awaited<ReturnType<typeof getPluginMetrics>>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresAgentMetadataRepository(database).getPluginMetrics(...args)
+    : getPluginMetrics(...args);
+}
+
+export async function clearPluginMetricsAsync(
+  ...args: Parameters<typeof clearPluginMetrics>
+): Promise<Awaited<ReturnType<typeof clearPluginMetrics>>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresAgentMetadataRepository(database).clearPluginMetrics(...args)
+    : clearPluginMetrics(...args);
 }

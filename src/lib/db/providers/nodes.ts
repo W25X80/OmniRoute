@@ -1,3 +1,4 @@
+import { getSelectedControlPlane } from "../controlPlaneContext";
 /**
  * db/providers/nodes.ts — Provider nodes CRUD.
  */
@@ -39,6 +40,8 @@ interface DbLike {
 }
 
 export async function getProviderNodes(filter: JsonRecord = {}, limit?: number, offset?: number) {
+  const selected = getSelectedControlPlane();
+  if (selected) return selected.nodes.list(filter, limit, offset);
   const db = getDbInstance() as unknown as DbLike;
   let sql = "SELECT * FROM provider_nodes";
   const params: Record<string, unknown> = {};
@@ -57,6 +60,11 @@ export async function getProviderNodes(filter: JsonRecord = {}, limit?: number, 
   return db.prepare(sql).all(params).map(rowToCamel);
 }
 
+export async function getProviderNodesCountAsync(filter: JsonRecord = {}): Promise<number> {
+  const selected = getSelectedControlPlane();
+  return selected ? selected.nodes.count(filter) : getProviderNodesCount(filter);
+}
+
 export function getProviderNodesCount(filter: JsonRecord = {}): number {
   const db = getDbInstance() as unknown as DbLike;
   let sql = "SELECT count(*) as cnt FROM provider_nodes";
@@ -72,6 +80,8 @@ export function getProviderNodesCount(filter: JsonRecord = {}): number {
 }
 
 export async function getProviderNodeById(id: string) {
+  const selected = getSelectedControlPlane();
+  if (selected) return selected.nodes.findById(id);
   const db = getDbInstance() as unknown as DbLike;
   const row = db.prepare("SELECT * FROM provider_nodes WHERE id = ?").get(id);
   return row ? rowToCamel(row) : null;
@@ -83,6 +93,8 @@ export async function getProviderNodeById(id: string) {
 // Falls back to the sole node of that type only when unambiguous; otherwise null (so the
 // caller still surfaces the existing 404).
 export async function resolveProviderNodeForConnection(idOrType: string) {
+  const selected = getSelectedControlPlane();
+  if (selected) return selected.nodes.resolveForConnection(idOrType);
   const exact = await getProviderNodeById(idOrType);
   if (exact) return exact;
   const all = (await getProviderNodes()) as JsonRecord[];
@@ -90,6 +102,8 @@ export async function resolveProviderNodeForConnection(idOrType: string) {
 }
 
 export async function createProviderNode(data: JsonRecord) {
+  const selected = getSelectedControlPlane();
+  if (selected) return selected.nodes.create(data);
   const db = getDbInstance() as unknown as DbLike;
   const now = new Date().toISOString();
 
@@ -127,6 +141,8 @@ export async function createProviderNode(data: JsonRecord) {
 }
 
 export async function updateProviderNode(id: string, data: JsonRecord) {
+  const selected = getSelectedControlPlane();
+  if (selected) return selected.nodes.update(id, data);
   const db = getDbInstance() as unknown as DbLike;
   const existing = db.prepare("SELECT * FROM provider_nodes WHERE id = ?").get(id);
   if (!existing) return null;
@@ -185,6 +201,8 @@ export async function updateProviderNode(id: string, data: JsonRecord) {
 }
 
 export async function deleteProviderNode(id: string) {
+  const selected = getSelectedControlPlane();
+  if (selected) return selected.nodes.deleteById(id);
   const db = getDbInstance() as unknown as DbLike;
   const existing = db.prepare("SELECT * FROM provider_nodes WHERE id = ?").get(id);
   if (!existing) return null;

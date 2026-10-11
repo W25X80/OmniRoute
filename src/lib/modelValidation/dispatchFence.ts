@@ -18,7 +18,7 @@ interface DispatchFenceOptions<T extends ValidationExecutor> {
   modelId: string;
   connectionId: string;
   signal: AbortSignal;
-  assertFresh: () => void;
+  assertFresh: () => void | Promise<void>;
   expectedExecutor: T;
   expectedCredentials?: ExecuteInput["credentials"];
 }
@@ -99,7 +99,7 @@ export function createValidationDispatchFence<T extends ValidationExecutor>(
   }
   const validationDispatch: StrictValidationDispatch = {
     reject,
-    beforeFetch(details) {
+    async beforeFetch(details) {
       if (
         violated ||
         dispatched !== 0 ||
@@ -108,7 +108,7 @@ export function createValidationDispatchFence<T extends ValidationExecutor>(
       )
         reject();
       options.signal.throwIfAborted();
-      options.assertFresh();
+      await options.assertFresh();
       assertChosenCredentials(details.credentials, options, reject);
       if (
         !matchesBearer(details.headers, options.expectedCredentials) ||
@@ -135,7 +135,7 @@ export function createValidationDispatchFence<T extends ValidationExecutor>(
               )
                 reject();
               options.signal.throwIfAborted();
-              options.assertFresh();
+              await options.assertFresh();
               assertChosenCredentials(input.credentials, options, reject);
               entered = true;
               return target.execute({
@@ -152,10 +152,10 @@ export function createValidationDispatchFence<T extends ValidationExecutor>(
         },
       });
     },
-    assertDispatched() {
+    async assertDispatched() {
       if (violated || dispatched !== 1) reject();
       options.signal.throwIfAborted();
-      options.assertFresh();
+      await options.assertFresh();
     },
   };
 }

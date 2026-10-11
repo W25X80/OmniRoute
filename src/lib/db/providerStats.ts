@@ -1,3 +1,5 @@
+import * as postgres from "./postgres/providerStatsRepository";
+import { getPostgresUsageDatabase } from "./postgres/usageQueries";
 import { getDbInstance } from "./core";
 
 /**
@@ -65,4 +67,14 @@ export function getModelCallStats(): ModelCallStat[] {
        ORDER BY c.provider, requests DESC`
     )
     .all() as ModelCallStat[];
+}
+
+export async function getProviderCallStatsAsync(): Promise<ProviderCallStat[]> {
+  const database = getPostgresUsageDatabase();
+  return database ? postgres.getProviderCallStats(database) : getProviderCallStats();
+}
+
+export async function getModelCallStatsAsync(): Promise<ModelCallStat[]> {
+  const database = getPostgresUsageDatabase();
+  return database ? postgres.getModelCallStats(database) : getModelCallStats();
 }

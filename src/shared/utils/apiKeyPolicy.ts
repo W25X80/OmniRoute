@@ -13,9 +13,13 @@ import { getApiKeyMetadata, isModelAllowedForKey, getApiKeyById } from "@/lib/db
 import { getComboByName } from "@/lib/db/combos";
 import { isDashboardSessionAuthenticated } from "./apiAuth";
 import { resolveComboForModel } from "@/lib/db/modelComboMappings";
-import { checkBudget } from "@/domain/costRules";
-import { checkKeyQuota } from "@/domain/keyQuota";
-import { checkTokenLimits } from "@omniroute/open-sse/services/tokenLimitCounter.ts";
+import { checkBudget, checkBudgetAsync } from "@/domain/costRules";
+import { checkKeyQuota, checkKeyQuotaAsync } from "@/domain/keyQuota";
+import {
+  checkTokenLimits,
+  checkTokenLimitsAsync,
+} from "@omniroute/open-sse/services/tokenLimitCounter.ts";
+import { getSelectedPersistenceIdentity } from "@/lib/db/controlPlaneContext";
 import {
   errorResponse,
   buildErrorBody,
@@ -713,17 +717,32 @@ function validateBudget(context: PolicyContext): Response | null {
   if (!apiKeyInfo.id) return null;
   try {
     const budgetOk = checkBudget(apiKeyInfo.id);
-    if (budgetOk.allowed) return null;
-    const resetSuffix = formatResetDurationSuffix(budgetOk.budgetResetAt);
-    const reason = budgetOk.reason || "Budget limit exceeded";
-    return errorResponse(
-      HTTP_STATUS.RATE_LIMITED,
-      resetSuffix ? `${reason} ${resetSuffix}` : reason,
-      {
-        code: "budget_exceeded",
-        retryAfter: budgetOk.budgetResetAt,
-      }
-    );
+    return budgetPolicyRejection(budgetOk);
+  } catch (error) {
+    log.error("API_POLICY", "Budget check failed. Request blocked.", { error });
+    return errorResponse(HTTP_STATUS.SERVICE_UNAVAILABLE, "Budget policy unavailable");
+  }
+}
+
+function budgetPolicyRejection(budgetOk: ReturnType<typeof checkBudget>): Response | null {
+  if (budgetOk.allowed) return null;
+  const resetSuffix = formatResetDurationSuffix(budgetOk.budgetResetAt);
+  const reason = budgetOk.reason || "Budget limit exceeded";
+  return errorResponse(
+    HTTP_STATUS.RATE_LIMITED,
+    resetSuffix ? `${reason} ${resetSuffix}` : reason,
+    { code: "budget_exceeded", retryAfter: budgetOk.budgetResetAt }
+  );
+}
+
+async function validateBudgetUnlessDeferredAsync(
+  context: PolicyContext,
+  options: EnforceApiKeyPolicyOptions | undefined
+): Promise<Response | null> {
+  if (options?.meteredBudget === "defer-to-candidate" || !context.apiKeyInfo.id) return null;
+  try {
+    if (!getSelectedPersistenceIdentity()) return validateBudgetUnlessDeferred(context, options);
+    return budgetPolicyRejection(await checkBudgetAsync(context.apiKeyInfo.id));
   } catch (error) {
     log.error("API_POLICY", "Budget check failed. Request blocked.", { error });
     return errorResponse(HTTP_STATUS.SERVICE_UNAVAILABLE, "Budget policy unavailable");
@@ -735,14 +754,32 @@ function validateTokenLimit(context: PolicyContext): Response | null {
   if (!apiKeyInfo.id) return null;
   try {
     const breach = checkTokenLimits(apiKeyInfo.id, undefined, modelStr ?? undefined);
-    if (!breach) return null;
-    const scopeLabel =
-      breach.scopeType === "global" ? "account" : `${breach.scopeType} "${breach.scopeValue}"`;
-    const resetSuffix = formatResetDurationSuffix(breach.nextResetAt) || "Please try again later.";
-    return errorResponse(
-      HTTP_STATUS.RATE_LIMITED,
-      `Token limit exceeded for ${scopeLabel}: ${breach.tokensUsed}/${breach.limitValue} tokens used in the current window. ${resetSuffix}`,
-      { code: "token_limit_exceeded", retryAfter: breach.nextResetAt }
+    return tokenPolicyRejection(breach);
+  } catch (error) {
+    log.error("API_POLICY", "Token limit check failed. Request blocked.", { error });
+    return errorResponse(HTTP_STATUS.SERVICE_UNAVAILABLE, "Token limit policy unavailable");
+  }
+}
+
+function tokenPolicyRejection(breach: ReturnType<typeof checkTokenLimits>): Response | null {
+  if (!breach) return null;
+  const scopeLabel =
+    breach.scopeType === "global" ? "account" : `${breach.scopeType} "${breach.scopeValue}"`;
+  const resetSuffix = formatResetDurationSuffix(breach.nextResetAt) || "Please try again later.";
+  return errorResponse(
+    HTTP_STATUS.RATE_LIMITED,
+    `Token limit exceeded for ${scopeLabel}: ${breach.tokensUsed}/${breach.limitValue} tokens used in the current window. ${resetSuffix}`,
+    { code: "token_limit_exceeded", retryAfter: breach.nextResetAt }
+  );
+}
+
+async function validateTokenLimitAsync(context: PolicyContext): Promise<Response | null> {
+  const { apiKeyInfo, modelStr } = context;
+  if (!apiKeyInfo.id) return null;
+  try {
+    if (!getSelectedPersistenceIdentity()) return validateTokenLimit(context);
+    return tokenPolicyRejection(
+      await checkTokenLimitsAsync(apiKeyInfo.id, undefined, modelStr ?? undefined)
     );
   } catch (error) {
     log.error("API_POLICY", "Token limit check failed. Request blocked.", { error });
@@ -755,8 +792,28 @@ function validateKeyQuota(context: PolicyContext): Response | null {
   if (!apiKeyInfo.id) return null;
   try {
     const verdict = checkKeyQuota(apiKeyInfo.id);
-    if (verdict.allowed) return null;
-    return errorResponse(HTTP_STATUS.RATE_LIMITED, verdict.reason || "API key quota exceeded");
+    return keyQuotaPolicyRejection(verdict);
+  } catch (error) {
+    log.error("API_POLICY", "API key quota check failed. Request blocked.", { error });
+    return errorResponse(HTTP_STATUS.SERVICE_UNAVAILABLE, "API key quota policy unavailable");
+  }
+}
+
+function keyQuotaPolicyRejection(verdict: ReturnType<typeof checkKeyQuota>): Response | null {
+  return verdict.allowed
+    ? null
+    : errorResponse(HTTP_STATUS.RATE_LIMITED, verdict.reason || "API key quota exceeded");
+}
+
+async function validateKeyQuotaAsync(context: PolicyContext): Promise<Response | null> {
+  if (!context.apiKeyInfo.id) return null;
+  try {
+    if (!getSelectedPersistenceIdentity()) return validateKeyQuota(context);
+  } catch {
+    // The domain async checker owns B16, including unavailable selection; do not override it here.
+  }
+  try {
+    return keyQuotaPolicyRejection(await checkKeyQuotaAsync(context.apiKeyInfo.id));
   } catch (error) {
     log.error("API_POLICY", "API key quota check failed. Request blocked.", { error });
     return errorResponse(HTTP_STATUS.SERVICE_UNAVAILABLE, "API key quota policy unavailable");
@@ -869,11 +926,11 @@ export async function enforceApiKeyPolicy(
   const modelRejection = await validateModelAccess(context);
   if (modelRejection) return { apiKey, apiKeyInfo, rejection: modelRejection };
 
-  const budgetRejection = validateBudgetUnlessDeferred(context, options);
+  const budgetRejection = await validateBudgetUnlessDeferredAsync(context, options);
   if (budgetRejection) return { apiKey, apiKeyInfo, rejection: budgetRejection };
-  const keyQuotaRejection = validateKeyQuota(context);
+  const keyQuotaRejection = await validateKeyQuotaAsync(context);
   if (keyQuotaRejection) return { apiKey, apiKeyInfo, rejection: keyQuotaRejection };
-  const tokenRejection = validateTokenLimit(context);
+  const tokenRejection = await validateTokenLimitAsync(context);
   if (tokenRejection) return { apiKey, apiKeyInfo, rejection: tokenRejection };
   const rateRejection = await validateRateLimitAndThrottle(context);
   if (rateRejection) return { apiKey, apiKeyInfo, rejection: rateRejection };

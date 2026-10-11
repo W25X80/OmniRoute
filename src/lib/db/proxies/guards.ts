@@ -1,5 +1,6 @@
+import { getSelectedPostgresDatabase } from "../controlPlaneContext";
+import { createPostgresProxyRepository } from "../postgres/proxyRepository";
 import { getDbInstance } from "../core";
-
 export const PROXY_ALIVE_PREDICATE =
   "(p.status IS NULL OR LOWER(p.status) NOT IN ('inactive','error','disabled','dead','down'))";
 
@@ -92,4 +93,28 @@ export function hasBlockingProxyAssignmentForProvider(providerId: string): boole
   } catch {
     return false;
   }
+}
+
+export async function hasBlockingProxyAssignmentAsync(
+  connectionId: string,
+  providerId?: string,
+  comboName?: string | null
+): Promise<boolean> {
+  const postgres = getSelectedPostgresDatabase();
+  return postgres
+    ? createPostgresProxyRepository(postgres).blockingConnection(
+        connectionId,
+        providerId,
+        comboName
+      )
+    : hasBlockingProxyAssignment(connectionId, providerId, comboName);
+}
+
+export async function hasBlockingProxyAssignmentForProviderAsync(
+  providerId: string
+): Promise<boolean> {
+  const postgres = getSelectedPostgresDatabase();
+  return postgres
+    ? createPostgresProxyRepository(postgres).blockingProvider(providerId)
+    : hasBlockingProxyAssignmentForProvider(providerId);
 }

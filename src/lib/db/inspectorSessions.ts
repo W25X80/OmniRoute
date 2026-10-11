@@ -1,3 +1,4 @@
+import { getSelectedPostgresDatabase } from "./controlPlaneContext";
 /**
  * Database module: InspectorSessions
  * CRUD + snapshot for inspector_sessions and inspector_session_requests tables.
@@ -35,10 +36,10 @@ function mapSessionRow(row: InspectorSessionDbRow): InspectorSessionRow {
   };
 }
 
-export function createSession(opts?: {
-  name?: string;
-  profile?: "llm" | "custom" | "all";
-}): { id: string; started_at: string } {
+export function createSession(opts?: { name?: string; profile?: "llm" | "custom" | "all" }): {
+  id: string;
+  started_at: string;
+} {
   const db = getDbInstance();
   const id = randomUUID();
   const started_at = new Date().toISOString();
@@ -71,9 +72,8 @@ export function listSessions(): InspectorSessionRow[] {
 
 export function getSession(id: string): InspectorSessionRow | null {
   const db = getDbInstance();
-  const row = db
-    .prepare("SELECT * FROM inspector_sessions WHERE id = ?")
-    .get(id) as InspectorSessionDbRow | undefined;
+  const row = db.prepare("SELECT * FROM inspector_sessions WHERE id = ?").get(id) as
+    InspectorSessionDbRow | undefined;
   return row ? mapSessionRow(row) : null;
 }
 
@@ -95,9 +95,9 @@ export function appendSessionRequest(sessionId: string, payload: string): number
       `INSERT INTO inspector_session_requests (session_id, seq, payload) VALUES (?, ?, ?)`
     ).run(sessionId, nextSeq, payload);
 
-    db.prepare(
-      "UPDATE inspector_sessions SET request_count = request_count + 1 WHERE id = ?"
-    ).run(sessionId);
+    db.prepare("UPDATE inspector_sessions SET request_count = request_count + 1 WHERE id = ?").run(
+      sessionId
+    );
 
     insertedSeq = nextSeq;
   });
@@ -158,4 +158,103 @@ export function snapshotSession(sessionId: string): InterceptedRequest[] | null 
   }
 
   return results;
+}
+
+export async function createSessionAsync(
+  ...args: Parameters<typeof createSession>
+): Promise<ReturnType<typeof createSession>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceInspector");
+    return postgres.transaction((transaction) => native.createSession(transaction, ...args));
+  }
+  return createSession(...args);
+}
+
+export async function stopSessionAsync(
+  ...args: Parameters<typeof stopSession>
+): Promise<ReturnType<typeof stopSession>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceInspector");
+    return postgres.transaction((transaction) => native.stopSession(transaction, ...args));
+  }
+  return stopSession(...args);
+}
+
+export async function renameSessionAsync(
+  ...args: Parameters<typeof renameSession>
+): Promise<ReturnType<typeof renameSession>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceInspector");
+    return postgres.transaction((transaction) => native.renameSession(transaction, ...args));
+  }
+  return renameSession(...args);
+}
+
+export async function listSessionsAsync(
+  ...args: Parameters<typeof listSessions>
+): Promise<ReturnType<typeof listSessions>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceInspector");
+    return postgres.transaction((transaction) => native.listSessions(transaction, ...args));
+  }
+  return listSessions(...args);
+}
+
+export async function getSessionAsync(
+  ...args: Parameters<typeof getSession>
+): Promise<ReturnType<typeof getSession>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceInspector");
+    return postgres.transaction((transaction) => native.getSession(transaction, ...args));
+  }
+  return getSession(...args);
+}
+
+export async function appendSessionRequestAsync(
+  ...args: Parameters<typeof appendSessionRequest>
+): Promise<ReturnType<typeof appendSessionRequest>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceInspector");
+    return postgres.transaction((transaction) => native.appendSessionRequest(transaction, ...args));
+  }
+  return appendSessionRequest(...args);
+}
+
+export async function getSessionRequestsAsync(
+  ...args: Parameters<typeof getSessionRequests>
+): Promise<ReturnType<typeof getSessionRequests>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceInspector");
+    return postgres.transaction((transaction) => native.getSessionRequests(transaction, ...args));
+  }
+  return getSessionRequests(...args);
+}
+
+export async function deleteSessionAsync(
+  ...args: Parameters<typeof deleteSession>
+): Promise<ReturnType<typeof deleteSession>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceInspector");
+    return postgres.transaction((transaction) => native.deleteSession(transaction, ...args));
+  }
+  return deleteSession(...args);
+}
+
+export async function snapshotSessionAsync(
+  ...args: Parameters<typeof snapshotSession>
+): Promise<ReturnType<typeof snapshotSession>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceInspector");
+    return postgres.transaction((transaction) => native.snapshotSession(transaction, ...args));
+  }
+  return snapshotSession(...args);
 }

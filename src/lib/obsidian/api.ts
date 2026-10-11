@@ -1,4 +1,3 @@
-import { getDbInstance } from "@/lib/db/core";
 import { safeOutboundFetch } from "@/shared/network/safeOutboundFetch";
 
 const DEFAULT_OBSIDIAN_BASE_URL = "http://127.0.0.1:27123";
@@ -145,7 +144,9 @@ function combineSignals(...signals: AbortSignal[]): AbortSignal {
       controller.abort(signal.reason);
       return controller.signal;
     }
-    signal.addEventListener("abort", () => controller.abort(signal.reason), { once: true });
+    signal.addEventListener("abort", () => controller.abort(signal.reason), {
+      once: true,
+    });
   }
   return controller.signal;
 }
@@ -251,7 +252,9 @@ export function createObsidianClient(apiKey: string, baseUrl?: string) {
       targetType?: TargetType,
       target?: string
     ): Promise<void> {
-      const headers: Record<string, string> = { "Content-Type": "text/markdown" };
+      const headers: Record<string, string> = {
+        "Content-Type": "text/markdown",
+      };
       if (targetType) headers["Target-Type"] = targetType;
       if (target) headers["Target"] = encodeURIComponent(target);
       await obsidianFetch(`/vault/${encodePath(path)}`, apiKey, resolvedBaseUrl, {
@@ -315,57 +318,25 @@ export function createObsidianClient(apiKey: string, baseUrl?: string) {
 export type ObsidianClient = ReturnType<typeof createObsidianClient>;
 
 const DEFAULT_SYNC_SERVER_URL = "http://127.0.0.1:27781";
-const SYNC_TOKEN_KEY = "omniroute_sync_token";
-
-export function getSyncToken(): string | null {
-  try {
-    const db = getDbInstance();
-    const row = db
-      .prepare("SELECT value FROM key_value WHERE namespace = ? AND key = ?")
-      .get("sync", SYNC_TOKEN_KEY) as { value?: string } | undefined;
-    return typeof row?.value === "string" ? JSON.parse(row.value) : null;
-  } catch {
-    return null;
-  }
-}
-
-export function setSyncToken(token: string | null): void {
-  try {
-    const db = getDbInstance();
-    if (token === null) {
-      db.prepare("DELETE FROM key_value WHERE namespace = ? AND key = ?").run(
-        "sync",
-        SYNC_TOKEN_KEY
-      );
-    } else {
-      const existing = db
-        .prepare("SELECT value FROM key_value WHERE namespace = ? AND key = ?")
-        .get("sync", SYNC_TOKEN_KEY);
-      if (existing) {
-        db.prepare("UPDATE key_value SET value = ? WHERE namespace = ? AND key = ?").run(
-          JSON.stringify(token),
-          "sync",
-          SYNC_TOKEN_KEY
-        );
-      } else {
-        db.prepare("INSERT INTO key_value (namespace, key, value) VALUES (?, ?, ?)").run(
-          "sync",
-          SYNC_TOKEN_KEY,
-          JSON.stringify(token)
-        );
-      }
-    }
-  } catch {
-    /* ignore */
-  }
-}
+export {
+  getSyncToken,
+  setSyncToken,
+  getSyncTokenAsync,
+  setSyncTokenAsync,
+} from "../db/obsidianSyncToken";
 
 export interface SyncServerStatus {
   running: boolean;
   uptime: number;
   port: number;
   vaultName: string;
-  lastSync: { ok: boolean; pulled: number; pushed: number; deleted: number; conflicts: number };
+  lastSync: {
+    ok: boolean;
+    pulled: number;
+    pushed: number;
+    deleted: number;
+    conflicts: number;
+  };
 }
 
 export interface SyncConflict {

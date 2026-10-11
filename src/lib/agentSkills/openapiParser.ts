@@ -8,6 +8,7 @@
  */
 
 import fs from "node:fs";
+import { readFile } from "node:fs/promises";
 import path from "node:path";
 import * as yaml from "js-yaml";
 import type { SkillArea } from "./types";
@@ -162,6 +163,24 @@ export function parseOpenapi(): ParsedOpenapi {
     );
   }
 
+  return parseOpenapiContent(rawContent);
+}
+
+export async function parseOpenapiAsync(): Promise<ParsedOpenapi> {
+  const yamlPath = path.resolve(process.cwd(), "docs", "openapi.yaml");
+  let rawContent: string;
+  try {
+    rawContent = await readFile(yamlPath, "utf-8");
+  } catch (err) {
+    throw new Error(
+      `openapiParser: could not read ${yamlPath}. ` +
+        `Run from project root. Underlying error: ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
+  return parseOpenapiContent(rawContent);
+}
+
+function parseOpenapiContent(rawContent: string): ParsedOpenapi {
   const doc = yaml.load(rawContent) as Record<string, any>;
 
   if (!doc || typeof doc !== "object") {

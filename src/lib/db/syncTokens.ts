@@ -1,6 +1,14 @@
 import { v4 as uuidv4 } from "uuid";
 import { getDbInstance, rowToCamel } from "./core";
 import { backupDbFile } from "./backup";
+import { getSelectedPostgresDatabase } from "./controlPlaneContext";
+import {
+  listPostgresSyncTokens,
+  getPostgresSyncToken,
+  createPostgresSyncToken,
+  revokePostgresSyncToken,
+  touchPostgresSyncToken,
+} from "./postgres/authSessionRepository";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -69,6 +77,8 @@ function ensureSyncTokensTable(db: DbLike) {
 }
 
 export async function listSyncTokens() {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) return listPostgresSyncTokens(postgres);
   const db = getDbInstance() as unknown as DbLike;
   ensureSyncTokensTable(db);
   const rows = db
@@ -83,6 +93,8 @@ export async function listSyncTokens() {
 }
 
 export async function getSyncTokenById(id: string) {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) return getPostgresSyncToken(postgres, "id", id);
   const db = getDbInstance() as unknown as DbLike;
   ensureSyncTokensTable(db);
   const row = db.prepare("SELECT * FROM sync_tokens WHERE id = ?").get(id);
@@ -90,6 +102,8 @@ export async function getSyncTokenById(id: string) {
 }
 
 export async function getSyncTokenByHash(tokenHash: string) {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) return getPostgresSyncToken(postgres, "token_hash", tokenHash);
   const db = getDbInstance() as unknown as DbLike;
   ensureSyncTokensTable(db);
   const row = db.prepare("SELECT * FROM sync_tokens WHERE token_hash = ?").get(tokenHash);
@@ -101,6 +115,8 @@ export async function createSyncTokenRecord(data: {
   tokenHash: string;
   syncApiKeyId?: string | null;
 }) {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) return createPostgresSyncToken(postgres, data);
   const db = getDbInstance() as unknown as DbLike;
   ensureSyncTokensTable(db);
 
@@ -136,6 +152,8 @@ export async function createSyncTokenRecord(data: {
 }
 
 export async function revokeSyncToken(id: string) {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) return revokePostgresSyncToken(postgres, id);
   const db = getDbInstance() as unknown as DbLike;
   ensureSyncTokensTable(db);
 
@@ -154,6 +172,8 @@ export async function revokeSyncToken(id: string) {
 }
 
 export async function touchSyncTokenLastUsed(id: string, usedAt = new Date().toISOString()) {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) return touchPostgresSyncToken(postgres, id, usedAt);
   const db = getDbInstance() as unknown as DbLike;
   ensureSyncTokensTable(db);
   const result = db

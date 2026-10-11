@@ -2,9 +2,9 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 import { buildErrorBody } from "@omniroute/open-sse/utils/error";
-import { loadRtkFilters } from "@omniroute/open-sse/services/compression/engines/rtk/filterLoader";
+import { loadRtkFiltersAsync as loadRtkFilters } from "@omniroute/open-sse/services/compression/engines/rtk/filterLoader";
 import {
-  installGlobalRtkTomlV1,
+  installGlobalRtkTomlV1Async as installGlobalRtkTomlV1,
   parseRtkTomlV1,
   RTK_TOML_MAX_BYTES,
   RtkTomlCompatibilityError,
@@ -52,7 +52,9 @@ export async function POST(request: Request) {
   try {
     body = await request.json();
   } catch {
-    return NextResponse.json(buildErrorBody(400, "Invalid JSON body"), { status: 400 });
+    return NextResponse.json(buildErrorBody(400, "Invalid JSON body"), {
+      status: 400,
+    });
   }
   const parsed = RequestSchema.safeParse(body);
   if (!parsed.success) {
@@ -64,15 +66,19 @@ export async function POST(request: Request) {
   try {
     const result =
       parsed.data.action === "install"
-        ? installGlobalRtkTomlV1(parsed.data.content, { overwrite: parsed.data.overwrite })
+        ? await installGlobalRtkTomlV1(parsed.data.content, {
+            overwrite: parsed.data.overwrite,
+          })
         : parseRtkTomlV1(parsed.data.content);
     if (parsed.data.action === "install") {
-      loadRtkFilters({ refresh: true });
+      await loadRtkFilters({ refresh: true });
     }
     return NextResponse.json(responseBody(result));
   } catch (error) {
     if (error instanceof RtkTomlCompatibilityError) {
-      return NextResponse.json(buildErrorBody(400, error.publicMessage), { status: 400 });
+      return NextResponse.json(buildErrorBody(400, error.publicMessage), {
+        status: 400,
+      });
     }
     return NextResponse.json(buildErrorBody(500, "Failed to process RTK TOML filter import"), {
       status: 500,

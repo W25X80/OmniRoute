@@ -10,6 +10,8 @@
 import { z } from "zod";
 
 import type { A2ATaskManager, TaskState } from "@/lib/a2a/taskManager";
+import { isPostgresErrorKind } from "@/lib/db/postgres/database";
+import { runPersistenceBackgroundWork } from "@/lib/db/persistenceRuntime";
 
 export interface ConductorEvent {
   id: string;
@@ -58,7 +60,12 @@ function climb(tm: A2ATaskManager, a2aId: string, target: TaskState): void {
   }
 }
 
-function ensureMirrored(tm: A2ATaskManager, index: Map<string, string>, conductorId: string, payload: Record<string, unknown>): string {
+function ensureMirrored(
+  tm: A2ATaskManager,
+  index: Map<string, string>,
+  conductorId: string,
+  payload: Record<string, unknown>
+): string {
   const known = index.get(conductorId);
   if (known && tm.getTask(known)) return known;
   const mode = typeof payload.mode === "string" ? payload.mode : "?";
@@ -87,7 +94,11 @@ function conductorMeta(tm: A2ATaskManager, a2aId: string): Record<string, unknow
 }
 
 /** Applies one hub event to the mirror. Never throws for event-shaped input. */
-export function applyConductorEvent(tm: A2ATaskManager, index: Map<string, string>, ev: ConductorEvent): void {
+export function applyConductorEvent(
+  tm: A2ATaskManager,
+  index: Map<string, string>,
+  ev: ConductorEvent
+): void {
   const target = conductorStateFor(ev.type);
   if (!target) return;
   const conductorId = typeof ev.payload.task_id === "string" ? ev.payload.task_id : null;
@@ -96,7 +107,8 @@ export function applyConductorEvent(tm: A2ATaskManager, index: Map<string, strin
   const a2aId = ensureMirrored(tm, index, conductorId, ev.payload);
   const meta = conductorMeta(tm, a2aId);
   if (meta) {
-    if (ev.type === "task.scheduled" && typeof ev.payload.runner_id === "string") meta.runner = ev.payload.runner_id;
+    if (ev.type === "task.scheduled" && typeof ev.payload.runner_id === "string")
+      meta.runner = ev.payload.runner_id;
     if (ev.type === "task.input_required") meta.input_required = true;
     if (ev.type === "task.completed" || ev.type === "task.failed") {
       const manifest = (ev.payload.manifest ?? {}) as Record<string, unknown>;
@@ -155,7 +167,10 @@ export interface ConductorBridgeOptions {
   hubUrl: string;
   token: string;
   tm: A2ATaskManager;
-  cursor: { get(): string | null; set(v: string): void };
+  cursor: {
+    get(): string | null | Promise<string | null>;
+    set(v: string): void | Promise<void>;
+  };
   fetchImpl?: typeof fetch;
   log?: (msg: string) => void;
   backoffBaseMs?: number;
@@ -189,21 +204,40 @@ export function createConductorBridge(opts: ConductorBridgeOptions): ConductorBr
     if (!reader) throw new Error("SSE response without body");
     const parser = new SseParser();
     const decoder = new TextDecoder();
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done) return;
-      for (const frame of parser.push(decoder.decode(value, { stream: true }))) {
-        if (!frame.id || !frame.event) continue; // keepalive/partial frame — nada a espelhar
-        let payload: Record<string, unknown>;
-        try {
-          payload = hubDataSchema.parse(JSON.parse(frame.data)).payload;
-        } catch {
-          log(`evento SSE malformado ignorado (id=${frame.id})`);
-          continue;
+    try {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) return;
+        for (const frame of parser.push(decoder.decode(value, { stream: true }))) {
+          const { id, event } = frame;
+          if (!id || !event) continue; // keepalive/partial frame — nada a espelhar
+          let payload: Record<string, unknown>;
+          try {
+            payload = hubDataSchema.parse(JSON.parse(frame.data)).payload;
+          } catch {
+            log(`evento SSE malformado ignorado (id=${id})`);
+            continue;
+          }
+          await runPersistenceBackgroundWork(async () => {
+            applyConductorEvent(opts.tm, index, {
+              id: id,
+              type: event,
+              payload,
+            });
+            try {
+              await opts.tm.flushPersistence();
+            } catch (error) {
+              running = false;
+              log("Task history persistence failed; cursor advancement stopped");
+              throw error;
+            }
+            await opts.cursor.set(id); // replay covers any gap on reconnect
+          });
         }
-        applyConductorEvent(opts.tm, index, { id: frame.id, type: frame.event, payload });
-        opts.cursor.set(frame.id); // persisted per event — replay covers any gap on reconnect
       }
+    } finally {
+      await reader.cancel().catch(() => {});
+      reader.releaseLock();
     }
   }
 
@@ -211,11 +245,17 @@ export function createConductorBridge(opts: ConductorBridgeOptions): ConductorBr
     while (running) {
       abort = new AbortController();
       try {
-        const since = opts.cursor.get() ?? "0";
-        const res = await doFetch(`${opts.hubUrl}/v1/events?last_event_id=${encodeURIComponent(since)}`, {
-          headers: { authorization: `Bearer ${opts.token}`, accept: "text/event-stream" },
-          signal: abort.signal,
-        });
+        const since = (await runPersistenceBackgroundWork(async () => opts.cursor.get())) ?? "0";
+        const res = await doFetch(
+          `${opts.hubUrl}/v1/events?last_event_id=${encodeURIComponent(since)}`,
+          {
+            headers: {
+              authorization: `Bearer ${opts.token}`,
+              accept: "text/event-stream",
+            },
+            signal: abort.signal,
+          }
+        );
         if (!res.ok) throw new Error(`hub respondeu HTTP ${res.status}`);
         state = "connected";
         attempt = 0;
@@ -224,10 +264,17 @@ export function createConductorBridge(opts: ConductorBridgeOptions): ConductorBr
         throw new Error("stream encerrado pelo hub");
       } catch (err) {
         if (!running) break;
+        if (isPostgresErrorKind(err, "commit_unknown")) {
+          running = false;
+          log("Cursor commit outcome is unknown; bridge stopped");
+          break;
+        }
         state = "reconnecting";
         const wait = Math.min(backoffBase * 2 ** attempt, BACKOFF_CAP_MS);
         attempt++;
-        log(`conexão caiu (${err instanceof Error ? err.message : String(err)}) — reconectando em ${wait}ms`);
+        log(
+          `conexão caiu (${err instanceof Error ? err.message : String(err)}) — reconectando em ${wait}ms`
+        );
         await new Promise((resolve) => setTimeout(resolve, wait));
       }
     }

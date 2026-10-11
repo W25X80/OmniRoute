@@ -1,12 +1,13 @@
 /** Upstream proxy config persistence for upstream_proxy_config table. */
-import { getDbInstance } from "./core";
 import {
   isCloudMetadataHost,
   isPrivateHost as isPrivateNetworkHost,
   mappedIpv4Host,
 } from "@/shared/network/outboundUrlGuard";
 import { normalizeHost } from "@/shared/network/privateHost";
-
+import { createPostgresUpstreamProxyRepository } from "./postgres/upstreamProxyRepository";
+import { getSelectedPostgresDatabase } from "./controlPlaneContext";
+import { getDbInstance } from "./core";
 /** Which embedded proxy handles the retry leg when mode === "fallback". */
 export type FallbackBackend = "cliproxyapi" | "dario";
 
@@ -122,6 +123,9 @@ function rowToConfig(record: Record<string, unknown>): UpstreamProxyConfig {
   };
 }
 export async function getUpstreamProxyConfig(providerId: string) {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) return createPostgresUpstreamProxyRepository(postgres).get(providerId);
+
   const db = getDbInstance();
   const row = db
     .prepare("SELECT * FROM upstream_proxy_config WHERE provider_id = ?")
@@ -140,6 +144,9 @@ export async function upsertUpstreamProxyConfig(data: {
   family?: string;
   fallbackBackend?: FallbackBackend;
 }) {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) return createPostgresUpstreamProxyRepository(postgres).upsert(data);
+
   const db = getDbInstance();
   const mode = data.mode ?? "native";
   const cliproxyapiModelMapping =
@@ -183,6 +190,9 @@ export async function updateUpstreamProxyConfig(
   providerId: string,
   updates: Record<string, unknown>
 ) {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) return createPostgresUpstreamProxyRepository(postgres).update(providerId, updates);
+
   const db = getDbInstance();
   const current = await getUpstreamProxyConfig(providerId);
   if (!current) {
@@ -234,6 +244,9 @@ export async function updateUpstreamProxyConfig(
 }
 
 export async function deleteUpstreamProxyConfig(providerId: string) {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) return createPostgresUpstreamProxyRepository(postgres).delete(providerId);
+
   const db = getDbInstance();
   const result = db
     .prepare("DELETE FROM upstream_proxy_config WHERE provider_id = ?")
@@ -242,6 +255,9 @@ export async function deleteUpstreamProxyConfig(providerId: string) {
 }
 
 export async function getProvidersByMode(mode: string) {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) return createPostgresUpstreamProxyRepository(postgres).byMode(mode);
+
   const db = getDbInstance();
   const rows = db
     .prepare(
@@ -255,16 +271,25 @@ export async function getFallbackChainForProvider(providerId: string) {
   const config = await getUpstreamProxyConfig(providerId);
   if (!config) return [];
 
-  const chain: { executor: "native" | "cliproxyapi" | "dario"; priority: number }[] = [];
+  const chain: {
+    executor: "native" | "cliproxyapi" | "dario";
+    priority: number;
+  }[] = [];
 
   if (config.enabled) {
     chain.push({ executor: "native", priority: config.nativePriority });
     if (config.mode === "cliproxyapi") {
-      chain.push({ executor: "cliproxyapi", priority: config.cliproxyapiPriority });
+      chain.push({
+        executor: "cliproxyapi",
+        priority: config.cliproxyapiPriority,
+      });
     } else if (config.mode === "dario") {
       chain.push({ executor: "dario", priority: config.cliproxyapiPriority });
     } else if (config.mode === "fallback") {
-      chain.push({ executor: config.fallbackBackend, priority: config.cliproxyapiPriority });
+      chain.push({
+        executor: config.fallbackBackend,
+        priority: config.cliproxyapiPriority,
+      });
     }
   }
 

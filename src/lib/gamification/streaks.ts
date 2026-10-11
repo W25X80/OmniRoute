@@ -1,3 +1,9 @@
+import {
+  readStreakValueAsync,
+  listStreakValuesAsync,
+  advanceStreakValueAsync,
+  isNativeGamificationPersistenceSelected,
+} from "../db/gamificationRuntime";
 /**
  * Streak Tracker for OmniRoute Gamification
  *
@@ -8,7 +14,7 @@
  * @module lib/gamification/streaks
  */
 
-import { getDbInstance, isBuildPhase, isCloud } from "../db/core";
+import { isBuildPhase, isCloud } from "../db/core";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -23,23 +29,7 @@ export interface StreakData {
   streakStartDate: string;
 }
 
-interface StatementLike<TRow = unknown> {
-  get: (...params: unknown[]) => TRow | undefined;
-  run: (...params: unknown[]) => { changes?: number };
-  all: (...params: unknown[]) => TRow[];
-}
-
-interface DbLike {
-  prepare: <TRow = unknown>(sql: string) => StatementLike<TRow>;
-}
-
-interface KeyValueRow {
-  value: string;
-}
-
 // ─── Constants ───────────────────────────────────────────────────────────────
-
-const NAMESPACE = "gamification:streaks";
 
 /** One day in milliseconds */
 const MS_PER_DAY = 86_400_000;
@@ -96,15 +86,9 @@ function parseStreakJson(raw: string): StreakData {
  * console.log(streak.currentStreak); // 7
  */
 export async function getStreak(apiKeyId: string): Promise<StreakData> {
-  if (isBuildPhase || isCloud) return emptyStreak();
-
-  const db = getDbInstance() as unknown as DbLike;
-  const row = db
-    .prepare("SELECT value FROM key_value WHERE namespace = ? AND key = ?")
-    .get(NAMESPACE, apiKeyId) as KeyValueRow | undefined;
-
-  if (!row?.value) return emptyStreak();
-  return parseStreakJson(row.value);
+  if (!isNativeGamificationPersistenceSelected() && (isBuildPhase || isCloud)) return emptyStreak();
+  const value = await readStreakValueAsync(apiKeyId);
+  return value ? parseStreakJson(value) : emptyStreak();
 }
 
 /**
@@ -123,19 +107,12 @@ export async function getAggregateStreak(): Promise<
   Pick<StreakData, "currentStreak" | "longestStreak">
 > {
   const aggregate = { currentStreak: 0, longestStreak: 0 };
-  if (isBuildPhase || isCloud) return aggregate;
-
-  const db = getDbInstance() as unknown as DbLike;
-  const rows = db
-    .prepare("SELECT value FROM key_value WHERE namespace = ?")
-    .all(NAMESPACE) as KeyValueRow[];
-
-  for (const row of rows) {
+  if (!isNativeGamificationPersistenceSelected() && (isBuildPhase || isCloud)) return aggregate;
+  for (const row of await listStreakValuesAsync()) {
     const streak = parseStreakJson(row.value);
     aggregate.currentStreak = Math.max(aggregate.currentStreak, streak.currentStreak);
     aggregate.longestStreak = Math.max(aggregate.longestStreak, streak.longestStreak);
   }
-
   return aggregate;
 }
 
@@ -189,34 +166,26 @@ export interface StreakAdvance {
  * if (extended) console.log(`day ${currentStreak} of the streak`);
  */
 export async function advanceStreak(apiKeyId: string): Promise<StreakAdvance> {
-  if (isBuildPhase || isCloud) return { currentStreak: 0, extended: false };
-
-  const db = getDbInstance() as unknown as DbLike;
-  const today = todayUtc();
-  const streak = await getStreak(apiKeyId);
-
-  // Already counted today
-  if (streak.lastActiveDate === today) {
-    return { currentStreak: streak.currentStreak, extended: false };
-  }
-
-  const yesterday = yesterdayUtc();
-  const extended = streak.lastActiveDate === yesterday;
-  // Consecutive day — extend streak; otherwise streak broken or first activity — start fresh
-  const newStreak = extended ? streak.currentStreak + 1 : 1;
-
-  const newData: StreakData = {
-    currentStreak: newStreak,
-    longestStreak: Math.max(newStreak, streak.longestStreak),
-    lastActiveDate: today,
-    streakStartDate: newStreak === 1 ? today : streak.streakStartDate,
-  };
-
-  db.prepare("INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES (?, ?, ?)").run(
-    NAMESPACE,
-    apiKeyId,
-    JSON.stringify(newData)
-  );
-
-  return { currentStreak: newStreak, extended };
+  if (!isNativeGamificationPersistenceSelected() && (isBuildPhase || isCloud))
+    return { currentStreak: 0, extended: false };
+  return advanceStreakValueAsync(apiKeyId, (raw) => {
+    const today = todayUtc();
+    const streak = raw ? parseStreakJson(raw) : emptyStreak();
+    if (streak.lastActiveDate === today)
+      return {
+        result: { currentStreak: streak.currentStreak, extended: false },
+      };
+    const extended = streak.lastActiveDate === yesterdayUtc();
+    const newStreak = extended ? streak.currentStreak + 1 : 1;
+    const newData: StreakData = {
+      currentStreak: newStreak,
+      longestStreak: Math.max(newStreak, streak.longestStreak),
+      lastActiveDate: today,
+      streakStartDate: newStreak === 1 ? today : streak.streakStartDate,
+    };
+    return {
+      value: JSON.stringify(newData),
+      result: { currentStreak: newStreak, extended },
+    };
+  });
 }

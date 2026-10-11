@@ -1,3 +1,5 @@
+import { assertSqliteBackendAllowed } from "../db/controlPlaneContext";
+import { upsertDiscoveryResultAsync as dbUpsertDiscoveryResultAsync } from "../db/discoveryResults";
 /**
  * Plugin Discovery Tool — Automated provider scanning.
  *
@@ -115,8 +117,10 @@ export async function scanProvider(
  * re-discovering the same endpoint updates the existing row. Returns the
  * persisted row (with its id).
  */
-export function persistDiscoveryResult(result: DiscoveryResult): DiscoveryResult {
-  return dbUpsertDiscoveryResult(result as DbDiscoveryResult) as DiscoveryResult;
+export async function persistDiscoveryResultAsync(
+  result: DiscoveryResult
+): Promise<DiscoveryResult> {
+  return (await dbUpsertDiscoveryResultAsync(result as DbDiscoveryResult)) as DiscoveryResult;
 }
 
 /**
@@ -134,4 +138,9 @@ export function getDiscoveryResults(providerId?: string): DiscoveryResult[] {
  */
 export function isDiscoveryEnabled(): boolean {
   return DEFAULT_DISCOVERY_CONFIG.enabled;
+}
+
+export function persistDiscoveryResult(result: DiscoveryResult): DiscoveryResult {
+  assertSqliteBackendAllowed();
+  return dbUpsertDiscoveryResult(result as DbDiscoveryResult) as DiscoveryResult;
 }

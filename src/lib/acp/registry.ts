@@ -12,6 +12,7 @@
 
 import { execFileSync } from "child_process";
 import path from "path";
+import { probeNativeHostCapability } from "../nativeHostProbes";
 import {
   CLI_INTEGRATION_MANIFEST,
   listCliIntegrationIds,
@@ -84,6 +85,16 @@ const AGENT_DEFINITIONS: Omit<CliAgentInfo, "version" | "installed">[] = BUILT_I
 let _cachedAgents: CliAgentInfo[] | null = null;
 let _cacheTimestamp = 0;
 const CACHE_TTL_MS = 60_000;
+let nativeGeneration = 0;
+let nativeCachedAgents: CliAgentInfo[] | null = null;
+let nativeCacheTimestamp = 0;
+let nativeScan: { generation: number; result: Promise<CliAgentInfo[]> } | null = null;
+
+function invalidateNativeDetection(): void {
+  nativeGeneration += 1;
+  nativeCachedAgents = null;
+  nativeScan = null;
+}
 
 /** Custom agents loaded from settings */
 let _customAgentDefs: CustomAgentDef[] = [];
@@ -104,6 +115,7 @@ const SAFE_VERSION_PROBE_ARG = /^(-v|-V|--version|-version|version|--ver)$/;
 export function setCustomAgents(agents: CustomAgentDef[]): void {
   _customAgentDefs = agents || [];
   _cachedAgents = null; // invalidate cache
+  invalidateNativeDetection();
 }
 
 /**
@@ -321,6 +333,7 @@ export function detectInstalledAgents(): CliAgentInfo[] {
  */
 export function refreshAgentCache(): CliAgentInfo[] {
   _cachedAgents = null;
+  invalidateNativeDetection();
   return detectInstalledAgents();
 }
 
@@ -349,4 +362,70 @@ export function hasRegisteredAgent(id: string): boolean {
  */
 export function getAvailableAgents(): CliAgentInfo[] {
   return detectInstalledAgents().filter((a) => a.installed);
+}
+
+async function detectAgentAsync(
+  def: Omit<CliAgentInfo, "version" | "installed">,
+  isCustom: boolean
+): Promise<CliAgentInfo> {
+  let version: string | null = null;
+  let installed = false;
+  try {
+    const probe = resolveVersionProbe(def.binary, def.versionCommand, isCustom);
+    if (probe) {
+      const useShell = shouldUseShellForVersionProbe(probe.command);
+      if (!useShell || isShellSafeCommand(probe.command)) {
+        const result = await probeNativeHostCapability(probe.command, probe.args, {
+          ...(useShell ? { shell: true } : {}),
+        });
+        if (result.success) {
+          const output = result.stdout.trim();
+          const versionMatch = output.match(/(\d+\.\d+\.\d+(?:-\w+)?)/);
+          version = versionMatch ? versionMatch[1] : output.split("\n")[0];
+          installed = true;
+        }
+      }
+    }
+  } catch {
+    // Preserve the source per-agent unavailable result for malformed/unrunnable definitions.
+  }
+  return { ...def, version, installed, isCustom };
+}
+
+/** Native serving scans retain definition order, validation and the source 60s start-time TTL. */
+export function detectInstalledAgentsAsync(): Promise<CliAgentInfo[]> {
+  const now = Date.now();
+  if (nativeCachedAgents && now - nativeCacheTimestamp < CACHE_TTL_MS) {
+    return Promise.resolve(nativeCachedAgents);
+  }
+  const generation = nativeGeneration;
+  if (nativeScan?.generation === generation) return nativeScan.result;
+  const definitions = [
+    ...AGENT_DEFINITIONS.map((definition) => ({ ...definition, isCustom: false })),
+    ..._customAgentDefs.map((definition) => ({ ...definition, isCustom: true })),
+  ];
+  const result = (async () => {
+    const agents: CliAgentInfo[] = [];
+    for (const { isCustom, ...definition } of definitions) {
+      agents.push(await detectAgentAsync(definition, isCustom));
+    }
+    // An older scan may satisfy its caller, but cannot publish over a refresh/custom edit.
+    if (generation === nativeGeneration) {
+      nativeCachedAgents = agents;
+      nativeCacheTimestamp = now;
+    }
+    return agents;
+  })();
+  nativeScan = { generation, result };
+  void result
+    .finally(() => {
+      if (nativeScan?.result === result) nativeScan = null;
+    })
+    .catch(() => {});
+  return result;
+}
+
+export function refreshAgentCacheAsync(): Promise<CliAgentInfo[]> {
+  invalidateNativeDetection();
+  return detectInstalledAgentsAsync();
 }

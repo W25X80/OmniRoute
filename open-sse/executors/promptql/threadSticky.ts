@@ -17,6 +17,11 @@
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import {
+  withNativeThreadCacheFile,
+  readNativeThreadCacheFile,
+  writeNativeThreadCacheFile,
+} from "../../utils/nativeThreadCacheFile.ts";
 import { extractMessageTextFromMessage, isUserLikeRole, type ChatMessage } from "./messageText.ts";
 
 export interface PromptQlRequestBody {
@@ -91,22 +96,10 @@ export function normalizeForFingerprint(text: string): string {
   t = t.replace(/^[\s\S]*?\bCurrent request:\s*/i, "");
   t = t.replace(/^[\s\S]*?\bMy current task:\s*/i, "");
   // Tool-result follow-up wrappers (WinUI soft PromptQL / generic agentic)
-  t = t.replace(
-    /^Here is data returned by my desktop application[\s\S]*?(?:\n\n|$)/i,
-    ""
-  );
-  t = t.replace(
-    /^Here is the output from my local tool[\s\S]*?(?:\n\n|$)/i,
-    ""
-  );
-  t = t.replace(
-    /\n\nBased on this result[\s\S]*$/i,
-    ""
-  );
-  t = t.replace(
-    /\n\n(?:Please |If a structured)[\s\S]*$/i,
-    ""
-  );
+  t = t.replace(/^Here is data returned by my desktop application[\s\S]*?(?:\n\n|$)/i, "");
+  t = t.replace(/^Here is the output from my local tool[\s\S]*?(?:\n\n|$)/i, "");
+  t = t.replace(/\n\nBased on this result[\s\S]*$/i, "");
+  t = t.replace(/\n\n(?:Please |If a structured)[\s\S]*$/i, "");
   // Soft PromptQL first-turn preamble (strip when whole message is pin+request)
   if (/interoperability layer between PromptQL/i.test(t)) {
     const m = t.match(/\bCurrent request:\s*([\s\S]+)$/i);
@@ -126,7 +119,8 @@ export function extractToolNameSignature(text: string): string {
   const names = new Set<string>();
   for (const m of text.matchAll(/"tool"\s*:\s*"([^"]+)"/g)) names.add(m[1]!.toLowerCase());
   for (const m of text.matchAll(/tool_call:([A-Za-z0-9_.-]+):/g)) names.add(m[1]!.toLowerCase());
-  for (const m of text.matchAll(/function_call:([A-Za-z0-9_.-]+):/g)) names.add(m[1]!.toLowerCase());
+  for (const m of text.matchAll(/function_call:([A-Za-z0-9_.-]+):/g))
+    names.add(m[1]!.toLowerCase());
   for (const m of text.matchAll(/\[tool result for\s+([^\]]+)\]/gi)) {
     names.add(m[1]!.trim().toLowerCase());
   }
@@ -182,7 +176,10 @@ export function lastAssistantStickyKeys(projectId: string, messages: ChatMessage
 }
 
 /** Rolling sticky key: last assistant reply alone (survives last-user rewrites). */
-export function lastAssistantFingerprint(projectId: string, messages: ChatMessage[]): string | null {
+export function lastAssistantFingerprint(
+  projectId: string,
+  messages: ChatMessage[]
+): string | null {
   return lastAssistantStickyKeys(projectId, messages)[0] ?? null;
 }
 
@@ -224,6 +221,11 @@ function setThreadBinding(key: string, binding: ThreadBinding) {
   memoryThreads.set(key, binding);
   const disk = loadThreadDisk();
   disk[key] = binding;
+  pruneThreadBindings(disk);
+  saveThreadDisk(disk);
+}
+
+function pruneThreadBindings(disk: Record<string, ThreadBinding>): void {
   const keys = Object.keys(disk);
   if (keys.length > THREAD_CACHE_MAX) {
     keys
@@ -234,7 +236,6 @@ function setThreadBinding(key: string, binding: ThreadBinding) {
         memoryThreads.delete(k);
       });
   }
-  saveThreadDisk(disk);
 }
 
 /** Test helper — clear in-memory + optional disk cache. */
@@ -291,6 +292,20 @@ export function resolvePromptQlThreadBinding(
   messages: ChatMessage[],
   clientThreadId?: string
 ): PromptQlThreadResolve {
+  return resolvePromptQlThreadBindingFromCache(
+    projectId,
+    messages,
+    clientThreadId,
+    getThreadBinding
+  );
+}
+
+function resolvePromptQlThreadBindingFromCache(
+  projectId: string,
+  messages: ChatMessage[],
+  clientThreadId: string | undefined,
+  lookup: (key: string) => ThreadBinding | null
+): PromptQlThreadResolve {
   const clientId = (clientThreadId || "").trim();
   const prefix = historyPrefixBeforeLastUser(messages);
   const prefixKey =
@@ -303,7 +318,7 @@ export function resolvePromptQlThreadBinding(
   }
 
   if (prefixKey) {
-    const cached = getThreadBinding(prefixKey);
+    const cached = lookup(prefixKey);
     if (cached?.threadId && cached.projectId === projectId) {
       return { threadId: cached.threadId, isFollowUp: true, prefixKey };
     }
@@ -314,7 +329,7 @@ export function resolvePromptQlThreadBinding(
   if (hasAssistantMessage(messages)) {
     const scope = prefix.length ? prefix : messages;
     for (const asstKey of lastAssistantStickyKeys(projectId, scope)) {
-      const cached = getThreadBinding(asstKey);
+      const cached = lookup(asstKey);
       if (cached?.threadId && cached.projectId === projectId) {
         return { threadId: cached.threadId, isFollowUp: true, prefixKey: asstKey };
       }
@@ -322,7 +337,7 @@ export function resolvePromptQlThreadBinding(
     // Also try full messages (assistant may only appear after a tool-only prefix miss)
     if (scope !== messages) {
       for (const asstKey of lastAssistantStickyKeys(projectId, messages)) {
-        const cached = getThreadBinding(asstKey);
+        const cached = lookup(asstKey);
         if (cached?.threadId && cached.projectId === projectId) {
           return { threadId: cached.threadId, isFollowUp: true, prefixKey: asstKey };
         }
@@ -332,6 +347,39 @@ export function resolvePromptQlThreadBinding(
 
   // First turn or no sticky match: mint a new PromptQL thread.
   return { threadId: "", isFollowUp: false, prefixKey: null };
+}
+
+export async function resolvePromptQlThreadBindingAsync(
+  projectId: string,
+  messages: ChatMessage[],
+  clientThreadId?: string
+): Promise<PromptQlThreadResolve> {
+  const missing = new Set<string>();
+  const memoryLookup = (key: string): ThreadBinding | null => {
+    const entry = memoryThreads.get(key);
+    if (!entry) missing.add(key);
+    return entry ?? null;
+  };
+  const result = resolvePromptQlThreadBindingFromCache(
+    projectId,
+    messages,
+    clientThreadId,
+    memoryLookup
+  );
+  if (result.isFollowUp || missing.size === 0) return result;
+  const path = threadCachePath();
+  return withNativeThreadCacheFile(path, async () => {
+    const disk = await readNativeThreadCacheFile<ThreadBinding>(path);
+    for (const key of missing) {
+      if (!memoryThreads.has(key) && disk[key]) memoryThreads.set(key, disk[key]);
+    }
+    return resolvePromptQlThreadBindingFromCache(
+      projectId,
+      messages,
+      clientThreadId,
+      (key) => memoryThreads.get(key) ?? null
+    );
+  });
 }
 
 /**
@@ -345,31 +393,69 @@ export function storePromptQlThreadAfterTurn(
   assistantText: string,
   threadId: string
 ): string | null {
+  return storePromptQlThreadAfterTurnWithBindings(
+    projectId,
+    messages,
+    assistantText,
+    threadId,
+    setThreadBinding
+  );
+}
+
+function storePromptQlThreadAfterTurnWithBindings(
+  projectId: string,
+  messages: ChatMessage[],
+  assistantText: string,
+  threadId: string,
+  setBinding: (key: string, binding: ThreadBinding) => void
+): string | null {
   if (!projectId || !threadId) return null;
-  const full: ChatMessage[] = [
-    ...messages,
-    { role: "assistant", content: assistantText || "" },
-  ];
+  const full: ChatMessage[] = [...messages, { role: "assistant", content: assistantText || "" }];
   // Only store if there is at least one user-like + assistant pair.
-  if (
-    !hasAssistantMessage(full) ||
-    !messages.some((m) => isUserLikeRole(m.role || ""))
-  ) {
+  if (!hasAssistantMessage(full) || !messages.some((m) => isUserLikeRole(m.role || ""))) {
     return null;
   }
   const key = conversationFingerprint(projectId, full);
   const binding: ThreadBinding = { threadId, projectId, updatedAt: Date.now() };
-  setThreadBinding(key, binding);
+  setBinding(key, binding);
   // Also bind the current prefix key when present (idempotent re-touch).
   const prefix = historyPrefixBeforeLastUser(messages);
   if (prefix.length > 0 && hasAssistantMessage(prefix)) {
-    setThreadBinding(conversationFingerprint(projectId, prefix), binding);
+    setBinding(conversationFingerprint(projectId, prefix), binding);
   }
   // Rolling last-assistant keys (full text + tool-name signature)
   for (const asstKey of lastAssistantStickyKeys(projectId, full)) {
-    setThreadBinding(asstKey, binding);
+    setBinding(asstKey, binding);
   }
   // If the assistant reply embeds tool names, also bind tool-signature alone from raw text
   // (lastAssistantStickyKeys already does this; kept for clarity).
+  return key;
+}
+
+export async function storePromptQlThreadAfterTurnAsync(
+  projectId: string,
+  messages: ChatMessage[],
+  assistantText: string,
+  threadId: string
+): Promise<string | null> {
+  const entries: [string, ThreadBinding][] = [];
+  const key = storePromptQlThreadAfterTurnWithBindings(
+    projectId,
+    messages,
+    assistantText,
+    threadId,
+    (name, binding) => entries.push([name, binding])
+  );
+  if (!key) return null;
+  const path = threadCachePath();
+  await withNativeThreadCacheFile(path, async () => {
+    const disk = await readNativeThreadCacheFile<ThreadBinding>(path);
+    for (const [name, binding] of entries) {
+      memoryThreads.set(name, binding);
+      disk[name] = binding;
+      pruneThreadBindings(disk);
+    }
+    await writeNativeThreadCacheFile(path, disk);
+  });
   return key;
 }

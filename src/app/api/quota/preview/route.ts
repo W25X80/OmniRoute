@@ -25,7 +25,7 @@ import { NextResponse } from "next/server";
 import { buildErrorBody } from "@omniroute/open-sse/utils/error";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 import { QuotaPreviewQuerySchema } from "@/shared/schemas/quota";
-import { getPool } from "@/lib/db/quotaPools";
+import { getPoolAsync as getPool } from "@/lib/db/quotaPools";
 import { enforceQuotaShare } from "@/lib/quota/enforce";
 
 export const dynamic = "force-dynamic";
@@ -53,7 +53,7 @@ export async function GET(request: Request): Promise<Response> {
     const { apiKeyId, poolId, estimatedTokens, estimatedUsd, estimatedRequests } = parsed.data;
 
     // Resolve pool to get connectionId and provider
-    const pool = getPool(poolId);
+    const pool = await getPool(poolId);
     if (!pool) {
       return NextResponse.json(buildErrorBody(404, "Pool not found"), { status: 404 });
     }

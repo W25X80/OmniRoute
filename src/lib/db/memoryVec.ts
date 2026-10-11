@@ -1,3 +1,4 @@
+import { getSelectedMemoryRepository } from "./memory";
 /**
  * db/memoryVec.ts — CRUD for memory vector metadata and reindex state.
  *
@@ -70,15 +71,11 @@ export function setMemoryVecMeta(meta: Partial<MemoryVecMeta>): void {
   // Read current values first so we can merge (partial update pattern).
   const current = getMemoryVecMeta();
 
-  const activeDim = "activeDim" in meta ? meta.activeDim ?? null : current.activeDim;
+  const activeDim = "activeDim" in meta ? (meta.activeDim ?? null) : current.activeDim;
   const embeddingSignature =
-    "embeddingSignature" in meta
-      ? meta.embeddingSignature ?? null
-      : current.embeddingSignature;
-  const lastResetAt =
-    "lastResetAt" in meta ? meta.lastResetAt ?? null : current.lastResetAt;
-  const vecLoaded =
-    "vecLoaded" in meta ? (meta.vecLoaded ? 1 : 0) : current.vecLoaded ? 1 : 0;
+    "embeddingSignature" in meta ? (meta.embeddingSignature ?? null) : current.embeddingSignature;
+  const lastResetAt = "lastResetAt" in meta ? (meta.lastResetAt ?? null) : current.lastResetAt;
+  const vecLoaded = "vecLoaded" in meta ? (meta.vecLoaded ? 1 : 0) : current.vecLoaded ? 1 : 0;
 
   db.prepare(
     `INSERT OR REPLACE INTO memory_vec_meta
@@ -131,8 +128,38 @@ export function getMemoryReindexQueue(
  */
 export function countMemoryReindexPending(): number {
   const db = getDbInstance();
-  const row = db
-    .prepare("SELECT COUNT(*) AS cnt FROM memories WHERE needs_reindex = 1")
-    .get() as { cnt: number };
+  const row = db.prepare("SELECT COUNT(*) AS cnt FROM memories WHERE needs_reindex = 1").get() as {
+    cnt: number;
+  };
   return row.cnt;
+}
+
+export async function getMemoryVecMetaAsync() {
+  const selected = getSelectedMemoryRepository();
+  return selected ? selected.getVectorMeta() : getMemoryVecMeta();
+}
+
+export async function setMemoryVecMetaAsync(meta: Partial<MemoryVecMeta>) {
+  const selected = getSelectedMemoryRepository();
+  return selected ? selected.setVectorMeta(meta) : setMemoryVecMeta(meta);
+}
+
+export async function markMemoryNeedsReindexAsync(id: string, needs: boolean) {
+  const selected = getSelectedMemoryRepository();
+  return selected ? selected.markReindex(id, needs) : markMemoryNeedsReindex(id, needs);
+}
+
+export async function markAllMemoriesNeedReindexAsync() {
+  const selected = getSelectedMemoryRepository();
+  return selected ? selected.markAllReindex() : markAllMemoriesNeedReindex();
+}
+
+export async function getMemoryReindexQueueAsync(limit: number) {
+  const selected = getSelectedMemoryRepository();
+  return selected ? selected.reindexQueue(limit) : getMemoryReindexQueue(limit);
+}
+
+export async function countMemoryReindexPendingAsync() {
+  const selected = getSelectedMemoryRepository();
+  return selected ? selected.reindexCount() : countMemoryReindexPending();
 }

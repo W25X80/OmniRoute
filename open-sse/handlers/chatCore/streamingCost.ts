@@ -22,15 +22,24 @@ type LedgerDetails = {
   success?: boolean;
   timestamp?: string;
   requestId?: string | null;
+  completedAt?: number;
 };
 
 /** Build a {@link LedgerDetails} for a completed streaming response. */
 export function buildStreamLedgerDetails(
   serviceTier: string | null | undefined,
   success: boolean,
-  requestId: string | null | undefined
+  requestId: string | null | undefined,
+  completedAt?: number
 ): LedgerDetails {
-  return { serviceTier, success, timestamp: new Date().toISOString(), requestId };
+  return {
+    serviceTier,
+    success,
+    timestamp:
+      completedAt === undefined ? new Date().toISOString() : new Date(completedAt).toISOString(),
+    requestId,
+    ...(completedAt === undefined ? {} : { completedAt }),
+  };
 }
 
 export function recordStreamingCost(args: {
@@ -51,6 +60,7 @@ export function recordStreamingCost(args: {
       success?: boolean;
       timestamp?: string;
       requestId?: string | null;
+      completedAt?: number;
     }
   ) => void;
   ledger?: LedgerDetails;
@@ -59,7 +69,9 @@ export function recordStreamingCost(args: {
 
   const apiKeyId = args.apiKeyId;
   args
-    .calculateCost(args.provider, args.model, args.streamUsage, { serviceTier: args.serviceTier })
+    .calculateCost(args.provider, args.model, args.streamUsage, {
+      serviceTier: args.serviceTier,
+    })
     .then((estimatedCost) => {
       if (estimatedCost > 0) {
         args.recordCost(apiKeyId, estimatedCost, {
@@ -74,4 +86,31 @@ export function recordStreamingCost(args: {
       }
     })
     .catch(() => {});
+}
+
+export async function recordStreamingCostAsync(
+  args: Omit<Parameters<typeof recordStreamingCost>[0], "recordCost"> & {
+    recordCost: (
+      ...args: Parameters<Parameters<typeof recordStreamingCost>[0]["recordCost"]>
+    ) => void | Promise<void>;
+  }
+): Promise<void> {
+  if (!args.apiKeyId || !args.streamUsage) return;
+  if (!args.provider || !args.model) {
+    throw new Error("Streaming cost attribution requires provider and model");
+  }
+  const cost = await args.calculateCost(args.provider, args.model, args.streamUsage, {
+    serviceTier: args.serviceTier,
+  });
+  if (!(cost > 0)) return;
+  await args.recordCost(args.apiKeyId, cost, {
+    provider: args.provider,
+    model: args.model,
+    tokens: args.streamUsage,
+    serviceTier: args.serviceTier ?? args.ledger?.serviceTier,
+    success: args.ledger?.success ?? true,
+    timestamp: args.ledger?.timestamp,
+    requestId: args.ledger?.requestId,
+    completedAt: args.ledger?.completedAt,
+  });
 }

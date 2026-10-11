@@ -1,3 +1,4 @@
+import { getSelectedPostgresDatabase } from "./controlPlaneContext";
 import { getDbInstance } from "./core";
 import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
 
@@ -74,4 +75,26 @@ export function getDeliveries(webhookId: string, limit: number): WebhookDelivery
        LIMIT ?`
     )
     .all(webhookId, limit) as WebhookDeliverySafe[];
+}
+
+export async function insertDeliveryAsync(
+  ...args: Parameters<typeof insertDelivery>
+): Promise<ReturnType<typeof insertDelivery>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceWebhooks");
+    return postgres.transaction((transaction) => native.insertDelivery(transaction, ...args));
+  }
+  return insertDelivery(...args);
+}
+
+export async function getDeliveriesAsync(
+  ...args: Parameters<typeof getDeliveries>
+): Promise<ReturnType<typeof getDeliveries>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceWebhooks");
+    return postgres.transaction((transaction) => native.getDeliveries(transaction, ...args));
+  }
+  return getDeliveries(...args);
 }

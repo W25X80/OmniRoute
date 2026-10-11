@@ -1,15 +1,14 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import {
-  getRelayToken,
-  updateRelayToken,
-  deleteRelayToken,
-  toggleRelayToken,
-  getRelayLogs,
-  getRelayUsage,
+  getRelayTokenAsync,
+  updateRelayTokenAsync,
+  deleteRelayTokenAsync,
+  toggleRelayTokenAsync,
+  getRelayLogsAsync,
+  getRelayUsageAsync,
 } from "@/lib/db/relayProxies";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
-
 const relayTokenPatchSchema = z
   .object({
     enabled: z.boolean().optional(),
@@ -26,14 +25,14 @@ const relayTokenPatchSchema = z
 
 export async function GET(request: Request, { params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
-  const token = getRelayToken(id);
+  const token = await getRelayTokenAsync(id);
   if (!token) return NextResponse.json({ error: "Token not found" }, { status: 404 });
 
   // Get usage stats
   const now = Math.floor(Date.now() / 1000);
-  const lastHour = getRelayUsage(id, now - 3600);
-  const lastDay = getRelayUsage(id, now - 86400);
-  const logs = getRelayLogs(id, 20);
+  const lastHour = await getRelayUsageAsync(id, now - 3600);
+  const lastDay = await getRelayUsageAsync(id, now - 86400);
+  const logs = await getRelayLogsAsync(id, 20);
 
   return NextResponse.json({
     ...token,
@@ -52,12 +51,12 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ id
   const body = validation.data;
 
   if (body.enabled !== undefined) {
-    const token = toggleRelayToken(id, body.enabled);
+    const token = await toggleRelayTokenAsync(id, body.enabled);
     if (!token) return NextResponse.json({ error: "Token not found" }, { status: 404 });
     return NextResponse.json(token);
   }
 
-  const token = updateRelayToken(id, {
+  const token = await updateRelayTokenAsync(id, {
     name: body.name,
     description: body.description,
     comboId: body.comboId,
@@ -74,6 +73,6 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ id
 
 export async function DELETE(request: Request, { params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
-  deleteRelayToken(id);
+  await deleteRelayTokenAsync(id);
   return NextResponse.json({ success: true });
 }

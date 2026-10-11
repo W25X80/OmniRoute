@@ -1,4 +1,6 @@
 // @ts-nocheck
+import { parseDatabaseBackend } from "../db/backendSelection";
+import { getSelectedPostgresDatabase } from "../db/controlPlaneContext";
 /**
  * Usage Migrations — extracted from usageDb.js (T-15)
  *
@@ -25,6 +27,11 @@ import {
 } from "./accountIdentity";
 
 export const shouldPersistToDisk = !isCloud && !isBuildPhase;
+
+/** Explicit profiles and operation-scoped native composition share one storage authority. */
+function isPostgresUsagePersistenceSelected(): boolean {
+  return parseDatabaseBackend() === "postgres" || getSelectedPostgresDatabase() !== undefined;
+}
 
 const LEGACY_DATA_DIR = isCloud ? null : getLegacyDotDataDir();
 
@@ -274,6 +281,7 @@ function deleteArchivedTargets(targets: ArchiveTarget[]) {
 }
 
 export function migrateLegacyUsageFiles() {
+  if (isPostgresUsagePersistenceSelected()) return;
   if (!shouldPersistToDisk || !LEGACY_DATA_DIR) return;
   if (isSamePath(DATA_DIR, LEGACY_DATA_DIR)) return;
 
@@ -286,6 +294,7 @@ export function migrateLegacyUsageFiles() {
 }
 
 export async function archiveLegacyRequestLogs() {
+  if (isPostgresUsagePersistenceSelected()) return;
   if (!shouldPersistToDisk) return null;
   if (LEGACY_LAYOUT_MARKER && fs.existsSync(LEGACY_LAYOUT_MARKER)) return null;
 
@@ -301,6 +310,8 @@ export async function archiveLegacyRequestLogs() {
 }
 
 export function migrateUsageJsonToSqlite() {
+  if (isPostgresUsagePersistenceSelected())
+    throw new Error("Legacy JSON migration requires the SQLite backend");
   if (!shouldPersistToDisk) return;
   const db = getDbInstance();
 
@@ -441,6 +452,7 @@ export function migrateUsageJsonToSqlite() {
                     cacheRead: null,
                     cacheWrite: null,
                     reasoning: null,
+                    compressed: null,
                   },
                   requestType: log.requestType || null,
                   sourceFormat: log.sourceFormat || null,
@@ -517,7 +529,7 @@ export function migrateUsageJsonToSqlite() {
 
 migrateLegacyUsageFiles();
 
-if (shouldPersistToDisk) {
+if (shouldPersistToDisk && !isPostgresUsagePersistenceSelected()) {
   try {
     await archiveLegacyRequestLogs();
   } catch (error) {

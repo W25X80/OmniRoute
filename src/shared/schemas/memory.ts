@@ -113,7 +113,7 @@ export const EmbeddingProviderListingSchema = z.object({
 export const MemoryEngineStatusSchema = z.object({
   keyword: z.object({
     available: z.boolean(),
-    backend: z.enum(["FTS5", "none"]),
+    backend: z.enum(["FTS5", "PostgreSQL", "none"]),
     reason: z.string(),
   }),
   embedding: z.object({
@@ -125,7 +125,7 @@ export const MemoryEngineStatusSchema = z.object({
     cacheStats: z.object({ hits: z.number(), misses: z.number(), size: z.number() }),
   }),
   vectorStore: z.object({
-    backend: z.enum(["sqlite-vec", "qdrant", "none"]),
+    backend: z.enum(["sqlite-vec", "postgres-array", "qdrant", "none"]),
     available: z.boolean(),
     rowCount: z.number(),
     needsReindex: z.number(),
@@ -156,7 +156,7 @@ export const RetrievePreviewResultSchema = z.object({
       content: z.string(),
       score: z.number(),
       tokens: z.number(),
-      tier: z.enum(["fts5", "vector", "hybrid-rrf", "qdrant"]),
+      tier: z.enum(["fts5", "postgres-fulltext", "vector", "hybrid-rrf", "qdrant"]),
       vecScore: z.number().nullable(),
       ftsScore: z.number().nullable(),
     })
@@ -164,7 +164,7 @@ export const RetrievePreviewResultSchema = z.object({
   resolution: z.object({
     embeddingSource: z.enum(["remote", "static", "transformers"]).nullable(),
     embeddingModel: z.string().nullable(),
-    vectorStore: z.enum(["sqlite-vec", "qdrant", "none"]),
+    vectorStore: z.enum(["sqlite-vec", "postgres-array", "qdrant", "none"]),
     strategyUsed: z.enum(["exact", "semantic", "hybrid"]),
     rerankApplied: z.boolean(),
     fallbackReason: z.string().nullable(),

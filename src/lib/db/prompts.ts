@@ -1,3 +1,12 @@
+import { assertSqliteBackendAllowed } from "./controlPlaneContext";
+import { getSelectedPostgresDatabase } from "./controlPlaneContext";
+import {
+  catalogTableRows,
+  compareCatalogText,
+  requirePostgresCatalogSnapshot,
+  mutatePostgresCatalog,
+  writePostgresCatalog,
+} from "./postgres/catalogSnapshot";
 /**
  * Prompt Template Versioning — L-6
  *
@@ -90,6 +99,8 @@ const PROMPT_SCHEMA = `
 let _initialized = false;
 
 function ensureSchema(): void {
+  if (getSelectedPostgresDatabase()) return;
+
   if (_initialized) return;
   try {
     const db = getDbInstance() as unknown as DbLike;
@@ -123,11 +134,49 @@ export interface PromptTemplate {
  * has changed, a new version is created. If content is identical,
  * returns the existing version without duplicating.
  */
-export function savePrompt(
+export async function savePromptAsync(
   slug: string,
   content: string,
   options: { variables?: string[]; description?: string } = {}
-): PromptTemplate {
+): Promise<PromptTemplate> {
+  const catalogDatabase = getSelectedPostgresDatabase();
+  if (catalogDatabase)
+    return mutatePostgresCatalog(catalogDatabase, async () => {
+      const hash = hashContent(content);
+      const rows = catalogTableRows<PromptRow>("prompt_templates")
+        .filter((row) => row.slug === slug)
+        .sort((a, b) => toNumber(a.id) - toNumber(b.id));
+      const existing = rows.find((row) => row.content_hash === hash);
+      if (existing) return rowToPrompt(existing);
+      await writePostgresCatalog(
+        "UPDATE omniroute.prompt_templates SET is_active=0 WHERE slug=$1 AND is_active=1",
+        [slug]
+      );
+      const nextVersion = Math.max(0, ...rows.map((row) => toNumber(row.version))) + 1;
+      const result = await writePostgresCatalog<{ id: number }>(
+        "INSERT INTO omniroute.prompt_templates(slug,version,content,content_hash,variables,description,is_active) VALUES($1,$2,$3,$4,$5,$6,1) RETURNING id",
+        [
+          slug,
+          nextVersion,
+          content,
+          hash,
+          options.variables ? JSON.stringify(options.variables) : null,
+          options.description || null,
+        ]
+      );
+      return {
+        id: result.rows[0].id,
+        slug,
+        version: nextVersion,
+        content,
+        contentHash: hash,
+        variables: options.variables || null,
+        description: options.description || null,
+        isActive: true,
+        createdAt: new Date().toISOString(),
+      };
+    });
+
   ensureSchema();
   const db = getDbInstance() as unknown as DbLike;
   const hash = hashContent(content);
@@ -186,6 +235,14 @@ export function savePrompt(
  * Get the active (latest) version of a prompt by slug.
  */
 export function getActivePrompt(slug: string): PromptTemplate | null {
+  if (getSelectedPostgresDatabase()) {
+    requirePostgresCatalogSnapshot();
+    const row = catalogTableRows<PromptRow>("prompt_templates")
+      .filter((row) => row.slug === slug && row.is_active === 1)
+      .sort((a, b) => toNumber(a.id) - toNumber(b.id))[0];
+    return row ? rowToPrompt(row) : null;
+  }
+
   ensureSchema();
   const db = getDbInstance() as unknown as DbLike;
   const row = db
@@ -198,6 +255,14 @@ export function getActivePrompt(slug: string): PromptTemplate | null {
  * Get a specific version of a prompt.
  */
 export function getPromptVersion(slug: string, version: number): PromptTemplate | null {
+  if (getSelectedPostgresDatabase()) {
+    requirePostgresCatalogSnapshot();
+    const row = catalogTableRows<PromptRow>("prompt_templates").find(
+      (row) => row.slug === slug && row.version === version
+    );
+    return row ? rowToPrompt(row) : null;
+  }
+
   ensureSchema();
   const db = getDbInstance() as unknown as DbLike;
   const row = db
@@ -210,6 +275,14 @@ export function getPromptVersion(slug: string, version: number): PromptTemplate 
  * List all versions of a prompt (newest first).
  */
 export function listPromptVersions(slug: string): PromptTemplate[] {
+  if (getSelectedPostgresDatabase()) {
+    requirePostgresCatalogSnapshot();
+    return catalogTableRows<PromptRow>("prompt_templates")
+      .filter((row) => row.slug === slug)
+      .sort((a, b) => toNumber(b.version) - toNumber(a.version))
+      .map(rowToPrompt);
+  }
+
   ensureSchema();
   const db = getDbInstance() as unknown as DbLike;
   const rows = db
@@ -226,6 +299,23 @@ export function listPrompts(): Array<{
   activeVersion: number;
   totalVersions: number;
 }> {
+  if (getSelectedPostgresDatabase()) {
+    requirePostgresCatalogSnapshot();
+    const grouped = new Map<
+      string,
+      { slug: string; activeVersion: number; totalVersions: number }
+    >();
+    for (const row of catalogTableRows<PromptRow>("prompt_templates")) {
+      const slug = toString(row.slug);
+      const current = grouped.get(slug) ?? { slug, activeVersion: 0, totalVersions: 0 };
+      current.totalVersions++;
+      if (row.is_active === 1)
+        current.activeVersion = Math.max(current.activeVersion, toNumber(row.version));
+      grouped.set(slug, current);
+    }
+    return [...grouped.values()].sort((a, b) => compareCatalogText(a.slug, b.slug));
+  }
+
   ensureSchema();
   const db = getDbInstance() as unknown as DbLike;
   const rows = db
@@ -249,7 +339,28 @@ export function listPrompts(): Array<{
 /**
  * Rollback to a previous version (makes it the active one).
  */
-export function rollbackPrompt(slug: string, version: number): PromptTemplate | null {
+export async function rollbackPromptAsync(
+  slug: string,
+  version: number
+): Promise<PromptTemplate | null> {
+  const catalogDatabase = getSelectedPostgresDatabase();
+  if (catalogDatabase)
+    return mutatePostgresCatalog(catalogDatabase, async () => {
+      const target = catalogTableRows<PromptRow>("prompt_templates").find(
+        (row) => row.slug === slug && row.version === version
+      );
+      if (!target) return null;
+      await writePostgresCatalog(
+        "UPDATE omniroute.prompt_templates SET is_active=0 WHERE slug=$1",
+        [slug]
+      );
+      await writePostgresCatalog(
+        "UPDATE omniroute.prompt_templates SET is_active=1 WHERE slug=$1 AND version=$2",
+        [slug, version]
+      );
+      return rowToPrompt({ ...target, is_active: 1 });
+    });
+
   ensureSchema();
   const db = getDbInstance() as unknown as DbLike;
 
@@ -299,4 +410,87 @@ function rowToPrompt(row: PromptRow): PromptTemplate {
     isActive: row.is_active === 1 || row.is_active === true,
     createdAt: toString(row.created_at),
   };
+}
+
+export function savePrompt(
+  slug: string,
+  content: string,
+  options: { variables?: string[]; description?: string } = {}
+): PromptTemplate {
+  assertSqliteBackendAllowed();
+  ensureSchema();
+  const db = getDbInstance() as unknown as DbLike;
+  const hash = hashContent(content);
+
+  // Check if identical content already exists for this slug
+  const existing = db
+    .prepare<PromptRow>("SELECT * FROM prompt_templates WHERE slug = ? AND content_hash = ?")
+    .get(slug, hash);
+
+  if (existing) {
+    return rowToPrompt(existing);
+  }
+
+  // Deactivate previous active version
+  db.prepare("UPDATE prompt_templates SET is_active = 0 WHERE slug = ? AND is_active = 1").run(
+    slug
+  );
+
+  // Get next version number
+  const maxVersion = db
+    .prepare<{
+      max_v: unknown;
+    }>("SELECT MAX(version) as max_v FROM prompt_templates WHERE slug = ?")
+    .get(slug);
+  const nextVersion = toNumber(maxVersion?.max_v, 0) + 1;
+
+  // Insert new version
+  const result = db
+    .prepare(
+      `INSERT INTO prompt_templates (slug, version, content, content_hash, variables, description, is_active)
+       VALUES (?, ?, ?, ?, ?, ?, 1)`
+    )
+    .run(
+      slug,
+      nextVersion,
+      content,
+      hash,
+      options.variables ? JSON.stringify(options.variables) : null,
+      options.description || null
+    );
+
+  return {
+    id: toNumber(result.lastInsertRowid, 0),
+    slug,
+    version: nextVersion,
+    content,
+    contentHash: hash,
+    variables: options.variables || null,
+    description: options.description || null,
+    isActive: true,
+    createdAt: new Date().toISOString(),
+  };
+}
+
+export function rollbackPrompt(slug: string, version: number): PromptTemplate | null {
+  assertSqliteBackendAllowed();
+  ensureSchema();
+  const db = getDbInstance() as unknown as DbLike;
+
+  const target = db
+    .prepare<PromptRow>("SELECT * FROM prompt_templates WHERE slug = ? AND version = ?")
+    .get(slug, version);
+
+  if (!target) return null;
+
+  const rollback = db.transaction(() => {
+    db.prepare("UPDATE prompt_templates SET is_active = 0 WHERE slug = ?").run(slug);
+    db.prepare("UPDATE prompt_templates SET is_active = 1 WHERE slug = ? AND version = ?").run(
+      slug,
+      version
+    );
+  });
+  rollback();
+
+  return rowToPrompt({ ...target, is_active: 1 });
 }

@@ -2,7 +2,7 @@
 
 import { NextResponse } from "next/server";
 import { buildErrorBody, sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
-import { getRadarOffers } from "@/lib/radar";
+import { getRadarOffersAsync } from "@/lib/radar";
 import { isAuthenticated } from "@/shared/utils/apiAuth";
 import { CORS_HEADERS, handleCorsOptions } from "@/shared/utils/cors";
 import { isFeatureFlagEnabled } from "@/shared/utils/featureFlags";
@@ -29,7 +29,7 @@ export async function GET(request: Request) {
   }
 
   try {
-    return NextResponse.json(getRadarOffers(), {
+    return NextResponse.json(await getRadarOffersAsync(), {
       headers: { ...CORS_HEADERS, "Cache-Control": "no-store" },
     });
   } catch (error: unknown) {

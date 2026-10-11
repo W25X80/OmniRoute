@@ -1,3 +1,8 @@
+import type { StreamCompletionClock } from "./streamingCompletion.ts";
+import { getSelectedUsageHistoryRepository } from "@/lib/db/postgres/usageHistoryRepository";
+import { saveRequestUsageWithReceipt, type UsageEntry } from "@/lib/usage/usageHistory";
+import { recordKeyQuotaUsageAsync } from "@/domain/keyQuota";
+import { recordTokenUsageAsync } from "../../services/tokenLimitCounter.ts";
 /**
  * chatCore streaming usage-stats persistence (Quality Gate v2 / Fase 9 — chatCore god-file
  * decomposition, #3501).
@@ -21,7 +26,7 @@ export type RecordStreamingUsageStatsContext = {
   model: string | null | undefined;
   streamStatus: number;
   startTime: number;
-  ttft: number;
+  ttft: number | undefined;
   streamErrorCode: string | null | undefined;
   connectionId: string | null | undefined;
   apiKeyInfo: { id?: string | null; name?: string | null } | null | undefined;
@@ -30,6 +35,7 @@ export type RecordStreamingUsageStatsContext = {
   comboStrategy: string | null | undefined;
   endpoint?: string | null | undefined;
   cpaAuthIndex?: string | null | undefined;
+  completionClock?: StreamCompletionClock;
 };
 
 function persistStreamingUsageRow(usage: object, ctx: RecordStreamingUsageStatsContext): void {
@@ -81,4 +87,54 @@ export function recordStreamingUsageStats(
   if (!usage || typeof usage !== "object") return;
   persistStreamingUsageRow(usage, ctx);
   recordStreamingBillableTokens(usage, ctx);
+}
+
+export async function recordStreamingUsageStatsAsync(
+  usage: unknown,
+  ctx: RecordStreamingUsageStatsContext
+): Promise<void> {
+  if (!getSelectedUsageHistoryRepository()) {
+    recordStreamingUsageStats(usage, ctx);
+    return;
+  }
+  if (!usage || typeof usage !== "object") return;
+  const { provider, model, streamStatus, startTime, ttft, streamErrorCode, completionClock } = ctx;
+  const entry: UsageEntry = {
+    provider: provider || "unknown",
+    model: model || "unknown",
+    tokens: usage,
+    status: String(streamStatus),
+    success: streamStatus === 200,
+    latencyMs: completionClock?.latencyMs ?? Date.now() - startTime,
+    timeToFirstTokenMs: ttft,
+    errorCode: streamStatus === 200 ? null : streamErrorCode || String(streamStatus),
+    timestamp: completionClock?.timestamp ?? new Date().toISOString(),
+    connectionId: ctx.connectionId || undefined,
+    apiKeyId: ctx.apiKeyInfo?.id || undefined,
+    apiKeyName: ctx.apiKeyInfo?.name || undefined,
+    serviceTier: ctx.effectiveServiceTier,
+    comboStrategy: ctx.isCombo ? ctx.comboStrategy || undefined : undefined,
+    endpoint: ctx.endpoint || undefined,
+    cpaAuthIndex: ctx.cpaAuthIndex || undefined,
+  };
+  const receipt = await saveRequestUsageWithReceipt(entry);
+  if (ctx.streamStatus !== 200) return;
+  if (ctx.apiKeyInfo?.id) {
+    const billable = computeBillableTokens(usage);
+    if (receipt?.inserted)
+      await recordKeyQuotaUsageAsync(
+        ctx.apiKeyInfo.id,
+        billable,
+        completionClock ? { now: () => completionClock.completedAt } : {}
+      );
+    if (billable > 0)
+      await recordTokenUsageAsync(
+        ctx.apiKeyInfo.id,
+        ctx.provider || "unknown",
+        ctx.model || "unknown",
+        billable,
+        receipt?.id,
+        completionClock?.completedAt
+      );
+  }
 }

@@ -28,17 +28,21 @@
  * @see src/app/api/v1/relay/chat/completions/route.ts (the TS relay fallback)
  */
 
+import { z } from "zod";
 import { CORS_HEADERS, handleCorsOptions } from "@/shared/utils/cors";
 import { stripSensitiveResponseHeaders } from "@omniroute/open-sse/utils/upstreamResponseHeaders";
 import { createInjectionGuard } from "@/middleware/promptInjectionGuard";
-import { getRelayTokenByHash, checkRateLimit, recordRelayUsage } from "@/lib/db/relayProxies";
+import {
+  getRelayTokenByHashAsync,
+  checkRateLimitAsync,
+  recordRelayUsageAsync,
+} from "@/lib/db/relayProxies";
 import {
   buildErrorBody,
   parseUpstreamError,
   sanitizeErrorMessage,
 } from "@omniroute/open-sse/utils/error";
 import { getProviderPluginManifestHeader } from "@omniroute/open-sse/config/providerPluginManifestUrl.ts";
-import { z } from "zod";
 import {
   checkIpRateLimit,
   extractToken,
@@ -47,7 +51,6 @@ import {
   sanitizeForensicHeader,
 } from "../relaySecurity";
 import { finalizeReadableStream } from "../streamFinalizer";
-
 // Minimal request-shape validation (Rule #7). `.passthrough()` keeps every other
 // OpenAI chat-completion field intact (temperature, tools, response_format, …) —
 // we only assert the fields this route and the sidecar rely on, so a malformed
@@ -73,7 +76,7 @@ const BIFROST_ENABLED = process.env.BIFROST_ENABLED !== "0";
 
 const injectionGuard = createInjectionGuard();
 
-type RelayUsageRecorder = (status: "success" | "error", statusCode: number) => void;
+type RelayUsageRecorder = (status: "success" | "error", statusCode: number) => Promise<void>;
 
 export async function OPTIONS() {
   return handleCorsOptions();
@@ -136,9 +139,9 @@ export async function POST(request: Request) {
     }
 
     const tokenHash = hashToken(rawToken);
-    const token = getRelayTokenByHash(tokenHash);
+    const token = await getRelayTokenByHashAsync(tokenHash);
     if (!token) {
-      recordRelayUsage("unknown", {
+      await recordRelayUsageAsync("unknown", {
         requestId: request.headers.get("x-request-id") || undefined,
         status: "auth_failed",
         statusCode: 401,
@@ -163,7 +166,7 @@ export async function POST(request: Request) {
     // sidecar path does not weaken leaked-token abuse protection.
     const ipCheck = checkIpRateLimit(token.id, clientIp);
     if (!ipCheck.allowed) {
-      recordRelayUsage(token.id, {
+      await recordRelayUsageAsync(token.id, {
         requestId: request.headers.get("x-request-id") || undefined,
         status: "rate_limited",
         statusCode: 429,
@@ -181,9 +184,9 @@ export async function POST(request: Request) {
       });
     }
 
-    const rateCheck = checkRateLimit(token.id, token);
+    const rateCheck = await checkRateLimitAsync(token.id, token);
     if (!rateCheck.allowed) {
-      recordRelayUsage(token.id, {
+      await recordRelayUsageAsync(token.id, {
         requestId: request.headers.get("x-request-id") || undefined,
         status: "rate_limited",
         statusCode: 429,
@@ -224,7 +227,7 @@ export async function POST(request: Request) {
 
     const guard = injectionGuard(body);
     if (guard.blocked) {
-      recordRelayUsage(token.id, {
+      await recordRelayUsageAsync(token.id, {
         requestId: request.headers.get("x-request-id") || undefined,
         status: "error",
         statusCode: 400,
@@ -293,8 +296,8 @@ export async function POST(request: Request) {
 
     // 5. Forward response. Non-streaming responses can be accounted for as soon
     //    as headers arrive; streaming responses finalize on body close/cancel/error.
-    const recordUsage: RelayUsageRecorder = (status, statusCode) => {
-      recordRelayUsage(token.id, {
+    const recordUsage: RelayUsageRecorder = async (status, statusCode) => {
+      await recordRelayUsageAsync(token.id, {
         requestId: request.headers.get("x-request-id") || undefined,
         status,
         statusCode,
@@ -316,11 +319,11 @@ export async function POST(request: Request) {
     }
 
     if (wantsStream && upstream.body) {
-      const stream = finalizeReadableStream(upstream.body, (error) => {
+      const stream = finalizeReadableStream(upstream.body, async (error) => {
         clearTimeout(tid);
         const statusCode = timedOut ? 504 : upstream.status;
         const status = error || statusCode >= 500 ? "error" : "success";
-        recordUsage(status, statusCode);
+        await recordUsage(status, statusCode);
       });
 
       return new Response(stream, {
@@ -345,14 +348,14 @@ export async function POST(request: Request) {
       if (parsed.retryAfterMs && parsed.retryAfterMs > 0) {
         newHeaders.set("Retry-After", String(Math.ceil(parsed.retryAfterMs / 1000)));
       }
-      recordUsage("error", parsed.statusCode);
+      await recordUsage("error", parsed.statusCode);
       return new Response(JSON.stringify(errorBody), {
         status: parsed.statusCode,
         headers: newHeaders,
       });
     }
 
-    recordUsage(upstream.status < 500 ? "success" : "error", upstream.status);
+    await recordUsage(upstream.status < 500 ? "success" : "error", upstream.status);
 
     return new Response(upstream.body, {
       status: upstream.status,

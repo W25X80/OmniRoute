@@ -1,5 +1,5 @@
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
-import { createPendingCommandCodeAuthSession } from "@/lib/db/commandCodeAuth";
+import { createPendingCommandCodeAuthSessionAsync } from "@/lib/db/commandCodeAuth";
 
 import {
   buildCommandCodeCliCallbackUrl,
@@ -17,12 +17,18 @@ export async function POST(request: Request) {
   const state = generateCommandCodeState();
   const expiresAt = new Date(Date.now() + COMMAND_CODE_AUTH_TTL_MS).toISOString();
   const stateHash = stateHashFromState(state);
-  createPendingCommandCodeAuthSession({ stateHash, expiresAt });
+  await createPendingCommandCodeAuthSessionAsync({ stateHash, expiresAt });
 
   const callbackUrl = buildCommandCodeCliCallbackUrl();
   const authUrl = `${COMMAND_CODE_STUDIO_AUTH_URL}?callback=${encodeURIComponent(
     callbackUrl
   )}&state=${encodeURIComponent(state)}`;
 
-  return noStoreJson({ state, authUrl, callbackUrl, expiresAt, mode: "manual" });
+  return noStoreJson({
+    state,
+    authUrl,
+    callbackUrl,
+    expiresAt,
+    mode: "manual",
+  });
 }

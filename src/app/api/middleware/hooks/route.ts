@@ -1,10 +1,10 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import {
-  getAllMiddlewareHooks,
-  createMiddlewareHook,
-  getMiddlewareHook,
-  getHookLogs,
+  getAllMiddlewareHooksAsync,
+  createMiddlewareHookAsync,
+  getMiddlewareHookAsync,
+  getHookLogsAsync,
 } from "@/lib/db/middleware";
 import { registerHook, getAllHooks } from "@/lib/middleware/registry";
 import type { HookConfig, CreateHookRequest } from "@/lib/middleware/types";
@@ -43,19 +43,19 @@ export async function GET(request: Request) {
     const logLimit = parseInt(url.searchParams.get("logLimit") || "10", 10);
 
     if (hookName) {
-      const hook = getMiddlewareHook(hookName);
+      const hook = await getMiddlewareHookAsync(hookName);
       if (!hook) {
         return NextResponse.json({ error: "Hook not found" }, { status: 404 });
       }
 
       const result: Record<string, unknown> = { hook };
       if (includeLogs) {
-        result.logs = getHookLogs(hookName, logLimit);
+        result.logs = await getHookLogsAsync(hookName, logLimit);
       }
       return NextResponse.json(result);
     }
 
-    const hooks = getAllMiddlewareHooks();
+    const hooks = await getAllMiddlewareHooksAsync();
     const registryHooks = getAllHooks();
 
     return NextResponse.json({
@@ -89,7 +89,7 @@ export async function POST(request: Request) {
     const body: CreateHookRequest = validation.data;
 
     // Check for duplicate
-    const existing = getMiddlewareHook(body.name);
+    const existing = await getMiddlewareHookAsync(body.name);
     if (existing) {
       return NextResponse.json({ error: `Hook "${body.name}" already exists` }, { status: 409 });
     }
@@ -107,7 +107,7 @@ export async function POST(request: Request) {
     };
 
     // Persist to DB
-    const saved = createMiddlewareHook(hookConfig);
+    const saved = await createMiddlewareHookAsync(hookConfig);
 
     // Register in runtime registry
     registerHook(saved);

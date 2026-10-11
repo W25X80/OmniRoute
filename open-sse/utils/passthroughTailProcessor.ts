@@ -32,6 +32,7 @@ export type PassthroughTailProcessorContext = {
   emitConvertedOutput: (output: string) => void;
   pushProviderPayload: (payload: unknown) => void;
   pushClientPayload: (payload: unknown) => void;
+  beforeClientPayload?: (payload: unknown) => void;
   sanitizeUsagePayload: (payload: unknown) => boolean;
   setPassthroughResponsesId: (value: string) => void;
   setUsage: (value: unknown) => void;
@@ -66,7 +67,7 @@ function handleResponsesTailPayload(
   parsed: JsonRecord,
   output: string,
   context: PassthroughTailProcessorContext
-): string {
+): { output: string; payload: JsonRecord } {
   const responsesIdsNormalized = normalizeResponsesSseIds(parsed);
   const parsedResponse = asRecord(parsed.response);
   const responseId =
@@ -196,7 +197,7 @@ function handleResponsesTailPayload(
     output = `data: ${JSON.stringify(outputPayload)}\n\n`;
   }
 
-  return output;
+  return { output, payload: outputPayload };
 }
 
 function handleOpenAiTailPayload(parsed: JsonRecord, context: PassthroughTailProcessorContext) {
@@ -300,15 +301,19 @@ export function processBufferedPassthroughLine(
     const isResponses = parsedType.startsWith("response.");
     const isClaude = context.isClaudeEventPayload(parsed);
 
+    let clientPayload = parsed;
     if (isResponses) {
-      output = handleResponsesTailPayload(parsed, output, context);
+      const processed = handleResponsesTailPayload(parsed, output, context);
+      output = processed.output;
+      if (context.beforeClientPayload) clientPayload = processed.payload;
     } else if (!isClaude) {
       const restoredToolName = context.restoreOpenAIToolNames(parsed);
       handleOpenAiTailPayload(parsed, context);
       if (restoredToolName) output = `data: ${JSON.stringify(parsed)}\n\n`;
     }
 
-    context.pushClientPayload(parsed);
+    context.pushClientPayload(clientPayload);
+    context.beforeClientPayload?.(clientPayload);
 
     output = context.passthroughEventPrefix.prefixData(output, line);
     context.emitConvertedOutput(output);

@@ -41,7 +41,7 @@ import {
   resolveDisableSessionStickiness,
 } from "./sessionStickiness.ts";
 import { makeConnectionConcurrencyResolver } from "./concurrencyCaps.ts";
-import { orderTargetsByEvalScores } from "../evalRouting.ts";
+import { orderTargetsByEvalScoresAsync } from "../evalRouting.ts";
 import {
   applyPromptCacheAffinity,
   expandPromptCacheAffinityTargets,
@@ -226,7 +226,11 @@ export async function handleRoundRobinCombo({
     apiKeyAllowedConnectionIds: apiKeyAllowedConnections,
   });
   const tagFilteredTargets = await applyRequestTagRouting(orderedTargets, body, log);
-  const evalRankedTargets = orderTargetsByEvalScores(tagFilteredTargets, config.evalRouting, log);
+  const evalRankedTargets = await orderTargetsByEvalScoresAsync(
+    tagFilteredTargets,
+    config.evalRouting,
+    log
+  );
   // Align with the main/auto paths: combo config OR top-level settings (#8488 / #8494).
   const rrCompatFailOpen =
     (config as { compatFilterFailOpen?: unknown }).compatFilterFailOpen === true ||
@@ -717,10 +721,16 @@ export async function handleRoundRobinCombo({
             typeof attemptBody === "object"
           ) {
             try {
-              const { reserveQuota } = await import("../../../src/lib/quota/quotaScheduler.ts");
-              reserveQuota(target.connectionId, modelStr, attemptBody as Record<string, unknown>, {
-                tokenLimit: await resolveTargetTokenLimit(target),
-              });
+              const { reserveQuotaAsync: reserveQuota } =
+                await import("../../../src/lib/quota/quotaScheduler.ts");
+              await reserveQuota(
+                target.connectionId,
+                modelStr,
+                attemptBody as Record<string, unknown>,
+                {
+                  tokenLimit: await resolveTargetTokenLimit(target),
+                }
+              );
             } catch {
               // best-effort only
             }

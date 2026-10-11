@@ -1,3 +1,4 @@
+import { getSelectedPostgresDatabase } from "./controlPlaneContext";
 /**
  * db/playgroundPresets.ts — Playground Studio preset persistence.
  *
@@ -176,4 +177,67 @@ export function deletePlaygroundPreset(id: string): boolean {
   const db = getDbInstance();
   const result = db.prepare("DELETE FROM playground_presets WHERE id = ?").run(id);
   return result.changes > 0;
+}
+
+export async function listPlaygroundPresetsAsync(
+  ...args: Parameters<typeof listPlaygroundPresets>
+): Promise<ReturnType<typeof listPlaygroundPresets>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceOperations");
+    return postgres.transaction((transaction) =>
+      native.listPlaygroundPresets(transaction, ...args)
+    );
+  }
+  return listPlaygroundPresets(...args);
+}
+
+export async function getPlaygroundPresetAsync(
+  ...args: Parameters<typeof getPlaygroundPreset>
+): Promise<ReturnType<typeof getPlaygroundPreset>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceOperations");
+    return postgres.transaction((transaction) => native.getPlaygroundPreset(transaction, ...args));
+  }
+  return getPlaygroundPreset(...args);
+}
+
+export async function createPlaygroundPresetAsync(
+  ...args: Parameters<typeof createPlaygroundPreset>
+): Promise<ReturnType<typeof createPlaygroundPreset>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceOperations");
+    return postgres.transaction((transaction) =>
+      native.createPlaygroundPreset(transaction, ...args)
+    );
+  }
+  return createPlaygroundPreset(...args);
+}
+
+export async function updatePlaygroundPresetAsync(
+  ...args: Parameters<typeof updatePlaygroundPreset>
+): Promise<ReturnType<typeof updatePlaygroundPreset>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceOperations");
+    return postgres.transaction((transaction) =>
+      native.updatePlaygroundPreset(transaction, ...args)
+    );
+  }
+  return updatePlaygroundPreset(...args);
+}
+
+export async function deletePlaygroundPresetAsync(
+  ...args: Parameters<typeof deletePlaygroundPreset>
+): Promise<ReturnType<typeof deletePlaygroundPreset>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceOperations");
+    return postgres.transaction((transaction) =>
+      native.deletePlaygroundPreset(transaction, ...args)
+    );
+  }
+  return deletePlaygroundPreset(...args);
 }

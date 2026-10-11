@@ -1,3 +1,10 @@
+import {
+  getRadarCacheAsync,
+  getRadarLocalMergeStateAsync,
+  getRadarReferralsCacheAsync,
+  getRadarOffersCacheAsync,
+  getRadarIntelCacheAsync,
+} from "@/lib/db/radar";
 /**
  * index.ts — Radar client public accessor.
  *
@@ -349,3 +356,65 @@ export { findDefaultReferral } from "./referrals";
 export type { RadarReferral } from "./feedSchema";
 export type { RadarOffer, RadarOfferBenefit, RadarOfferLocalizedText } from "./offersFeedSchema";
 export type { RadarIntelFeed, RadarIntelRanking, RadarIntelCatalog } from "./intelFeedSchema";
+
+export async function getRadarCatalogAsync(
+  deps: GetRadarCatalogDeps = {}
+): Promise<RadarCatalogResult> {
+  const enabled = deps.getFlag
+    ? deps.getFlag("RADAR_ENABLED")
+    : await resolveRadarFlagAsync("RADAR_ENABLED");
+  if (!enabled) return getRadarCatalog({ ...deps, getFlag: () => false });
+  const cache = deps.getCache ? deps.getCache() : await getRadarCacheAsync();
+  const local = deps.getLocalState ? deps.getLocalState() : await getRadarLocalMergeStateAsync();
+  return getRadarCatalog({
+    ...deps,
+    getFlag: () => enabled,
+    getCache: () => cache,
+    getLocalState: () => local,
+  });
+}
+export async function getCatalogWithoutOverlayAsync(
+  deps: GetCatalogWithoutOverlayDeps = {}
+): Promise<MergedEntry[]> {
+  const local = deps.getLocalState ? deps.getLocalState() : await getRadarLocalMergeStateAsync();
+  return getCatalogWithoutOverlay({ ...deps, getLocalState: () => local });
+}
+export async function getRadarReferralsAsync(
+  deps: GetRadarReferralsDeps = {}
+): Promise<RadarReferralsResult> {
+  const enabled = deps.getFlag
+    ? deps.getFlag("RADAR_ENABLED")
+    : await resolveRadarFlagAsync("RADAR_ENABLED");
+  if (!enabled) return getRadarReferrals({ ...deps, getFlag: () => false });
+  const cache = deps.getCache ? deps.getCache() : await getRadarReferralsCacheAsync();
+  return getRadarReferrals({ ...deps, getFlag: () => enabled, getCache: () => cache });
+}
+export async function getDefaultReferralForAsync(
+  provider: string,
+  deps: GetRadarReferralsDeps = {}
+): Promise<RadarReferral | null> {
+  return findDefaultReferral((await getRadarReferralsAsync(deps)).fixed, provider);
+}
+export async function getRadarOffersAsync(
+  deps: GetRadarOffersDeps = {}
+): Promise<RadarOffersResult> {
+  const enabled = deps.getFlag
+    ? deps.getFlag("RADAR_ENABLED")
+    : await resolveRadarFlagAsync("RADAR_ENABLED");
+  if (!enabled) return getRadarOffers({ ...deps, getFlag: () => false });
+  const cache = deps.getCache ? deps.getCache() : await getRadarOffersCacheAsync();
+  return getRadarOffers({ ...deps, getFlag: () => enabled, getCache: () => cache });
+}
+export async function getRadarIntelAsync(deps: GetRadarIntelDeps = {}): Promise<RadarIntelResult> {
+  const enabled = deps.getFlag
+    ? deps.getFlag("RADAR_ENABLED")
+    : await resolveRadarFlagAsync("RADAR_ENABLED");
+  if (!enabled) return getRadarIntel({ ...deps, getFlag: () => false });
+  const cache = deps.getCache ? deps.getCache() : await getRadarIntelCacheAsync();
+  return getRadarIntel({ ...deps, getFlag: () => enabled, getCache: () => cache });
+}
+
+async function resolveRadarFlagAsync(key: string): Promise<boolean> {
+  const { isFeatureFlagEnabledAsync } = await import("@/shared/utils/featureFlags");
+  return isFeatureFlagEnabledAsync(key);
+}

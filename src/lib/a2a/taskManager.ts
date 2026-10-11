@@ -1,3 +1,5 @@
+import { runPersistenceBackgroundWork } from "../db/persistenceRuntime";
+import { getAgentRuntimeAuthority, requiresDurableAgentPersistence } from "../db/agentRuntimeState";
 /**
  * A2A Task Manager — Full lifecycle management for A2A tasks.
  *
@@ -14,7 +16,15 @@
 import { randomUUID } from "crypto";
 
 import { emit } from "@/lib/events/eventBus";
-import { upsertA2ATask, appendA2ATaskEvent, purgeA2AHistory } from "@/lib/db/a2aTasks";
+import {
+  upsertA2ATask,
+  appendA2ATaskEvent,
+  purgeA2AHistory,
+  upsertA2ATaskAsync,
+  appendA2ATaskEventAsync,
+  purgeA2AHistoryAsync,
+  persistA2ATaskHistoryAsync,
+} from "@/lib/db/a2aTasks";
 import { logger } from "@omniroute/open-sse/utils/logger";
 
 const log = logger("A2A_TASKS");
@@ -36,15 +46,17 @@ function emitAgentTaskUpdated(source: "cloud-agent" | "a2a", taskId: string, sta
  * `src/lib/db/a2aTasks.ts` module functions; tests inject a fake so they never touch SQLite.
  */
 export interface A2APersistence {
-  upsert: typeof upsertA2ATask;
-  appendEvent: typeof appendA2ATaskEvent;
-  purge: typeof purgeA2AHistory;
+  upsert: (...args: Parameters<typeof upsertA2ATask>) => void | Promise<void>;
+  appendEvent: (...args: Parameters<typeof appendA2ATaskEvent>) => void | Promise<void>;
+  purge: (...args: Parameters<typeof purgeA2AHistory>) => number | Promise<number>;
+  persist?: typeof persistA2ATaskHistoryAsync;
 }
 
 const defaultPersistence: A2APersistence = {
-  upsert: upsertA2ATask,
-  appendEvent: appendA2ATaskEvent,
-  purge: purgeA2AHistory,
+  upsert: upsertA2ATaskAsync,
+  appendEvent: appendA2ATaskEventAsync,
+  purge: purgeA2AHistoryAsync,
+  persist: persistA2ATaskHistoryAsync,
 };
 
 /** Terminal task states — mirrors `A2ATaskManager`'s own terminal-state notion. */
@@ -130,6 +142,12 @@ const VALID_TRANSITIONS: Record<TaskState, TaskState[]> = {
 
 export class A2ATaskManager {
   private tasks = new Map<string, A2ATask>();
+  private persistenceQueue: Promise<void> | undefined;
+  private persistenceFailure: unknown;
+  private pendingPurge: Promise<void> | undefined;
+  private shuttingDown = false;
+  private readonly runtimeAuthority = getAgentRuntimeAuthority();
+  private readonly durablePersistence = requiresDurableAgentPersistence();
   private readonly ttlMs: number;
   private readonly persistence: A2APersistence;
   private cleanupInterval: ReturnType<typeof setInterval>;
@@ -139,7 +157,20 @@ export class A2ATaskManager {
   constructor(ttlMinutes: number = 5, persistence: A2APersistence = defaultPersistence) {
     this.ttlMs = ttlMinutes * 60 * 1000;
     this.persistence = persistence;
-    this.cleanupInterval = setInterval(() => this.cleanupExpired(), 60_000);
+    this.cleanupInterval = setInterval(() => {
+      if (this.shuttingDown) return;
+      if (!this.durablePersistence) {
+        this.cleanupExpired();
+        return;
+      }
+      void runPersistenceBackgroundWork(async () => {
+        if (getAgentRuntimeAuthority() !== this.runtimeAuthority) {
+          throw new Error("A2A maintenance authority does not match the selected runtime");
+        }
+        this.cleanupExpired();
+        await this.flushMaintenance();
+      }).catch((err: unknown) => log.warn("a2a maintenance tick failed", { err }));
+    }, 60_000);
     if (
       this.cleanupInterval &&
       typeof this.cleanupInterval === "object" &&
@@ -155,26 +186,48 @@ export class A2ATaskManager {
    * the source of truth for live tasks, and this call must never break the caller's write path.
    */
   private persist(task: A2ATask, eventType: string, message?: string): void {
-    try {
-      this.persistence.upsert({
-        id: task.id,
-        state: task.state,
-        skillId: task.skill,
-        inputJson: JSON.stringify(task.input),
-        outputJson: task.artifacts.length ? JSON.stringify(task.artifacts) : null,
-        apiKeyId: task.owner ?? null,
-        createdAt: task.createdAt,
-        updatedAt: task.updatedAt,
-        completedAt: TERMINAL.has(task.state) ? task.updatedAt : null,
-      });
-      this.persistence.appendEvent(
-        task.id,
-        eventType,
-        message ? JSON.stringify({ message }) : undefined
-      );
-    } catch (err) {
+    // Freeze the mutable live task now, before an asynchronous predecessor finishes.
+    const row = {
+      id: task.id,
+      state: task.state,
+      skillId: task.skill,
+      inputJson: JSON.stringify(task.input),
+      outputJson: task.artifacts.length ? JSON.stringify(task.artifacts) : null,
+      apiKeyId: task.owner ?? null,
+      createdAt: task.createdAt,
+      updatedAt: task.updatedAt,
+      completedAt: TERMINAL.has(task.state) ? task.updatedAt : null,
+    };
+    const dataJson = message ? JSON.stringify({ message }) : undefined;
+    const work = (): void | Promise<void> => {
+      if (this.persistence.persist) return this.persistence.persist(row, eventType, dataJson);
+      const upsert = this.persistence.upsert(row);
+      if (upsert && typeof upsert.then === "function")
+        return upsert.then(() => this.persistence.appendEvent(task.id, eventType, dataJson));
+      return this.persistence.appendEvent(task.id, eventType, dataJson);
+    };
+    const failed = (err: unknown) => {
+      if (this.durablePersistence) this.persistenceFailure ??= err;
       log.warn("a2a task history persist failed", { err, taskId: task.id, eventType });
+    };
+    try {
+      const result = this.persistenceQueue ? this.persistenceQueue.then(work) : work();
+      if (result && typeof result.then === "function") {
+        const pending = result.catch(failed);
+        this.persistenceQueue = pending;
+        void pending.finally(() => {
+          if (this.persistenceQueue === pending) this.persistenceQueue = undefined;
+        });
+      }
+    } catch (err) {
+      failed(err);
     }
+  }
+
+  /** Await queued history without changing the synchronous live-task state API. */
+  async flushPersistence(): Promise<void> {
+    await this.persistenceQueue;
+    if (this.persistenceFailure) throw this.persistenceFailure;
   }
 
   /**
@@ -185,7 +238,19 @@ export class A2ATaskManager {
     if (Date.now() - this.lastPurgeAt <= DAY_MS) return;
     this.lastPurgeAt = Date.now();
     try {
-      this.persistence.purge(historyRetentionDays());
+      const purge = this.persistence.purge(historyRetentionDays());
+      if (purge && typeof (purge as Promise<number>).then === "function") {
+        const pending = (purge as Promise<number>).then(
+          () => {},
+          (err: unknown) => {
+            log.warn("a2a task history purge failed", { err });
+          }
+        );
+        this.pendingPurge = pending;
+        void pending.finally(() => {
+          if (this.pendingPurge === pending) this.pendingPurge = undefined;
+        });
+      }
     } catch (err) {
       log.warn("a2a task history purge failed", { err });
     }
@@ -361,17 +426,61 @@ export class A2ATaskManager {
     this.maybePurge();
   }
 
+  private async flushMaintenance(): Promise<void> {
+    const results = await Promise.allSettled([this.flushPersistence(), this.pendingPurge]);
+    for (const result of results) if (result.status === "rejected") throw result.reason;
+  }
+
+  async shutdown(): Promise<void> {
+    this.shuttingDown = true;
+    try {
+      await this.flushMaintenance();
+    } finally {
+      this.destroy();
+    }
+  }
+
   destroy() {
+    this.shuttingDown = true;
     clearInterval(this.cleanupInterval);
   }
 }
 
 // Singleton
-const globalForA2A = globalThis as unknown as { _a2aTaskManager?: A2ATaskManager };
+const globalForA2A = globalThis as unknown as {
+  _a2aTaskManager?: A2ATaskManager;
+  _a2aTaskManagers?: WeakMap<object, A2ATaskManager>;
+};
 
 export function getTaskManager(): A2ATaskManager {
-  if (!globalForA2A._a2aTaskManager) {
-    globalForA2A._a2aTaskManager = new A2ATaskManager();
+  if (!requiresDurableAgentPersistence())
+    return (globalForA2A._a2aTaskManager ??= new A2ATaskManager());
+  const managers = (globalForA2A._a2aTaskManagers ??= new WeakMap());
+  const authority = getAgentRuntimeAuthority();
+  let manager = managers.get(authority);
+  if (!manager) {
+    manager = new A2ATaskManager();
+    managers.set(authority, manager);
   }
-  return globalForA2A._a2aTaskManager;
+  return manager;
+}
+
+/** Shutdown owner calls this inside its accepted persistence work scope. */
+export async function shutdownA2ATaskManagerRuntime(): Promise<void> {
+  if (!requiresDurableAgentPersistence()) {
+    const manager = globalForA2A._a2aTaskManager;
+    try {
+      await manager?.shutdown();
+    } finally {
+      globalForA2A._a2aTaskManager = undefined;
+    }
+    return;
+  }
+  const authority = getAgentRuntimeAuthority();
+  const manager = globalForA2A._a2aTaskManagers?.get(authority);
+  try {
+    await manager?.shutdown();
+  } finally {
+    globalForA2A._a2aTaskManagers?.delete(authority);
+  }
 }

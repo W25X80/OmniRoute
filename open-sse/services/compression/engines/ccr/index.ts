@@ -1,3 +1,4 @@
+import { runPersistenceBackgroundWork } from "../../../../../src/lib/db/persistenceRuntime.ts";
 /**
  * CCR (Content-Compression-Retrieve) engine (H4)
  *
@@ -37,11 +38,15 @@
  */
 import crypto from "node:crypto";
 import {
-  deleteAllCcrBlocks,
-  deleteCcrBlockRow,
+  ccrPersistenceAuthority,
+  isPostgresCcrStoreSelected,
+  deleteAllCcrBlocksAsync,
+  deleteCcrBlockRowAsync,
   loadCcrBlock,
-  persistCcrBlock,
+  loadCcrBlockAsync,
+  persistCcrBlockAsync,
   touchCcrBlock,
+  touchCcrBlockAsync,
 } from "../../../../../src/lib/db/ccrBlocks.ts";
 import { createCompressionStats } from "../../stats.ts";
 import { queryBlock, type CcrQuery } from "./ccrQuery.ts";
@@ -97,6 +102,7 @@ export interface CcrEntryMetadata {
 }
 
 type CcrEntry = Omit<CcrEntryMetadata, "retrievalCount"> & {
+  persistenceAuthority?: object;
   principalId: string;
   content: string;
 };
@@ -227,36 +233,47 @@ const MAX_PENDING_DURABLE_WRITES = 1_000;
 let pendingDurableWrites = 0;
 let droppedDurableWrites = 0;
 
-function deferDurable(operation: string, work: () => void, droppable = false): void {
-  // Backpressure. A burst faster than SQLite drains would otherwise queue without bound
-  // and hold every block's content live in the closure. Dropping a persist is safe: the
-  // block is still in the map, and the client re-stores it under the same hash on its
-  // next request. Deletes are never dropped, or a deleted block would come back.
+let durableWriteTail: Promise<void> = Promise.resolve();
+function deferDurable(
+  operation: string,
+  work: () => void | Promise<void>,
+  droppable = false
+): void {
   if (droppable && pendingDurableWrites >= MAX_PENDING_DURABLE_WRITES) {
-    droppedDurableWrites++;
+    droppedDurableWrites = Math.min(Number.MAX_SAFE_INTEGER, droppedDurableWrites + 1);
+    warnDurableError("queue", new Error(`Deferred cache writes dropped: ${droppedDurableWrites}`));
     return;
   }
   pendingDurableWrites++;
-  setImmediate(() => {
-    pendingDurableWrites--;
-    try {
-      work();
-    } catch (error) {
-      warnDurableError(operation, error);
-    }
-  });
+  const previous = durableWriteTail;
+  const execute = async () => {
+    await previous;
+    await work();
+  };
+  const operationPromise = isPostgresCcrStoreSelected()
+    ? runPersistenceBackgroundWork(execute)
+    : new Promise<void>((resolve, reject) => setImmediate(() => execute().then(resolve, reject)));
+  durableWriteTail = operationPromise
+    .catch((error) => warnDurableError(operation, error))
+    .finally(() => {
+      pendingDurableWrites--;
+    });
 }
 
 function persistEntry(entry: CcrEntry): void {
   if (!durableTierEnabled()) return;
   if (entry.bytes > MAX_DURABLE_BLOCK_BYTES) return;
   const snapshot = { ...entry };
-  deferDurable("persist", () => persistCcrBlock(snapshot), true);
+  deferDurable("persist", () => persistCcrBlockAsync(snapshot), true);
 }
 
-function forgetEntry(hash: string, principalId: string): void {
-  if (!durableTierEnabled()) return;
-  deferDurable("delete", () => deleteCcrBlockRow(principalId, hash));
+function forgetEntry(
+  hash: string,
+  principalId: string,
+  authority = ccrPersistenceAuthority()
+): void {
+  if (!durableTierEnabled() || authority !== ccrPersistenceAuthority()) return;
+  deferDurable("delete", () => deleteCcrBlockRowAsync(principalId, hash));
 }
 
 /**
@@ -265,6 +282,7 @@ function forgetEntry(hash: string, principalId: string): void {
  * is also what a missing database looks like.
  */
 function rehydrateEntry(hash: string, principalId: string, now: number): CcrEntry | null {
+  if (isPostgresCcrStoreSelected()) return null;
   if (!durableTierEnabled()) return null;
   let row: ReturnType<typeof loadCcrBlock>;
   try {
@@ -296,6 +314,8 @@ function rehydrateEntry(hash: string, principalId: string, now: number): CcrEntr
     enforceGlobalBudget(entry.principalId, entry.bytes)
   ) {
     const key = buildStoreKey(hash, principalId === ANON ? undefined : principalId);
+    if (ccrStore.has(key)) removeEntry(key);
+    entry.persistenceAuthority = ccrPersistenceAuthority();
     ccrStore.set(key, entry);
     ccrTotalBytes += entry.bytes;
     principalBytesMap.set(entry.principalId, principalBytes(entry.principalId) + entry.bytes);
@@ -360,7 +380,7 @@ function removeEntry(key: string, reason?: "expired" | "capacity"): boolean {
     counters.expiredEvictions++;
     // Expiry is the one eviction that means the block is finished. Capacity eviction is
     // not: that block stays on disk, which is the point of the durable tier (#9061).
-    forgetEntry(entry.hash, entry.principalId);
+    forgetEntry(entry.hash, entry.principalId, entry.persistenceAuthority);
   }
   if (reason === "capacity") counters.capacityEvictions++;
   return true;
@@ -374,7 +394,7 @@ function purgeExpired(now = Date.now()): void {
 
 function getActiveEntry(key: string, now = Date.now()): CcrEntry | null {
   const entry = ccrStore.get(key);
-  if (!entry) return null;
+  if (!entry || entry.persistenceAuthority !== ccrPersistenceAuthority()) return null;
   if (entry.expiresAt <= now) {
     removeEntry(key, "expired");
     return null;
@@ -470,13 +490,15 @@ export function tryStoreBlock(
   purgeExpired(now);
 
   const existing = ccrStore.get(key);
-  if (existing) {
+  if (existing && existing.persistenceAuthority === ccrPersistenceAuthority()) {
     existing.lastAccessedAt = now;
     existing.expiresAt = now + normalizeTtlSeconds(options.ttlSeconds) * 1000;
     ccrStore.delete(key);
     ccrStore.set(key, existing);
     return { stored: true, hash, metadata: publicMetadata(existing) };
   }
+
+  if (existing) removeEntry(key);
 
   const bytes = Buffer.byteLength(text, "utf8");
   if (bytes > MAX_CCR_BLOCK_BYTES) {
@@ -505,6 +527,7 @@ export function tryStoreBlock(
     lastAccessedAt: now,
     expiresAt: now + ttlSeconds * 1000,
   };
+  entry.persistenceAuthority = ccrPersistenceAuthority();
   ccrStore.set(key, entry);
   ccrTotalBytes += bytes;
   principalBytesMap.set(owner, principalBytes(owner) + bytes);
@@ -539,6 +562,7 @@ export function retrieveBlock(hash: string, principalId?: string, now = Date.now
   }
   entry.lastAccessedAt = now;
   ccrStore.delete(key);
+  entry.persistenceAuthority = ccrPersistenceAuthority();
   ccrStore.set(key, entry);
   return entry.content;
 }
@@ -601,12 +625,12 @@ export function resetCcrStore(): void {
   lifecycleByPrincipal.clear();
   // Through the same queue as persist/delete, so a reset cannot overtake a write it was
   // meant to clear.
-  deferDurable("reset", deleteAllCcrBlocks);
+  deferDurable("reset", deleteAllCcrBlocksAsync);
 }
 
 /** Resolves once the deferred durable writes queued so far have run. */
 export function flushCcrDurableWrites(): Promise<void> {
-  return new Promise((resolve) => setImmediate(resolve));
+  return durableWriteTail;
 }
 
 export function inspectCcrBlock(
@@ -1021,3 +1045,119 @@ export const ccrEngine: CompressionEngine = {
     return validateCcrConfig(config);
   },
 };
+
+async function rehydrateEntryAsync(
+  hash: string,
+  principalId: string,
+  now: number
+): Promise<CcrEntry | null> {
+  if (!durableTierEnabled()) return null;
+  let row: Awaited<ReturnType<typeof loadCcrBlockAsync>>;
+  try {
+    row = await loadCcrBlockAsync(principalId, hash, now);
+  } catch (error) {
+    warnDurableError("load", error);
+    return null;
+  }
+  if (!row) return null;
+
+  const entry: CcrEntry = {
+    hash: row.hash,
+    principalId: row.principalId,
+    content: row.content,
+    bytes: row.bytes,
+    chars: row.chars,
+    lines: row.lines,
+    contentType: row.contentType,
+    source: row.source as CcrEntrySource,
+    createdAt: row.createdAt,
+    lastAccessedAt: now,
+    expiresAt: row.expiresAt,
+  };
+
+  // Re-admit through the same budgets a fresh store would face. If the block no longer
+  // fits, it stays on disk and is served straight from the row instead of being cached.
+  if (
+    enforcePrincipalBudget(entry.principalId, entry.bytes) &&
+    enforceGlobalBudget(entry.principalId, entry.bytes)
+  ) {
+    const key = buildStoreKey(hash, principalId === ANON ? undefined : principalId);
+    if (ccrStore.has(key)) removeEntry(key);
+    entry.persistenceAuthority = ccrPersistenceAuthority();
+    ccrStore.set(key, entry);
+    ccrTotalBytes += entry.bytes;
+    principalBytesMap.set(entry.principalId, principalBytes(entry.principalId) + entry.bytes);
+  }
+
+  try {
+    await touchCcrBlockAsync(entry.principalId, hash, now);
+  } catch (error) {
+    warnDurableError("touch", error);
+  }
+  return entry;
+}
+
+export async function retrieveBlockAsync(
+  hash: string,
+  principalId?: string,
+  now = Date.now()
+): Promise<string | null> {
+  if (!isPostgresCcrStoreSelected()) return retrieveBlock(hash, principalId, now);
+  const key = buildStoreKey(hash, principalId);
+  let entry = getActiveEntry(key, now);
+  if (!entry) entry = await rehydrateEntryAsync(hash, principalId ?? ANON, now);
+  if (!entry) return null;
+  entry.lastAccessedAt = now;
+  if (ccrStore.get(key) === entry) {
+    ccrStore.delete(key);
+    ccrStore.set(key, entry);
+  }
+  return entry.content;
+}
+
+export async function inspectCcrBlockAsync(
+  hash: string,
+  principalId?: string,
+  now = Date.now()
+): Promise<CcrEntryMetadata | null> {
+  if (!isPostgresCcrStoreSelected()) return inspectCcrBlock(hash, principalId, now);
+  const entry =
+    getActiveEntry(buildStoreKey(hash, principalId), now) ??
+    (await rehydrateEntryAsync(hash, principalId ?? ANON, now));
+  return entry ? publicMetadata(entry) : null;
+}
+
+export async function handleCcrRetrieveAsync(
+  args: { hash: string } & CcrQuery,
+  callerId?: string
+): Promise<{ content: string } | { error: string }> {
+  if (!isPostgresCcrStoreSelected()) return handleCcrRetrieve(args, callerId);
+  if (!args.hash || typeof args.hash !== "string")
+    return { error: "hash parameter is required and must be a string" };
+  const block = await retrieveBlockAsync(args.hash, callerId);
+  if (block === null)
+    return {
+      error: `CCR block not found for hash=${args.hash}. The block may have expired or the hash is invalid.`,
+    };
+  recordRetrieval(args.hash, callerId);
+  return !args.mode || args.mode === "full" ? { content: block } : queryBlock(block, args);
+}
+
+export async function deleteCcrBlockAsync(
+  hash: string,
+  principalId?: string,
+  now = Date.now()
+): Promise<boolean> {
+  if (!isPostgresCcrStoreSelected()) return deleteCcrBlock(hash, principalId, now);
+  const principal = principalId ?? ANON;
+  const persisted = await loadCcrBlockAsync(principal, hash, now);
+  const entry = getActiveEntry(buildStoreKey(hash, principalId), now);
+  const removed = entry ? removeEntry(buildStoreKey(hash, principalId)) : false;
+  // Serialize an explicit delete after queued persists before acknowledging it.
+  const previous = durableWriteTail;
+  await runPersistenceBackgroundWork(async () => {
+    await previous;
+    await deleteCcrBlockRowAsync(principal, hash);
+  });
+  return removed || persisted !== null;
+}

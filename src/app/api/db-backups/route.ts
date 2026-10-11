@@ -1,3 +1,7 @@
+import {
+  requireSqliteMaintenance,
+  persistenceCapabilityResponse,
+} from "@/lib/db/persistenceCapabilities";
 import { NextRequest, NextResponse } from "next/server";
 import {
   listDbBackups,
@@ -47,12 +51,15 @@ export async function PUT(request: NextRequest) {
   }
 
   try {
+    requireSqliteMaintenance("sqlite-file-backup");
     const result = backupDbFile("manual");
     if (!result) {
       return NextResponse.json({ message: "No changes since last backup (throttled)" });
     }
     return NextResponse.json({ created: true, ...result });
   } catch (error) {
+    const unavailable = persistenceCapabilityResponse(error);
+    if (unavailable) return NextResponse.json(unavailable, { status: 501 });
     console.error("[API] Error creating manual backup:", error);
     return NextResponse.json({ error: sanitizeErrorMessage(error) }, { status: 500 });
   }
@@ -68,9 +75,12 @@ export async function GET(request: NextRequest) {
   }
 
   try {
+    requireSqliteMaintenance("sqlite-file-backup");
     const backups = await listDbBackups();
     return NextResponse.json({ backups });
   } catch (error) {
+    const unavailable = persistenceCapabilityResponse(error);
+    if (unavailable) return NextResponse.json(unavailable, { status: 501 });
     console.error("[API] Error listing DB backups:", error);
     return NextResponse.json({ error: sanitizeErrorMessage(error) }, { status: 500 });
   }
@@ -102,6 +112,7 @@ export async function POST(request: NextRequest) {
   }
 
   try {
+    requireSqliteMaintenance("sqlite-file-backup");
     const validation = validateBody(dbBackupRestoreSchema, rawBody);
     if (isValidationFailure(validation)) {
       return NextResponse.json({ error: validation.error }, { status: 400 });
@@ -111,6 +122,8 @@ export async function POST(request: NextRequest) {
     const result = await restoreDbBackup(backupId);
     return NextResponse.json(result);
   } catch (error) {
+    const unavailable = persistenceCapabilityResponse(error);
+    if (unavailable) return NextResponse.json(unavailable, { status: 501 });
     console.error("[API] Error restoring DB backup:", error);
     return NextResponse.json({ error: sanitizeErrorMessage(error) }, { status: 500 });
   }
@@ -141,6 +154,7 @@ export async function PATCH(request: NextRequest) {
   }
 
   try {
+    requireSqliteMaintenance("sqlite-file-backup");
     const validation = validateBody(dbBackupCleanupSchema, rawBody);
     if (isValidationFailure(validation)) {
       return NextResponse.json({ error: validation.error }, { status: 400 });
@@ -151,6 +165,8 @@ export async function PATCH(request: NextRequest) {
       ...persistDbBackupRetentionSettings(validation.data),
     });
   } catch (error) {
+    const unavailable = persistenceCapabilityResponse(error);
+    if (unavailable) return NextResponse.json(unavailable, { status: 501 });
     console.error("[API] Error saving DB backup retention settings:", error);
     return NextResponse.json({ error: sanitizeErrorMessage(error) }, { status: 500 });
   }
@@ -181,6 +197,7 @@ export async function DELETE(request: NextRequest) {
   }
 
   try {
+    requireSqliteMaintenance("sqlite-file-backup");
     const validation = validateBody(dbBackupCleanupSchema, rawBody);
     if (isValidationFailure(validation)) {
       return NextResponse.json({ error: validation.error }, { status: 400 });
@@ -195,6 +212,8 @@ export async function DELETE(request: NextRequest) {
       ...result,
     });
   } catch (error) {
+    const unavailable = persistenceCapabilityResponse(error);
+    if (unavailable) return NextResponse.json(unavailable, { status: 501 });
     console.error("[API] Error cleaning DB backups:", error);
     return NextResponse.json({ error: sanitizeErrorMessage(error) }, { status: 500 });
   }

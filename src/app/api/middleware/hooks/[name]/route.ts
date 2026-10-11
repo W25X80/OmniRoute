@@ -1,10 +1,10 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import {
-  getMiddlewareHook,
-  updateMiddlewareHook,
-  deleteMiddlewareHook,
-  getHookLogs,
+  getMiddlewareHookAsync,
+  updateMiddlewareHookAsync,
+  deleteMiddlewareHookAsync,
+  getHookLogsAsync,
 } from "@/lib/db/middleware";
 import { registerHook, unregisterHook, updateHook } from "@/lib/middleware/registry";
 import type { HookConfig } from "@/lib/middleware/types";
@@ -42,14 +42,14 @@ export async function GET(request: Request, { params }: RouteParams) {
     const includeLogs = url.searchParams.get("logs") === "true";
     const logLimit = parseInt(url.searchParams.get("logLimit") || "20", 10);
 
-    const hook = getMiddlewareHook(name);
+    const hook = await getMiddlewareHookAsync(name);
     if (!hook) {
       return NextResponse.json({ error: "Hook not found" }, { status: 404 });
     }
 
     const result: Record<string, unknown> = { hook };
     if (includeLogs) {
-      result.logs = getHookLogs(name, logLimit);
+      result.logs = await getHookLogsAsync(name, logLimit);
     }
 
     return NextResponse.json(result);
@@ -77,7 +77,7 @@ export async function PUT(request: Request, { params }: RouteParams) {
     }
     const body = validation.data;
 
-    const existing = getMiddlewareHook(name);
+    const existing = await getMiddlewareHookAsync(name);
     if (!existing) {
       return NextResponse.json({ error: "Hook not found" }, { status: 404 });
     }
@@ -91,7 +91,7 @@ export async function PUT(request: Request, { params }: RouteParams) {
     if (body.code !== undefined) updates.code = body.code;
 
     // Persist to DB
-    const saved = updateMiddlewareHook(name, updates);
+    const saved = await updateMiddlewareHookAsync(name, updates);
     if (!saved) {
       return NextResponse.json({ error: "Failed to update hook" }, { status: 500 });
     }
@@ -123,13 +123,13 @@ export async function DELETE(request: Request, { params }: RouteParams) {
   try {
     const { name } = await params;
 
-    const existing = getMiddlewareHook(name);
+    const existing = await getMiddlewareHookAsync(name);
     if (!existing) {
       return NextResponse.json({ error: "Hook not found" }, { status: 404 });
     }
 
     // Remove from DB
-    const deleted = deleteMiddlewareHook(name);
+    const deleted = await deleteMiddlewareHookAsync(name);
     if (!deleted) {
       return NextResponse.json({ error: "Failed to delete hook" }, { status: 500 });
     }

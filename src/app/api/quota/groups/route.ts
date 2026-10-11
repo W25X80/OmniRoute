@@ -15,7 +15,10 @@ import { NextResponse } from "next/server";
 import { buildErrorBody } from "@omniroute/open-sse/utils/error";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 import { GroupCreateSchema } from "@/shared/schemas/quota";
-import { listGroups, createGroup } from "@/lib/db/quotaGroups";
+import {
+  listGroupsAsync as listGroups,
+  createGroupAsync as createGroup,
+} from "@/lib/db/quotaGroups";
 
 export const dynamic = "force-dynamic";
 
@@ -24,7 +27,7 @@ export async function GET(request: Request): Promise<Response> {
   if (authError) return authError;
 
   try {
-    const groups = listGroups();
+    const groups = await listGroups();
     return NextResponse.json({ groups });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Failed to list groups";
@@ -43,7 +46,7 @@ export async function POST(request: Request): Promise<Response> {
       return NextResponse.json(buildErrorBody(400, parsed.error.message), { status: 400 });
     }
 
-    const group = createGroup(parsed.data.name);
+    const group = await createGroup(parsed.data.name);
     return NextResponse.json({ group }, { status: 201 });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Failed to create group";

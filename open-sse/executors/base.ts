@@ -208,6 +208,11 @@ export type ExecuteInput = {
   skipUpstreamRetry?: boolean;
   /** In-process capability; never accepted from an HTTP body or client header. */
   validationDispatch?: StrictValidationDispatch;
+  /** In-process owner for post-disconnect stream callbacks; never read from client payloads. */
+  runNativeStreamingPersistence?: <T>(
+    body: () => Promise<T>,
+    observation?: { readonly owner: object; readonly observe: () => void }
+  ) => Promise<T>;
   /** Request-scoped id for log attribution; absent off the chat path, never fabricated. */
   correlationId?: string | null;
   /** Delegated Context Editing (Claude only): when enabled, attach the

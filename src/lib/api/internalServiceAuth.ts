@@ -1,6 +1,8 @@
 import { readFileSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { timingSafeEqual } from "node:crypto";
 import { AUTHZ_HEADER_PEER_LOCALITY } from "@/server/authz/headers";
+import { parseDatabaseBackend } from "../db/backendSelection";
 
 export const INTERNAL_SERVICE_AUTH_HEADER = "x-omniroute-internal-service-token";
 
@@ -37,4 +39,39 @@ export function isTrustedLoopbackInternalServiceRequest(request?: Request | null
     request.headers.get(AUTHZ_HEADER_PEER_LOCALITY) === "loopback" &&
     isInternalServiceRequest(request)
   );
+}
+
+async function configuredTokenAsync(): Promise<string> {
+  const inlineToken = process.env.OMNIROUTE_INTERNAL_SERVICE_TOKEN?.trim();
+  if (inlineToken) return inlineToken;
+  const tokenFile = process.env.OMNIROUTE_INTERNAL_SERVICE_TOKEN_FILE?.trim();
+  if (!tokenFile) return "";
+  try {
+    return (await readFile(tokenFile, "utf8")).trim();
+  } catch {
+    return "";
+  }
+}
+
+export async function getInternalServiceAuthHeadersAsync(): Promise<Record<string, string>> {
+  if (parseDatabaseBackend() === "sqlite") return getInternalServiceAuthHeaders();
+  const token = await configuredTokenAsync();
+  return token ? { [INTERNAL_SERVICE_AUTH_HEADER]: token } : {};
+}
+
+export async function isInternalServiceRequestAsync(request: Request): Promise<boolean> {
+  if (parseDatabaseBackend() === "sqlite") return isInternalServiceRequest(request);
+  const expected = await configuredTokenAsync();
+  const provided = request.headers.get(INTERNAL_SERVICE_AUTH_HEADER)?.trim() || "";
+  if (!expected || !provided || expected.length !== provided.length) return false;
+  return timingSafeEqual(Buffer.from(provided, "utf8"), Buffer.from(expected, "utf8"));
+}
+
+export async function isTrustedLoopbackInternalServiceRequestAsync(
+  request?: Request | null
+): Promise<boolean> {
+  if (parseDatabaseBackend() === "sqlite") return isTrustedLoopbackInternalServiceRequest(request);
+  if (!request?.headers || request.headers.get(AUTHZ_HEADER_PEER_LOCALITY) !== "loopback")
+    return false;
+  return isInternalServiceRequestAsync(request);
 }

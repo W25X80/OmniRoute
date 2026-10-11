@@ -4,7 +4,7 @@
  */
 
 import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
-import { isFeatureFlagEnabled } from "@/shared/utils/featureFlags";
+import { isFeatureFlagEnabledAsync } from "@/shared/utils/featureFlags";
 import { RadarOffersFeedSchema, type RadarOffersFeed } from "./offersFeedSchema";
 import { compareVersions, type RadarSettingsSnapshot } from "./sync";
 import { verifyFeedBytes } from "./verify";
@@ -36,7 +36,7 @@ export interface RadarOffersCacheEntry {
 export interface OffersSyncDeps {
   fetch?: typeof globalThis.fetch;
   now?: () => Date;
-  getFlag?: (key: string) => boolean;
+  getFlag?: (key: string) => boolean | Promise<boolean>;
   getSettings?: () => RadarSettingsSnapshot;
   getCache?: () => RadarOffersCacheEntry | null;
   setCache?: (entry: RadarOffersCacheEntry) => void;
@@ -76,18 +76,18 @@ export async function syncRadarOffers(deps: OffersSyncDeps = {}): Promise<Offers
   const {
     fetch: fetchFn = globalThis.fetch,
     now = () => new Date(),
-    getFlag = isFeatureFlagEnabled,
+    getFlag = isFeatureFlagEnabledAsync,
     getSettings: getSettingsFn,
     getCache: getCacheFn,
     setCache: setCacheFn,
   } = deps;
 
   try {
-    if (!getFlag("RADAR_ENABLED")) return { status: "disabled" };
+    if (!(await getFlag("RADAR_ENABLED"))) return { status: "disabled" };
 
     const settings = getSettingsFn
       ? getSettingsFn()
-      : (await import("@/lib/db/radar")).getRadarSettings();
+      : await (await import("@/lib/db/radar")).getRadarSettingsAsync();
     if (!settings.optIn) return { status: "opt_out" };
     if (!settings.supporterKey) return { status: "no_key" };
 
@@ -123,7 +123,7 @@ export async function syncRadarOffers(deps: OffersSyncDeps = {}): Promise<Offers
 
     const existing = getCacheFn
       ? getCacheFn()
-      : (await import("@/lib/db/radar")).getRadarOffersCache();
+      : await (await import("@/lib/db/radar")).getRadarOffersCacheAsync();
     if (existing && compareVersions(feed.version, existing.version) <= 0) {
       return { status: "stale" };
     }
@@ -138,7 +138,7 @@ export async function syncRadarOffers(deps: OffersSyncDeps = {}): Promise<Offers
     if (setCacheFn) {
       setCacheFn(cacheEntry);
     } else {
-      (await import("@/lib/db/radar")).setRadarOffersCache(cacheEntry);
+      await (await import("@/lib/db/radar")).setRadarOffersCacheAsync(cacheEntry);
     }
 
     return { status: "updated", version: feed.version };

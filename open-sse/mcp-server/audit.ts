@@ -7,6 +7,7 @@
  */
 
 import { hashInput, summarizeOutput } from "./schemas/audit.ts";
+import { getPostgresAuditRepository } from "../../src/lib/db/audit.ts";
 import { runtimeRequire } from "../../src/lib/db/adapters/runtimeRequire.ts";
 import { isNativeSqliteLoadError } from "../../src/lib/db/core.ts";
 import { resolveMcpCallerApiKeyId } from "./mcpCallerIdentity.ts";
@@ -29,7 +30,10 @@ interface AuditDatabase {
 
 interface NodeSqliteDatabase {
   prepare: (sql: string) => {
-    run: (...params: unknown[]) => { changes: number | bigint; lastInsertRowid: number | bigint };
+    run: (...params: unknown[]) => {
+      changes: number | bigint;
+      lastInsertRowid: number | bigint;
+    };
     get: (...params: unknown[]) => unknown;
     all: (...params: unknown[]) => unknown[];
   };
@@ -163,7 +167,10 @@ function mapAuditEntry(row: AuditEntryRow): McpAuditEntry {
   };
 }
 
-function buildAuditFilterSql(filters: McpAuditQuery): { whereSql: string; params: unknown[] } {
+function buildAuditFilterSql(filters: McpAuditQuery): {
+  whereSql: string;
+  params: unknown[];
+} {
   const clauses: string[] = [];
   const params: unknown[] = [];
 
@@ -344,6 +351,7 @@ async function getDb(): Promise<AuditDatabase | null> {
 }
 
 export function closeAuditDb(): boolean {
+  if (getPostgresAuditRepository()) return false;
   const database = getCachedAuditDb();
   if (!database) return false;
 
@@ -389,6 +397,19 @@ export async function logToolCall(
   errorCode?: string
 ): Promise<void> {
   try {
+    const postgres = getPostgresAuditRepository();
+    if (postgres) {
+      await postgres.writeMcp({
+        toolName,
+        inputHash: await hashInput(input),
+        outputSummary: summarizeOutput(output),
+        durationMs,
+        apiKeyId: await resolveAuditCallerId(),
+        success,
+        errorCode,
+      });
+      return;
+    }
     const database = await getDb();
     if (!database) return; // Audit disabled if no DB
 
@@ -420,9 +441,14 @@ export async function logToolCall(
 /**
  * Get recent audit entries (for dashboard/monitoring).
  */
-export async function queryAuditEntries(
-  filters: McpAuditQuery = {}
-): Promise<{ entries: McpAuditEntry[]; total: number; limit: number; offset: number }> {
+export async function queryAuditEntries(filters: McpAuditQuery = {}): Promise<{
+  entries: McpAuditEntry[];
+  total: number;
+  limit: number;
+  offset: number;
+}> {
+  const postgres = getPostgresAuditRepository();
+  if (postgres) return postgres.queryMcp(filters);
   try {
     const database = await getDb();
     const limit = Math.max(1, Math.min(500, toPositiveInt(filters.limit, 50)));
@@ -480,6 +506,8 @@ export async function getAuditStats(): Promise<{
   avgDurationMs: number;
   topTools: Array<{ tool: string; count: number }>;
 }> {
+  const postgres = getPostgresAuditRepository();
+  if (postgres) return postgres.mcpStats();
   try {
     const database = await getDb();
     if (!database) return { totalCalls: 0, successRate: 0, avgDurationMs: 0, topTools: [] };

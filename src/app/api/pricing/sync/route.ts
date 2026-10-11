@@ -65,8 +65,8 @@ export async function DELETE(request: NextRequest) {
   if (authError) return authError;
 
   try {
-    const { clearSyncedPricing } = await import("@/lib/pricingSync");
-    clearSyncedPricing();
+    const { clearSyncedPricingAsync } = await import("@/lib/pricingSync");
+    await clearSyncedPricingAsync();
     return NextResponse.json({ success: true, message: "Synced pricing data cleared" });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

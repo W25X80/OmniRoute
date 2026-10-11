@@ -38,3 +38,27 @@ export function registerTokenHealthCheck(registry: JobRegistry): void {
     },
   });
 }
+
+export async function registerTokenHealthCheckAsync(registry: JobRegistry): Promise<void> {
+  const now = new Date().toISOString();
+  await registry.registerAsync({
+    id: "token_health_check",
+    type: "interval",
+    cron: null,
+    intervalMs: TOKEN_HEALTH_CHECK_INTERVAL_MS,
+    enabled: true,
+    envFlag: null,
+    config: {},
+    createdAt: now,
+    updatedAt: now,
+    handler: async () => {
+      if (isHealthCheckDisabled()) {
+        return { success: true, recordsAffected: 0 };
+      }
+      // Errors are not caught here: safeRun records a thrown error as a failure run
+      // with its message, the same as the budget reset job.
+      const swept = await sweep();
+      return { success: true, recordsAffected: swept };
+    },
+  });
+}

@@ -31,7 +31,7 @@ import {
   getCcAliasModelSetting,
   type CcAliasSetting,
 } from "@/lib/db/ccDiscoveryAliases";
-import { incrementCcAliasRequestCount } from "@/lib/db/ccDiscoveryMetrics";
+import { incrementCcAliasRequestCountAsync as incrementCcAliasRequestCount } from "@/lib/db/ccDiscoveryMetrics";
 
 // Virtual provider key combos are gated under (mirrors
 // src/app/api/v1/models/ccAliasPredicate.ts — combos have no real provider id,
@@ -210,7 +210,7 @@ export async function resolveCcDiscoveryAliasStrip(
   // production wrapper (not the injectable core) so the core's unit tests stay
   // DB-free.
   if (result.stripped) {
-    incrementCcAliasRequestCount(result.model);
+    void incrementCcAliasRequestCount(result.model).catch(() => {});
   }
 
   return result;

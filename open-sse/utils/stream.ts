@@ -1,3 +1,7 @@
+import {
+  createStreamTerminalPublication,
+  type StreamBeforeTerminal,
+} from "./streamTerminalPublication.ts";
 import { translateResponse, initState } from "../translator/index.ts";
 import { FORMATS } from "../translator/formats.ts";
 import { appendRequestLog } from "@/lib/usageDb";
@@ -202,7 +206,8 @@ type StreamOptions = {
   connectionId?: string | null;
   apiKeyInfo?: unknown;
   body?: unknown;
-  onComplete?: ((payload: StreamCompletePayload) => void) | null;
+  onComplete?: ((payload: StreamCompletePayload) => void | Promise<void>) | null;
+  onBeforeTerminal?: StreamBeforeTerminal | null;
   onFailure?: ((payload: StreamFailurePayload) => boolean | void | Promise<void>) | null;
   /**
    * Request-scoped `{namespace, name}` ledger for Responses namespace child
@@ -769,6 +774,7 @@ export function createSSEStream(options: StreamOptions = {}) {
     apiKeyInfo = null,
     body = null,
     onComplete = null,
+    onBeforeTerminal = null,
     onFailure = null,
     dropResponsesCommentary,
     customToolNames = new Set<string>(),
@@ -799,11 +805,22 @@ export function createSSEStream(options: StreamOptions = {}) {
   // stream, marked from the transform below. ttft() = first-forwarded-SSE-chunk
   // latency (NOT token-level) — see streamTiming.ts.
   const timing: StreamTiming = createStreamTiming();
-  /** Forward a pre-encoded SSE chunk, marking TTFT/ITL on the way. */
-  const forward = (controller: TransformStreamDefaultController<Uint8Array>, bytes: Uint8Array) => {
+  const terminalPublication = onBeforeTerminal
+    ? createStreamTerminalPublication(onBeforeTerminal)
+    : undefined;
+  const settleTerminalPublication = () => terminalPublication?.settle();
+  const publishChunk = (
+    controller: TransformStreamDefaultController<Uint8Array>,
+    bytes: Uint8Array
+  ) => {
     timing.markForward();
     timing.observeOutput(bytes);
     controller.enqueue(bytes);
+  };
+  /** Forward a pre-encoded SSE chunk, marking TTFT/ITL on the way. */
+  const forward = (controller: TransformStreamDefaultController<Uint8Array>, bytes: Uint8Array) => {
+    if (terminalPublication) terminalPublication.publish(() => publishChunk(controller, bytes));
+    else publishChunk(controller, bytes);
   };
 
   // Drop internal commentary-phase Responses output before forwarding (#6199).
@@ -1176,6 +1193,30 @@ export function createSSEStream(options: StreamOptions = {}) {
     controller.error(markPendingRequestCleared(emptyStreamError));
   };
 
+  const prepareTerminalPublication = (
+    kind: "response.completed" | "response.incomplete" | "done"
+  ) => {
+    if (!terminalPublication) return;
+    terminalPublication.prepare({
+      kind,
+      clientResponse: clientPayloadCollector.build(clientPayloadCollector.getSummary(), {
+        includeEvents: false,
+      }),
+    });
+  };
+
+  const prepareResponsesTerminalPublication = (payload: unknown): boolean => {
+    if (!terminalPublication) return false;
+    const record = asRecord(payload);
+    const kind =
+      record.event === "response.completed" || record.event === "response.incomplete"
+        ? record.event
+        : record.type;
+    if (kind !== "response.completed" && kind !== "response.incomplete") return false;
+    prepareTerminalPublication(kind);
+    return true;
+  };
+
   const emitTranslatedClientItem = (
     controller: TransformStreamDefaultController,
     item: Record<string, unknown>
@@ -1224,6 +1265,8 @@ export function createSSEStream(options: StreamOptions = {}) {
 
     const output = formatSSE(itemSanitized, sourceFormat);
     clientPayloadCollector.push(itemSanitized);
+    if (!prepareResponsesTerminalPublication(itemSanitized) && itemSanitized.done === true)
+      prepareTerminalPublication("done");
     reqLogger?.appendConvertedChunk?.(output);
     forwardedValuableChunk = true;
     forward(controller, encoder.encode(output));
@@ -1421,7 +1464,7 @@ export function createSSEStream(options: StreamOptions = {}) {
       },
 
       transform(chunk, controller) {
-        if (streamTimedOut) return;
+        if (streamTimedOut) return settleTerminalPublication();
         const now = Date.now();
         timing.markByte();
         lastChunkTime = now;
@@ -1467,7 +1510,7 @@ export function createSSEStream(options: StreamOptions = {}) {
                 })
               ) {
                 emitClaudeEmptyStreamErrorAndAbort(controller);
-                return;
+                return settleTerminalPublication();
               }
 
               passthroughEventPrefix.remember(line);
@@ -1910,7 +1953,7 @@ export function createSSEStream(options: StreamOptions = {}) {
                     )
                   ) {
                     emitClaudeEmptyStreamErrorAndAbort(controller);
-                    return;
+                    return settleTerminalPublication();
                   }
                   updateClaudeEmptyResponseLifecycle(claudeEmptyResponseLifecycle, parsed);
                   const restoredToolName = restoreClaudePassthroughToolUseName(
@@ -2273,6 +2316,7 @@ export function createSSEStream(options: StreamOptions = {}) {
 
             if (clientPayload) {
               clientPayloadCollector.push(clientPayload);
+              prepareResponsesTerminalPublication(clientPayload);
             }
 
             reqLogger?.appendConvertedChunk?.(output);
@@ -2283,7 +2327,7 @@ export function createSSEStream(options: StreamOptions = {}) {
                 failurePayload,
                 publicFailureMessage || "Upstream failure"
               );
-              return;
+              return settleTerminalPublication();
             }
             if (!trimmed) {
               clearPendingPassthroughEvent();
@@ -2303,7 +2347,7 @@ export function createSSEStream(options: StreamOptions = {}) {
 
           if (upstreamErrorForwarded) continue;
 
-          if (emitTranslatedFailureAndAbort(controller, parsed)) return;
+          if (emitTranslatedFailureAndAbort(controller, parsed)) return settleTerminalPublication();
 
           // OpenAI-format upstreams may stream `delta.content` as typed part arrays
           // (Mistral thinking chunks); translators expect a string.
@@ -2521,6 +2565,8 @@ export function createSSEStream(options: StreamOptions = {}) {
             }
           }
         }
+
+        return settleTerminalPublication();
       },
 
       async flush(controller) {
@@ -2529,11 +2575,19 @@ export function createSSEStream(options: StreamOptions = {}) {
           clearIdleTimer();
         }
         if (streamTimedOut) {
-          return;
+          {
+            const publication = settleTerminalPublication();
+            if (publication) await publication;
+            return;
+          }
         }
         if (upstreamErrorForwarded) {
           clearPendingRequestFromStream();
-          return;
+          {
+            const publication = settleTerminalPublication();
+            if (publication) await publication;
+            return;
+          }
         }
         try {
           const remaining = decoder.decode();
@@ -2569,6 +2623,11 @@ export function createSSEStream(options: StreamOptions = {}) {
               },
               pushProviderPayload: (payload: unknown) => providerPayloadCollector.push(payload),
               pushClientPayload: (payload: unknown) => clientPayloadCollector.push(payload),
+              beforeClientPayload: terminalPublication
+                ? (payload: unknown) => {
+                    prepareResponsesTerminalPublication(payload);
+                  }
+                : undefined,
               sanitizeUsagePayload: (payload: unknown) =>
                 sanitizeUsagePayloadForRequest(payload as UsageLike, body, clientResponseFormat),
               setPassthroughResponsesId: (value: string) => {
@@ -2618,7 +2677,11 @@ export function createSSEStream(options: StreamOptions = {}) {
 
             for (const line of normalizedTailLines) {
               if (processBufferedPassthroughLine(line, tailProcessorContext)) {
-                return;
+                {
+                  const publication = settleTerminalPublication();
+                  if (publication) await publication;
+                  return;
+                }
               }
             }
             const bufferedLine = buffer.trim();
@@ -2648,7 +2711,11 @@ export function createSSEStream(options: StreamOptions = {}) {
                   )
                 ) {
                   emitClaudeEmptyStreamErrorAndAbort(controller);
-                  return;
+                  {
+                    const publication = settleTerminalPublication();
+                    if (publication) await publication;
+                    return;
+                  }
                 }
                 if (isClaudeEventPayload(bufferedPayload)) {
                   updateClaudeEmptyResponseLifecycle(claudeEmptyResponseLifecycle, bufferedPayload);
@@ -2685,6 +2752,7 @@ export function createSSEStream(options: StreamOptions = {}) {
               if (output && !output.endsWith("\n\n")) {
                 output = output.endsWith("\n") ? `${output}\n` : `${output}\n\n`;
               }
+              prepareResponsesTerminalPublication(bufferedPayload);
               reqLogger?.appendConvertedChunk?.(output);
               forward(controller, encoder.encode(output));
               if (bufferedProjectedFailure) {
@@ -2693,13 +2761,21 @@ export function createSSEStream(options: StreamOptions = {}) {
                   bufferedProjectedFailure.internalFailure,
                   bufferedProjectedFailure.publicMessage
                 );
-                return;
+                {
+                  const publication = settleTerminalPublication();
+                  if (publication) await publication;
+                  return;
+                }
               }
             }
 
             if (shouldAbortClaudeStream()) {
               emitClaudeEmptyStreamErrorAndAbort(controller);
-              return;
+              {
+                const publication = settleTerminalPublication();
+                if (publication) await publication;
+                return;
+              }
             } else if (shouldInjectClaudeMissingFinalizersOnFlush(claudeEmptyResponseLifecycle)) {
               emitSyntheticClaudeEmptyResponse(controller, {
                 includeContentBlock: false,
@@ -2813,11 +2889,14 @@ export function createSSEStream(options: StreamOptions = {}) {
               doneSent = true;
               if (shouldEmitDoneTerminator) {
                 clientPayloadCollector.push({ done: true });
+                prepareTerminalPublication("done");
                 const doneOutput = "data: [DONE]\n\n";
                 reqLogger?.appendConvertedChunk?.(doneOutput);
                 forward(controller, encoder.encode(doneOutput));
               }
             }
+            const publication = settleTerminalPublication();
+            if (publication) await publication;
             // Notify caller for call log persistence (include full response body with accumulated content)
             if (onComplete) {
               try {
@@ -2885,7 +2964,7 @@ export function createSSEStream(options: StreamOptions = {}) {
                   },
                   _streamed: true,
                 };
-                onComplete({
+                await onComplete({
                   status: 200,
                   usage,
                   responseBody,
@@ -2934,14 +3013,22 @@ export function createSSEStream(options: StreamOptions = {}) {
             } else {
               clearPendingRequestFromStream();
             }
-            return;
+            {
+              const publication = settleTerminalPublication();
+              if (publication) await publication;
+              return;
+            }
           }
 
           // Translate mode: process remaining buffer
           if (buffer.trim()) {
             const parsed = parseSSELine(buffer.trim());
             if (parsed && !parsed.done) {
-              if (emitTranslatedFailureAndAbort(controller, parsed)) return;
+              if (emitTranslatedFailureAndAbort(controller, parsed)) {
+                const publication = settleTerminalPublication();
+                if (publication) await publication;
+                return;
+              }
               if (targetFormat === FORMATS.OPENAI) normalizeArrayContentChunk(parsed);
               providerPayloadCollector.push(parsed);
               // Extract usage from remaining buffer — if the usage-bearing event
@@ -3010,7 +3097,11 @@ export function createSSEStream(options: StreamOptions = {}) {
             const errorBody = buildErrorBody(err.status, err.message);
             const publicErrorMessage = errorBody.error.message;
             abortStreamFailure(controller, err, publicErrorMessage, { notifyComplete: true });
-            return;
+            {
+              const publication = settleTerminalPublication();
+              if (publication) await publication;
+              return;
+            }
           }
 
           // #9268: reject a translate-mode stream that forwarded no valuable chunk
@@ -3031,7 +3122,11 @@ export function createSSEStream(options: StreamOptions = {}) {
             })
           ) {
             controller.error(markPendingRequestCleared(buildEmptyChoicesStreamError()));
-            return;
+            {
+              const publication = settleTerminalPublication();
+              if (publication) await publication;
+              return;
+            }
           }
 
           // Flush remaining events (only once at stream end)
@@ -3058,13 +3153,21 @@ export function createSSEStream(options: StreamOptions = {}) {
               notifyComplete: true,
               preserveQueuedChunks: true,
             });
-            return;
+            {
+              const publication = settleTerminalPublication();
+              if (publication) await publication;
+              return;
+            }
           }
 
           if (sourceFormat === FORMATS.CLAUDE) {
             if (shouldAbortClaudeStream()) {
               emitClaudeEmptyStreamErrorAndAbort(controller);
-              return;
+              {
+                const publication = settleTerminalPublication();
+                if (publication) await publication;
+                return;
+              }
             } else if (shouldInjectClaudeMissingFinalizersOnFlush(claudeEmptyResponseLifecycle)) {
               emitSyntheticClaudeEmptyResponse(controller, {
                 includeContentBlock: false,
@@ -3108,6 +3211,7 @@ export function createSSEStream(options: StreamOptions = {}) {
             doneSent = true;
             if (shouldEmitDoneTerminator) {
               clientPayloadCollector.push({ done: true });
+              prepareTerminalPublication("done");
               const doneOutput = "data: [DONE]\n\n";
               reqLogger?.appendConvertedChunk?.(doneOutput);
               forward(controller, encoder.encode(doneOutput));
@@ -3125,6 +3229,8 @@ export function createSSEStream(options: StreamOptions = {}) {
               status: "200 OK",
             }).catch(() => {});
           }
+          const publication = settleTerminalPublication();
+          if (publication) await publication;
           // Notify caller for call log persistence (include full response body with accumulated content)
           if (onComplete) {
             try {
@@ -3186,7 +3292,7 @@ export function createSSEStream(options: StreamOptions = {}) {
                 },
                 _streamed: true,
               };
-              onComplete({
+              await onComplete({
                 status: 200,
                 usage: state?.usage,
                 responseBody,
@@ -3261,7 +3367,7 @@ export function createSSETransformStreamWithLogger(
   model: string | null = null,
   connectionId: string | null = null,
   body: unknown = null,
-  onComplete: ((payload: StreamCompletePayload) => void) | null = null,
+  onComplete: ((payload: StreamCompletePayload) => void | Promise<void>) | null = null,
   apiKeyInfo: unknown = null,
   onFailure: ((payload: StreamFailurePayload) => boolean | void | Promise<void>) | null = null,
   copilotCompatibleReasoning = false,
@@ -3269,7 +3375,8 @@ export function createSSETransformStreamWithLogger(
   requestedThinking: boolean | undefined = undefined,
   customToolNames: ReadonlySet<string> = new Set(),
   requestToolIdentityMap: Map<string, { namespace: string; name: string }> | null = null,
-  streamBufferBytes: number = DEFAULT_STREAM_BUFFER_BYTES
+  streamBufferBytes: number = DEFAULT_STREAM_BUFFER_BYTES,
+  onBeforeTerminal: StreamBeforeTerminal | null = null
 ) {
   return createSSEStream({
     mode: STREAM_MODE.TRANSLATE,
@@ -3290,6 +3397,7 @@ export function createSSETransformStreamWithLogger(
     customToolNames,
     requestToolIdentityMap,
     streamBufferBytes,
+    onBeforeTerminal,
   });
 }
 
@@ -3300,11 +3408,12 @@ export function createPassthroughStreamWithLogger(
   model: string | null = null,
   connectionId: string | null = null,
   body: unknown = null,
-  onComplete: ((payload: StreamCompletePayload) => void) | null = null,
+  onComplete: ((payload: StreamCompletePayload) => void | Promise<void>) | null = null,
   apiKeyInfo: unknown = null,
   onFailure: ((payload: StreamFailurePayload) => boolean | void | Promise<void>) | null = null,
   clientResponseFormat: string | null = null,
-  requestToolIdentityMap: Map<string, { namespace: string; name: string }> | null = null
+  requestToolIdentityMap: Map<string, { namespace: string; name: string }> | null = null,
+  onBeforeTerminal: StreamBeforeTerminal | null = null
 ) {
   return createSSEStream({
     mode: STREAM_MODE.PASSTHROUGH,
@@ -3319,6 +3428,7 @@ export function createPassthroughStreamWithLogger(
     onFailure,
     clientResponseFormat,
     requestToolIdentityMap,
+    onBeforeTerminal,
   });
 }
 

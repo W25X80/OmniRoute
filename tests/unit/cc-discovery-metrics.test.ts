@@ -17,7 +17,12 @@ test.beforeEach(() => {
 test.after(() => {
   core.resetDbInstance();
   try {
-    fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    fs.rmSync(TEST_DATA_DIR, {
+      recursive: true,
+      force: true,
+      maxRetries: 5,
+      retryDelay: 100,
+    });
   } catch {
     // best-effort cleanup
   }
@@ -26,7 +31,11 @@ test.after(() => {
 test("getCcDiscoveryMetrics starts at zero", async () => {
   const { getCcDiscoveryMetrics } = await import("../../src/lib/db/ccDiscoveryMetrics.ts");
   const metrics = getCcDiscoveryMetrics();
-  assert.deepEqual(metrics, { aliasRequests: 0, discoveryHits: 0, byModel: {} });
+  assert.deepEqual(metrics, {
+    aliasRequests: 0,
+    discoveryHits: 0,
+    byModel: {},
+  });
 });
 
 test("incrementCcAliasRequestCount bumps total and per-model counters", async () => {
@@ -72,4 +81,33 @@ test("getCcDiscoveryMetrics aggregates both counters together and repeated incre
   assert.equal(after.aliasRequests - before.aliasRequests, 3);
   assert.equal(after.discoveryHits - before.discoveryHits, 1);
   assert.equal(after.byModel["combo/my-combo"], 3);
+});
+
+test("async discovery hits preserve immediate SQLite writes without allocating native runtime", async () => {
+  const { incrementCcDiscoveryHitCountAsync, getCcDiscoveryMetrics } =
+    await import("../../src/lib/db/ccDiscoveryMetrics.ts");
+  const originalRuntime = globalThis.__omniroutePersistenceRuntime;
+  assert.equal(originalRuntime, undefined);
+  const before = getCcDiscoveryMetrics().discoveryHits;
+  const pending = incrementCcDiscoveryHitCountAsync();
+  assert.ok(pending instanceof Promise);
+  assert.equal(getCcDiscoveryMetrics().discoveryHits, before + 1);
+  assert.equal(globalThis.__omniroutePersistenceRuntime, undefined);
+  await pending;
+});
+
+test("sync and async SQLite hit writes keep corrupt-value recovery and sync void signature", async () => {
+  const { incrementCcDiscoveryHitCount, incrementCcDiscoveryHitCountAsync, getCcDiscoveryMetrics } =
+    await import("../../src/lib/db/ccDiscoveryMetrics.ts");
+  core
+    .getDbInstance()
+    .prepare(
+      "INSERT INTO key_value(namespace,key,value) VALUES('ccDiscoveryMetrics','discovery:hits','invalid') " +
+        "ON CONFLICT(namespace,key) DO UPDATE SET value=excluded.value"
+    )
+    .run();
+  assert.equal(incrementCcDiscoveryHitCount(), undefined);
+  assert.equal(getCcDiscoveryMetrics().discoveryHits, 1);
+  await incrementCcDiscoveryHitCountAsync();
+  assert.equal(getCcDiscoveryMetrics().discoveryHits, 2);
 });

@@ -15,10 +15,10 @@ export async function GET(_request: Request, { params }: { params: Promise<{ id:
   try {
     const { id } = await params;
     const registry = getJobRegistry();
-    if (!registry.listJobs().some((j) => j.id === id)) {
+    if (!(await registry.listJobsAsync()).some((j) => j.id === id)) {
       return NextResponse.json(buildErrorBody(404, "Job not found"), { status: 404 });
     }
-    return NextResponse.json({ data: registry.getRuns(id) });
+    return NextResponse.json({ data: await registry.getRunsAsync(id) });
   } catch (err) {
     console.error("[API] GET /api/jobs/:id/runs error:", err);
     return NextResponse.json(buildErrorBody(500, "Failed to load runs"), { status: 500 });

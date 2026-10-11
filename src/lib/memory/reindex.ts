@@ -4,9 +4,10 @@
  */
 
 import {
-  getMemoryReindexQueue,
+  getMemoryReindexQueueAsync,
   countMemoryReindexPending,
-  markMemoryNeedsReindex,
+  countMemoryReindexPendingAsync,
+  markMemoryNeedsReindexAsync,
 } from "@/lib/db/memoryVec";
 import { resolveEmbeddingSource, embed, withMeasuredDimensions } from "./embedding";
 import type { EmbeddingResolution } from "./embedding/types";
@@ -96,8 +97,8 @@ async function reindexOneItem(
       return "error";
     }
 
-    await vec.upsertVector(item.id, embeddingResult.vector);
-    markMemoryNeedsReindex(item.id, false);
+    await vec.upsertVector(item.id, embeddingResult.vector, item.content);
+    await markMemoryNeedsReindexAsync(item.id, false);
     return "processed";
   } catch (err: unknown) {
     log.warn("memory.reindex.item.fail", {
@@ -116,7 +117,7 @@ async function reindexOneItem(
  * @returns { processed: number; errors: number }
  */
 export async function runReindexBatch(limit = 100): Promise<{ processed: number; errors: number }> {
-  const queue = getMemoryReindexQueue(limit);
+  const queue = await getMemoryReindexQueueAsync(limit);
 
   if (queue.length === 0) {
     return { processed: 0, errors: 0 };
@@ -166,4 +167,8 @@ export async function runReindexBatch(limit = 100): Promise<{ processed: number;
  */
 export function getReindexPending(): number {
   return countMemoryReindexPending();
+}
+
+export async function getReindexPendingAsync(): Promise<number> {
+  return countMemoryReindexPendingAsync();
 }

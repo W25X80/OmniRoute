@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import {
-  getDatabaseSettings,
-  updateDatabaseSettings,
+  getDatabaseSettingsAsync,
+  updateDatabaseSettingsAsync,
   type UserDatabaseSettings,
 } from "@/lib/db/databaseSettings";
 import { getSettings, updateSettings } from "@/lib/db/settings";
@@ -91,7 +91,7 @@ export async function GET(request: NextRequest) {
   }
 
   try {
-    const dbSettings = getDatabaseSettings();
+    const dbSettings = await getDatabaseSettingsAsync();
     const cache = dbSettings.cache ?? {};
     // idempotencyWindowMs is not part of the databaseSettings "cache" section —
     // it lives in the flat general settings (src/lib/db/settings.ts), which is
@@ -202,11 +202,11 @@ export async function PUT(request: NextRequest) {
       updates.modelCatalogCacheTtlMs = body.modelCatalogCacheTtlMs;
     }
 
-    // updateDatabaseSettings() calls invalidateDbCache("settings") internally,
+    // await updateDatabaseSettingsAsync() calls invalidateDbCache("settings") internally,
     // which bumps the model-catalog cache version so in-flight responses pick
     // up the fresh TTL — no separate version bump needed here.
     if (Object.keys(updates).length > 0) {
-      updateDatabaseSettings({ cache: updates });
+      await updateDatabaseSettingsAsync({ cache: updates });
       // Drop the in-memory semantic cache manager so the next request rebuilds it
       // from the freshly-persisted databaseSettings (dual-layer cache work).
       resetSemanticCacheManager();

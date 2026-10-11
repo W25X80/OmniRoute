@@ -23,6 +23,9 @@
 import { registerQuotaFetcher, registerQuotaWindows, type QuotaInfo } from "./quotaPreflight.ts";
 import { registerMonitorFetcher } from "./quotaMonitor.ts";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { readFile, writeFile } from "node:fs/promises";
+import { parseDatabaseBackend } from "@/lib/db/backendSelection";
+import { withNativeThreadCacheFile } from "../utils/nativeThreadCacheFile.ts";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -152,6 +155,40 @@ function readAuthFile(): Record<string, GrokAuthEntry> | null {
   }
 }
 
+async function readAuthFileAsync(): Promise<Record<string, GrokAuthEntry> | null> {
+  const path = getAuthPath();
+  return withNativeThreadCacheFile(path, async () => {
+    try {
+      const raw = JSON.parse(await readFile(path, "utf8")) as Record<string, GrokAuthEntry>;
+      return raw && typeof raw === "object" ? raw : null;
+    } catch {
+      return null;
+    }
+  });
+}
+
+async function writeRefreshedTokensAsync(
+  entryId: string,
+  update: { access: string; refresh?: string; expiresAtIso: string }
+): Promise<void> {
+  const path = getAuthPath();
+  await withNativeThreadCacheFile(path, async () => {
+    try {
+      const file = JSON.parse(await readFile(path, "utf8")) as Record<string, GrokAuthEntry>;
+      if (!file || typeof file !== "object" || !file[entryId]) return;
+      file[entryId] = {
+        ...file[entryId],
+        key: update.access,
+        ...(update.refresh ? { refresh_token: update.refresh } : {}),
+        expires_at: update.expiresAtIso,
+      };
+      await writeFile(path, `${JSON.stringify(file, null, 2)}\n`, { encoding: "utf8" });
+    } catch {
+      // Refresh remains valid in memory when the local CLI file cannot be updated.
+    }
+  });
+}
+
 function pickAuthEntry(file: Record<string, GrokAuthEntry>): ResolvedAuth | null {
   const now = Date.now();
   const scored = Object.entries(file)
@@ -263,11 +300,10 @@ async function refreshAccessToken(auth: ResolvedAuth, signal: AbortSignal): Prom
   const refresh = String(payload.refresh_token || auth.refreshToken).trim();
 
   try {
-    writeRefreshedTokens(auth.entryId, {
-      access,
-      refresh,
-      expiresAtIso,
-    });
+    const update = { access, refresh, expiresAtIso };
+    if (parseDatabaseBackend() === "postgres")
+      await writeRefreshedTokensAsync(auth.entryId, update);
+    else writeRefreshedTokens(auth.entryId, update);
   } catch {
     // Non-fatal
   }
@@ -287,7 +323,7 @@ function needsRefresh(auth: ResolvedAuth): boolean {
 }
 
 async function resolveAuth(signal: AbortSignal): Promise<ResolvedAuth> {
-  const file = readAuthFile();
+  const file = parseDatabaseBackend() === "postgres" ? await readAuthFileAsync() : readAuthFile();
   if (!file) throw new Error("no grok auth — run `grok login`");
   const auth = pickAuthEntry(file);
   if (!auth) throw new Error("no usable Grok credentials — run `grok login`");

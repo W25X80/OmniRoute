@@ -1,6 +1,10 @@
+import type { CompressionCombo } from "@/lib/db/compressionCombos";
 import { NextResponse } from "next/server";
 import { z } from "zod";
-import { createCompressionCombo, listCompressionCombos } from "@/lib/db/compressionCombos";
+import {
+  createCompressionComboAsync,
+  listCompressionCombosAsync,
+} from "@/lib/db/compressionCombos";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
 import {
@@ -26,7 +30,7 @@ export const compressionComboCreateSchema = z
 export async function GET(request: Request) {
   const authError = await requireManagementAuth(request);
   if (authError) return authError;
-  return NextResponse.json({ combos: listCompressionCombos() });
+  return NextResponse.json({ combos: await listCompressionCombosAsync() });
 }
 
 export async function POST(request: Request) {
@@ -45,6 +49,6 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: validation.error }, { status: 400 });
   }
 
-  const combo = createCompressionCombo(validation.data);
+  const combo = await createCompressionComboAsync(validation.data as Partial<CompressionCombo>);
   return NextResponse.json(combo, { status: 201 });
 }

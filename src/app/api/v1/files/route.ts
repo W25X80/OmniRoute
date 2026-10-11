@@ -1,5 +1,18 @@
+import { parseDatabaseBackend } from "@/lib/db/backendSelection";
+import { getCachedSettings } from "@/lib/db/readCache";
+import {
+  getBodySizeLimit,
+  readFormDataWithLimit,
+  RequestBodyTooLargeError,
+  createBodyTooLargeResponse,
+} from "@/shared/middleware/bodySizeGuard";
 import { CORS_HEADERS, handleCorsOptions } from "@/shared/utils/cors";
-import { createFile, listFiles, formatFileResponse, countFiles } from "@/lib/db/files";
+import {
+  createFileAsync,
+  listFilesAsync,
+  formatFileResponse,
+  countFilesAsync,
+} from "@/lib/db/files";
 import { NextResponse } from "next/server";
 import {
   getApiKeyRequestScope,
@@ -104,7 +117,16 @@ export async function POST(request: Request) {
   const apiKeyId = resolveEffectiveApiKeyId(scope, policy.apiKeyInfo);
 
   try {
-    const formData = await request.formData();
+    let formData: FormData;
+    if (parseDatabaseBackend() === "postgres") {
+      let settings: Record<string, unknown> | undefined;
+      try {
+        settings = await getCachedSettings();
+      } catch {
+        console.warn("[FILES] Request body limit settings unavailable; using defaults.");
+      }
+      formData = await readFormDataWithLimit(request, getBodySizeLimit("/api/v1/files", settings));
+    } else formData = await request.formData();
     const file = formData.get("file") as File;
     const purpose = formData.get("purpose") as string;
     const expiresAfterAnchor = formData.get("expires_after[anchor]") as string;
@@ -143,7 +165,7 @@ export async function POST(request: Request) {
       }
     }
 
-    const record = createFile({
+    const record = await createFileAsync({
       bytes,
       filename,
       purpose,
@@ -155,6 +177,11 @@ export async function POST(request: Request) {
 
     return NextResponse.json(formatFileResponse(record), { headers: CORS_HEADERS });
   } catch (error) {
+    if (error instanceof RequestBodyTooLargeError) {
+      const response = createBodyTooLargeResponse(error.limit);
+      for (const [name, value] of Object.entries(CORS_HEADERS)) response.headers.set(name, value);
+      return response;
+    }
     console.error("[FILES] Upload failed:", error);
     return NextResponse.json(
       { error: { message: "Upload failed", type: "server_error" } },
@@ -206,7 +233,7 @@ export async function GET(request: Request) {
   const { limit, after, order, purpose } = parsed;
 
   // We fetch limit + 1 to check if there are more items
-  const files = listFiles({
+  const files = await listFilesAsync({
     apiKeyId: ownerFilter,
     purpose,
     limit: limit + 1,
@@ -216,7 +243,7 @@ export async function GET(request: Request) {
 
   const hasMore = files.length > limit;
   const data = files.slice(0, limit);
-  const totalCount = countFiles({ apiKeyId: ownerFilter, purpose });
+  const totalCount = await countFilesAsync({ apiKeyId: ownerFilter, purpose });
 
   return NextResponse.json(
     {

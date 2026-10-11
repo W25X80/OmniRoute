@@ -1,3 +1,9 @@
+import { getSelectedPostgresDatabase } from "../controlPlaneContext";
+import {
+  catalogNamespaceRows,
+  catalogValue,
+  requirePostgresCatalogSnapshot,
+} from "../postgres/catalogSnapshot";
 /**
  * Explicit Custom Models "Vision capable" lookup.
  *
@@ -121,6 +127,37 @@ export function getCustomModelVisionOverride(
   bulk?: CustomModelVisionOverrideMap | null,
   options: CustomModelVisionOverrideReadOptions = {}
 ): boolean | null {
+  if (!options.getDatabase && getSelectedPostgresDatabase()) {
+    if (bulk) {
+      const canScan = isPathShaped(modelId) || isPathShaped(options.lookupKey);
+      if (!canScan && providerId) return bulk.get(providerId)?.get(modelId) ?? null;
+      return pickMatchingOverride(
+        collectOverrideHits(bulk),
+        providerId,
+        modelId,
+        options.lookupKey
+      );
+    }
+    requirePostgresCatalogSnapshot();
+    const canScan = isPathShaped(modelId) || isPathShaped(options.lookupKey);
+    if (!providerId && !canScan) return null;
+    if (providerId) {
+      const exact = readVisionOverrideFromModels(
+        catalogValue("customModels", providerId)?.value ?? null,
+        modelId
+      );
+      if (exact !== null) return exact;
+    }
+    return canScan
+      ? pickMatchingOverride(
+          collectOverrideHits(listCustomModelVisionOverrides()),
+          providerId,
+          modelId,
+          options.lookupKey
+        )
+      : null;
+  }
+
   try {
     const lookupKey = options.lookupKey;
     const canScan = isPathShaped(modelId) || isPathShaped(lookupKey);
@@ -156,6 +193,32 @@ export function getCustomModelVisionOverride(
 export function listCustomModelVisionOverrides(
   options: CustomModelVisionOverrideReadOptions = {}
 ): CustomModelVisionOverrideMap {
+  if (!options.getDatabase && getSelectedPostgresDatabase()) {
+    requirePostgresCatalogSnapshot();
+    const result = new Map<string, Map<string, boolean>>();
+    for (const row of catalogNamespaceRows("customModels")) {
+      try {
+        const parsed: unknown = JSON.parse(row.value);
+        if (!Array.isArray(parsed)) continue;
+        const models = new Map<string, boolean>();
+        for (const value of parsed) {
+          if (
+            value &&
+            typeof value === "object" &&
+            !Array.isArray(value) &&
+            typeof value.id === "string" &&
+            typeof value.supportsVision === "boolean"
+          )
+            models.set(value.id, value.supportsVision);
+        }
+        if (models.size) result.set(row.key, models);
+      } catch {
+        /* Malformed rows do not participate. */
+      }
+    }
+    return result;
+  }
+
   try {
     const db = options.getDatabase?.() ?? getDbInstance();
     const rows = db

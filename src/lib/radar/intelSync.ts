@@ -4,7 +4,7 @@ import crypto from "node:crypto";
 
 import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
 
-import { isFeatureFlagEnabled } from "@/shared/utils/featureFlags";
+import { isFeatureFlagEnabledAsync } from "@/shared/utils/featureFlags";
 
 import { RadarIntelFeedSchema, type RadarIntelFeed } from "./intelFeedSchema";
 import { compareVersions, type RadarSettingsSnapshot } from "./sync";
@@ -38,7 +38,7 @@ export interface RadarIntelCacheEntry {
 export interface IntelSyncDeps {
   fetch?: typeof globalThis.fetch;
   now?: () => Date;
-  getFlag?: (key: string) => boolean;
+  getFlag?: (key: string) => boolean | Promise<boolean>;
   getSettings?: () => RadarSettingsSnapshot;
   getCache?: () => RadarIntelCacheEntry | null;
   setCache?: (entry: RadarIntelCacheEntry) => void;
@@ -88,7 +88,7 @@ export async function syncRadarIntel(deps: IntelSyncDeps = {}): Promise<IntelSyn
   const {
     fetch: fetchFn = globalThis.fetch,
     now = () => new Date(),
-    getFlag = isFeatureFlagEnabled,
+    getFlag = isFeatureFlagEnabledAsync,
     getSettings: getSettingsFn,
     getCache: getCacheFn,
     setCache: setCacheFn,
@@ -96,10 +96,10 @@ export async function syncRadarIntel(deps: IntelSyncDeps = {}): Promise<IntelSyn
   } = deps;
 
   try {
-    if (!getFlag("RADAR_ENABLED")) return { status: "disabled" };
+    if (!(await getFlag("RADAR_ENABLED"))) return { status: "disabled" };
     const settings = getSettingsFn
       ? getSettingsFn()
-      : (await import("@/lib/db/radar")).getRadarSettings();
+      : await (await import("@/lib/db/radar")).getRadarSettingsAsync();
     if (!settings.optIn) return { status: "opt_out" };
     if (!settings.supporterKey) return { status: "no_key" };
 
@@ -134,7 +134,7 @@ export async function syncRadarIntel(deps: IntelSyncDeps = {}): Promise<IntelSyn
 
     const existing = getCacheFn
       ? getCacheFn()
-      : (await import("@/lib/db/radar")).getRadarIntelCache();
+      : await (await import("@/lib/db/radar")).getRadarIntelCacheAsync();
     if (existing && compareVersions(feed.version, existing.version) <= 0) {
       return { status: "stale" };
     }
@@ -149,7 +149,7 @@ export async function syncRadarIntel(deps: IntelSyncDeps = {}): Promise<IntelSyn
       fetchedAt: now().toISOString(),
     };
     if (setCacheFn) setCacheFn(cacheEntry);
-    else (await import("@/lib/db/radar")).setRadarIntelCache(cacheEntry);
+    else await (await import("@/lib/db/radar")).setRadarIntelCacheAsync(cacheEntry);
 
     // Recognition is local and best-effort. It runs only after the signed live
     // bytes have been accepted and persisted, and never changes sync success.

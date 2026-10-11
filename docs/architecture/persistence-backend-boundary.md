@@ -1,7 +1,7 @@
 ---
 title: "ADR: Pluggable persistence boundary"
 status: proposed
-lastUpdated: 2026-07-23
+lastUpdated: 2026-10-11
 ---
 
 # ADR: Pluggable persistence boundary
@@ -9,6 +9,12 @@ lastUpdated: 2026-07-23
 - **Status:** Proposed — requires maintainer approval before runtime work begins
 - **Tracking issue:** [#8075](https://github.com/diegosouzapw/OmniRoute/issues/8075)
 - **Scope:** Persistence architecture only; this decision does not add or select an external database
+
+> **Implementation note for this fork (2026-10-11):** The opt-in native PostgreSQL server
+> selector and offline migration/restore tools are implemented separately from this upstream
+> proposal. See the [native persistence README](../../src/lib/db/postgres/README.md) and
+> [operations runbook](../ops/POSTGRESQL.md) for current behavior, limits and pending qualification.
+> The proposal status above is unchanged; this note does not establish MySQL, HA or deployment readiness.
 
 ## Context
 

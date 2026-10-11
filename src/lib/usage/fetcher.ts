@@ -16,7 +16,7 @@ import {
   ANTIGRAVITY_RUNTIME_BASE_URLS,
 } from "@omniroute/open-sse/config/antigravityUpstream.ts";
 import {
-  getAntigravityRemainingCredits,
+  getAntigravityRemainingCreditsAsync,
   updateAntigravityRemainingCredits,
 } from "@omniroute/open-sse/executors/antigravity.ts";
 import { getCreditsMode } from "@omniroute/open-sse/services/antigravityCredits.ts";
@@ -246,7 +246,7 @@ async function getAntigravityUsage(
     const accountId: string = connectionId || "unknown";
 
     // Read cached credit balance from executor module (populated from SSE remainingCredits)
-    let creditBalance = getAntigravityRemainingCredits(accountId);
+    let creditBalance = await getAntigravityRemainingCreditsAsync(accountId);
 
     // Only always mode may proactively spend credits to discover the balance.
     // Retry mode must wait for an eligible user request quota failure.

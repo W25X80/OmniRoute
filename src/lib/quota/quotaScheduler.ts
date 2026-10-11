@@ -16,7 +16,13 @@
  *
  * Part of: Quota-aware provider scheduling (feat/quota-aware-scheduling).
  */
-import { getProviderQuota, recordProviderQuotaUsage } from "./providerQuotaState";
+import {
+  getProviderQuota,
+  getProviderQuotaAsync,
+  recordProviderQuotaUsage,
+  recordProviderQuotaUsageAsync,
+  type ProviderQuotaSnapshot,
+} from "./providerQuotaState";
 import { estimateChatTokenCost } from "./tokenEstimator";
 
 export interface QuotaDecision {
@@ -48,6 +54,13 @@ export function canAffordRequest(
   }
 
   const snapshot = getProviderQuota(connectionId, model);
+  return quotaDecision(snapshot, requestBody);
+}
+
+function quotaDecision(
+  snapshot: ProviderQuotaSnapshot | null,
+  requestBody: Record<string, unknown> | null | undefined
+): QuotaDecision {
   if (!snapshot || !snapshot.known || snapshot.tokenLimit <= 0) {
     // No configured budget → nothing to enforce → affordable.
     return { affordable: true, reason: "unconfigured", remainingRatio: 1 };
@@ -99,4 +112,34 @@ export function reserveQuota(
   const cost = estimateChatTokenCost(requestBody);
   if (cost.totalTokens <= 0) return;
   recordProviderQuotaUsage(connectionId, model, cost.totalTokens, opts);
+}
+
+export async function canAffordRequestAsync(
+  connectionId: string,
+  model: string,
+  requestBody: Record<string, unknown> | null | undefined
+): Promise<QuotaDecision> {
+  if (!connectionId || !model)
+    return { affordable: true, reason: "unconfigured", remainingRatio: 1 };
+  try {
+    return quotaDecision(await getProviderQuotaAsync(connectionId, model), requestBody);
+  } catch {
+    return { affordable: true, reason: "unconfigured", remainingRatio: 1 };
+  }
+}
+
+export async function reserveQuotaAsync(
+  connectionId: string,
+  model: string,
+  requestBody: Record<string, unknown> | null | undefined,
+  options: { tokenLimit?: number; windowMs?: number } = {}
+): Promise<void> {
+  if (!connectionId || !model) return;
+  const cost = estimateChatTokenCost(requestBody);
+  if (cost.totalTokens <= 0) return;
+  try {
+    await recordProviderQuotaUsageAsync(connectionId, model, cost.totalTokens, options);
+  } catch {
+    // Preserve the source reservation's best-effort contract.
+  }
 }

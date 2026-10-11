@@ -19,8 +19,8 @@
  * (fail closed). Pure except for the DNS lookup in the fetch-time variant.
  */
 
+import { getSelectedProxySubscriptionStore } from "../db/proxySubscriptionStore";
 import { extractIpv4MappedAddress, isIpLiteral, isIpv4Blocked, isIpv6Blocked } from "./fetchGuard";
-
 export type SelectorGuardReason =
   | "ok"
   | "bad-url"
@@ -87,6 +87,8 @@ async function loadDb(): Promise<{
 /** Async DB-first resolver for server paths (trigger, routes). Never throws. */
 export async function resolveSelectorAllowlist(): Promise<string[]> {
   try {
+    const store = getSelectedProxySubscriptionStore();
+    if (store) return readSelectorAllowlist(await store.allowlist());
     const db = await loadDb();
     const row = db
       ?.prepare("SELECT value FROM key_value WHERE namespace = ? AND key = ?")
@@ -231,7 +233,12 @@ export async function isSelectorControlUrlAllowedAtFetchTime(
   try {
     const dns = await import("node:dns");
     const addrs = await dns.promises.lookup(host, { all: true });
-    return (await checkResolvedAddrs(addrs, effectiveAllowlist)) ?? { allowed: true, reason: "ok" };
+    return (
+      (await checkResolvedAddrs(addrs, effectiveAllowlist)) ?? {
+        allowed: true,
+        reason: "ok",
+      }
+    );
   } catch {
     return { allowed: false, reason: "dns-failed" };
   }

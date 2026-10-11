@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { saveCustomEvalSuite } from "@/lib/db/evals";
+import { saveCustomEvalSuiteAsync } from "@/lib/db/evals";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
 import { evalSuiteSaveSchema } from "@/shared/validation/schemas";
@@ -29,7 +29,7 @@ export async function POST(request: Request) {
   }
 
   try {
-    const suite = saveCustomEvalSuite(validation.data);
+    const suite = await saveCustomEvalSuiteAsync(validation.data);
     return NextResponse.json({ suite }, { status: 201 });
   } catch (error: any) {
     return NextResponse.json(

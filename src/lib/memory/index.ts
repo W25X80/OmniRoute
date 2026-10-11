@@ -1,3 +1,5 @@
+import { parseDatabaseBackend } from "../db/backendSelection";
+import { postgresMemoryBackend } from "./postgresBackend";
 /**
  * Memory module exports and initialization
  */
@@ -43,6 +45,10 @@ export async function initMemoryBackends(): Promise<void> {
   const { getMemorySettings } = await import("./settings");
   try {
     const settings = await getMemorySettings();
+    if (parseDatabaseBackend() === "postgres") {
+      memoryManager.unregister("sqlite");
+      memoryManager.register(postgresMemoryBackend);
+    }
     // Optional backends are opt-in via `backendConfigs[<id>]`; register before configure()
     // so they can be selected as primary or fallback.
     const claudeMem = createClaudeMemBackendFromSettings(settings.backendConfigs);
@@ -53,3 +59,5 @@ export async function initMemoryBackends(): Promise<void> {
     log.warn("Failed to initialize backends", { error: String(e) });
   }
 }
+
+export { PostgresMemoryBackend, postgresMemoryBackend } from "./postgresBackend";

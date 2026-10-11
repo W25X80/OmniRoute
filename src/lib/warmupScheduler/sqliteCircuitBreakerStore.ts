@@ -1,6 +1,6 @@
 import type { CircuitBreakerStore, CircuitBreakerState } from "./circuitBreakerStore";
 import {
-  getConnectionRuntimeState,
+  getConnectionRuntimeStateAsync,
   upsertWarmupState,
   upsertWarmupCircuit,
   clearWarmupCircuit,
@@ -11,7 +11,7 @@ import type { WarmupResult } from "./core";
 
 export class SqliteCircuitBreakerStore implements CircuitBreakerStore {
   async get(connectionId: string): Promise<CircuitBreakerState | null> {
-    const row = await getConnectionRuntimeState(connectionId);
+    const row = await getConnectionRuntimeStateAsync(connectionId);
     if (!row) return null;
     return {
       connectionId: row.connectionId,

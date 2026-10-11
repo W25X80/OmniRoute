@@ -9,7 +9,7 @@
 import { NextRequest, NextResponse } from "next/server";
 
 import { CORS_HEADERS, handleCorsOptions } from "@/shared/utils/cors";
-import { getXp, getAggregateXp } from "@/lib/db/gamification";
+import { getXpAsync as getXp, getAggregateXpAsync as getAggregateXp } from "@/lib/db/gamification";
 import { getStreak, getAggregateStreak } from "@/lib/gamification/streaks";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 
@@ -22,8 +22,11 @@ export async function GET(request: NextRequest) {
   if (authError) return authError;
 
   const apiKeyId = new URL(request.url).searchParams.get("apiKeyId");
-  const level = apiKeyId ? getXp(apiKeyId) : getAggregateXp();
+  const level = apiKeyId ? await getXp(apiKeyId) : await getAggregateXp();
   const streakData = apiKeyId ? await getStreak(apiKeyId) : await getAggregateStreak();
-  const streak = { current: streakData.currentStreak, longest: streakData.longestStreak };
+  const streak = {
+    current: streakData.currentStreak,
+    longest: streakData.longestStreak,
+  };
   return NextResponse.json({ level, streak }, { headers: CORS_HEADERS });
 }

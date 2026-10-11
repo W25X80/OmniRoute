@@ -1,3 +1,7 @@
+import {
+  requireSqliteMaintenance,
+  persistenceCapabilityResponse,
+} from "@/lib/db/persistenceCapabilities";
 import { NextRequest, NextResponse } from "next/server";
 import { getDbInstance, SQLITE_FILE } from "@/lib/db/core";
 import { exportAllSummaryRows } from "@/lib/db/backup";
@@ -19,6 +23,7 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
   try {
+    requireSqliteMaintenance("sqlite-file-export");
     if (!SQLITE_FILE) {
       return NextResponse.json(
         { error: "Export is only available in local (non-cloud) mode" },
@@ -106,6 +111,8 @@ export async function GET(request: NextRequest) {
       throw innerError;
     }
   } catch (error: unknown) {
+    const unavailable = persistenceCapabilityResponse(error);
+    if (unavailable) return NextResponse.json(unavailable, { status: 501 });
     console.error("[ExportAll] Error:", error);
     return NextResponse.json(
       {

@@ -17,6 +17,8 @@ import {
   deleteFallbackChain,
   deleteAllFallbackChains,
 } from "../lib/db/domainState";
+import { getSelectedPostgresDatabase } from "@/lib/db/controlPlaneContext";
+import { PostgresDomainStateRepository } from "@/lib/db/postgres/domainStateRepository";
 
 /**
  * @typedef {Object} FallbackEntry
@@ -157,4 +159,62 @@ export function resetAllFallbacks() {
   } catch {
     // Non-critical
   }
+}
+
+export async function registerFallbackAsync(
+  model: string,
+  chain: Array<{ provider: string; priority?: number; enabled?: boolean }>
+): Promise<void> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return registerFallback(model, chain);
+  const sorted = chain
+    .map((e) => ({
+      provider: e.provider,
+      priority: e.priority ?? 0,
+      enabled: e.enabled ?? true,
+    }))
+    .sort((a, b) => a.priority - b.priority);
+  await new PostgresDomainStateRepository(database).saveFallbackChain(model, sorted);
+}
+
+export async function resolveFallbackChainAsync(
+  model: string,
+  excludeProviders: string[] = []
+): Promise<Array<{ provider: string; priority: number; enabled: boolean }>> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return resolveFallbackChain(model, excludeProviders);
+  const chain = await new PostgresDomainStateRepository(database).loadFallbackChain(model);
+  const exclude = new Set(excludeProviders);
+  return (chain || []).filter((e) => e.enabled && !exclude.has(e.provider));
+}
+
+export async function getNextFallbackAsync(
+  model: string,
+  exclude: string[] = []
+): Promise<string | null> {
+  return (await resolveFallbackChainAsync(model, exclude))[0]?.provider ?? null;
+}
+
+export async function hasFallbackAsync(model: string): Promise<boolean> {
+  return (await resolveFallbackChainAsync(model)).length > 0;
+}
+
+export async function removeFallbackAsync(model: string): Promise<boolean> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? new PostgresDomainStateRepository(database).deleteFallbackChain(model)
+    : removeFallback(model);
+}
+
+export async function getAllFallbackChainsAsync() {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? new PostgresDomainStateRepository(database).loadAllFallbackChains()
+    : getAllFallbackChains();
+}
+
+export async function resetAllFallbacksAsync(): Promise<void> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return resetAllFallbacks();
+  await new PostgresDomainStateRepository(database).deleteAllFallbackChains();
 }

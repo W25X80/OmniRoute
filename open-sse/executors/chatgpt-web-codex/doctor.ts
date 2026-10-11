@@ -1,18 +1,25 @@
 import { existsSync, readFileSync } from "node:fs";
+import { access, readFile } from "node:fs/promises";
+import { parseDatabaseBackend } from "../../../src/lib/db/backendSelection.ts";
 
-import { browserLoginStateExists } from "../../vendor/codex-chatgpt-web/browser-login.ts";
+import {
+  browserLoginStateExists,
+  browserLoginStateExistsAsync,
+} from "../../vendor/codex-chatgpt-web/browser-login.ts";
 import { sanitizeErrorMessage } from "../../utils/error.ts";
-import { detectChromeExecutable } from "../chatgpt-web-codex.ts";
+import { detectChromeExecutable, detectChromeExecutableAsync } from "../chatgpt-web-codex.ts";
 import { decodeChatGptWebCodexSecrets } from "./credentials.ts";
 import { getChatGptWebCodexRuntimeCounts } from "./runtime.ts";
 import {
   connectionRuntimePaths,
   ensureConnectionStorageStateFromCredential,
+  ensureConnectionStorageStateFromCredentialAsync,
 } from "./storageState.ts";
 import {
   getTunnelRuntimeStatus,
   tunnelClientPaths,
   tunnelSupervisorLeaseStatus,
+  tunnelSupervisorLeaseStatusAsync,
 } from "./tunnelClient.ts";
 
 function record(value: unknown): Record<string, unknown> {
@@ -27,14 +34,17 @@ export async function getChatGptWebCodexDoctorStatus(connection: {
   providerSpecificData?: unknown;
   lastError?: unknown;
 }) {
+  const native = parseDatabaseBackend() === "postgres";
   const connectionId = typeof connection.id === "string" ? connection.id : "";
   const data = record(connection.providerSpecificData);
   const paths = connectionRuntimePaths(connectionId);
   const tunnelPaths = tunnelClientPaths();
   const cdpConfigured = Boolean(process.env.CHATGPT_WEB_CODEX_CDP_URL?.trim());
-  const chrome = detectChromeExecutable(
-    typeof data.chromeExecutablePath === "string" ? data.chromeExecutablePath : undefined
-  );
+  const explicitChrome =
+    typeof data.chromeExecutablePath === "string" ? data.chromeExecutablePath : undefined;
+  const chrome = native
+    ? await detectChromeExecutableAsync(explicitChrome)
+    : detectChromeExecutable(explicitChrome);
   let storageState = false;
   let login = false;
   let solAvailable = data.solAvailable !== false;
@@ -43,13 +53,22 @@ export async function getChatGptWebCodexDoctorStatus(connection: {
   try {
     const secrets = decodeChatGptWebCodexSecrets(String(connection.apiKey || ""));
     credential = Boolean(secrets.storageState);
-    if (credential) ensureConnectionStorageStateFromCredential(connectionId, secrets);
-    storageState = existsSync(paths.storageStatePath);
-    login = browserLoginStateExists({ storageStatePath: paths.storageStatePath });
+    if (credential) {
+      if (native) await ensureConnectionStorageStateFromCredentialAsync(connectionId, secrets);
+      else ensureConnectionStorageStateFromCredential(connectionId, secrets);
+    }
+    storageState = native
+      ? await pathExistsAsync(paths.storageStatePath)
+      : existsSync(paths.storageStatePath);
+    login = native
+      ? await browserLoginStateExistsAsync({ storageStatePath: paths.storageStatePath })
+      : browserLoginStateExists({ storageStatePath: paths.storageStatePath });
     if (login) {
       try {
         const marker = JSON.parse(
-          readFileSync(`${paths.storageStatePath}.verified.json`, "utf8")
+          native
+            ? await readFile(`${paths.storageStatePath}.verified.json`, "utf8")
+            : readFileSync(`${paths.storageStatePath}.verified.json`, "utf8")
         ) as Record<string, unknown>;
         if (typeof marker.solAvailable === "boolean") solAvailable = marker.solAvailable;
         if (typeof marker.proAvailable === "boolean") proAvailable = marker.proAvailable;
@@ -69,13 +88,15 @@ export async function getChatGptWebCodexDoctorStatus(connection: {
     detail: "not checked",
   };
   try {
-    if (existsSync(tunnelPaths.binary)) tunnel = await getTunnelRuntimeStatus({});
+    if (native ? await pathExistsAsync(tunnelPaths.binary) : existsSync(tunnelPaths.binary)) {
+      tunnel = await getTunnelRuntimeStatus({});
+    }
   } catch (error) {
     tunnel.detail = sanitizeErrorMessage(error instanceof Error ? error.message : error);
   }
 
   const runtime = getChatGptWebCodexRuntimeCounts();
-  const lease = tunnelSupervisorLeaseStatus();
+  const lease = native ? await tunnelSupervisorLeaseStatusAsync() : tunnelSupervisorLeaseStatus();
   return {
     browser: {
       ready: Boolean(chrome || cdpConfigured),
@@ -84,7 +105,9 @@ export async function getChatGptWebCodexDoctorStatus(connection: {
     storageState: { ready: storageState && credential },
     login: { ready: login },
     temporaryChats: { ready: login },
-    tunnelBinary: { ready: existsSync(tunnelPaths.binary) },
+    tunnelBinary: {
+      ready: native ? await pathExistsAsync(tunnelPaths.binary) : existsSync(tunnelPaths.binary),
+    },
     tunnel: {
       ready: tunnel.ok,
       processRunning: tunnel.processRunning,
@@ -107,4 +130,13 @@ export async function getChatGptWebCodexDoctorStatus(connection: {
         ? sanitizeErrorMessage(connection.lastError)
         : null,
   };
+}
+
+async function pathExistsAsync(path: string): Promise<boolean> {
+  try {
+    await access(path);
+    return true;
+  } catch {
+    return false;
+  }
 }

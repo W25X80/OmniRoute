@@ -453,12 +453,10 @@ export const builtinSkills: Record<string, SkillHandler> = {
       throw new Error(`Unsupported code language: ${language}`);
     }
 
-    const result = await sandboxRunner.run(
-      selectedImage,
-      command,
-      {},
-      sandboxConfig({ timeoutMs, networkEnabled })
-    );
+    const config = sandboxConfig({ timeoutMs, networkEnabled });
+    const result = context.abortSignal
+      ? await sandboxRunner.run(selectedImage, command, {}, config, context.abortSignal)
+      : await sandboxRunner.run(selectedImage, command, {}, config);
     const stdout = truncateOutput(result.stdout);
     const stderr = truncateOutput(result.stderr);
     return {
@@ -496,12 +494,16 @@ export const builtinSkills: Record<string, SkillHandler> = {
 
     const normalizedArgs = normalizeArgs(args);
     const selectedImage = normalizeImage(image, DEFAULT_COMMAND_IMAGE);
-    const result = await sandboxRunner.run(
-      selectedImage,
-      [command, ...normalizedArgs],
-      {},
-      sandboxConfig({ timeoutMs, networkEnabled })
-    );
+    const config = sandboxConfig({ timeoutMs, networkEnabled });
+    const result = context.abortSignal
+      ? await sandboxRunner.run(
+          selectedImage,
+          [command, ...normalizedArgs],
+          {},
+          config,
+          context.abortSignal
+        )
+      : await sandboxRunner.run(selectedImage, [command, ...normalizedArgs], {}, config);
     const stdout = truncateOutput(result.stdout);
     const stderr = truncateOutput(result.stderr);
 

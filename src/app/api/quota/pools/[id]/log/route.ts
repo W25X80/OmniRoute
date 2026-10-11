@@ -16,7 +16,7 @@
 import { NextResponse } from "next/server";
 import { buildErrorBody } from "@omniroute/open-sse/utils/error";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
-import { listConsumptionForPool } from "@/lib/db/quotaConsumption";
+import { listConsumptionForPoolAsync as listConsumptionForPool } from "@/lib/db/quotaConsumption";
 
 export const dynamic = "force-dynamic";
 
@@ -32,11 +32,9 @@ export async function GET(request: Request, { params }: RouteParams): Promise<Re
     const url = new URL(request.url);
     const rawLimit = url.searchParams.get("limit");
     const parsedLimit = rawLimit !== null ? parseInt(rawLimit, 10) : 50;
-    const limit = Number.isFinite(parsedLimit) && parsedLimit > 0
-      ? Math.min(parsedLimit, 200)
-      : 50;
+    const limit = Number.isFinite(parsedLimit) && parsedLimit > 0 ? Math.min(parsedLimit, 200) : 50;
 
-    const events = listConsumptionForPool(id, limit);
+    const events = await listConsumptionForPool(id, limit);
     return NextResponse.json({ events });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Failed to get pool log";

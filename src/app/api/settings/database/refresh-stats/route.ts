@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { isAuthenticated } from "@/shared/utils/apiAuth";
-import { getDatabaseStats } from "@/lib/db/stats";
+import { getDatabaseStatsAsync } from "@/lib/db/stats";
 
 export async function POST(request: NextRequest) {
   if (!(await isAuthenticated(request))) {
@@ -8,7 +8,7 @@ export async function POST(request: NextRequest) {
   }
 
   try {
-    const stats = await getDatabaseStats();
+    const stats = await getDatabaseStatsAsync();
     return NextResponse.json({ success: true, stats });
   } catch (error) {
     console.error("Failed to refresh database stats:", error);

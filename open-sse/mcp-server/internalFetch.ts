@@ -29,7 +29,7 @@
  * move the `handle*` bodies into `tools/canonical/*.ts` without re-introducing a cycle.
  */
 import { getMcpHttpAuthHeadersForInternalFetch, hasMcpHttpAuthContext } from "./httpAuthContext.ts";
-import { getInternalServiceAuthHeaders } from "../../src/lib/api/internalServiceAuth.ts";
+import { getInternalServiceAuthHeadersAsync } from "../../src/lib/api/internalServiceAuth.ts";
 import { resolveOmniRouteBaseUrl } from "../../src/shared/utils/resolveOmniRouteBaseUrl.ts";
 import { mcpFetchTimeoutSignal } from "./fetchTimeout.ts";
 import { sanitizeErrorMessage } from "../utils/error.ts";
@@ -69,7 +69,7 @@ export async function omniRouteFetch(path: string, options: RequestInit = {}): P
     ...((options.headers as Record<string, string>) || {}),
     // Authenticate only the server-to-server hop. This does not replace or
     // weaken the caller identity forwarded above.
-    ...getInternalServiceAuthHeaders(),
+    ...(await getInternalServiceAuthHeadersAsync()),
   };
 
   const signal = options.signal || mcpFetchTimeoutSignal("management");

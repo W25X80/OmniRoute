@@ -1,3 +1,5 @@
+import { getSelectedPostgresDatabase } from "../controlPlaneContext";
+import { afterProviderRuntimeWrite, writeProviderRuntime } from "../postgres/providerRuntime";
 import { backupDbFile } from "../backup";
 import { getDbInstance, rowToCamel } from "../core";
 import { invalidateDbCache } from "../readCache";
@@ -114,15 +116,100 @@ export function stripCodexChildCooldownsFromConnection(
   if (wrote) invalidateDbCache("connections", id, { skipModelCatalog: true });
 }
 
-/**
- * Atomically merge one virtual Codex child's quota evidence into its persisted parent.
- * The transaction reads the latest row so sibling child state cannot be lost.
- */
+/** Pure source-preserving merge of one virtual Codex child's quota evidence. */
+export function applyCodexScopedQuotaPatch(
+  providerSpecificData: JsonRecord,
+  scope: "codex" | "spark",
+  patch: CodexScopedQuotaPatch
+): JsonRecord {
+  const nextProviderSpecificData: JsonRecord = { ...providerSpecificData };
+  if (patch.quotaState) {
+    const quotaByScope = toRecord(providerSpecificData.codexQuotaStateByScope);
+    nextProviderSpecificData.codexQuotaStateByScope = {
+      ...quotaByScope,
+      [scope]: patch.quotaState,
+    };
+    nextProviderSpecificData.codexQuotaState = {
+      ...patch.quotaState,
+      scope,
+      updatedAt: patch.quotaState.observedAt,
+    };
+  }
+
+  if (patch.exhaustedWindow !== undefined) {
+    const exhaustedByScope = { ...toRecord(providerSpecificData.codexExhaustedWindowByScope) };
+    if (patch.exhaustedWindow) exhaustedByScope[scope] = patch.exhaustedWindow;
+    else delete exhaustedByScope[scope];
+    nextProviderSpecificData.codexExhaustedWindowByScope = exhaustedByScope;
+    if (patch.exhaustedWindow) {
+      nextProviderSpecificData.codexExhaustedWindow = patch.exhaustedWindow;
+    } else {
+      delete nextProviderSpecificData.codexExhaustedWindow;
+    }
+  }
+
+  if (patch.rateLimitedUntil !== undefined) {
+    const scopeCooldowns = { ...toRecord(providerSpecificData.codexScopeRateLimitedUntil) };
+    const sourceByScope = { ...toRecord(providerSpecificData.codexScopeRateLimitSource) };
+    if (patch.rateLimitedUntil) {
+      const existingCooldownMs =
+        typeof scopeCooldowns[scope] === "string"
+          ? new Date(scopeCooldowns[scope] as string).getTime()
+          : NaN;
+      const existingIsAuthoritative =
+        sourceByScope[scope] === "quota_reset" &&
+        patch.rateLimitSource !== "quota_reset" &&
+        Number.isFinite(existingCooldownMs) &&
+        existingCooldownMs > Date.now();
+      scopeCooldowns[scope] = existingIsAuthoritative
+        ? scopeCooldowns[scope]
+        : patch.rateLimitedUntil;
+      sourceByScope[scope] = existingIsAuthoritative
+        ? sourceByScope[scope]
+        : (patch.rateLimitSource ?? "fallback");
+    } else {
+      delete scopeCooldowns[scope];
+      delete sourceByScope[scope];
+    }
+    const nextCooldowns = omitEmptyRecord(scopeCooldowns);
+    const nextSources = omitEmptyRecord(sourceByScope);
+    if (nextCooldowns) nextProviderSpecificData.codexScopeRateLimitedUntil = nextCooldowns;
+    else delete nextProviderSpecificData.codexScopeRateLimitedUntil;
+    if (nextSources) nextProviderSpecificData.codexScopeRateLimitSource = nextSources;
+    else delete nextProviderSpecificData.codexScopeRateLimitSource;
+  }
+  return nextProviderSpecificData;
+}
+
+/** Reads the latest parent inside one transaction so sibling child state cannot be lost. */
 export async function updateCodexScopedQuotaState(
   id: string,
   scope: "codex" | "spark",
   patch: CodexScopedQuotaPatch
 ): Promise<JsonRecord | null> {
+  const database = getSelectedPostgresDatabase();
+  if (database) {
+    const persisted = await writeProviderRuntime(database, async (transaction) => {
+      const { rows } = await transaction.query<JsonRecord>(
+        "SELECT * FROM omniroute.provider_connections WHERE id=$1 FOR UPDATE",
+        [id]
+      );
+      const row = rows[0];
+      if (!row || row.provider !== "codex") return null;
+      const data = toRecord(toRecord(rowToCamel(row)).providerSpecificData);
+      const next = applyCodexScopedQuotaPatch(data, scope, patch);
+      await transaction.query(
+        "UPDATE omniroute.provider_connections SET provider_specific_data=$1,updated_at=$2 WHERE id=$3",
+        [JSON.stringify(next), new Date().toISOString(), id]
+      );
+      return next;
+    });
+    if (persisted)
+      await afterProviderRuntimeWrite("codex_quota", () =>
+        invalidateDbCache("connections", id, { skipModelCatalog: true })
+      );
+    return persisted;
+  }
   const db = getDbInstance() as unknown as DbLike;
   const candidate = db.prepare("SELECT provider FROM provider_connections WHERE id = ?").get(id);
   if (toRecord(candidate).provider !== "codex") return null;
@@ -135,63 +222,7 @@ export async function updateCodexScopedQuotaState(
     const existingRecord = toRecord(rowToCamel(existing));
     if (existingRecord.provider !== "codex") return null;
     const providerSpecificData = toRecord(existingRecord.providerSpecificData);
-    const nextProviderSpecificData: JsonRecord = { ...providerSpecificData };
-
-    if (patch.quotaState) {
-      const quotaByScope = toRecord(providerSpecificData.codexQuotaStateByScope);
-      nextProviderSpecificData.codexQuotaStateByScope = {
-        ...quotaByScope,
-        [scope]: patch.quotaState,
-      };
-      nextProviderSpecificData.codexQuotaState = {
-        ...patch.quotaState,
-        scope,
-        updatedAt: patch.quotaState.observedAt,
-      };
-    }
-
-    if (patch.exhaustedWindow !== undefined) {
-      const exhaustedByScope = { ...toRecord(providerSpecificData.codexExhaustedWindowByScope) };
-      if (patch.exhaustedWindow) exhaustedByScope[scope] = patch.exhaustedWindow;
-      else delete exhaustedByScope[scope];
-      nextProviderSpecificData.codexExhaustedWindowByScope = exhaustedByScope;
-      if (patch.exhaustedWindow) {
-        nextProviderSpecificData.codexExhaustedWindow = patch.exhaustedWindow;
-      } else {
-        delete nextProviderSpecificData.codexExhaustedWindow;
-      }
-    }
-
-    if (patch.rateLimitedUntil !== undefined) {
-      const scopeCooldowns = { ...toRecord(providerSpecificData.codexScopeRateLimitedUntil) };
-      const sourceByScope = { ...toRecord(providerSpecificData.codexScopeRateLimitSource) };
-      if (patch.rateLimitedUntil) {
-        const existingCooldownMs =
-          typeof scopeCooldowns[scope] === "string"
-            ? new Date(scopeCooldowns[scope] as string).getTime()
-            : NaN;
-        const existingIsAuthoritative =
-          sourceByScope[scope] === "quota_reset" &&
-          patch.rateLimitSource !== "quota_reset" &&
-          Number.isFinite(existingCooldownMs) &&
-          existingCooldownMs > Date.now();
-        scopeCooldowns[scope] = existingIsAuthoritative
-          ? scopeCooldowns[scope]
-          : patch.rateLimitedUntil;
-        sourceByScope[scope] = existingIsAuthoritative
-          ? sourceByScope[scope]
-          : (patch.rateLimitSource ?? "fallback");
-      } else {
-        delete scopeCooldowns[scope];
-        delete sourceByScope[scope];
-      }
-      const nextCooldowns = omitEmptyRecord(scopeCooldowns);
-      const nextSources = omitEmptyRecord(sourceByScope);
-      if (nextCooldowns) nextProviderSpecificData.codexScopeRateLimitedUntil = nextCooldowns;
-      else delete nextProviderSpecificData.codexScopeRateLimitedUntil;
-      if (nextSources) nextProviderSpecificData.codexScopeRateLimitSource = nextSources;
-      else delete nextProviderSpecificData.codexScopeRateLimitSource;
-    }
+    const nextProviderSpecificData = applyCodexScopedQuotaPatch(providerSpecificData, scope, patch);
 
     db.prepare(
       `UPDATE provider_connections
@@ -315,4 +346,126 @@ export async function updateCodexScopeCooldown(
     rateLimitedUntil,
     rateLimitSource: "fallback",
   });
+}
+
+/** Async selected-backend counterpart of the legacy synchronous child-map clear. */
+export async function stripCodexChildCooldownsFromConnectionAsync(
+  id: string,
+  options?: { alsoClearTopLevel?: boolean }
+): Promise<void> {
+  if (typeof id !== "string" || id.length === 0) return;
+  const database = getSelectedPostgresDatabase();
+  if (!database) return stripCodexChildCooldownsFromConnection(id, options);
+  const alsoClearTopLevel = options?.alsoClearTopLevel === true;
+  const wrote = await writeProviderRuntime(database, async (transaction) => {
+    const { rows } = await transaction.query<JsonRecord>(
+      "SELECT provider,provider_specific_data FROM omniroute.provider_connections WHERE id=$1 FOR UPDATE",
+      [id]
+    );
+    const row = rows[0];
+    if (!row) return false;
+    const data = toRecord(toRecord(rowToCamel(row)).providerSpecificData);
+    const stripNested = row.provider === "codex" && connectionHasCodexChildCooldown(data);
+    if (!alsoClearTopLevel && !stripNested) return false;
+    if (stripNested) {
+      await transaction.query(
+        `UPDATE omniroute.provider_connections SET provider_specific_data=$1,updated_at=$2,
+         rate_limited_until=CASE WHEN $3::boolean THEN NULL ELSE rate_limited_until END WHERE id=$4`,
+        [
+          JSON.stringify(stripCodexChildCooldownFields(data)),
+          new Date().toISOString(),
+          alsoClearTopLevel,
+          id,
+        ]
+      );
+    } else {
+      await transaction.query(
+        "UPDATE omniroute.provider_connections SET rate_limited_until=NULL,updated_at=$1 WHERE id=$2",
+        [new Date().toISOString(), id]
+      );
+    }
+    return true;
+  });
+  if (wrote)
+    await afterProviderRuntimeWrite("codex_cooldown_clear", () =>
+      invalidateDbCache("connections", id, { skipModelCatalog: true })
+    );
+}
+
+/** Native read does not fall back to SQLite when the selected backend rejects it. */
+export async function hasCodexScopeCooldownAsync(
+  id: string,
+  scope: "codex" | "spark"
+): Promise<boolean> {
+  if (typeof id !== "string" || id.length === 0) return false;
+  const database = getSelectedPostgresDatabase();
+  if (!database) return hasCodexScopeCooldown(id, scope);
+  return database.transaction(async (transaction) => {
+    const { rows } = await transaction.query<JsonRecord>(
+      "SELECT provider,provider_specific_data FROM omniroute.provider_connections WHERE id=$1",
+      [id]
+    );
+    if (!rows[0] || rows[0].provider !== "codex") return false;
+    const data = toRecord(toRecord(rowToCamel(rows[0])).providerSpecificData);
+    return Boolean(toRecord(data.codexScopeRateLimitedUntil)[scope]);
+  });
+}
+
+export async function liftCodexScopeCooldownOnHeadroomAsync(
+  id: string,
+  scope: "codex" | "spark"
+): Promise<boolean> {
+  if (typeof id !== "string" || id.length === 0) return false;
+  const database = getSelectedPostgresDatabase();
+  if (!database) return liftCodexScopeCooldownOnHeadroom(id, scope);
+  const wrote = await writeProviderRuntime(database, async (transaction) => {
+    const { rows } = await transaction.query<JsonRecord>(
+      "SELECT provider,provider_specific_data FROM omniroute.provider_connections WHERE id=$1 FOR UPDATE",
+      [id]
+    );
+    if (!rows[0] || rows[0].provider !== "codex") return false;
+    const currentPsd = toRecord(toRecord(rowToCamel(rows[0])).providerSpecificData);
+    const currentCooldowns = { ...toRecord(currentPsd.codexScopeRateLimitedUntil) };
+    if (!currentCooldowns[scope]) return false;
+    const currentSources = { ...toRecord(currentPsd.codexScopeRateLimitSource) };
+    const untilMs =
+      typeof currentCooldowns[scope] === "string"
+        ? new Date(currentCooldowns[scope] as string).getTime()
+        : NaN;
+    if (
+      currentSources[scope] === "quota_reset" &&
+      Number.isFinite(untilMs) &&
+      untilMs > Date.now() - QUOTA_RESET_CLOCK_SKEW_GRACE_MS
+    )
+      return false;
+    delete currentCooldowns[scope];
+    delete currentSources[scope];
+    const next: JsonRecord = { ...currentPsd };
+    const cooldowns = omitEmptyRecord(currentCooldowns),
+      sources = omitEmptyRecord(currentSources);
+    if (cooldowns) next.codexScopeRateLimitedUntil = cooldowns;
+    else delete next.codexScopeRateLimitedUntil;
+    if (sources) next.codexScopeRateLimitSource = sources;
+    else delete next.codexScopeRateLimitSource;
+    const exhausted = { ...toRecord(currentPsd.codexExhaustedWindowByScope) };
+    if (exhausted[scope]) {
+      delete exhausted[scope];
+      const remaining = omitEmptyRecord(exhausted);
+      if (remaining) next.codexExhaustedWindowByScope = remaining;
+      else {
+        delete next.codexExhaustedWindowByScope;
+        delete next.codexExhaustedWindow;
+      }
+    }
+    await transaction.query(
+      "UPDATE omniroute.provider_connections SET provider_specific_data=$1,updated_at=$2 WHERE id=$3",
+      [JSON.stringify(next), new Date().toISOString(), id]
+    );
+    return true;
+  });
+  if (wrote)
+    await afterProviderRuntimeWrite("codex_headroom", () =>
+      invalidateDbCache("connections", id, { skipModelCatalog: true })
+    );
+  return wrote;
 }

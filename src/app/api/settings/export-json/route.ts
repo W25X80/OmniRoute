@@ -6,9 +6,9 @@ import { getCombos } from "@/lib/db/combos";
 import { getApiKeys } from "@/lib/db/apiKeys";
 import { isAuthRequired, isAuthenticated } from "@/shared/utils/apiAuth";
 import {
-  getAllUsageHistory,
-  getAllDomainCostHistory,
-  getAllDomainBudgets,
+  getAllUsageHistoryAsync as getAllUsageHistory,
+  getAllDomainCostHistoryAsync as getAllDomainCostHistory,
+  getAllDomainBudgetsAsync as getAllDomainBudgets,
 } from "@/lib/db/usageAnalytics";
 import { isFreeModel, providerHasFreeModels } from "@/shared/utils/freeModels";
 
@@ -96,9 +96,9 @@ export async function GET(request: Request) {
     // These tables (usage_history, domain_cost_history, domain_budgets) can contain
     // thousands of rows and make the config backup grow to many MBs.
     if (includeHistory) {
-      exportData.usageHistory = getAllUsageHistory();
-      exportData.domainCostHistory = getAllDomainCostHistory();
-      exportData.domainBudgets = getAllDomainBudgets();
+      exportData.usageHistory = await getAllUsageHistory();
+      exportData.domainCostHistory = await getAllDomainCostHistory();
+      exportData.domainBudgets = await getAllDomainBudgets();
     }
 
     return new NextResponse(JSON.stringify(exportData, null, 2), {

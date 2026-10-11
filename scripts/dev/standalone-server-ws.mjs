@@ -1,3 +1,4 @@
+import { wrapRequestListenerWithPersistence } from "./persistence-request-boundary.mjs";
 import http from "node:http";
 import net from "node:net";
 import { randomUUID } from "node:crypto";
@@ -216,7 +217,7 @@ function wrapRequestListenerWithWebdav(listener) {
       return listener.call(this, req, res);
     }
     const self = this;
-    (async () => {
+    return (async () => {
       try {
         const handled = await maybeHandleWebdav(req, res);
         if (handled) return;
@@ -238,7 +239,9 @@ http.createServer = function createServerWithResponsesWs(...args) {
     // HEAD request regardless of which inner layer ends up handling it (#6400).
     args[lastFnIdx] = wrapRequestListenerWithHeadResponseGuard(
       wrapRequestListenerWithMethodGuard(
-        wrapRequestListenerWithWebdav(wrapRequestListenerWithPeerStamp(args[lastFnIdx]))
+        wrapRequestListenerWithPersistence(
+          wrapRequestListenerWithWebdav(wrapRequestListenerWithPeerStamp(args[lastFnIdx]))
+        )
       )
     );
   }
@@ -275,7 +278,9 @@ http.createServer = function createServerWithResponsesWs(...args) {
         eventName,
         wrapRequestListenerWithHeadResponseGuard(
           wrapRequestListenerWithMethodGuard(
-            wrapRequestListenerWithWebdav(wrapRequestListenerWithPeerStamp(listener))
+            wrapRequestListenerWithPersistence(
+              wrapRequestListenerWithWebdav(wrapRequestListenerWithPeerStamp(listener))
+            )
           )
         )
       );
@@ -292,7 +297,9 @@ http.createServer = function createServerWithResponsesWs(...args) {
         eventName,
         wrapRequestListenerWithHeadResponseGuard(
           wrapRequestListenerWithMethodGuard(
-            wrapRequestListenerWithWebdav(wrapRequestListenerWithPeerStamp(listener))
+            wrapRequestListenerWithPersistence(
+              wrapRequestListenerWithWebdav(wrapRequestListenerWithPeerStamp(listener))
+            )
           )
         )
       );
@@ -319,4 +326,6 @@ http.createServer = function createServerWithResponsesWs(...args) {
   return server;
 };
 
+// The factory and request-registration paths above install the application persistence boundary.
+globalThis.__omniroutePersistenceTransportInstalled = true;
 await import("./server.js");

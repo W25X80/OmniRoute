@@ -1,3 +1,14 @@
+import { assertSqliteBackendAllowed } from "./controlPlaneContext";
+import { getSelectedPostgresDatabase } from "./controlPlaneContext";
+import {
+  catalogTableRows,
+  compareCatalogText,
+  requirePostgresCatalogSnapshot,
+  isPostgresCatalogMutation,
+  mutatePostgresCatalog,
+  writePostgresCatalog,
+  afterPostgresCatalogCommit,
+} from "./postgres/catalogSnapshot";
 import { getDbInstance } from "./core";
 import { invalidateDbCache } from "./readCache";
 
@@ -62,15 +73,23 @@ export function getModelContextOverrideRecord(
   provider: string | null | undefined,
   modelId: string | null | undefined
 ): ModelContextOverride | null {
+  requirePostgresCatalogSnapshot();
+
   const key = normalizeKey(provider, modelId);
   if (!key) return null;
   try {
-    const row = getDbInstance()
-      .prepare(
-        "SELECT provider, model_id, real_context, source, refreshed_at " +
-          "FROM model_context_overrides WHERE provider = ? AND model_id = ?"
-      )
-      .get(key.provider, key.modelId) as OverrideRow | undefined;
+    const row = (
+      getSelectedPostgresDatabase()
+        ? catalogTableRows<OverrideRow>("model_context_overrides").filter(
+            (row) => row.provider === key.provider && row.model_id === key.modelId
+          )[0]
+        : getDbInstance()
+            .prepare(
+              "SELECT provider, model_id, real_context, source, refreshed_at " +
+                "FROM model_context_overrides WHERE provider = ? AND model_id = ?"
+            )
+            .get(key.provider, key.modelId)
+    ) as OverrideRow | undefined;
     return row ? toOverride(row) : null;
   } catch {
     // Table may not exist yet (pre-migration) — fall through to the catalog.
@@ -100,12 +119,112 @@ export function getModelContextOverride(
  * Upsert an override. `realContext` must be a positive integer (a token count);
  * anything else is rejected (no write). Returns true when a row was written.
  */
+export async function setModelContextOverrideAsync(
+  provider: string,
+  modelId: string,
+  realContext: number,
+  source: ModelContextOverrideSource = "manual"
+): Promise<boolean> {
+  const catalogDatabase = getSelectedPostgresDatabase();
+  const execute = async () => {
+    const key = normalizeKey(provider, modelId);
+    if (!key || !isPositiveInteger(realContext)) return false;
+    const normalizedSource: ModelContextOverrideSource =
+      source === "auto:discovery" ? "auto:discovery" : "manual";
+    getSelectedPostgresDatabase()
+      ? {
+          changes:
+            (
+              await writePostgresCatalog(
+                "INSERT INTO omniroute.model_context_overrides (provider, model_id, real_context, source, refreshed_at) VALUES ($1, $2, $3, $4, to_char(timezone('UTC',clock_timestamp()),'YYYY-MM-DD HH24:MI:SS')) ON CONFLICT(provider,model_id) DO UPDATE SET real_context=EXCLUDED.real_context,source=EXCLUDED.source,refreshed_at=EXCLUDED.refreshed_at",
+                [key.provider, key.modelId, realContext, normalizedSource]
+              )
+            ).rowCount ?? 0,
+        }
+      : getDbInstance()
+          .prepare(
+            "INSERT OR REPLACE INTO model_context_overrides " +
+              "(provider, model_id, real_context, source, refreshed_at) " +
+              "VALUES (?, ?, ?, ?, datetime('now'))"
+          )
+          .run(key.provider, key.modelId, realContext, normalizedSource);
+    if (getSelectedPostgresDatabase())
+      afterPostgresCatalogCommit(() => invalidateDbCache("model-capabilities"));
+    else invalidateDbCache("model-capabilities");
+    return true;
+  };
+  if (catalogDatabase && !isPostgresCatalogMutation(catalogDatabase))
+    return mutatePostgresCatalog(catalogDatabase, execute);
+  return execute();
+}
+
+/** Remove an override. Returns true when a row was deleted. */
+export async function removeModelContextOverrideAsync(
+  provider: string,
+  modelId: string
+): Promise<boolean> {
+  const catalogDatabase = getSelectedPostgresDatabase();
+  const execute = async () => {
+    const key = normalizeKey(provider, modelId);
+    if (!key) return false;
+    const info = getSelectedPostgresDatabase()
+      ? {
+          changes:
+            (
+              await writePostgresCatalog(
+                "DELETE FROM omniroute.model_context_overrides WHERE provider = $1 AND model_id = $2",
+                [key.provider, key.modelId]
+              )
+            ).rowCount ?? 0,
+        }
+      : getDbInstance()
+          .prepare("DELETE FROM model_context_overrides WHERE provider = ? AND model_id = ?")
+          .run(key.provider, key.modelId);
+    if (info.changes > 0) {
+      if (getSelectedPostgresDatabase())
+        afterPostgresCatalogCommit(() => invalidateDbCache("model-capabilities"));
+      else invalidateDbCache("model-capabilities");
+    }
+    return info.changes > 0;
+  };
+  if (catalogDatabase && !isPostgresCatalogMutation(catalogDatabase))
+    return mutatePostgresCatalog(catalogDatabase, execute);
+  return execute();
+}
+
+/** All overrides, newest refresh first. Never throws. */
+export function listModelContextOverrides(): ModelContextOverride[] {
+  requirePostgresCatalogSnapshot();
+
+  try {
+    const rows = (
+      getSelectedPostgresDatabase()
+        ? catalogTableRows<OverrideRow>("model_context_overrides").sort(
+            (a, b) =>
+              compareCatalogText(b.refreshed_at, a.refreshed_at) ||
+              compareCatalogText(a.provider, b.provider) ||
+              compareCatalogText(a.model_id, b.model_id)
+          )
+        : getDbInstance()
+            .prepare(
+              "SELECT provider, model_id, real_context, source, refreshed_at " +
+                "FROM model_context_overrides ORDER BY refreshed_at DESC"
+            )
+            .all()
+    ) as OverrideRow[];
+    return rows.map(toOverride);
+  } catch {
+    return [];
+  }
+}
+
 export function setModelContextOverride(
   provider: string,
   modelId: string,
   realContext: number,
   source: ModelContextOverrideSource = "manual"
 ): boolean {
+  assertSqliteBackendAllowed();
   const key = normalizeKey(provider, modelId);
   if (!key || !isPositiveInteger(realContext)) return false;
   const normalizedSource: ModelContextOverrideSource =
@@ -121,8 +240,8 @@ export function setModelContextOverride(
   return true;
 }
 
-/** Remove an override. Returns true when a row was deleted. */
 export function removeModelContextOverride(provider: string, modelId: string): boolean {
+  assertSqliteBackendAllowed();
   const key = normalizeKey(provider, modelId);
   if (!key) return false;
   const info = getDbInstance()
@@ -130,19 +249,4 @@ export function removeModelContextOverride(provider: string, modelId: string): b
     .run(key.provider, key.modelId);
   if (info.changes > 0) invalidateDbCache("model-capabilities");
   return info.changes > 0;
-}
-
-/** All overrides, newest refresh first. Never throws. */
-export function listModelContextOverrides(): ModelContextOverride[] {
-  try {
-    const rows = getDbInstance()
-      .prepare(
-        "SELECT provider, model_id, real_context, source, refreshed_at " +
-          "FROM model_context_overrides ORDER BY refreshed_at DESC"
-      )
-      .all() as OverrideRow[];
-    return rows.map(toOverride);
-  } catch {
-    return [];
-  }
 }

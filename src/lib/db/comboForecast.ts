@@ -1,3 +1,5 @@
+import * as postgres from "./postgres/comboForecastRepository";
+import { getPostgresUsageDatabase } from "./postgres/usageQueries";
 import { getDbInstance } from "./core";
 
 export type ComboForecastUsageRow = {
@@ -116,4 +118,15 @@ export function getComboForecastUsageRows(opts: {
     avgLatencyMs: toNumber(row.avgLatencyMs),
     lastUsedAt: typeof row.lastUsedAt === "string" ? row.lastUsedAt : null,
   }));
+}
+
+export async function getComboForecastUsageRowsAsync(opts: {
+  since: string;
+  until?: string;
+  comboName?: string;
+}): Promise<ComboForecastUsageRow[]> {
+  const database = getPostgresUsageDatabase();
+  return database
+    ? postgres.getComboForecastUsageRows(database, opts)
+    : getComboForecastUsageRows(opts);
 }

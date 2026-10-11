@@ -1,3 +1,7 @@
+import { runPersistenceBackgroundWork } from "../db/persistenceRuntime";
+import { deleteSemanticMemoryPoint } from "./qdrant";
+import { syncSelectedMemoryVector } from "./store";
+import { getSelectedMemoryRepository } from "../db/memory";
 import { Memory, MemoryType } from "./types";
 import { getDbInstance } from "../db/core";
 import { deleteMemory, createMemory } from "./store";
@@ -13,6 +17,26 @@ export async function summarizeMemories(
   sessionId?: string,
   maxTokens: number = 4000
 ): Promise<SummarizationResult> {
+  const selected = getSelectedMemoryRepository();
+  if (selected) {
+    const memories = (await selected.list({ apiKeyId, sessionId, limit: -1 })).data;
+    let totalTokens = 0,
+      summarizedCount = 0,
+      tokensSaved = 0;
+    for (const memory of memories) {
+      const tokens = estimateTokens(memory.content);
+      if (totalTokens + tokens <= maxTokens) {
+        totalTokens += tokens;
+        continue;
+      }
+      const content = generateSummary(memory.content);
+      if (await selected.update(memory.id, { content })) {
+        summarizedCount++;
+        tokensSaved += tokens - estimateTokens(content);
+      }
+    }
+    return { originalCount: memories.length, summarizedCount, tokensSaved };
+  }
   const db = getDbInstance();
 
   const whereClause = sessionId
@@ -147,25 +171,59 @@ export async function summarizeMemoriesOlderThan(
   days: number,
   dryRun: boolean
 ): Promise<SummarizeOlderThanResult> {
-  const db = getDbInstance();
+  const selected = getSelectedMemoryRepository();
+  const db = selected ? null : getDbInstance();
 
   const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
 
-  const rows: MemoryRow[] = apiKeyId
-    ? (db
-        .prepare(
-          "SELECT * FROM memories WHERE api_key_id = ? AND created_at < ? ORDER BY created_at ASC"
-        )
-        .all(apiKeyId, cutoff) as MemoryRow[])
-    : (db
-        .prepare("SELECT * FROM memories WHERE created_at < ? ORDER BY created_at ASC")
-        .all(cutoff) as MemoryRow[]);
+  const rows: MemoryRow[] = selected
+    ? []
+    : apiKeyId
+      ? (db!
+          .prepare(
+            "SELECT * FROM memories WHERE api_key_id = ? AND created_at < ? ORDER BY created_at ASC"
+          )
+          .all(apiKeyId, cutoff) as MemoryRow[])
+      : (db!
+          .prepare("SELECT * FROM memories WHERE created_at < ? ORDER BY created_at ASC")
+          .all(cutoff) as MemoryRow[]);
 
-  const candidates = rows.map(rowToMemory);
+  const candidates = selected ? await selected.olderThan(apiKeyId, cutoff) : rows.map(rowToMemory);
   const totalTokens = candidates.reduce((sum, m) => sum + estimateTokens(m.content), 0);
 
   if (dryRun || candidates.length === 0) {
     return { candidates, totalTokens, deletedCount: 0, summaryId: null, dryRun: true };
+  }
+
+  if (selected) {
+    const compacted = await selected.compactOlderThan(apiKeyId, cutoff, (memories) => ({
+      apiKeyId: apiKeyId ?? "",
+      sessionId: "",
+      type: MemoryType.SEMANTIC,
+      key: `summary_${new Date().toISOString()}`,
+      content: `Resumo de ${memories.length} memórias (>${days} dias):\n${memories
+        .map((m) => `[${m.type}] ${m.key ? m.key + ": " : ""}${generateSummary(m.content)}`)
+        .join("\n")}`,
+      metadata: {
+        summarizedCount: memories.length,
+        olderThanDays: days,
+        generatedAt: new Date().toISOString(),
+      },
+      expiresAt: null,
+    }));
+    const summary = compacted.summary;
+    if (summary)
+      void runPersistenceBackgroundWork(async () => {
+        await syncSelectedMemoryVector(summary);
+        for (const candidate of compacted.candidates) await deleteSemanticMemoryPoint(candidate.id);
+      }).catch(() => {});
+    return {
+      candidates: compacted.candidates,
+      totalTokens: compacted.candidates.reduce((sum, m) => sum + estimateTokens(m.content), 0),
+      deletedCount: compacted.deletedCount,
+      summaryId: summary?.id ?? null,
+      dryRun: false,
+    };
   }
 
   // Build a condensed summary text from all candidates

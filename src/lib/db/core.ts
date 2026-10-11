@@ -5,6 +5,7 @@
  */
 
 import type { SqliteAdapter, PreparedStatement } from "./adapters/types";
+import { assertSqliteBackendAllowed, getSelectedPostgresDatabase } from "./controlPlaneContext";
 import {
   tryOpenSync,
   getSqlJsAdapter,
@@ -982,6 +983,7 @@ export function runManagedDbHealthCheck(options?: ManagedHealthCheckOptions) {
 }
 
 export function getDbInstance(): SqliteDatabase {
+  assertSqliteBackendAllowed();
   const existing = getDb();
   if (existing) return existing;
 
@@ -1444,6 +1446,20 @@ export function pingDb(): boolean {
   }
 }
 
+/** Checks the selected backend; failures never fall back to a different database. */
+export async function pingDbAsync(): Promise<boolean> {
+  try {
+    const database = getSelectedPostgresDatabase();
+    if (!database) return pingDb();
+    return await database.transaction(async (transaction) => {
+      const result = await transaction.query<{ ok: number }>("SELECT 1 AS ok");
+      return result.rows[0]?.ok === 1;
+    });
+  } catch {
+    return false;
+  }
+}
+
 export async function shutdownDbInstance(): Promise<boolean> {
   clearDbHealthCheckScheduler();
   await managedHealth.stop(() => healthShutdown.abort());
@@ -1609,8 +1625,7 @@ function migrateFromJson(db: SqliteDatabase, jsonPath: string) {
         let rateLimitOverridesJson = serializeJsonField(conn.rateLimitOverrides);
         if (!hasOverrides && typeof conn.id === "string") {
           const existing = selectExistingOverrides.get(conn.id) as
-            | { rate_limit_overrides_json: string | null }
-            | undefined;
+            { rate_limit_overrides_json: string | null } | undefined;
           if (existing) rateLimitOverridesJson = existing.rate_limit_overrides_json;
         }
         insertConn.run({

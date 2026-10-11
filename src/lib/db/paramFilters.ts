@@ -1,3 +1,14 @@
+import { assertSqliteBackendAllowed } from "./controlPlaneContext";
+import { getSelectedPostgresDatabase } from "./controlPlaneContext";
+import {
+  catalogNamespaceRows,
+  requirePostgresCatalogSnapshot,
+  isPostgresCatalogMutation,
+  mutatePostgresCatalog,
+  putCatalogValue,
+  deleteCatalogValue,
+  afterPostgresCatalogCommit,
+} from "./postgres/catalogSnapshot";
 /**
  * db/paramFilters.ts — Provider/Model parameter filter configuration.
  *
@@ -93,10 +104,14 @@ function toProviderParamFilter(raw: unknown): ProviderParamFilter | null {
 // ── Read ────────────────────────────────────────────────────────────────────
 
 function readNamespace(namespace: string): Record<string, unknown> {
-  const db = getDbInstance();
-  const rows = db
-    .prepare("SELECT key, value FROM key_value WHERE namespace = ?")
-    .all(namespace) as Array<{ key: string; value: string }>;
+  requirePostgresCatalogSnapshot();
+
+  const db = getSelectedPostgresDatabase() ? undefined : getDbInstance();
+  const rows = (
+    getSelectedPostgresDatabase()
+      ? catalogNamespaceRows(namespace)
+      : db!.prepare("SELECT key, value FROM key_value WHERE namespace = ?").all(namespace)
+  ) as Array<{ key: string; value: string }>;
 
   const values: Record<string, unknown> = {};
   for (const row of rows) {
@@ -124,6 +139,11 @@ function loadAllConfigs(): Map<string, ProviderParamFilter> {
  * does not hit the DB. Idempotent — subsequent calls return the cached map.
  */
 export function loadParamFilterConfigs(): Map<string, ProviderParamFilter> {
+  if (getSelectedPostgresDatabase()) {
+    requirePostgresCatalogSnapshot();
+    return loadAllConfigs();
+  }
+
   if (filterCache === null) {
     filterCache = loadAllConfigs();
   }
@@ -142,37 +162,59 @@ export function getParamFilterConfig(provider: string): ProviderParamFilter | nu
  * Upsert the entire param filter config for a provider.
  * Invalidates the in-memory cache.
  */
-export function setParamFilterConfig(provider: string, config: ProviderParamFilter): void {
-  if (!toNormalizedString(provider)) return;
+export async function setParamFilterConfigAsync(
+  provider: string,
+  config: ProviderParamFilter
+): Promise<void> {
+  const catalogDatabase = getSelectedPostgresDatabase();
+  const execute = async () => {
+    if (!toNormalizedString(provider)) return;
 
-  const db = getDbInstance();
-  const stmt = db.prepare(
-    "INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES (?, ?, ?)"
-  );
+    const db = getSelectedPostgresDatabase() ? undefined : getDbInstance();
+    const stmt = getSelectedPostgresDatabase()
+      ? undefined
+      : db!.prepare("INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES (?, ?, ?)");
 
-  // Normalize the filter before persisting
-  const normalized: ProviderParamFilter = {
-    block: config.block ?? [],
-    allow: config.allow ?? [],
-    autoLearn: config.autoLearn ?? false,
-    models: config.models && Object.keys(config.models).length > 0 ? config.models : undefined,
+    // Normalize the filter before persisting
+    const normalized: ProviderParamFilter = {
+      block: config.block ?? [],
+      allow: config.allow ?? [],
+      autoLearn: config.autoLearn ?? false,
+      models: config.models && Object.keys(config.models).length > 0 ? config.models : undefined,
+    };
+
+    getSelectedPostgresDatabase()
+      ? await putCatalogValue(NAMESPACE, provider, JSON.stringify(normalized))
+      : stmt!.run(NAMESPACE, provider, JSON.stringify(normalized));
+    if (getSelectedPostgresDatabase()) afterPostgresCatalogCommit(bumpCacheGeneration);
+    else bumpCacheGeneration();
   };
-
-  stmt.run(NAMESPACE, provider, JSON.stringify(normalized));
-  bumpCacheGeneration();
+  if (catalogDatabase && !isPostgresCatalogMutation(catalogDatabase))
+    return mutatePostgresCatalog(catalogDatabase, execute);
+  return execute();
 }
 
 /**
  * Delete the param filter config for a provider.
  * Resets to no filtering for that provider.
  */
-export function deleteParamFilterConfig(provider: string): void {
-  if (!toNormalizedString(provider)) return;
+export async function deleteParamFilterConfigAsync(provider: string): Promise<void> {
+  const catalogDatabase = getSelectedPostgresDatabase();
+  const execute = async () => {
+    if (!toNormalizedString(provider)) return;
 
-  const db = getDbInstance();
-  const stmt = db.prepare("DELETE FROM key_value WHERE namespace = ? AND key = ?");
-  stmt.run(NAMESPACE, provider);
-  bumpCacheGeneration();
+    const db = getSelectedPostgresDatabase() ? undefined : getDbInstance();
+    const stmt = getSelectedPostgresDatabase()
+      ? undefined
+      : db!.prepare("DELETE FROM key_value WHERE namespace = ? AND key = ?");
+    getSelectedPostgresDatabase()
+      ? await deleteCatalogValue(NAMESPACE, provider)
+      : stmt!.run(NAMESPACE, provider);
+    bumpCacheGeneration();
+  };
+  if (catalogDatabase && !isPostgresCatalogMutation(catalogDatabase))
+    return mutatePostgresCatalog(catalogDatabase, execute);
+  return execute();
 }
 
 // ── Global auto-learn flag ──────────────────────────────────────────────────
@@ -195,7 +237,97 @@ export function isAutoLearnGloballyEnabled(): boolean {
  * When enabled, the per-provider autoLearn flag is still honored after
  * the global check (either being on is sufficient to trigger auto-learn).
  */
+export async function setGlobalAutoLearnEnabledAsync(enabled: boolean): Promise<void> {
+  const catalogDatabase = getSelectedPostgresDatabase();
+  const execute = async () => {
+    const existing = getParamFilterConfig(GLOBAL_AUTOLEARN_KEY);
+    await setParamFilterConfigAsync(GLOBAL_AUTOLEARN_KEY, {
+      block: existing?.block ?? [],
+      allow: existing?.allow ?? [],
+      autoLearn: enabled,
+    });
+  };
+  if (catalogDatabase && !isPostgresCatalogMutation(catalogDatabase))
+    return mutatePostgresCatalog(catalogDatabase, execute);
+  return execute();
+}
+
+/**
+ * Auto-learn helper: add a single parameter to a provider's block list.
+ * If the field is already in the block list (or the config does not exist),
+ * this is a no-op. Optionally scoped to a specific model.
+ */
+export async function addParamToBlocklistAsync(
+  provider: string,
+  paramName: string,
+  model?: string
+): Promise<void> {
+  const catalogDatabase = getSelectedPostgresDatabase();
+  const execute = async () => {
+    if (!toNormalizedString(provider) || !toNormalizedString(paramName)) return;
+
+    const existing = getParamFilterConfig(provider) ?? {
+      block: [],
+      allow: [],
+      autoLearn: false,
+    };
+
+    if (model) {
+      // Model-level
+      const models = existing.models ?? {};
+      const modelCfg = models[model] ?? {};
+
+      if (Array.isArray(modelCfg.block) && modelCfg.block.includes(paramName)) return;
+
+      const updatedBlock = [...(modelCfg.block ?? []), paramName];
+      models[model] = { ...modelCfg, block: updatedBlock };
+      existing.models = models;
+    } else {
+      // Provider-level
+      if (existing.block.includes(paramName)) return;
+      existing.block = [...existing.block, paramName];
+    }
+
+    await setParamFilterConfigAsync(provider, existing);
+  };
+  if (catalogDatabase && !isPostgresCatalogMutation(catalogDatabase))
+    return mutatePostgresCatalog(catalogDatabase, execute);
+  return execute();
+}
+
+export function setParamFilterConfig(provider: string, config: ProviderParamFilter): void {
+  assertSqliteBackendAllowed();
+  if (!toNormalizedString(provider)) return;
+
+  const db = getDbInstance();
+  const stmt = db.prepare(
+    "INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES (?, ?, ?)"
+  );
+
+  // Normalize the filter before persisting
+  const normalized: ProviderParamFilter = {
+    block: config.block ?? [],
+    allow: config.allow ?? [],
+    autoLearn: config.autoLearn ?? false,
+    models: config.models && Object.keys(config.models).length > 0 ? config.models : undefined,
+  };
+
+  stmt.run(NAMESPACE, provider, JSON.stringify(normalized));
+  bumpCacheGeneration();
+}
+
+export function deleteParamFilterConfig(provider: string): void {
+  assertSqliteBackendAllowed();
+  if (!toNormalizedString(provider)) return;
+
+  const db = getDbInstance();
+  const stmt = db.prepare("DELETE FROM key_value WHERE namespace = ? AND key = ?");
+  stmt.run(NAMESPACE, provider);
+  bumpCacheGeneration();
+}
+
 export function setGlobalAutoLearnEnabled(enabled: boolean): void {
+  assertSqliteBackendAllowed();
   const existing = getParamFilterConfig(GLOBAL_AUTOLEARN_KEY);
   setParamFilterConfig(GLOBAL_AUTOLEARN_KEY, {
     block: existing?.block ?? [],
@@ -204,12 +336,8 @@ export function setGlobalAutoLearnEnabled(enabled: boolean): void {
   });
 }
 
-/**
- * Auto-learn helper: add a single parameter to a provider's block list.
- * If the field is already in the block list (or the config does not exist),
- * this is a no-op. Optionally scoped to a specific model.
- */
 export function addParamToBlocklist(provider: string, paramName: string, model?: string): void {
+  assertSqliteBackendAllowed();
   if (!toNormalizedString(provider) || !toNormalizedString(paramName)) return;
 
   const existing = getParamFilterConfig(provider) ?? {

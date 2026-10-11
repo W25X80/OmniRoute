@@ -1,11 +1,13 @@
+import { isNativeAgentPersistenceError } from "../db/agentRuntimeState";
 import type { A2ATask, TaskArtifact } from "./taskManager";
-import { appendA2ATaskEvent } from "@/lib/db/a2aTasks";
+import { appendA2ATaskEventAsync } from "@/lib/db/a2aTasks";
 import { memoryManager } from "@/lib/memory/manager";
 import { logger } from "@omniroute/open-sse/utils/logger";
 
 const log = logger("A2A_TASKS");
 
 type TaskManagerLike = {
+  flushPersistence?: () => Promise<void>;
   updateTask: (
     taskId: string,
     state: "completed" | "failed",
@@ -43,7 +45,7 @@ export interface MemoryHitsDeps {
     apiKeyId: string;
     limit?: number;
   }) => Promise<Array<{ id: string; key: string; type: string; content: string }>>;
-  appendEvent?: (taskId: string, eventType: string, dataJson?: string) => void;
+  appendEvent?: (taskId: string, eventType: string, dataJson?: string) => void | Promise<void>;
   /** Recall deadline override — tests inject a few ms instead of waiting {@link MEMORY_RECALL_TIMEOUT_MS}. */
   timeoutMs?: number;
 }
@@ -168,12 +170,17 @@ export async function executeA2ATaskWithState(
   handler: (task: A2ATask) => Promise<StreamTaskResult>,
   deps?: MemoryHitsDeps
 ) {
+  await tm.flushPersistence?.();
   try {
     const hits = await collectMemoryHits(task, deps);
     if (hits.length) {
       task.metadata.memoryHits = hits;
       try {
-        (deps?.appendEvent ?? appendA2ATaskEvent)(task.id, "memory_hits", JSON.stringify(hits));
+        await (deps?.appendEvent ?? appendA2ATaskEventAsync)(
+          task.id,
+          "memory_hits",
+          JSON.stringify(hits)
+        );
       } catch {
         // best-effort — never break the task's write path
       }
@@ -181,11 +188,14 @@ export async function executeA2ATaskWithState(
 
     const result = await handler(task);
     tm.updateTask(task.id, "completed", result.artifacts);
+    await tm.flushPersistence?.();
     return result;
   } catch (err) {
+    if (isNativeAgentPersistenceError(err)) throw err;
     const msg = err instanceof Error ? err.message : String(err);
     try {
       tm.updateTask(task.id, "failed", [{ type: "error", content: msg }], msg);
+      await tm.flushPersistence?.();
     } catch {
       // Task may already be terminal (e.g., cancelled). Preserve original error.
     }

@@ -1,11 +1,12 @@
 // Proxy-subscription-specific pool operations, split out of `proxies.ts` to keep
 // that module under its frozen size cap. Re-exported from `proxies.ts` so callers
 // (subscriptionService.ts et al.) can keep importing from the original module.
+import { getSelectedPostgresDatabase } from "./controlPlaneContext";
+import { createPostgresProxyRepository } from "./postgres/proxyRepository";
 import { getDbInstance } from "./core";
 import { backupDbFile } from "./backup";
 import { normalizeScope, normalizeAssignmentScopeId, isScopeIdMissing } from "./proxies/mappers";
 import { bumpProxyRegistryGeneration } from "./proxies/registryGeneration";
-
 /**
  * Add MULTIPLE proxies to a scope's rotation POOL in a single batched write
  * (#6365). Idempotent per (scope, scope_id, proxy_id): existing members are
@@ -19,6 +20,8 @@ export async function addProxiesToScopePool(
   scopeId: string | null,
   proxyIds: string[]
 ): Promise<number> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) return createPostgresProxyRepository(postgres).addToPool(scope, scopeId, proxyIds);
   const normalizedScope = normalizeScope(scope);
   const normalizedScopeId = normalizeAssignmentScopeId(normalizedScope, scopeId);
   // Contract: normalizedScope is already normalized — the raw-scope guard applies to it directly.
@@ -30,7 +33,9 @@ export async function addProxiesToScopePool(
 
   const db = getDbInstance();
   const maxRow = db
-    .prepare("SELECT MAX(position) AS maxPos FROM proxy_assignments WHERE scope = ? AND scope_id IS ?")
+    .prepare(
+      "SELECT MAX(position) AS maxPos FROM proxy_assignments WHERE scope = ? AND scope_id IS ?"
+    )
     .get(normalizedScope, normalizedScopeId) as { maxPos?: number | null } | undefined;
   const base = maxRow && typeof maxRow.maxPos === "number" ? maxRow.maxPos + 1 : 0;
   const now = new Date().toISOString();

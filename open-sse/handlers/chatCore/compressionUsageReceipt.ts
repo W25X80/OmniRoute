@@ -1,3 +1,5 @@
+import { parseDatabaseBackend } from "@/lib/db/backendSelection";
+import { runPersistenceBackgroundWork } from "@/lib/db/persistenceRuntime";
 /**
  * chatCore compression-usage receipt attachment (Quality Gate v2 / Fase 9 — chatCore god-file
  * decomposition, #3501).
@@ -15,13 +17,15 @@ export function attachCompressionUsageReceiptAfterAnalytics(
   ctx: { pendingWrite: Promise<void> | null; skillRequestId: string }
 ) {
   const { pendingWrite, skillRequestId } = ctx;
-  void (async () => {
+  const work = runPersistenceBackgroundWork(async () => {
     try {
       if (pendingWrite) await pendingWrite;
-      const { attachCompressionUsageReceipt } = await import("@/lib/db/compressionAnalytics.ts");
-      attachCompressionUsageReceipt(skillRequestId, usage, source);
+      const { attachCompressionUsageReceiptAsync } =
+        await import("@/lib/db/compressionAnalytics.ts");
+      await attachCompressionUsageReceiptAsync(skillRequestId, usage, source);
     } catch {
       // Compression analytics are best-effort and must never affect responses.
     }
-  })();
+  }).catch(() => {});
+  if (parseDatabaseBackend() === "postgres") return work;
 }

@@ -1,3 +1,5 @@
+import { getSelectedPostgresDatabase } from "./controlPlaneContext";
+import { createPostgresOperationsRepository } from "./postgres/operationsRepository";
 /**
  * Database Statistics Module
  *
@@ -8,20 +10,22 @@ import type { SqliteAdapter } from "./adapters/types";
 import { getDbInstance } from "./core";
 
 export interface DatabaseStats {
+  backend?: "sqlite" | "postgresql";
   totalSize: number;
-  pageSize: number;
-  pageCount: number;
+  pageSize: number | null;
+  pageCount: number | null;
   tables: Array<{
     name: string;
     rowCount: number;
+    rowCountApproximate?: boolean;
     size: number;
   }>;
   indexes: Array<{
     name: string;
     tableName: string;
   }>;
-  walSize?: number;
-  cacheSize: number;
+  walSize?: number | null;
+  cacheSize: number | null;
 }
 
 /**
@@ -65,8 +69,7 @@ export function getDatabaseStats(db: SqliteAdapter = getDbInstance()): DatabaseS
     try {
       const quotedName = `"${table.name.replaceAll('"', '""')}"`;
       const row = db.prepare(`SELECT COUNT(*) as count FROM ${quotedName}`).get() as
-        | { count: number }
-        | undefined;
+        { count: number } | undefined;
       rowCount = row?.count ?? 0;
     } catch (error) {
       if (!(error instanceof Error) || !error.message.startsWith("no such module:")) {
@@ -104,4 +107,10 @@ export function getDatabaseStats(db: SqliteAdapter = getDbInstance()): DatabaseS
     indexes,
     cacheSize,
   };
+}
+
+export async function getDatabaseStatsAsync(): Promise<DatabaseStats> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return getDatabaseStats();
+  return createPostgresOperationsRepository(database).getDatabaseStats();
 }

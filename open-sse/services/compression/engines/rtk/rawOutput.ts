@@ -4,6 +4,8 @@ import path from "node:path";
 import os from "node:os";
 import crypto from "node:crypto";
 
+import { parseDatabaseBackend } from "../../../../../src/lib/db/backendSelection";
+
 import type { CommandSample } from "./discover.ts";
 import { severityWordPattern } from "./severityVocabulary.ts";
 
@@ -52,7 +54,10 @@ function safeUtf8Slice(value: string, maxBytes: number): string {
   return `${output}\n\n--- truncated at ${maxBytes} bytes ---`;
 }
 
-export function redactRtkRawOutput(value: string): { text: string; redacted: boolean } {
+export function redactRtkRawOutput(value: string): {
+  text: string;
+  redacted: boolean;
+} {
   let redacted = false;
   let text = value;
   for (const [pattern, replacement] of SECRET_PATTERNS) {
@@ -89,20 +94,26 @@ function bucketDir(id: string): string {
   return path.join(rawOutputDir(), id.slice(0, RAW_OUTPUT_BUCKET_LEN));
 }
 
-export function maybePersistRtkRawOutput(
+interface RtkRawOutputOptions {
+  retention: RtkRawOutputRetention;
+  command?: string | null;
+  maxBytes?: number;
+  failure?: boolean;
+}
+
+function prepareRtkRawOutput(
   raw: string,
-  options: {
-    retention: RtkRawOutputRetention;
-    command?: string | null;
-    maxBytes?: number;
-    failure?: boolean;
-  }
-): RtkRawOutputPointer | null {
+  options: RtkRawOutputOptions
+): {
+  pointer: RtkRawOutputPointer;
+  directory: string;
+  text: string;
+  metadata: string;
+} | null {
   if (options.retention === "never") return null;
   const failure = options.failure ?? isLikelyFailureOutput(raw);
   if (options.retention === "failures" && !failure) return null;
   if (raw.trim().length === 0) return null;
-
   const maxBytes = Math.max(1024, Math.floor(options.maxBytes ?? 1_048_576));
   const redaction = redactRtkRawOutput(safeUtf8Slice(raw, maxBytes));
   const now = Date.now();
@@ -111,46 +122,69 @@ export function maybePersistRtkRawOutput(
     .replace(/^_+|_+$/g, "")
     .slice(0, 48);
   const id = safeId(`${now}:${commandSlug}:${raw.length}:${redaction.text}`);
-  const dir = bucketDir(id);
-  const fileName = `${now}-${commandSlug || "tool-output"}-${id}.log`;
-  const filePath = path.join(dir, fileName);
+  const directory = bucketDir(id);
+  const filePath = path.join(directory, `${now}-${commandSlug || "tool-output"}-${id}.log`);
+  const bytes = Buffer.byteLength(redaction.text, "utf8");
+  return {
+    pointer: {
+      id,
+      path: filePath,
+      bytes,
+      sha256: crypto.createHash("sha256").update(redaction.text).digest("hex"),
+      redacted: redaction.redacted,
+    },
+    directory,
+    text: redaction.text,
+    metadata: JSON.stringify({
+      command: options.command ?? null,
+      timestamp: now,
+      failure,
+      redacted: redaction.redacted,
+      bytes,
+    }),
+  };
+}
+
+export function maybePersistRtkRawOutput(
+  raw: string,
+  options: RtkRawOutputOptions
+): RtkRawOutputPointer | null {
+  const capture = prepareRtkRawOutput(raw, options);
+  if (!capture) return null;
   try {
-    fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(filePath, redaction.text);
+    fs.mkdirSync(capture.directory, { recursive: true });
+    fs.writeFileSync(capture.pointer.path, capture.text);
   } catch {
-    // Best-effort capture: a disk error (ENOSPC / EACCES / read-only DATA_DIR) must NEVER
-    // fail the compression pipeline. Skip the capture, exactly like retention "never".
+    // A failed log write never fails compression or advertises an unavailable receipt.
     return null;
   }
-
-  // Sidecar metadata: the .log filename only carries a lossy command SLUG, so persist
-  // the FULL command (and timestamp/flags) next to it. Keeps the .log pure output (the
-  // raw-output recovery route still returns it verbatim) while letting the RTK
-  // learn/discover sample source recover the exact command. Best-effort: a sidecar
-  // write failure never fails the capture.
   try {
-    const metaPath = filePath.replace(/\.log$/, ".meta.json");
-    fs.writeFileSync(
-      metaPath,
-      JSON.stringify({
-        command: options.command ?? null,
-        timestamp: now,
-        failure,
-        redacted: redaction.redacted,
-        bytes: Buffer.byteLength(redaction.text, "utf8"),
-      })
-    );
+    fs.writeFileSync(capture.pointer.path.replace(/\.log$/, ".meta.json"), capture.metadata);
   } catch {
-    // Sidecar is an optimisation for learn/discover; the .log (with slug) still works.
+    // The log remains recoverable when optional command metadata cannot be written.
   }
+  return capture.pointer;
+}
 
-  return {
-    id,
-    path: filePath,
-    bytes: Buffer.byteLength(redaction.text, "utf8"),
-    sha256: crypto.createHash("sha256").update(redaction.text).digest("hex"),
-    redacted: redaction.redacted,
-  };
+/** Native inline compression awaits the file owner; the synchronous worker API stays intact. */
+export async function maybePersistRtkRawOutputAsync(
+  raw: string,
+  options: RtkRawOutputOptions
+): Promise<RtkRawOutputPointer | null> {
+  const capture = prepareRtkRawOutput(raw, options);
+  if (!capture) return null;
+  try {
+    await fsp.mkdir(capture.directory, { recursive: true });
+    await fsp.writeFile(capture.pointer.path, capture.text);
+  } catch {
+    return null;
+  }
+  try {
+    await fsp.writeFile(capture.pointer.path.replace(/\.log$/, ".meta.json"), capture.metadata);
+  } catch {
+    // Keep the source best-effort sidecar policy and successful log receipt.
+  }
+  return capture.pointer;
 }
 
 export function readRtkRawOutput(pointerId: string): string | null {
@@ -298,10 +332,28 @@ export interface RtkRawOutputPurgeResult {
 
 const PURGE_THROTTLE_MS = 60_000;
 let lastRawOutputPurgeAt = 0;
+const NATIVE_PURGE = Symbol.for("omniroute.rtkRawOutputPurge");
+const NATIVE_PURGE_AT = Symbol.for("omniroute.rtkRawOutputPurgeAt");
+interface NativePurgeTask {
+  timer?: ReturnType<typeof setImmediate>;
+  promise: Promise<void>;
+  finish(): void;
+}
+interface NativePurgeOwner {
+  stopped: boolean;
+  queued?: NativePurgeTask;
+  accepted: Set<Promise<void>>;
+  closing?: Promise<void>;
+}
+const nativePurgeGlobals = globalThis as typeof globalThis & {
+  [NATIVE_PURGE]?: NativePurgeOwner | false;
+  [NATIVE_PURGE_AT]?: number;
+};
 
 /** Test hook: clear the purge throttle so a test can exercise two consecutive purges. */
 export function resetRtkRawOutputPurgeThrottle(): void {
   lastRawOutputPurgeAt = 0;
+  delete nativePurgeGlobals[NATIVE_PURGE_AT];
 }
 
 async function mapLimit<T>(
@@ -331,18 +383,34 @@ async function mapLimit<T>(
 export async function purgeRtkRawOutput(
   opts: RtkRawOutputPurgeOptions = {}
 ): Promise<RtkRawOutputPurgeResult> {
+  return purgeRtkRawOutputAt(rawOutputDir(), opts, parseDatabaseBackend() === "postgres");
+}
+
+async function purgeRtkRawOutputAt(
+  dir: string,
+  opts: RtkRawOutputPurgeOptions,
+  native: boolean
+): Promise<RtkRawOutputPurgeResult> {
   const now = Date.now();
-  if (now - lastRawOutputPurgeAt < PURGE_THROTTLE_MS) {
+  if (
+    now - (native ? (nativePurgeGlobals[NATIVE_PURGE_AT] ?? 0) : lastRawOutputPurgeAt) <
+    PURGE_THROTTLE_MS
+  ) {
     return { skipped: true, scanned: 0, deleted: 0, errors: 0 };
   }
-  lastRawOutputPurgeAt = now;
+  if (native) nativePurgeGlobals[NATIVE_PURGE_AT] = now;
+  else lastRawOutputPurgeAt = now;
 
   const maxAgeDays = Math.max(1, Math.floor(opts.maxAgeDays ?? 30));
   const maxFiles = Math.max(1, Math.floor(opts.maxFiles ?? 100_000));
   const maxAgeMs = maxAgeDays * 86_400_000;
-  const dir = rawOutputDir();
-  const result: RtkRawOutputPurgeResult = { skipped: false, scanned: 0, deleted: 0, errors: 0 };
-  if (!fs.existsSync(dir)) return result;
+  const result: RtkRawOutputPurgeResult = {
+    skipped: false,
+    scanned: 0,
+    deleted: 0,
+    errors: 0,
+  };
+  if (native ? !(await pathExistsAsync(dir)) : !fs.existsSync(dir)) return result;
 
   try {
     const candidates: Array<{ file: string; meta: string | null; ts: number }> = [];
@@ -389,7 +457,8 @@ export async function purgeRtkRawOutput(
     result.scanned = candidates.length;
 
     const agedOut = candidates.filter((c) => c.ts > 0 && now - c.ts > maxAgeMs);
-    const remaining = candidates.filter((c) => !agedOut.includes(c));
+    const aged = new Set(agedOut);
+    const remaining = candidates.filter((c) => !aged.has(c));
     remaining.sort((a, b) => b.ts - a.ts || (a.file < b.file ? 1 : -1));
     const keep = new Set(remaining.slice(0, maxFiles).map((c) => c.file));
     const overflow = remaining.filter((c) => !keep.has(c.file));
@@ -427,9 +496,182 @@ export async function purgeRtkRawOutput(
  * purgeRtkRawOutput itself throttles to once per minute.
  */
 export function scheduleRtkRawOutputPurge(opts: RtkRawOutputPurgeOptions = {}): void {
+  if (parseDatabaseBackend() === "postgres") {
+    const existing = nativePurgeGlobals[NATIVE_PURGE];
+    if (existing === false || existing?.stopped || existing?.queued) return;
+    let directory: string;
+    try {
+      directory = rawOutputDir();
+    } catch {
+      console.warn("[rtk-raw-output] background purge unavailable.");
+      return;
+    }
+    const options = { ...opts };
+    const owner: NativePurgeOwner =
+      existing ??
+      (nativePurgeGlobals[NATIVE_PURGE] = { stopped: false, accepted: new Set<Promise<void>>() });
+    let finish!: () => void;
+    const promise = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    const task: NativePurgeTask = { promise, finish };
+    owner.accepted.add(promise);
+    owner.queued = task;
+    task.timer = setImmediate(() => {
+      if (owner.queued === task) owner.queued = undefined;
+      void purgeRtkRawOutputAt(directory, options, true)
+        .catch(() => {
+          console.warn("[rtk-raw-output] background purge failed.");
+        })
+        .finally(() => {
+          owner.accepted.delete(promise);
+          finish();
+        });
+    });
+    return;
+  }
   setImmediate(() => {
     void purgeRtkRawOutput(opts).catch(() => {
       /* best-effort */
     });
   });
+}
+
+/** Stop optional native production; already-running file maintenance remains owned until close. */
+export function stopRtkRawOutputPurgeScheduler(): void {
+  const owner = nativePurgeGlobals[NATIVE_PURGE];
+  if (!owner) {
+    nativePurgeGlobals[NATIVE_PURGE] = false;
+    return;
+  }
+  owner.stopped = true;
+  const queued = owner.queued;
+  if (queued) {
+    if (queued.timer) clearImmediate(queued.timer);
+    owner.queued = undefined;
+    owner.accepted.delete(queued.promise);
+    queued.finish();
+  }
+}
+
+/** Final sink stage, after accepted requests have completed their retained-log writes. */
+export async function closeRtkRawOutputPurgeScheduler(): Promise<void> {
+  stopRtkRawOutputPurgeScheduler();
+  const owner = nativePurgeGlobals[NATIVE_PURGE];
+  if (!owner) return;
+  await (owner.closing ??= Promise.all([...owner.accepted]).then(() => {}));
+}
+
+async function pathExistsAsync(filename: string): Promise<boolean> {
+  try {
+    await fsp.access(filename);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Async serving reader; synchronous exports remain the compression-worker/SQLite contract. */
+export async function readRtkRawOutputAsync(pointerId: string): Promise<string | null> {
+  if (parseDatabaseBackend() !== "postgres") return readRtkRawOutput(pointerId);
+  const dir = rawOutputDir();
+  if (!(await pathExistsAsync(dir))) return null;
+  const bucket = bucketDir(pointerId);
+  if (await pathExistsAsync(bucket)) {
+    const entry = (await fsp.readdir(bucket)).find(
+      (file) => file.endsWith(".log") && file.includes(pointerId)
+    );
+    if (entry) {
+      const fullPath = path.join(bucket, entry);
+      if (!fullPath.startsWith(dir)) return null;
+      return fsp.readFile(fullPath, "utf8");
+    }
+  }
+  const entries = await fsp.readdir(dir);
+  if (entries.length > LEGACY_FLAT_SCAN_GUARD) {
+    console.warn(
+      `[rtk-raw-output] legacy flat store has ${entries.length} entries; skipping O(n) pointer scan for ${pointerId}`
+    );
+    return null;
+  }
+  const entry = entries.find((file) => file.endsWith(".log") && file.includes(pointerId));
+  if (!entry) return null;
+  const fullPath = path.join(dir, entry);
+  return fullPath.startsWith(dir) ? fsp.readFile(fullPath, "utf8") : null;
+}
+
+async function collectRawOutputLogFilesAsync(
+  dir: string
+): Promise<Array<{ name: string; fullPath: string }>> {
+  const logs: Array<{ name: string; fullPath: string }> = [];
+  let entries: string[];
+  try {
+    entries = await fsp.readdir(dir);
+  } catch {
+    return logs;
+  }
+  if (entries.length <= LEGACY_FLAT_SCAN_GUARD) {
+    for (const entry of entries) {
+      if (entry.endsWith(".log")) logs.push({ name: entry, fullPath: path.join(dir, entry) });
+    }
+  } else {
+    console.warn(
+      `[rtk-raw-output] legacy flat store has ${entries.length} entries; skipping sample scan this run`
+    );
+  }
+  for (const entry of entries) {
+    if (entry.length !== RAW_OUTPUT_BUCKET_LEN) continue;
+    const subPath = path.join(dir, entry);
+    try {
+      if (!(await fsp.stat(subPath)).isDirectory()) continue;
+    } catch {
+      continue;
+    }
+    let subEntries: string[];
+    try {
+      subEntries = await fsp.readdir(subPath);
+    } catch {
+      continue;
+    }
+    for (const name of subEntries) {
+      if (name.endsWith(".log")) logs.push({ name, fullPath: path.join(subPath, name) });
+    }
+  }
+  return logs;
+}
+
+export async function listRtkCommandSamplesAsync(
+  opts: { limit?: number } = {}
+): Promise<CommandSample[]> {
+  if (parseDatabaseBackend() !== "postgres") return listRtkCommandSamples(opts);
+  const dir = rawOutputDir();
+  if (!(await pathExistsAsync(dir))) return [];
+  const limit = Math.max(1, Math.floor(opts.limit ?? 500));
+  const logs = await collectRawOutputLogFilesAsync(dir);
+  logs.sort((a, b) => (a.name < b.name ? 1 : a.name > b.name ? -1 : 0));
+  const samples: CommandSample[] = [];
+  for (const { name, fullPath } of logs) {
+    if (samples.length >= limit) break;
+    let output: string;
+    try {
+      output = await fsp.readFile(fullPath, "utf8");
+    } catch {
+      continue;
+    }
+    if (!output.trim()) continue;
+    let command = "";
+    try {
+      const meta = JSON.parse(
+        await fsp.readFile(fullPath.replace(/\.log$/, ".meta.json"), "utf8")
+      ) as {
+        command?: unknown;
+      };
+      if (typeof meta.command === "string" && meta.command.trim()) command = meta.command.trim();
+    } catch {
+      /* Preserve the legacy filename fallback. */
+    }
+    if (!command) command = commandFromSlug(name) || "tool-output";
+    samples.push({ command, output });
+  }
+  return samples;
 }

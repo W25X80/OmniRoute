@@ -1,3 +1,4 @@
+import { getSelectedPostgresDatabase } from "./controlPlaneContext";
 /**
  * JobRegistry persistence layer.
  *
@@ -172,4 +173,92 @@ export function cleanupOrphanedRuns(timeoutMinutes = 5): void {
          finished_at = datetime('now')
      WHERE status = 'running' AND started_at < ?`
   ).run(threshold);
+}
+
+export async function getAllJobsAsync(
+  ...args: Parameters<typeof getAllJobs>
+): Promise<ReturnType<typeof getAllJobs>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceOperations");
+    return postgres.transaction((transaction) => native.getAllJobs(transaction, ...args));
+  }
+  return getAllJobs(...args);
+}
+
+export async function getJobAsync(
+  ...args: Parameters<typeof getJob>
+): Promise<ReturnType<typeof getJob>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceOperations");
+    return postgres.transaction((transaction) => native.getJob(transaction, ...args));
+  }
+  return getJob(...args);
+}
+
+export async function upsertJobAsync(
+  ...args: Parameters<typeof upsertJob>
+): Promise<ReturnType<typeof upsertJob>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceOperations");
+    return postgres.transaction((transaction) => native.upsertJob(transaction, ...args));
+  }
+  return upsertJob(...args);
+}
+
+export async function updateJobEnabledAsync(
+  ...args: Parameters<typeof updateJobEnabled>
+): Promise<ReturnType<typeof updateJobEnabled>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceOperations");
+    return postgres.transaction((transaction) => native.updateJobEnabled(transaction, ...args));
+  }
+  return updateJobEnabled(...args);
+}
+
+export async function recordRunAsync(
+  ...args: Parameters<typeof recordRun>
+): Promise<ReturnType<typeof recordRun>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceOperations");
+    return postgres.transaction((transaction) => native.recordRun(transaction, ...args));
+  }
+  return recordRun(...args);
+}
+
+export async function pruneRunsAsync(
+  ...args: Parameters<typeof pruneRuns>
+): Promise<ReturnType<typeof pruneRuns>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceOperations");
+    return postgres.transaction((transaction) => native.pruneRuns(transaction, ...args));
+  }
+  return pruneRuns(...args);
+}
+
+export async function getRunsAsync(
+  ...args: Parameters<typeof getRuns>
+): Promise<ReturnType<typeof getRuns>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceOperations");
+    return postgres.transaction((transaction) => native.getRuns(transaction, ...args));
+  }
+  return getRuns(...args);
+}
+
+export async function cleanupOrphanedRunsAsync(
+  ...args: Parameters<typeof cleanupOrphanedRuns>
+): Promise<ReturnType<typeof cleanupOrphanedRuns>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceOperations");
+    return postgres.transaction((transaction) => native.cleanupOrphanedRuns(transaction, ...args));
+  }
+  return cleanupOrphanedRuns(...args);
 }

@@ -17,7 +17,7 @@ type CompletePayload = {
 
 type AborterContext = {
   onFailure?: ((payload: StreamFailurePayload) => boolean | void | Promise<void>) | null;
-  onComplete?: ((payload: CompletePayload) => void) | null;
+  onComplete?: ((payload: CompletePayload) => void | Promise<void>) | null;
   getUsage: () => unknown;
   timing: StreamTiming;
   buildProviderPayload: () => unknown;
@@ -39,7 +39,15 @@ export function createStreamFailureAborter(context: AborterContext) {
     context.timing.markInterrupted();
     if (context.onFailure) {
       try {
-        handled = context.onFailure(failure) === true;
+        const result = context.onFailure(failure);
+        handled = result === true;
+        if (result && typeof result !== "boolean")
+          void result.catch((error: unknown) =>
+            console.debug(
+              "[STREAM] Failure callback failed:",
+              error instanceof Error ? error.name : "Error"
+            )
+          );
       } catch (error) {
         console.debug("[STREAM] onFailure callback error:", error);
       }
@@ -49,7 +57,7 @@ export function createStreamFailureAborter(context: AborterContext) {
       const body = buildErrorBody(failure.status, failure.message);
       safeMessage = body.error.message;
       try {
-        context.onComplete({
+        const completion = context.onComplete({
           status: failure.status,
           usage: context.getUsage(),
           responseBody: body,
@@ -61,6 +69,13 @@ export function createStreamFailureAborter(context: AborterContext) {
           providerPayload: context.buildProviderPayload(),
           clientPayload: context.buildClientPayload(body),
         });
+        if (completion)
+          void completion.catch((error: unknown) =>
+            console.debug(
+              "[STREAM] Completion callback failed:",
+              error instanceof Error ? error.name : "Error"
+            )
+          );
         handled = true;
       } catch (error) {
         console.debug(

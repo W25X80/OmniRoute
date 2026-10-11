@@ -9,6 +9,9 @@
  */
 
 import { getDbInstance } from "./core";
+import { getSelectedPostgresDatabase } from "./controlPlaneContext";
+import { PostgresQuotaRepository } from "./postgres/quotaRepository";
+
 import { invalidateModelCatalogCache } from "./readCache";
 
 // ---------------------------------------------------------------------------
@@ -135,7 +138,7 @@ export function deleteGroup(id: string): boolean {
   // Protect the seed group.
   if (id === "group-demo") {
     throw new Error(
-      "Cannot delete the protected seed group 'group-demo'. Reassign its pools to another group first.",
+      "Cannot delete the protected seed group 'group-demo'. Reassign its pools to another group first."
     );
   }
 
@@ -149,4 +152,42 @@ export function deleteGroup(id: string): boolean {
 
   const result = getDb().prepare("DELETE FROM quota_groups WHERE id = ?").run(id);
   return result.changes > 0;
+}
+
+function selectedQuotaRepository(): PostgresQuotaRepository | undefined {
+  const database = getSelectedPostgresDatabase();
+  return database ? new PostgresQuotaRepository(database) : undefined;
+}
+
+export async function createGroupAsync(name: string): Promise<QuotaGroup> {
+  const repository = selectedQuotaRepository();
+  return repository ? repository.createGroup(name) : createGroup(name);
+}
+
+export async function getGroupAsync(id: string): Promise<QuotaGroup | null> {
+  const repository = selectedQuotaRepository();
+  return repository ? repository.getGroup(id) : getGroup(id);
+}
+
+export async function getGroupNameAsync(id: string): Promise<string | null> {
+  const repository = selectedQuotaRepository();
+  return repository ? repository.getGroupName(id) : getGroupName(id);
+}
+
+export async function listGroupsAsync(): Promise<QuotaGroup[]> {
+  const repository = selectedQuotaRepository();
+  return repository ? repository.listGroups() : listGroups();
+}
+
+export async function renameGroupAsync(id: string, name: string): Promise<boolean> {
+  const repository = selectedQuotaRepository();
+  if (!repository) return renameGroup(id, name);
+  const changed = await repository.renameGroup(id, name);
+  if (changed) invalidateModelCatalogCache();
+  return changed;
+}
+
+export async function deleteGroupAsync(id: string): Promise<boolean> {
+  const repository = selectedQuotaRepository();
+  return repository ? repository.deleteGroup(id) : deleteGroup(id);
 }

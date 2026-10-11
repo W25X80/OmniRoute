@@ -1,3 +1,10 @@
+import { AsyncLocalStorage } from "node:async_hooks";
+import {
+  observeSessionModelHistoryFence,
+  isPostgresSessionModelHistorySelected,
+  deleteSessionModelHistoryWithFence,
+  type SessionModelHistoryFence,
+} from "../../../src/lib/db/sessionModelHistoryFences.ts";
 /**
  * Per-session combo consecutive-failure tracker.
  *
@@ -27,6 +34,34 @@
  * No barrel import — consistent with the other combo/* leaves.
  */
 
+/**
+ * Per-session combo consecutive-failure tracker.
+ *
+ * Purpose: stop the silent-stop pattern where a combo cascade fails, the session
+ * keeps re-picking the same combo, and every retry hits the same dead/stale pin
+ * (the user has no visible signal to switch). After N consecutive failures for a
+ * (sessionId, comboName) pair we drop the session pin so the next request is
+ * forced to re-resolve targets from scratch — and we surface an
+ * `X-OmniRoute-Recovery-Action: try-auto` (or `switch-combo`) hint so the client
+ * (e.g. the OpenCode plugin) can render an actionable error instead of the
+ * previous opaque "model stopped producing output" loop.
+ *
+ * Design constraints
+ * ──────────────────
+ *  - In-memory Map (no DB) — failures are a per-process hot-path signal, the
+ *    pin that gets cleared is the same in-memory + DB record managed by
+ *    recordSessionModelUsage / deleteSessionModelHistory. Losing the
+ *    counter on process restart is acceptable: worst case the user takes N
+ *    retries before we clear the pin again.
+ *  - TTL eviction (default 5 min, matching sessionManager session stickiness)
+ *    prevents unbounded growth across long-lived sessions.
+ *  - Fail-open: every public function catches its own throws and returns a safe
+ *    default — a bug in the tracker must never block a request.
+ *  - Pinned to a counter threshold (default 3) so a single transient 5xx does
+ *    not destroy the prompt-cache pinning benefit.
+ *
+ * No barrel import — consistent with the other combo/* leaves.
+ */
 import { deleteSessionModelHistory } from "@/lib/db/contextHandoffs";
 
 /** Default threshold — after this many consecutive failures the pin is cleared. */
@@ -45,13 +80,14 @@ interface FailureEntry {
   lastFailureAt: number;
   /** Whether we have already auto-cleared the pin for this streak. */
   pinClearedThisStreak: boolean;
+  streak: object;
 }
 
 const failureMap = new Map<string, FailureEntry>();
 
 /** Pure keying helper — keeps the lookup format in one place. */
 function keyOf(sessionId: string, comboName: string): string {
-  return `${sessionId}::${comboName}`;
+  return JSON.stringify([sessionId, comboName]);
 }
 
 /**
@@ -103,23 +139,28 @@ export function recordComboFailure(
     const count = (existing?.count ?? 0) + 1;
     const pinClearedBefore = existing?.pinClearedThisStreak ?? false;
     const shouldClearNow = count >= COMBO_FAILURE_THRESHOLD && !pinClearedBefore;
-    failureMap.set(key, {
+    const entry: FailureEntry = {
       count,
       lastFailureAt: now,
-      pinClearedThisStreak: shouldClearNow || pinClearedBefore,
-    });
+      pinClearedThisStreak: pinClearedBefore,
+      streak: existing?.streak ?? {},
+    };
+    failureMap.set(key, entry);
+    let pinClearedNow = false;
     if (shouldClearNow) {
       try {
         // Session-scoped: clears ONLY this session's pin on this combo. Other
         // sessions sharing the same combo keep their own pin (see
         // deleteSessionModelHistory's docstring in contextHandoffs.ts).
         deleteSessionModelHistory(sessionId, comboName);
+        entry.pinClearedThisStreak = true;
+        pinClearedNow = true;
       } catch {
         // Best effort — the counter still records the streak, future clears will
         // retry on the next threshold-cross.
       }
     }
-    return { count, pinClearedNow: shouldClearNow };
+    return { count, pinClearedNow };
   } catch {
     return { count: 0, pinClearedNow: false };
   }
@@ -160,4 +201,76 @@ export function getComboFailureCount(
 /** Test-only — wipe all state. Not exported under a stable name (prefixed `__`). */
 export function __resetComboFailureTrackerForTests(): void {
   failureMap.clear();
+}
+
+const observedHistoryFences = new AsyncLocalStorage<
+  ReadonlyMap<string, SessionModelHistoryFence>
+>();
+
+/** Bound one request to the history it saw, preserving the per-process failure policy. */
+export async function withComboFailureFence<T>(
+  sessionId: string | null | undefined,
+  comboName: string,
+  operation: () => Promise<T>
+): Promise<T> {
+  if (!sessionId || !isPostgresSessionModelHistorySelected()) return operation();
+  let fence: SessionModelHistoryFence | null;
+  try {
+    fence = await observeSessionModelHistoryFence(sessionId, comboName);
+  } catch {
+    // The tracker is fail-open. Without an observed fence it cannot authorize deletion.
+    return observedHistoryFences.run(new Map(), operation);
+  }
+  const inherited = new Map(observedHistoryFences.getStore());
+  if (fence) inherited.set(keyOf(sessionId, comboName), fence);
+  return observedHistoryFences.run(inherited, operation);
+}
+
+export async function recordComboFailureAsync(
+  sessionId: string | null | undefined,
+  comboName: string
+): Promise<{ count: number; pinClearedNow: boolean }> {
+  if (!sessionId) return { count: 0, pinClearedNow: false };
+  try {
+    if (!isPostgresSessionModelHistorySelected()) return recordComboFailure(sessionId, comboName);
+    const now = Date.now();
+    evict(now);
+    const key = keyOf(sessionId, comboName);
+    const previous = failureMap.get(key);
+    const count = (previous?.count ?? 0) + 1;
+    const entry: FailureEntry = {
+      count,
+      lastFailureAt: now,
+      pinClearedThisStreak: previous?.pinClearedThisStreak ?? false,
+      streak: previous?.streak ?? {},
+    };
+    failureMap.set(key, entry);
+    const fence = observedHistoryFences.getStore()?.get(keyOf(sessionId, comboName));
+    if (
+      count < COMBO_FAILURE_THRESHOLD ||
+      entry.pinClearedThisStreak ||
+      !fence ||
+      fence.sessionId !== sessionId ||
+      fence.comboName !== comboName
+    ) {
+      return { count, pinClearedNow: false };
+    }
+    try {
+      const stillCurrent = () => {
+        const current = failureMap.get(key);
+        return current?.streak === entry.streak && !current.pinClearedThisStreak;
+      };
+      const committed = await deleteSessionModelHistoryWithFence(fence, stillCurrent);
+      const current = failureMap.get(key);
+      if (committed && current?.streak === entry.streak && !current.pinClearedThisStreak) {
+        current.pinClearedThisStreak = true;
+        return { count, pinClearedNow: true };
+      }
+    } catch {
+      // Failed or uncertain commits are never credited; a later failure may retry.
+    }
+    return { count, pinClearedNow: false };
+  } catch {
+    return { count: 0, pinClearedNow: false };
+  }
 }

@@ -21,7 +21,7 @@ import {
   toClientAntigravityQuotaModelId,
 } from "../../config/antigravityModelAliases.ts";
 import { isDiscoverableAgyModelId } from "../../config/agyModels.ts";
-import { getDbInstance } from "@/lib/db/core";
+import { getAntigravityLocalUsageUnitsAsync } from "@/lib/db/antigravityUsage";
 import {
   applyAntigravityClientProfileHeaders,
   getAntigravityClientProfile,
@@ -32,7 +32,7 @@ import {
   getAntigravityLoadCodeAssistMetadata,
 } from "../antigravityHeaders.ts";
 import {
-  getAntigravityRemainingCredits,
+  getAntigravityRemainingCreditsAsync,
   updateAntigravityRemainingCredits,
 } from "../../executors/antigravity.ts";
 import { getCreditsMode } from "../antigravityCredits.ts";
@@ -109,66 +109,26 @@ interface AntigravityUsageOptions {
   forceRefresh?: boolean;
 }
 
-const ANTIGRAVITY_LOCAL_USAGE_WINDOW_MS = 5 * 60 * 60 * 1000;
-const ANTIGRAVITY_LOCAL_USAGE_TOKENS_PER_UNIT = 1000;
-
 // `toClientAntigravityQuotaModelId` was an inline if-ladder here; it is now the single
 // source of truth in open-sse/config/antigravityModelAliases.ts (imported above), shared
 // with the provider-limits cache sanitizer. (#3821-review LEDGER-5)
 
-function getAntigravityLocalUsageUnits(
-  provider: "antigravity" | "agy",
-  connectionId: string | undefined,
-  modelId: string,
-  resetAt: string | null
-): number {
-  if (!connectionId || !modelId || !resetAt) return 0;
-
-  const resetMs = Date.parse(resetAt);
-  if (!Number.isFinite(resetMs)) return 0;
-
-  const windowStart = new Date(resetMs - ANTIGRAVITY_LOCAL_USAGE_WINDOW_MS).toISOString();
-  const windowEnd = new Date(resetMs).toISOString();
-
-  try {
-    const db = getDbInstance() as unknown as {
-      prepare: (sql: string) => { get: (...params: unknown[]) => unknown };
-    };
-    const row = db
-      .prepare(
-        `SELECT COALESCE(SUM(
-           COALESCE(tokens_input, 0) + COALESCE(tokens_output, 0) + COALESCE(tokens_reasoning, 0)
-         ), 0) AS tokens
-         FROM usage_history
-         WHERE provider = ?
-           AND connection_id = ?
-           AND model = ?
-           AND success = 1
-           AND timestamp >= ?
-           AND timestamp < ?`
-      )
-      .get(provider, connectionId, modelId, windowStart, windowEnd) as
-      { tokens?: unknown } | undefined;
-
-    const tokens = Number(row?.tokens || 0);
-    if (!Number.isFinite(tokens) || tokens <= 0) return 0;
-    return Math.max(1, Math.ceil(tokens / ANTIGRAVITY_LOCAL_USAGE_TOKENS_PER_UNIT));
-  } catch {
-    return 0;
-  }
-}
-
-function applyLocalUsageFallback(
+async function applyLocalUsageFallback(
   quota: UsageQuota,
   provider: "antigravity" | "agy",
   connectionId: string | undefined,
   modelId: string
-): UsageQuota {
+): Promise<UsageQuota> {
   if (quota.quotaSource !== "fetchAvailableModels" || quota.used > 0 || quota.unlimited) {
     return quota;
   }
 
-  const localUsed = getAntigravityLocalUsageUnits(provider, connectionId, modelId, quota.resetAt);
+  const localUsed = await getAntigravityLocalUsageUnitsAsync(
+    provider,
+    connectionId,
+    modelId,
+    quota.resetAt
+  );
   if (localUsed <= 0 || quota.total <= 0) return quota;
 
   const used = Math.min(quota.total, localUsed);
@@ -600,7 +560,7 @@ export async function getAntigravityUsage(
     const accountId: string = connectionId || "unknown";
 
     // Read cached credit balance (hydrated from DB on first access)
-    let creditBalance = getAntigravityRemainingCredits(accountId);
+    let creditBalance = await getAntigravityRemainingCreditsAsync(accountId);
 
     // Only an explicit refresh in always mode may proactively spend credits to discover
     // the balance. Automatic/scheduled refreshes must use the cached balance (if any)
@@ -686,7 +646,7 @@ export async function getAntigravityUsage(
       const remaining = Math.round(total * remainingFraction);
       const used = isUnlimited ? 0 : Math.max(0, total - remaining);
 
-      quotas[modelKey] = applyLocalUsageFallback(
+      quotas[modelKey] = await applyLocalUsageFallback(
         {
           // An omitted fraction is unknown, not a 0% sentinel. Keep the reset
           // timestamp for display, but omit numeric quota fields so cache and

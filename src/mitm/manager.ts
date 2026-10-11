@@ -16,21 +16,29 @@ import { resolveActiveCertPath } from "./cert/activeCert.ts";
 import { ALL_TARGETS } from "./targets/index.ts";
 import { detectAgent } from "./detection/index.ts";
 import type { AgentId, DetectionResult, MitmTarget } from "./types.ts";
-import { getAllAgentBridgeStates } from "@/lib/db/agentBridgeState.ts";
-import { getUserBypassPatterns } from "@/lib/db/agentBridgeBypass.ts";
-import { getGheCopilotHosts } from "@/lib/db/providers.ts";
+import {} from "@/lib/db/agentBridgeState.ts";
+import { getUserBypassPatterns, getUserBypassPatternsAsync } from "@/lib/db/agentBridgeBypass.ts";
+import { getGheCopilotHosts, getGheCopilotHostsAsync } from "@/lib/db/providers.ts";
 import { configureUpstreamCa } from "./upstreamTrust.ts";
 import { createLogger } from "@/shared/utils/logger.ts";
 import {
   buildRepairPlan,
   collectManagedHosts,
+  collectManagedHostsAsync,
+  buildRepairPlanAsync,
   performRepairSteps,
   type RepairPlan,
 } from "./repair.ts";
 import { runPrivilegedMitmStep } from "./privilegedMitmStep.ts";
 import { removeDnsEntriesAfterFailedStart, removeStopDnsEntries } from "./stopDnsTeardown.ts";
 
-export { buildRepairPlan, collectManagedHosts, type RepairPlan };
+export {
+  buildRepairPlan,
+  buildRepairPlanAsync,
+  collectManagedHosts,
+  collectManagedHostsAsync,
+  type RepairPlan,
+};
 
 const log = createLogger("mitm-manager");
 
@@ -157,7 +165,7 @@ function readStoredUpstreamCaPath(): string | null {
  * an extension of its baseline antigravity hosts. Hard Rule #13: only the
  * declarative target hosts are persisted — no runtime paths, no shell escapes.
  */
-export function writeTargetsJson(targets: MitmTarget[] = ALL_TARGETS): void {
+export function writeTargetsJson(targets: MitmTarget[] = ALL_TARGETS, gheHosts?: string[]): void {
   const dir = path.join(resolveMitmDataDir(), "mitm");
   try {
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
@@ -170,7 +178,10 @@ export function writeTargetsJson(targets: MitmTarget[] = ALL_TARGETS): void {
     targets: targets.map((t) => ({
       id: t.id,
       name: t.name,
-      hosts: t.id === "ghe-copilot" ? [...new Set([...t.hosts, ...getGheCopilotHosts()])] : t.hosts,
+      hosts:
+        t.id === "ghe-copilot"
+          ? [...new Set([...t.hosts, ...(gheHosts ?? getGheCopilotHosts())])]
+          : t.hosts,
       endpointPatterns: t.endpointPatterns,
       viability: t.viability ?? "supported",
     })),
@@ -316,14 +327,14 @@ export async function handleExitCleanup(
     getCachedPassword?: () => string | null;
     removeDNSEntry?: (sudoPassword: string) => Promise<void>;
     removeDNSEntries?: (hosts: string[], sudoPassword: string) => Promise<void>;
-    collectManagedHosts?: () => string[];
+    collectManagedHosts?: () => string[] | Promise<string[]>;
   }
 ): Promise<void> {
   const deps = {
     getCachedPassword: _depsOverride?.getCachedPassword ?? getCachedPassword,
     removeDNSEntry: _depsOverride?.removeDNSEntry ?? removeDNSEntry,
     removeDNSEntries: _depsOverride?.removeDNSEntries ?? removeDNSEntries,
-    collectManagedHosts: _depsOverride?.collectManagedHosts ?? collectManagedHosts,
+    collectManagedHosts: _depsOverride?.collectManagedHosts ?? collectManagedHostsAsync,
   };
 
   try {
@@ -344,7 +355,7 @@ export async function handleExitCleanup(
 
   try {
     await deps.removeDNSEntry(sudoPassword);
-    const managed = deps.collectManagedHosts();
+    const managed = await deps.collectManagedHosts();
     if (managed.length > 0) {
       await deps.removeDNSEntries(managed, sudoPassword);
     }
@@ -480,7 +491,7 @@ async function startMitmInternal(
   // 0. Persist the canonical targets.json so server.cjs can pick up the full
   //    AgentBridge target registry alongside its hard-coded antigravity baseline.
   try {
-    writeTargetsJson();
+    await writeTargetsJsonAsync();
   } catch (err) {
     log.error({ err }, "Failed to write targets.json (continuing)");
   }
@@ -489,7 +500,7 @@ async function startMitmInternal(
   //     route CONNECT tunnels for those hostnames without TLS decryption.
   //     Defaults (banks/gov/okta/auth0) are hard-coded in server.cjs.
   try {
-    writeBypassJson();
+    await writeBypassJsonAsync();
   } catch (err) {
     log.error({ err }, "Failed to write bypass.json (continuing)");
   }
@@ -667,7 +678,7 @@ async function startMitmInternal(
     // Remove PID file
     try {
       fs.unlinkSync(PID_FILE);
-    } catch (error) {
+    } catch (_error) {
       // Ignore
     }
   });
@@ -715,7 +726,7 @@ async function startMitmInternal(
       "Skipping DNS rollback after a failed start — no sudo password available",
       () =>
         removeDnsEntriesAfterFailedStart(
-          { removeDNSEntry, removeDNSEntries, collectManagedHosts },
+          { removeDNSEntry, removeDNSEntries, collectManagedHosts: collectManagedHostsAsync },
           sudoPassword
         )
     );
@@ -790,13 +801,13 @@ export async function stopMitm(
   _depsOverride?: {
     removeDNSEntry?: (sudoPassword: string) => Promise<void>;
     removeDNSEntries?: (hosts: string[], sudoPassword: string) => Promise<void>;
-    collectManagedHosts?: () => string[];
+    collectManagedHosts?: () => string[] | Promise<string[]>;
   }
 ): Promise<{ running: false; pid: null }> {
   const deps = {
     removeDNSEntry: _depsOverride?.removeDNSEntry ?? removeDNSEntry,
     removeDNSEntries: _depsOverride?.removeDNSEntries ?? removeDNSEntries,
-    collectManagedHosts: _depsOverride?.collectManagedHosts ?? collectManagedHosts,
+    collectManagedHosts: _depsOverride?.collectManagedHosts ?? collectManagedHostsAsync,
   };
 
   // 1. Remove DNS entries FIRST — see function doc + module doc above (#1809).
@@ -813,7 +824,7 @@ export async function stopMitm(
   clearCachedPassword(); // Clear password from memory when proxy stops
   try {
     fs.unlinkSync(PID_FILE);
-  } catch (error) {
+  } catch (_error) {
     // Ignore
   }
 
@@ -821,4 +832,12 @@ export async function stopMitm(
     running: false,
     pid: null,
   };
+}
+
+export async function writeBypassJsonAsync(userPatterns?: string[]): Promise<void> {
+  writeBypassJson(Array.isArray(userPatterns) ? userPatterns : await getUserBypassPatternsAsync());
+}
+
+export async function writeTargetsJsonAsync(targets: MitmTarget[] = ALL_TARGETS): Promise<void> {
+  writeTargetsJson(targets, await getGheCopilotHostsAsync());
 }

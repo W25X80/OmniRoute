@@ -1,11 +1,13 @@
 import { getDbInstance } from "./core";
 import { decrypt, encrypt } from "./encryption";
+import { assertSqliteBackendAllowed, getSelectedControlPlane } from "./controlPlaneContext";
 
 interface SecretRow {
   value?: string;
 }
 
 export function getPersistedSecret(key: string): string | null {
+  assertSqliteBackendAllowed();
   try {
     const db = getDbInstance();
     const row = db
@@ -25,6 +27,7 @@ export function getPersistedSecret(key: string): string | null {
 }
 
 export function persistSecret(key: string, value: string): void {
+  assertSqliteBackendAllowed();
   try {
     const db = getDbInstance();
     // SECURITY: encrypt with the project's AES-256-GCM field-encryption
@@ -39,4 +42,19 @@ export function persistSecret(key: string, value: string): void {
   } catch {
     // Non-fatal: secrets still work for the current process if persistence fails.
   }
+}
+
+export async function getPersistedSecretAsync(key: string): Promise<string | null> {
+  const selected = getSelectedControlPlane();
+  return selected ? selected.secrets.get(key) : getPersistedSecret(key);
+}
+
+/** First durable writer wins; PostgreSQL also returns the committed winner to bootstrap callers. */
+export async function persistSecretAsync(key: string, value: string): Promise<void> {
+  const selected = getSelectedControlPlane();
+  if (selected) {
+    await selected.secrets.getOrCreate(key, () => value);
+    return;
+  }
+  persistSecret(key, value);
 }

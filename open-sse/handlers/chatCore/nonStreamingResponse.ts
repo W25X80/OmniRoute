@@ -5,6 +5,9 @@
  */
 
 import { meteredBudgetCost } from "@/lib/usage/meteredBudgetPolicy";
+import { getSelectedControlPlane } from "@/lib/db/controlPlaneContext";
+import { scheduleQuotaShareConsumptionAsync } from "./quotaShareConsumption.ts";
+import { getSelectedPersistenceIdentity } from "@/lib/db/controlPlaneContext";
 import { readCpaAuthIndex } from "../chatCore/failureUsage.ts";
 
 import { createRoutingEvent, emitRoutingEvent } from "../../services/routing/index.ts";
@@ -54,11 +57,11 @@ import { runNonStreamingProviderLeg } from "../chatCore/nonStreamingProviderLeg.
 import type { NonStreamingProviderLegResult } from "@/lib/skills/toolLoopTypes.ts";
 import { finalizeToolLoopError } from "../chatCore/nonStreamingFinalization.ts";
 import { markCodexScopeRateLimited } from "../chatCore/codexFailover.ts";
-import { deleteSessionAccountAffinity } from "@/lib/db/sessionAccountAffinity";
+import { deleteSessionAccountAffinityAsync } from "@/lib/db/sessionAccountAffinity";
 import { writeTerminalStatus } from "@/shared/utils/terminalStatus";
 import { MEMORY_BUILTIN_TOOL_NAMES } from "@/lib/skills/memoryBuiltins";
 
-import { storeSemanticCacheResponse } from "../chatCore/semanticCacheStore.ts";
+import { storeSemanticCacheResponseAsync } from "../chatCore/semanticCacheStore.ts";
 import {
   isAntigravityProvider,
   toAntigravityDiagnosticPayload,
@@ -269,8 +272,8 @@ export async function runNonStreamingResponse(deps: NonStreamingDeps) {
           writeTerminalStatus,
           persistConnectionPatch: updateProviderConnection,
           setConnectionRateLimitedUntil: async (id, untilMs) => {
-            const { setConnectionRateLimitUntil } = await import("@/lib/db/providers");
-            setConnectionRateLimitUntil(id, untilMs);
+            const { setConnectionRateLimitUntilAsync } = await import("@/lib/db/providers");
+            await setConnectionRateLimitUntilAsync(id, untilMs);
           },
           lockModel,
           recordAntigravityQuotaState: recordCoreOwnedAntigravityQuotaState,
@@ -289,14 +292,14 @@ export async function runNonStreamingResponse(deps: NonStreamingDeps) {
               },
             });
           },
-          onClearSessionAffinity: () => {
+          onClearSessionAffinity: async () => {
             const key =
               sessionAffinityKey ||
               extractSessionAffinityKey(body, clientRawRequest?.headers) ||
               null;
             if (!key) return;
             try {
-              deleteSessionAccountAffinity(key, "codex");
+              await deleteSessionAccountAffinityAsync(key, "codex");
             } catch {
               // best-effort
             }
@@ -412,7 +415,7 @@ export async function runNonStreamingResponse(deps: NonStreamingDeps) {
         connectionId,
         status: `FAILED ${err.status}`,
       }).catch(() => {});
-      persistAttemptLogs({
+      const attemptLogPersistence = persistAttemptLogs({
         status: err.status,
         error: err.error || "Provider request failed",
         providerRequest: finalBody || translatedBody,
@@ -427,7 +430,12 @@ export async function runNonStreamingResponse(deps: NonStreamingDeps) {
           : buildErrorBody(err.status, err.error || "Provider request failed"),
         cacheSource: "upstream",
       });
-      persistFailureUsage(err.status, err.errorCode || `upstream_${err.status}`);
+      if (getSelectedControlPlane()) await attemptLogPersistence;
+      const failureUsagePersistence = persistFailureUsage(
+        err.status,
+        err.errorCode || `upstream_${err.status}`
+      );
+      if (getSelectedControlPlane()) await failureUsagePersistence;
       trackPendingRequest(model, provider, pendingConnId, false, undefined, pendingRequestId);
       return {
         response: err,
@@ -499,7 +507,7 @@ export async function runNonStreamingResponse(deps: NonStreamingDeps) {
       abortSignal: clientRawRequest?.signal,
       expectedConnectionId: expectedConn,
       followUpLeg: async (nextSourceBody) => {
-        translatedBody = translateRequest(
+        translatedBody = await translateRequest(
           sourceFormat,
           targetFormat,
           model,
@@ -658,6 +666,23 @@ export async function runNonStreamingResponse(deps: NonStreamingDeps) {
       log,
     });
     const usage = toolLoopUsage ?? extractUsageFromResponse(responseBody, provider);
+    const nativeQuotaCompletion = getSelectedControlPlane()
+      ? {
+          apiKeyId: apiKeyInfo?.id,
+          connectionId: credentials?.connectionId,
+          provider,
+          model,
+          usage:
+            usage && typeof usage === "object"
+              ? {
+                  prompt_tokens: (usage as Record<string, unknown>).prompt_tokens,
+                  completion_tokens: (usage as Record<string, unknown>).completion_tokens,
+                }
+              : null,
+          completedAtMs: Date.now(),
+          log,
+        }
+      : undefined;
     recordFinalInputCalibration(
       body,
       provider,
@@ -691,7 +716,7 @@ export async function runNonStreamingResponse(deps: NonStreamingDeps) {
       tokens: usage,
       status: "200 OK",
     }).catch(() => {});
-    recordNonStreamingUsageStats(usage, {
+    await recordNonStreamingUsageStats(usage, {
       traceEnabled,
       provider,
       connectionId: successConnectionId,
@@ -776,7 +801,7 @@ export async function runNonStreamingResponse(deps: NonStreamingDeps) {
 
     if (postCallGuardrails.blocked) {
       const guardrailMessage = postCallGuardrails.message || "Response blocked by guardrail";
-      persistAttemptLogs({
+      const attemptLogPersistence = persistAttemptLogs({
         status: HTTP_STATUS.BAD_REQUEST,
         tokens: usage,
         responseBody,
@@ -793,12 +818,21 @@ export async function runNonStreamingResponse(deps: NonStreamingDeps) {
         claudeCacheUsageMeta: cacheUsageLogMeta,
         cacheSource: "upstream",
       });
-      recordChatCallCost(
-        apiKeyInfo,
-        meteredBudgetCost(provider, estimatedCost),
-        chatCostCtx,
-        false
-      );
+      if (getSelectedControlPlane()) await attemptLogPersistence;
+      if (getSelectedPersistenceIdentity())
+        await recordChatCallCost(
+          apiKeyInfo,
+          meteredBudgetCost(provider, estimatedCost),
+          chatCostCtx,
+          false
+        );
+      else
+        recordChatCallCost(
+          apiKeyInfo,
+          meteredBudgetCost(provider, estimatedCost),
+          chatCostCtx,
+          false
+        );
       log?.warn?.(
         "GUARDRAIL",
         `Response blocked by ${postCallGuardrails.guardrail || "guardrail"}: ${guardrailMessage}`
@@ -874,7 +908,7 @@ export async function runNonStreamingResponse(deps: NonStreamingDeps) {
       const sanitizedMalformedProviderResponse = looksLikeSSE
         ? { _streamed: true, _format: "sse-json", summary: sanitizedMalformedResponse }
         : sanitizedMalformedResponse;
-      persistAttemptLogs({
+      const attemptLogPersistence = persistAttemptLogs({
         status: HTTP_STATUS.BAD_GATEWAY,
         error: malformedDiagnostic,
         tokens: usage,
@@ -886,7 +920,12 @@ export async function runNonStreamingResponse(deps: NonStreamingDeps) {
         claudeCacheUsageMeta: cacheUsageLogMeta,
         cacheSource: "upstream",
       });
-      persistFailureUsage(HTTP_STATUS.BAD_GATEWAY, "malformed_translated_response");
+      if (getSelectedControlPlane()) await attemptLogPersistence;
+      const failureUsagePersistence = persistFailureUsage(
+        HTTP_STATUS.BAD_GATEWAY,
+        "malformed_translated_response"
+      );
+      if (getSelectedControlPlane()) await failureUsagePersistence;
       trackPendingRequest(model, provider, pendingConnId, false, undefined, pendingRequestId);
       // Routing event (feedback foundation) — record the malformed outcome so
       // the quality tracker de-prioritizes this model over time.
@@ -932,7 +971,7 @@ export async function runNonStreamingResponse(deps: NonStreamingDeps) {
     }
 
     // ── Phase 9.1: Cache store (non-streaming, temp=0) ──
-    storeSemanticCacheResponse({
+    await storeSemanticCacheResponseAsync({
       enabled: semanticCacheEnabled,
       body: bodyForCacheWrite,
       headers: clientRawRequest?.headers,
@@ -952,7 +991,7 @@ export async function runNonStreamingResponse(deps: NonStreamingDeps) {
     // request). (#3821-review LEDGER-6)
     await saveIdempotency(idempotencyKey, translatedResponse, 200);
     reqLogger.logConvertedResponse(translatedResponse);
-    persistAttemptLogs({
+    const attemptLogPersistence = persistAttemptLogs({
       status: 200,
       tokens: usage,
       responseBody,
@@ -969,18 +1008,31 @@ export async function runNonStreamingResponse(deps: NonStreamingDeps) {
       claudeCacheUsageMeta: cacheUsageLogMeta,
       cacheSource: "upstream",
     });
-    recordChatCallCost(apiKeyInfo, meteredBudgetCost(provider, estimatedCost), chatCostCtx, true);
+    if (getSelectedControlPlane()) await attemptLogPersistence;
+    if (getSelectedPersistenceIdentity())
+      await recordChatCallCost(
+        apiKeyInfo,
+        meteredBudgetCost(provider, estimatedCost),
+        chatCostCtx,
+        true
+      );
+    else
+      recordChatCallCost(apiKeyInfo, meteredBudgetCost(provider, estimatedCost), chatCostCtx, true);
 
-    // === Quota Share POST-hook (B/F7) — fire-and-forget, fail-open ===
-    await scheduleQuotaShareConsumption({
-      apiKeyId: apiKeyInfo?.id,
-      connectionId: credentials?.connectionId,
-      provider,
-      model,
-      usage,
-      estimatedCost,
-      log,
-    });
+    // === Quota Share POST-hook (B/F7) ===
+    if (nativeQuotaCompletion) {
+      await scheduleQuotaShareConsumptionAsync({ ...nativeQuotaCompletion, estimatedCost });
+    } else {
+      await scheduleQuotaShareConsumption({
+        apiKeyId: apiKeyInfo?.id,
+        connectionId: credentials?.connectionId,
+        provider,
+        model,
+        usage,
+        estimatedCost,
+        log,
+      });
+    }
     // === /Quota Share POST-hook ===
 
     // ── Gamification event (fire-and-forget) ──
@@ -1113,7 +1165,7 @@ export async function runNonStreamingResponse(deps: NonStreamingDeps) {
         status: `FAILED ${semaphoreCode}`,
       }).catch(() => {});
       const failureMessage = sanitizeErrorMessage(errorMetadata.message) || "Semaphore timeout";
-      persistAttemptLogs({
+      const attemptLogPersistence = persistAttemptLogs({
         status: HTTP_STATUS.RATE_LIMITED,
         error: failureMessage,
         providerRequest: finalBody || translatedBody,
@@ -1121,7 +1173,9 @@ export async function runNonStreamingResponse(deps: NonStreamingDeps) {
         claudeCacheMeta: claudePromptCacheLogMeta,
         cacheSource: "upstream",
       });
-      persistFailureUsage(HTTP_STATUS.RATE_LIMITED, semaphoreCode);
+      if (getSelectedControlPlane()) await attemptLogPersistence;
+      const failureUsagePersistence = persistFailureUsage(HTTP_STATUS.RATE_LIMITED, semaphoreCode);
+      if (getSelectedControlPlane()) await failureUsagePersistence;
       const result = createErrorResult(HTTP_STATUS.RATE_LIMITED, failureMessage);
       return {
         response: {

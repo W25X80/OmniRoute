@@ -4,7 +4,16 @@
  * through deps.
  */
 
-import type { BaseExecutor } from "../../executors/base.ts";
+import type { BaseExecutor, ExecuteInput } from "../../executors/base.ts";
+import {
+  getSelectedPersistenceIdentity,
+  UnsupportedPersistenceDomainError,
+} from "@/lib/db/controlPlaneContext";
+import {
+  isApplicationPersistenceIdentity,
+  runPersistenceBackgroundWork,
+  type PersistenceTailPermit,
+} from "@/lib/db/persistenceRuntime";
 import type { AgentGoalPolicy } from "../../utils/agentGoalPolicy.ts";
 import { prepareUpstreamBody } from "./upstreamBody.ts";
 import { getExecutionConnectionId } from "./executionCredentials.ts";
@@ -81,6 +90,93 @@ export type ChatCoreExecutorResult = {
   [key: string]: unknown;
 };
 
+/** Internal request capability, adopted by the one existing streaming tail before handoff. */
+export function createNativeStreamingPersistence():
+  | {
+      run: NonNullable<ExecuteInput["runNativeStreamingPersistence"]>;
+      adopt(permit: PersistenceTailPermit): PersistenceTailPermit;
+    }
+  | undefined {
+  const identity = getSelectedPersistenceIdentity();
+  if (!identity) return undefined;
+  if (!isApplicationPersistenceIdentity(identity)) throw new UnsupportedPersistenceDomainError();
+  let permit: PersistenceTailPermit | undefined;
+  let retired = false;
+  const assertIdentity = () => {
+    if (
+      !isApplicationPersistenceIdentity(identity) ||
+      getSelectedPersistenceIdentity() !== identity
+    )
+      throw new UnsupportedPersistenceDomainError();
+  };
+  return {
+    run<T>(
+      body: () => Promise<T>,
+      observation?: { readonly owner: object; readonly observe: () => void }
+    ): Promise<T> {
+      if (retired) return Promise.reject(new Error("Persistence stream authority has ended"));
+      if (
+        !isApplicationPersistenceIdentity(identity) ||
+        (observation && observation.owner !== identity)
+      )
+        return Promise.reject(new UnsupportedPersistenceDomainError());
+      let observed!: () => void;
+      let observationFailed!: (error: unknown) => void;
+      const observationDone = observation
+        ? new Promise<void>((resolve, reject) => {
+            observed = resolve;
+            observationFailed = reject;
+          })
+        : undefined;
+      // Catalog admission can fail before its body waits for this gate.
+      if (observationDone) void observationDone.catch(() => {});
+      const owned = async () => {
+        if (observationDone) await observationDone;
+        assertIdentity();
+        return body();
+      };
+      let work: Promise<T>;
+      try {
+        if (permit) {
+          // run registers the accepted callback synchronously, before its scalar cache hint.
+          work = permit.run(owned);
+        } else if (observation) {
+          assertIdentity();
+          // Before handoff, retain the existing hint even if best-effort BG admission refuses.
+          work = runPersistenceBackgroundWork(owned);
+        } else {
+          work = owned();
+        }
+      } catch (error) {
+        observationFailed?.(error);
+        return Promise.reject(error);
+      }
+      if (observation) {
+        try {
+          observation.observe();
+          observed();
+        } catch (error) {
+          observationFailed(error);
+        }
+      }
+      return work;
+    },
+    adopt(next) {
+      assertIdentity();
+      if (permit) throw new Error("Streaming persistence authority is already adopted");
+      permit = {
+        run: (body) => next.run(body),
+        release() {
+          // Retire before any promise/microtask lets a producer admit another callback.
+          retired = true;
+          return next.release();
+        },
+      };
+      return permit;
+    },
+  };
+}
+
 export type TrustedEffortContext = {
   originModel?: string;
   resolvedThinkingEffort?: string | null;
@@ -99,7 +195,7 @@ type ChatLog =
 
 export type ExecuteProviderRequestDeps = {
   agentGoalPolicy: AgentGoalPolicy;
-  assertManagedLeaseFence: (attemptConnectionId: string | null | undefined) => void;
+  assertManagedLeaseFence: (attemptConnectionId: string | null | undefined) => void | Promise<void>;
   buildUpstreamHeadersForExecute: (modelToCall: string) => Record<string, string>;
   clientRawRequest: {
     headers?: Headers | Record<string, unknown> | null;
@@ -140,6 +236,7 @@ export type ExecuteProviderRequestDeps = {
   skipUpstreamRetry: boolean;
   stream: boolean;
   streamController: { signal: AbortSignal };
+  runNativeStreamingPersistence?: ExecuteInput["runNativeStreamingPersistence"];
   targetFormat: string;
   trace: (label: string, extra?: Record<string, unknown>) => void;
   traceId: string;
@@ -186,6 +283,7 @@ export async function executeProviderRequest(
     skipUpstreamRetry,
     stream,
     streamController,
+    runNativeStreamingPersistence,
     targetFormat,
     trace,
     traceId,
@@ -327,7 +425,7 @@ export async function executeProviderRequest(
                 updatePendingScope(pendingScope, {
                   stage: "rate_limit_slot_acquired",
                 });
-                assertManagedLeaseFence(attemptConnectionId);
+                await assertManagedLeaseFence(attemptConnectionId);
                 return executeWithUpstreamStartTimeout({
                   executor,
                   provider,
@@ -352,6 +450,7 @@ export async function executeProviderRequest(
                         skipUpstreamRetry,
                         contextEditing: { enabled: contextEditingEnabled },
                         correlationId,
+                        ...(runNativeStreamingPersistence ? { runNativeStreamingPersistence } : {}),
                       })
                     ),
                 });
@@ -527,11 +626,11 @@ export async function executeProviderRequest(
                 // Run the SAME upstream (same account/creds) with a given body and return
                 // its 2xx stream, or null. Used both by the early-retry re-open (same body)
                 // and the mid-stream continuation (assistant-prefilled body).
-                const runUpstreamStream = async (
+                const dispatchUpstreamStream = async (
                   body: unknown
                 ): Promise<ReadableStream<Uint8Array> | null> => {
                   try {
-                    assertManagedLeaseFence(attemptConnectionId);
+                    await assertManagedLeaseFence(attemptConnectionId);
                     const retryRaw = await executeWithUpstreamStartTimeout({
                       executor,
                       provider,
@@ -558,6 +657,9 @@ export async function executeProviderRequest(
                             skipUpstreamRetry,
                             contextEditing: { enabled: contextEditingEnabled },
                             correlationId,
+                            ...(runNativeStreamingPersistence
+                              ? { runNativeStreamingPersistence }
+                              : {}),
                           })
                         ),
                     });
@@ -573,6 +675,15 @@ export async function executeProviderRequest(
                     return null;
                   }
                 };
+
+                const runUpstreamStream = (
+                  body: unknown
+                ): Promise<ReadableStream<Uint8Array> | null> =>
+                  runNativeStreamingPersistence
+                    ? runNativeStreamingPersistence(() => dispatchUpstreamStream(body)).catch(
+                        () => null
+                      )
+                    : dispatchUpstreamStream(body);
 
                 // Mid-stream continuation (Fase 4.4): re-request with the partial text as an
                 // assistant prefill. Gated by its own setting and only for OpenAI-compatible

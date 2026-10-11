@@ -6,7 +6,7 @@ import { getCallLogById } from "@/lib/usageDb";
 import { getCompletedDetails, getPendingById } from "@/lib/usage/usageHistory";
 import {
   extractPreviousResponseId,
-  resolveCallLogIdByResponseId,
+  resolveCallLogIdByResponseIdAsync,
 } from "@/lib/db/responsesContinuationStore";
 
 // Each logged chunk-array element is one raw network read, timestamp-prefixed
@@ -200,7 +200,10 @@ export async function GET(
       persistedRequest.pipelinePayloads as Record<string, unknown> | null | undefined
     );
     const parentLogId = previousResponseId
-      ? resolveCallLogIdByResponseId(previousResponseId, persistedRequest.apiKeyId ?? null)
+      ? await resolveCallLogIdByResponseIdAsync(
+          previousResponseId,
+          persistedRequest.apiKeyId ?? null
+        )
       : null;
 
     return NextResponse.json({ ...persistedRequest, previousResponseId, parentLogId });

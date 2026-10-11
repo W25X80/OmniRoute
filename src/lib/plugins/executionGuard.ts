@@ -2,6 +2,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 
 interface PluginExecutionGuard {
   assertIdle(): void;
+  assertIdleAsync?: () => Promise<void>;
   reject(): never;
 }
 
@@ -28,4 +29,17 @@ export function assertPluginHandlerAllowed(): void {
 /** Re-check the latched policy at each dispatch and before receipt persistence. */
 export function assertRequestPluginsIdle(): void {
   requestGuard.getStore()?.assertIdle();
+}
+
+export async function canInitializeRequestPluginsAsync(): Promise<boolean> {
+  const guard = requestGuard.getStore();
+  if (!guard) return true;
+  if (guard.assertIdleAsync) await guard.assertIdleAsync();
+  else guard.assertIdle();
+  return false;
+}
+export async function assertRequestPluginsIdleAsync(): Promise<void> {
+  const guard = requestGuard.getStore();
+  if (guard?.assertIdleAsync) await guard.assertIdleAsync();
+  else guard?.assertIdle();
 }

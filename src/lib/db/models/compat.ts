@@ -1,3 +1,14 @@
+import { assertSqliteBackendAllowed } from "../controlPlaneContext";
+import { getSelectedPostgresDatabase } from "../controlPlaneContext";
+import {
+  catalogNamespaceRows,
+  catalogValue,
+  requirePostgresCatalogSnapshot,
+  isPostgresCatalogMutation,
+  mutatePostgresCatalog,
+  putCatalogValue,
+  deleteCatalogValue,
+} from "../postgres/catalogSnapshot";
 /** db/models/compat.ts — model-compat overrides (normalizeToolCallId, per-protocol flags, upstream headers). */
 
 import { getDbInstance } from "../core";
@@ -148,10 +159,14 @@ export function isOverrideHiddenForModality(
 }
 
 export function readCompatList(providerId: string): ModelCompatOverride[] {
-  const db = getDbInstance();
-  const row = db
-    .prepare("SELECT value FROM key_value WHERE namespace = ? AND key = ?")
-    .get(MODEL_COMPAT_NAMESPACE, providerId);
+  requirePostgresCatalogSnapshot();
+
+  const db = getSelectedPostgresDatabase() ? undefined : getDbInstance();
+  const row = getSelectedPostgresDatabase()
+    ? catalogValue(MODEL_COMPAT_NAMESPACE, providerId)
+    : db!
+        .prepare("SELECT value FROM key_value WHERE namespace = ? AND key = ?")
+        .get(MODEL_COMPAT_NAMESPACE, providerId);
   const value = getKeyValue(row).value;
   if (!value) return [];
   try {
@@ -170,21 +185,28 @@ export function readCompatList(providerId: string): ModelCompatOverride[] {
   }
 }
 
-export function writeCompatList(providerId: string, list: ModelCompatOverride[]) {
-  const db = getDbInstance();
-  if (list.length === 0) {
-    db.prepare("DELETE FROM key_value WHERE namespace = ? AND key = ?").run(
-      MODEL_COMPAT_NAMESPACE,
-      providerId
-    );
-  } else {
-    db.prepare("INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES (?, ?, ?)").run(
-      MODEL_COMPAT_NAMESPACE,
-      providerId,
-      JSON.stringify(list)
-    );
-  }
-  finishModelCatalogWriteWithBackup();
+export async function writeCompatListAsync(providerId: string, list: ModelCompatOverride[]) {
+  const catalogDatabase = getSelectedPostgresDatabase();
+  const execute = async () => {
+    const db = getSelectedPostgresDatabase() ? undefined : getDbInstance();
+    if (list.length === 0) {
+      getSelectedPostgresDatabase()
+        ? await deleteCatalogValue(MODEL_COMPAT_NAMESPACE, providerId)
+        : db!
+            .prepare("DELETE FROM key_value WHERE namespace = ? AND key = ?")
+            .run(MODEL_COMPAT_NAMESPACE, providerId);
+    } else {
+      getSelectedPostgresDatabase()
+        ? await putCatalogValue(MODEL_COMPAT_NAMESPACE, providerId, JSON.stringify(list))
+        : db!
+            .prepare("INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES (?, ?, ?)")
+            .run(MODEL_COMPAT_NAMESPACE, providerId, JSON.stringify(list));
+    }
+    finishModelCatalogWriteWithBackup();
+  };
+  if (catalogDatabase && !isPostgresCatalogMutation(catalogDatabase))
+    return mutatePostgresCatalog(catalogDatabase, execute);
+  return execute();
 }
 
 export function getModelCompatOverrides(providerId: string): ModelCompatOverride[] {
@@ -248,10 +270,14 @@ function parseCompatVisionOverrides(value: string): Map<string, boolean> {
 
 /** Bulk-load all explicit model-compat vision overrides with one SQLite query. */
 export function listModelCompatVisionOverrides(): ModelCompatVisionOverrideMap {
+  requirePostgresCatalogSnapshot();
+
   try {
-    const rows = getDbInstance()
-      .prepare("SELECT key, value FROM key_value WHERE namespace = 'modelCompatOverrides'")
-      .all();
+    const rows = getSelectedPostgresDatabase()
+      ? catalogNamespaceRows("modelCompatOverrides")
+      : getDbInstance()
+          .prepare("SELECT key, value FROM key_value WHERE namespace = 'modelCompatOverrides'")
+          .all();
     const result = new Map<string, Map<string, boolean>>();
     for (const row of rows) {
       const { key, value } = getKeyValue(row);
@@ -293,11 +319,157 @@ export function compatByProtocolHasEntries(map: CompatByProtocolMap | undefined)
   });
 }
 
+export async function mergeModelCompatOverrideAsync(
+  providerId: string,
+  modelId: string,
+  patch: ModelCompatPatch
+) {
+  const catalogDatabase = getSelectedPostgresDatabase();
+  const execute = async () => {
+    const list = readCompatList(providerId);
+    const idx = list.findIndex((e) => e.id === modelId);
+    const prev = idx >= 0 ? { ...list[idx] } : { id: modelId };
+    const next: ModelCompatOverride = { ...prev, id: modelId };
+    if ("normalizeToolCallId" in patch) {
+      if (patch.normalizeToolCallId) next.normalizeToolCallId = true;
+      else delete next.normalizeToolCallId;
+    }
+    if ("preserveOpenAIDeveloperRole" in patch) {
+      if (patch.preserveOpenAIDeveloperRole === null) {
+        delete next.preserveOpenAIDeveloperRole; // unset: revert to default (undefined at read time)
+      } else {
+        next.preserveOpenAIDeveloperRole = Boolean(patch.preserveOpenAIDeveloperRole);
+      }
+    }
+    if ("preserveVideoUrl" in patch) {
+      if (patch.preserveVideoUrl === null) {
+        delete next.preserveVideoUrl;
+      } else {
+        next.preserveVideoUrl = Boolean(patch.preserveVideoUrl);
+      }
+    }
+    if (patch.compatByProtocol && Object.keys(patch.compatByProtocol).length > 0) {
+      const merged = deepMergeCompatByProtocol(next.compatByProtocol, patch.compatByProtocol);
+      if (compatByProtocolHasEntries(merged)) next.compatByProtocol = merged;
+      else delete next.compatByProtocol;
+    }
+    if ("upstreamHeaders" in patch) {
+      if (patch.upstreamHeaders === null) {
+        delete next.upstreamHeaders;
+      } else if (patch.upstreamHeaders && typeof patch.upstreamHeaders === "object") {
+        const s = sanitizeUpstreamHeadersMap(patch.upstreamHeaders as Record<string, unknown>);
+        if (Object.keys(s).length === 0) delete next.upstreamHeaders;
+        else next.upstreamHeaders = s;
+      }
+    }
+    const filtered = list.filter((e) => e.id !== modelId);
+    const hasPreserveFlag = Object.prototype.hasOwnProperty.call(
+      next,
+      "preserveOpenAIDeveloperRole"
+    );
+    const hasVideoUrlFlag = Object.prototype.hasOwnProperty.call(next, "preserveVideoUrl");
+    const hasTopUpstream = next.upstreamHeaders && Object.keys(next.upstreamHeaders).length > 0;
+    if ("isHidden" in patch) {
+      const modality = typeof patch.modality === "string" && patch.modality ? patch.modality : null;
+      if (modality) {
+        const hiddenModalities = { ...(next.hiddenModalities || {}) };
+        if (patch.isHidden === null) {
+          delete hiddenModalities[modality];
+        } else {
+          hiddenModalities[modality] = Boolean(patch.isHidden);
+        }
+        if (Object.keys(hiddenModalities).length > 0) next.hiddenModalities = hiddenModalities;
+        else delete next.hiddenModalities;
+      } else if (patch.isHidden === null) {
+        delete next.isHidden;
+      } else {
+        next.isHidden = Boolean(patch.isHidden);
+      }
+    }
+    if ("apiFormat" in patch) {
+      if (!patch.apiFormat) {
+        delete next.apiFormat;
+      } else {
+        next.apiFormat = patch.apiFormat;
+      }
+    }
+    if ("targetFormat" in patch) {
+      if (!patch.targetFormat) {
+        delete next.targetFormat;
+      } else {
+        next.targetFormat = patch.targetFormat;
+      }
+    }
+    if ("supportsVision" in patch) {
+      if (patch.supportsVision === null) {
+        delete next.supportsVision;
+      } else {
+        next.supportsVision = Boolean(patch.supportsVision);
+      }
+    }
+    const hasHiddenFlag =
+      Object.prototype.hasOwnProperty.call(next, "isHidden") ||
+      (!!next.hiddenModalities && Object.keys(next.hiddenModalities).length > 0);
+    const hasApiFormat = Object.prototype.hasOwnProperty.call(next, "apiFormat");
+    const hasTargetFormat = Object.prototype.hasOwnProperty.call(next, "targetFormat");
+    const hasVisionFlag = Object.prototype.hasOwnProperty.call(next, "supportsVision");
+    if (
+      next.normalizeToolCallId ||
+      hasPreserveFlag ||
+      hasVideoUrlFlag ||
+      hasHiddenFlag ||
+      hasApiFormat ||
+      hasTargetFormat ||
+      hasVisionFlag ||
+      compatByProtocolHasEntries(next.compatByProtocol) ||
+      hasTopUpstream
+    ) {
+      filtered.push(next);
+    }
+    await writeCompatListAsync(providerId, filtered);
+  };
+  if (catalogDatabase && !isPostgresCatalogMutation(catalogDatabase))
+    return mutatePostgresCatalog(catalogDatabase, execute);
+  return execute();
+}
+
+export async function removeModelCompatOverrideAsync(providerId: string, modelId: string) {
+  const catalogDatabase = getSelectedPostgresDatabase();
+  const execute = async () => {
+    const list = readCompatList(providerId);
+    const filtered = list.filter((e) => e.id !== modelId);
+    if (filtered.length === list.length) return;
+    await writeCompatListAsync(providerId, filtered);
+  };
+  if (catalogDatabase && !isPostgresCatalogMutation(catalogDatabase))
+    return mutatePostgresCatalog(catalogDatabase, execute);
+  return execute();
+}
+
+export function writeCompatList(providerId: string, list: ModelCompatOverride[]) {
+  assertSqliteBackendAllowed();
+  const db = getDbInstance();
+  if (list.length === 0) {
+    db.prepare("DELETE FROM key_value WHERE namespace = ? AND key = ?").run(
+      MODEL_COMPAT_NAMESPACE,
+      providerId
+    );
+  } else {
+    db.prepare("INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES (?, ?, ?)").run(
+      MODEL_COMPAT_NAMESPACE,
+      providerId,
+      JSON.stringify(list)
+    );
+  }
+  finishModelCatalogWriteWithBackup();
+}
+
 export function mergeModelCompatOverride(
   providerId: string,
   modelId: string,
   patch: ModelCompatPatch
 ) {
+  assertSqliteBackendAllowed();
   const list = readCompatList(providerId);
   const idx = list.findIndex((e) => e.id === modelId);
   const prev = idx >= 0 ? { ...list[idx] } : { id: modelId };
@@ -399,6 +571,7 @@ export function mergeModelCompatOverride(
 }
 
 export function removeModelCompatOverride(providerId: string, modelId: string) {
+  assertSqliteBackendAllowed();
   const list = readCompatList(providerId);
   const filtered = list.filter((e) => e.id !== modelId);
   if (filtered.length === list.length) return;

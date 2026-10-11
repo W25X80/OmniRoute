@@ -5,11 +5,14 @@ export const dynamic = "force-dynamic";
 import {
   type CliAgentInfo,
   detectInstalledAgents,
+  detectInstalledAgentsAsync,
   refreshAgentCache,
+  refreshAgentCacheAsync,
   resolveVersionProbe,
   setCustomAgents,
   type CustomAgentDef,
 } from "@/lib/acp/registry";
+import { usesNativeHostProfile } from "@/lib/nativeHostProbes";
 import { getSettings, updateSettings } from "@/lib/db/settings";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
 import { isAuthenticated } from "@/shared/utils/apiAuth";
@@ -37,7 +40,9 @@ export async function GET(request: Request) {
       setCustomAgents(settings.customAgents as CustomAgentDef[]);
     }
 
-    const agents = detectInstalledAgents();
+    const agents = usesNativeHostProfile()
+      ? await detectInstalledAgentsAsync()
+      : detectInstalledAgents();
     const installed = agents.filter((a: CliAgentInfo) => a.installed).length;
     const total = agents.length;
 
@@ -78,7 +83,7 @@ export async function POST(request: Request) {
     const body = validation.data;
 
     if (body.action === "refresh") {
-      const agents = refreshAgentCache();
+      const agents = usesNativeHostProfile() ? await refreshAgentCacheAsync() : refreshAgentCache();
       return NextResponse.json({ agents, refreshed: true });
     }
 
@@ -125,7 +130,7 @@ export async function POST(request: Request) {
     setCustomAgents(updated);
 
     // Refresh cache to detect the new agent
-    const agents = refreshAgentCache();
+    const agents = usesNativeHostProfile() ? await refreshAgentCacheAsync() : refreshAgentCache();
     return NextResponse.json({ agents, added: newAgent });
   } catch (error) {
     console.error("Error adding custom agent:", error);
@@ -159,7 +164,7 @@ export async function DELETE(request: Request) {
 
     await updateSettings({ customAgents: updated });
     setCustomAgents(updated);
-    const agents = refreshAgentCache();
+    const agents = usesNativeHostProfile() ? await refreshAgentCacheAsync() : refreshAgentCache();
 
     return NextResponse.json({ agents, removed: agentId });
   } catch (error) {

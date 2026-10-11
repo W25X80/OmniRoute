@@ -1,7 +1,16 @@
 import fs from "node:fs";
 import path from "node:path";
+import {
+  getSelectedPersistenceIdentity,
+  UnsupportedPersistenceDomainError,
+} from "@/lib/db/controlPlaneContext";
+import {
+  isApplicationPersistenceIdentity,
+  runPersistenceBackgroundWork,
+} from "@/lib/db/persistenceRuntime";
+import { resolveDataDir, resolveDataDirAsync } from "@/lib/dataPaths";
 import type { ProbeCause } from "./decision.ts";
-import { resolveDataDir } from "@/lib/dataPaths";
+import { NativeBlockedHistoryStore } from "./nativeBlockedHistoryStore";
 
 const HISTORY_FILE = "blocked-history.json";
 
@@ -227,4 +236,112 @@ export function __blockedHistoryCapForTesting(): number {
 /** Tests only: size oracle for the size test. */
 export function __blockedHistorySizeForTesting(): number {
   return getHistoryMap().size;
+}
+
+const NATIVE_HISTORY = Symbol.for("omniroute.nativeBlockedHistory");
+const nativeGlobals = globalThis as typeof globalThis & {
+  [NATIVE_HISTORY]?: WeakMap<object, Promise<NativeBlockedHistoryStore>>;
+};
+
+function nativeHistory(create = true): Promise<NativeBlockedHistoryStore> | undefined {
+  const identity = getSelectedPersistenceIdentity();
+  if (!identity) return undefined;
+  if (!isApplicationPersistenceIdentity(identity)) {
+    throw new UnsupportedPersistenceDomainError();
+  }
+  let store = nativeGlobals[NATIVE_HISTORY]?.get(identity);
+  if (!store && create) {
+    store = (async () => {
+      const directory = await resolveDataDirAsync();
+      if (
+        getSelectedPersistenceIdentity() !== identity ||
+        !isApplicationPersistenceIdentity(identity)
+      ) {
+        throw new UnsupportedPersistenceDomainError();
+      }
+      let failureLogged = false;
+      return new NativeBlockedHistoryStore(
+        path.join(directory, HISTORY_FILE),
+        (flush, dispatched) => {
+          const timer = setTimeout(() => {
+            dispatched();
+            if (!isApplicationPersistenceIdentity(identity)) return;
+            void runPersistenceBackgroundWork(async () => {
+              if (getSelectedPersistenceIdentity() !== identity)
+                throw new UnsupportedPersistenceDomainError();
+              await flush();
+            }).catch(() => {
+              if (!failureLogged) {
+                failureLogged = true;
+                console.warn("[ProxyHealth] Blocked history not persisted.");
+              }
+            });
+          }, SAVE_DEBOUNCE_MS);
+          timer.unref?.();
+          return () => clearTimeout(timer);
+        }
+      );
+    })();
+    (nativeGlobals[NATIVE_HISTORY] ??= new WeakMap()).set(identity, store);
+  }
+  return store?.then((resolved) => {
+    if (
+      getSelectedPersistenceIdentity() !== identity ||
+      !isApplicationPersistenceIdentity(identity)
+    ) {
+      throw new UnsupportedPersistenceDomainError();
+    }
+    return resolved;
+  });
+}
+
+export async function recordBlockedObservationAsync(
+  id: string,
+  cause: ProbeCause,
+  status: number | null,
+  at: number
+): Promise<void> {
+  const store = nativeHistory();
+  if (store) await (await store).record(id, cause, status, at);
+  else recordBlockedObservation(id, cause, status, at);
+}
+
+export async function getBlockedHistoriesAsync(
+  ids: Iterable<string>
+): Promise<Record<string, BlockedHistoryEntry>> {
+  const store = nativeHistory();
+  if (store) return (await store).read(ids);
+  const result: Record<string, BlockedHistoryEntry> = Object.create(null);
+  for (const id of ids) {
+    const entry = getBlockedHistory(id);
+    if (entry) result[id] = { ...entry };
+  }
+  return result;
+}
+
+export async function getBlockedHistoryAsync(id: string): Promise<BlockedHistoryEntry | undefined> {
+  return (await getBlockedHistoriesAsync([id]))[id];
+}
+
+export async function deleteBlockedHistoryAsync(id: string): Promise<void> {
+  const store = nativeHistory();
+  if (store) await (await store).remove(id);
+  else deleteBlockedHistory(id);
+}
+
+export async function pruneBlockedHistoryAsync(liveIds: Iterable<string>): Promise<number> {
+  const store = nativeHistory();
+  return store ? (await store).prune(liveIds) : pruneBlockedHistory(liveIds);
+}
+
+export async function flushBlockedHistoryAsync(): Promise<void> {
+  const store = nativeHistory(false);
+  if (store) await (await store).flush();
+  else if (!getSelectedPersistenceIdentity()) flushBlockedHistory();
+}
+
+export async function closeBlockedHistoryAsync(): Promise<void> {
+  const store = nativeHistory(false);
+  if (store) await (await store).close();
+  else if (!getSelectedPersistenceIdentity()) flushBlockedHistory();
 }

@@ -1,7 +1,11 @@
-import { getUserDatabaseSettings } from "@/lib/db/databaseSettings";
+import { getProviderConnections } from "@/lib/db/providers";
+import { getUserDatabaseSettings, getUserDatabaseSettingsAsync } from "@/lib/db/databaseSettings";
 import { getDbInstance } from "@/lib/db/core";
 import { decryptConnectionFields } from "@/lib/db/encryption";
-import { registerSemanticCacheConfigResolver } from "@omniroute/open-sse/config/semanticCacheConfig.ts";
+import {
+  registerSemanticCacheConfigResolver,
+  registerSemanticCacheAsyncConfigResolver,
+} from "@omniroute/open-sse/config/semanticCacheConfig.ts";
 import { resolveEmbeddingCredentials } from "@omniroute/open-sse/services/cache/embeddingEndpoint";
 
 let registered = false;
@@ -83,4 +87,76 @@ export function ensureSemanticCacheDbBridge(): void {
       return null;
     }
   });
+  registerSemanticCacheAsyncConfigResolver(async () => {
+    try {
+      // Configuration reads must not run full DB statistics or integrity checks.
+      const s = (await getUserDatabaseSettingsAsync()).cache;
+      if (!s) return null;
+
+      const conn = s.semanticCacheEmbeddingProvider
+        ? await resolveProviderConnectionDetailsAsync(s.semanticCacheEmbeddingProvider)
+        : {};
+
+      const { baseUrl: embeddingBaseUrl, apiKey: embeddingApiKey } = resolveEmbeddingCredentials(
+        { baseUrl: s.semanticCacheEmbeddingBaseUrl, apiKey: s.semanticCacheEmbeddingApiKey },
+        conn
+      );
+
+      return {
+        // The vector layer is opt-in (#14159): it only runs when the operator turned
+        // on BOTH the master semantic-cache toggle and the vector-layer toggle. With
+        // it off, chatCore behaves exactly like the legacy SQLite exact-match cache.
+        enabled: s.semanticCacheEnabled !== false && s.semanticCacheVectorEnabled === true,
+        backend: s.semanticCacheBackend,
+        similarityThreshold: s.semanticCacheThreshold,
+        ttlMs: s.semanticCacheTTL,
+        maxEntries: s.semanticCacheMaxSize,
+        embeddingProvider: s.semanticCacheEmbeddingProvider,
+        embeddingModel: s.semanticCacheEmbeddingModel,
+        embeddingDimension: s.semanticCacheEmbeddingDimension,
+        embeddingBaseUrl,
+        embeddingApiKey,
+        redisUrl: s.semanticCacheRedisUrl,
+        redisPrefix: s.semanticCacheRedisPrefix,
+        requireZeroTemperature: s.semanticCacheRequireZeroTemp,
+      };
+    } catch {
+      return null;
+    }
+  });
+}
+
+export async function resolveProviderConnectionDetailsAsync(
+  provider: string
+): Promise<{ baseUrl?: string; apiKey?: string }> {
+  if (!provider) return {};
+  try {
+    const connections = await getProviderConnections({ provider, isActive: true });
+    connections.sort((a, b) => {
+      const priority =
+        a.priority == null
+          ? b.priority == null
+            ? 0
+            : -1
+          : b.priority == null
+            ? 1
+            : Number(a.priority) - Number(b.priority);
+      const left = String(a.id),
+        right = String(b.id);
+      return priority || (left < right ? -1 : left > right ? 1 : 0);
+    });
+    const connection = connections[0];
+    if (!connection) return {};
+    const data = connection.providerSpecificData as Record<string, unknown> | undefined;
+    return {
+      baseUrl:
+        typeof data?.baseUrl === "string" && data.baseUrl.trim() ? data.baseUrl.trim() : undefined,
+      apiKey:
+        typeof connection.apiKey === "string" && connection.apiKey.trim()
+          ? connection.apiKey.trim()
+          : undefined,
+    };
+  } catch {
+    return {};
+  }
 }

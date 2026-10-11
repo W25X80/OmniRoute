@@ -3,8 +3,16 @@
  */
 
 import { getDbInstance } from "../core";
+import { getSelectedPostgresDatabase } from "../controlPlaneContext";
+import {
+  readPostgresCacheMetrics,
+  readPostgresCacheTrend,
+} from "../postgres/cacheMetricsRepository";
+import { projectCacheMetrics } from "./cacheMetricsSemantics";
 
 export async function getCacheMetrics() {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) return readPostgresCacheMetrics(postgres);
   const db = getDbInstance();
 
   try {
@@ -89,68 +97,7 @@ export async function getCacheMetrics() {
       cacheCreationTokens: number | null;
     }>;
 
-    const tokensSaved = totalsRow?.totalCachedTokens || 0;
-
-    const AVG_INPUT_PRICE_PER_MILLION = 3;
-    const CACHE_DISCOUNT = 0.9;
-    const estimatedCostSaved =
-      Math.round((tokensSaved / 1_000_000) * AVG_INPUT_PRICE_PER_MILLION * CACHE_DISCOUNT * 100) /
-      100;
-
-    // Build byProvider object
-    const byProvider: Record<
-      string,
-      {
-        requests: number;
-        totalRequests: number;
-        cachedRequests: number;
-        inputTokens: number;
-        cachedTokens: number;
-        cacheCreationTokens: number;
-      }
-    > = {};
-    for (const row of byProviderRows) {
-      byProvider[row.provider] = {
-        requests: row.cachedRequests,
-        totalRequests: row.totalRequests,
-        cachedRequests: row.cachedRequests,
-        inputTokens: row.inputTokens || 0,
-        cachedTokens: row.cachedTokens || 0,
-        cacheCreationTokens: row.cacheCreationTokens || 0,
-      };
-    }
-
-    // Build byStrategy object
-    const byStrategy: Record<
-      string,
-      {
-        requests: number;
-        inputTokens: number;
-        cachedTokens: number;
-        cacheCreationTokens: number;
-      }
-    > = {};
-    for (const row of byStrategyRows) {
-      byStrategy[row.strategy] = {
-        requests: row.requests,
-        inputTokens: row.inputTokens || 0,
-        cachedTokens: row.cachedTokens || 0,
-        cacheCreationTokens: row.cacheCreationTokens || 0,
-      };
-    }
-
-    return {
-      totalRequests: allRequestsRow?.totalRequests || totalsRow?.totalRequests || 0,
-      requestsWithCacheControl: totalsRow?.totalRequests || 0,
-      totalInputTokens: totalsRow?.totalInputTokens || 0,
-      totalCachedTokens: totalsRow?.totalCachedTokens || 0,
-      totalCacheCreationTokens: totalsRow?.totalCacheCreationTokens || 0,
-      tokensSaved,
-      estimatedCostSaved,
-      byProvider,
-      byStrategy,
-      lastUpdated: new Date().toISOString(),
-    };
+    return projectCacheMetrics(totalsRow, allRequestsRow, byProviderRows, byStrategyRows);
   } catch (error) {
     console.error("Failed to fetch cache metrics from usage_history:", error);
     return {
@@ -175,7 +122,7 @@ export async function updateCacheMetrics(_metrics: Record<string, unknown>) {
 }
 
 export interface CacheTrendPoint {
-  timestamp: string;
+  timestamp: string | null;
   requests: number;
   cachedRequests: number;
   inputTokens: number;
@@ -184,6 +131,8 @@ export interface CacheTrendPoint {
 }
 
 export async function getCacheTrend(hours = 24): Promise<CacheTrendPoint[]> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) return readPostgresCacheTrend(postgres, hours);
   const db = getDbInstance();
 
   try {

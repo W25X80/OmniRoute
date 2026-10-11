@@ -4,6 +4,11 @@
 // types share the exact same x-relay-target / x-relay-path / x-relay-auth header spec; only the
 // deployment surface differs.
 import { randomUUID } from "crypto";
+import { isProxyRegistryStatus } from "@/shared/constants/proxyRegistryStatus";
+import { getPostgresProxyHealthStats } from "./postgres/proxyHealthRepository";
+import { resolvePostgresProxyForProvider } from "./postgres/proxyResolution";
+import { getSelectedPostgresDatabase } from "./controlPlaneContext";
+import { createPostgresProxyRepository } from "./postgres/proxyRepository";
 import { getDbInstance } from "./core";
 import { backupDbFile } from "./backup";
 import type {
@@ -28,19 +33,8 @@ import {
   coerceProxyPayload,
   redactProxySecrets,
 } from "./proxies/mappers";
-import { isGlobalProxyEnabled, PROXY_ALIVE_PREDICATE } from "./proxies/guards";
+import { isGlobalProxyEnabled } from "./proxies/guards";
 import { bumpProxyRegistryGeneration } from "./proxies/registryGeneration";
-import { isProxyRegistryStatus } from "@/shared/constants/proxyRegistryStatus";
-export {
-  hasBlockingProxyAssignment,
-  hasBlockingProxyAssignmentForProvider,
-} from "./proxies/guards";
-export { extractRelayAuth, redactProxySecrets } from "./proxies/mappers";
-export { addProxiesToScopePool } from "./proxySubscriptions";
-export {
-  bumpProxyRegistryGeneration,
-  getProxyRegistryGeneration,
-} from "./proxies/registryGeneration";
 import {
   normalizeRotationScopeId,
   clearRotationState,
@@ -52,6 +46,20 @@ import {
   resolveProxyForConnectionFromRegistry,
   resolveProxyForScopeFromRegistry,
 } from "./proxies/rotation";
+export {
+  hasBlockingProxyAssignment,
+  hasBlockingProxyAssignmentForProvider,
+  hasBlockingProxyAssignmentAsync,
+  hasBlockingProxyAssignmentForProviderAsync,
+} from "./proxies/guards";
+export { extractRelayAuth, redactProxySecrets } from "./proxies/mappers";
+export { getScopePoolEgressRowsAsync } from "./proxies/rotation";
+export { addProxiesToScopePool } from "./proxySubscriptions";
+export {
+  bumpProxyRegistryGeneration,
+  getProxyRegistryGeneration,
+} from "./proxies/registryGeneration";
+
 export {
   getScopePoolEgressRows,
   getScopeProxyPool,
@@ -265,6 +273,9 @@ export async function listProxies(options?: {
   limit?: number;
   offset?: number;
 }) {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) return createPostgresProxyRepository(postgres).list(options);
+
   const includeSecrets = options?.includeSecrets === true;
   const limit = options?.limit;
   const offset = options?.offset ?? 0;
@@ -279,10 +290,16 @@ export async function listProxies(options?: {
   const rows = db.prepare(sql).all(...params) as unknown[];
   const total = (db.prepare("SELECT count(*) as cnt FROM proxy_registry").get() as CountResult).cnt;
   const proxies = rows.map(mapProxyRow);
-  return { items: includeSecrets ? proxies : proxies.map(redactProxySecrets), total };
+  return {
+    items: includeSecrets ? proxies : proxies.map(redactProxySecrets),
+    total,
+  };
 }
 
 export async function getProxyById(id: string, options?: { includeSecrets?: boolean }) {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) return createPostgresProxyRepository(postgres).get(id, options);
+
   const db = getDbInstance();
   return getProxyRowById(db, id, options);
 }
@@ -316,6 +333,9 @@ function getProxyRowByIdOrThrow(
 }
 
 export async function createProxy(payload: ProxyPayload) {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) return createPostgresProxyRepository(postgres).create(payload);
+
   const db = getDbInstance();
   const id = randomUUID();
   const now = new Date().toISOString();
@@ -348,17 +368,27 @@ export async function createProxy(payload: ProxyPayload) {
  * at all and the call returns `action: "skipped"`. The sync always sends its subscriptionId:
  * a caller that omits it would find manual rows (null === null) counted as owned.
  */
-export async function upsertProxy(
-  payload: ProxyPayload
-): Promise<{ proxy: ProxyRegistryRecord | null; action: "created" | "updated" }>;
+export async function upsertProxy(payload: ProxyPayload): Promise<{
+  proxy: ProxyRegistryRecord | null;
+  action: "created" | "updated";
+}>;
 export async function upsertProxy(
   payload: ProxyPayload,
   options: { claimOwnership?: boolean }
-): Promise<{ proxy: ProxyRegistryRecord | null; action: "created" | "updated" | "skipped" }>;
+): Promise<{
+  proxy: ProxyRegistryRecord | null;
+  action: "created" | "updated" | "skipped";
+}>;
 export async function upsertProxy(
   payload: ProxyPayload,
   options: { claimOwnership?: boolean } = {}
-): Promise<{ proxy: ProxyRegistryRecord | null; action: "created" | "updated" | "skipped" }> {
+): Promise<{
+  proxy: ProxyRegistryRecord | null;
+  action: "created" | "updated" | "skipped";
+}> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) return createPostgresProxyRepository(postgres).upsert(payload, options);
+
   const db = getDbInstance();
   const host = (payload.host || "").trim();
   const port = Number(payload.port);
@@ -389,6 +419,9 @@ export async function upsertProxy(
 }
 
 export async function updateProxy(id: string, payload: Partial<ProxyPayload>) {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) return createPostgresProxyRepository(postgres).update(id, payload);
+
   // No status filtering here: callers own the status they send. Writes that must
   // preserve the stored status filter it in upsertProxy before calling this.
   const db = getDbInstance();
@@ -406,6 +439,17 @@ export async function createProxyAndAssign(
   payload: ProxyPayload,
   assignment: ProxyAssignmentPayload
 ): Promise<ProxyMutationResult> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const result = await createPostgresProxyRepository(postgres).mutateAndAssign(
+      null,
+      payload,
+      assignment
+    );
+    if (!result) throw new Error("Created proxy was not returned");
+    return result;
+  }
+
   const db = getDbInstance();
   const id = randomUUID();
   const now = new Date().toISOString();
@@ -441,6 +485,10 @@ export async function updateProxyAndAssign(
   payload: Partial<ProxyPayload>,
   assignment: ProxyAssignmentPayload
 ): Promise<ProxyMutationResult | null> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres)
+    return createPostgresProxyRepository(postgres).mutateAndAssign(id, payload, assignment);
+
   const db = getDbInstance();
   const now = new Date().toISOString();
 
@@ -475,6 +523,9 @@ export async function updateProxyAndAssign(
 }
 
 export async function getProxyAssignments(filters?: { proxyId?: string; scope?: string }) {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) return createPostgresProxyRepository(postgres).assignments(filters);
+
   try {
     const db = getDbInstance();
 
@@ -512,6 +563,9 @@ export async function getProxyAssignments(filters?: { proxyId?: string; scope?: 
 }
 
 export async function getProxyWhereUsed(proxyId: string) {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) return createPostgresProxyRepository(postgres).whereUsed(proxyId);
+
   const db = getDbInstance();
   const rows = db
     .prepare(
@@ -573,6 +627,9 @@ export async function assignProxyToScope(
   scopeId: string | null,
   proxyId: string | null
 ): Promise<ProxyAssignmentRecord | null> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) return createPostgresProxyRepository(postgres).assign(scope, scopeId, proxyId);
+
   const normalizedScope = normalizeScope(scope);
   const normalizedScopeId = normalizeAssignmentScopeId(normalizedScope, scopeId);
   // Contract: scope already normalized above — the raw-scope guard applies to it directly.
@@ -594,7 +651,9 @@ export async function assignProxyToScope(
 
   const proxy = await getProxyById(proxyId, { includeSecrets: true });
   if (!proxy) {
-    const err = new Error(`Proxy not found: ${proxyId}`) as Error & { status?: number };
+    const err = new Error(`Proxy not found: ${proxyId}`) as Error & {
+      status?: number;
+    };
     err.status = 404;
     throw err;
   }
@@ -626,6 +685,12 @@ export async function addProxyToScopePool(
   scopeId: string | null,
   proxyId: string
 ): Promise<ProxyAssignmentRecord | null> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const repository = createPostgresProxyRepository(postgres);
+    await repository.addToPool(scope, scopeId, [proxyId]);
+    return (await repository.pool(scope, scopeId)).find((row) => row.proxyId === proxyId) ?? null;
+  }
   const normalizedScope = normalizeScope(scope);
   const normalizedScopeId = normalizeAssignmentScopeId(normalizedScope, scopeId);
   // Contract: normalizedScope is already normalized — the raw-scope guard applies to it directly.
@@ -636,7 +701,9 @@ export async function addProxyToScopePool(
   const db = getDbInstance();
   const proxy = await getProxyById(proxyId, { includeSecrets: true });
   if (!proxy) {
-    const err = new Error(`Proxy not found: ${proxyId}`) as Error & { status?: number };
+    const err = new Error(`Proxy not found: ${proxyId}`) as Error & {
+      status?: number;
+    };
     err.status = 404;
     throw err;
   }
@@ -684,6 +751,10 @@ export async function removeProxyFromScopePool(
   scopeId: string | null,
   proxyId: string
 ): Promise<boolean> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres)
+    return createPostgresProxyRepository(postgres).removeFromPool(scope, scopeId, proxyId);
+
   const normalizedScope = normalizeScope(scope);
   const normalizedScopeId = normalizeAssignmentScopeId(normalizedScope, scopeId);
   const db = getDbInstance();
@@ -708,6 +779,10 @@ export async function setScopeRotationStrategy(
   strategy: ProxyRotationStrategy | string,
   options?: { stickyWindowMinutes?: number }
 ): Promise<ProxyRotationStrategy> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres)
+    return createPostgresProxyRepository(postgres).setStrategy(scope, scopeId, strategy, options);
+
   const normalizedScope = normalizeScope(scope);
   const rotationScopeId = normalizeRotationScopeId(normalizedScope, scopeId);
   const normalizedStrategy = normalizeRotationStrategy(strategy);
@@ -740,6 +815,9 @@ export async function setScopeRotationStrategy(
 }
 
 export async function deleteProxyById(id: string, options?: { force?: boolean }) {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) return createPostgresProxyRepository(postgres).delete(id, options);
+
   const force = options?.force === true;
   const db = getDbInstance();
   const usage = await getProxyWhereUsed(id);
@@ -773,18 +851,38 @@ export async function deleteProxyById(id: string, options?: { force?: boolean })
 
 export async function migrateLegacyProxyConfigToRegistry(options?: { force?: boolean }) {
   const force = options?.force === true;
-  const db = getDbInstance();
+  const postgres = getSelectedPostgresDatabase();
+  const db = postgres ? null : getDbInstance();
 
-  const existingCountRow = db.prepare("SELECT COUNT(*) AS cnt FROM proxy_registry").get() as
-    { cnt?: number } | undefined;
+  const existingCountRow = postgres
+    ? await postgres.transaction(
+        async (tx) =>
+          (await tx.query<{ cnt: string }>("SELECT count(*) AS cnt FROM omniroute.proxy_registry"))
+            .rows[0]
+      )
+    : (db!.prepare("SELECT COUNT(*) AS cnt FROM proxy_registry").get() as
+        { cnt?: number } | undefined);
   const existingCount = Number(existingCountRow?.cnt || 0);
   if (!force && existingCount > 0) {
-    return { migrated: 0, skipped: true, reason: "registry_not_empty" as const };
+    return {
+      migrated: 0,
+      skipped: true,
+      reason: "registry_not_empty" as const,
+    };
   }
 
-  const rows = db
-    .prepare("SELECT key, value FROM key_value WHERE namespace = 'proxyConfig'")
-    .all() as Array<{ key?: string; value?: string }>;
+  const rows = postgres
+    ? await postgres.transaction(
+        async (tx) =>
+          (
+            await tx.query<{ key: string; value: string }>(
+              "SELECT key,value FROM omniroute.key_value WHERE namespace='proxyConfig'"
+            )
+          ).rows
+      )
+    : (db!
+        .prepare("SELECT key, value FROM key_value WHERE namespace = 'proxyConfig'")
+        .all() as Array<{ key?: string; value?: string }>);
 
   const raw: LegacyProxyConfig = {};
   for (const row of rows) {
@@ -842,73 +940,9 @@ export async function migrateLegacyProxyConfigToRegistry(options?: { force?: boo
   return { migrated, skipped: false as const };
 }
 
-/**
- * Upstream failure spread grouped by provider, read from the proxy log. One row
- * per provider with real (non connection-test) requests since `since`, and per
- * exit (distinct proxy host + port) the attempts and 5xx counts behind that
- * provider. Providers with a null or blank name are excluded: they can never
- * own a regime line. Only numbers leave this function.
- */
-export type ProviderUpstreamExit = { exit: string; attempts: number; serverErrors: number };
-
-export type ProviderUpstreamRow = {
-  provider: string;
-  attempts: number;
-  measured: number;
-  serverErrors: number;
-  exits: ProviderUpstreamExit[];
-};
-
-export function getProviderUpstreamSummary(since: string): ProviderUpstreamRow[] {
-  const db = getDbInstance();
-  const rows = db
-    .prepare(
-      `SELECT
-         provider,
-         proxy_host AS exit_host,
-         proxy_port AS exit_port,
-         COUNT(*) AS attempts,
-         SUM(CASE WHEN upstream_status IS NOT NULL THEN 1 ELSE 0 END) AS measured,
-         SUM(CASE WHEN upstream_status >= 500 AND upstream_status < 600 THEN 1 ELSE 0 END) AS server_errors
-       FROM proxy_logs
-       WHERE timestamp >= ?
-         AND provider IS NOT NULL AND TRIM(provider) <> ''
-         AND (target_url NOT LIKE '%/connection-test' OR target_url IS NULL)
-       GROUP BY provider, exit_host, exit_port`
-    )
-    .all(since) as Array<{
-    provider: string;
-    exit_host: string | null;
-    exit_port: number | null;
-    attempts: number;
-    measured: number;
-    server_errors: number;
-  }>;
-
-  const byProvider = new Map<string, ProviderUpstreamRow>();
-  for (const row of rows) {
-    const provider = row.provider;
-    let entry = byProvider.get(provider);
-    if (!entry) {
-      entry = { provider, attempts: 0, measured: 0, serverErrors: 0, exits: [] };
-      byProvider.set(provider, entry);
-    }
-    const attempts = Number(row.attempts || 0);
-    const measured = Number(row.measured || 0);
-    const serverErrors = Number(row.server_errors || 0);
-    entry.attempts += attempts;
-    entry.measured += measured;
-    entry.serverErrors += serverErrors;
-    entry.exits.push({
-      exit: `${row.exit_host ?? "?"}:${row.exit_port ?? "?"}`,
-      attempts,
-      serverErrors,
-    });
-  }
-  return [...byProvider.values()].sort((a, b) => a.provider.localeCompare(b.provider));
-}
-
 export async function getProxyHealthStats(options?: { hours?: number }) {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) return getPostgresProxyHealthStats(postgres, options);
   const db = getDbInstance();
   const hours = Math.max(1, Math.min(24 * 30, Number(options?.hours || 24)));
   const sinceIso = new Date(Date.now() - hours * 60 * 60 * 1000).toISOString();
@@ -1003,7 +1037,10 @@ export async function bulkAssignProxyToScope(
   scope: string,
   scopeIds: string[],
   proxyId: string | null
-): Promise<{ updated: number; failed: Array<{ scopeId: string; reason: string }> }> {
+): Promise<{
+  updated: number;
+  failed: Array<{ scopeId: string; reason: string }>;
+}> {
   const uniqueScopeIds = [
     ...new Set((scopeIds || []).map((id) => String(id).trim()).filter(Boolean)),
   ];
@@ -1036,6 +1073,8 @@ export async function bulkAssignProxyToScope(
  * Priority: provider-level → global → null
  */
 export async function resolveProxyForProvider(providerId: string) {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) return resolvePostgresProxyForProvider(postgres, providerId);
   try {
     const db = getDbInstance();
     if (!isGlobalProxyEnabled(db)) return null;
@@ -1087,3 +1126,6 @@ export async function resolveProxyForProvider(providerId: string) {
     throw error;
   }
 }
+
+export { getProviderUpstreamSummary, getProviderUpstreamSummaryAsync } from "./proxyHealth";
+export type { ProviderUpstreamExit, ProviderUpstreamRow } from "./proxyHealth";

@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { getFile, getFileContent } from "@/lib/db/files";
+import { getFileAsync, getFileContentAsync } from "@/lib/db/files";
 import { getApiKeyRequestScope, canAccessOwnedRecord } from "@/app/api/v1/_helpers/apiKeyScope";
 
 export async function GET(request: Request, { params }: { params: Promise<{ id: string }> }) {
@@ -7,7 +7,7 @@ export async function GET(request: Request, { params }: { params: Promise<{ id: 
   if (scope.rejection) return scope.rejection;
 
   const { id } = await params;
-  const file = getFile(id);
+  const file = await getFileAsync(id);
 
   // `getFileContent` has no ownership check of its own — this guard is the only
   // thing between a caller and the raw bytes. Mirrors /api/v1/files/[id]/content
@@ -20,7 +20,7 @@ export async function GET(request: Request, { params }: { params: Promise<{ id: 
     );
   }
 
-  const content = getFileContent(id);
+  const content = await getFileContentAsync(id);
   if (!content) {
     return NextResponse.json(
       { error: { message: "File content not found", type: "invalid_request_error" } },

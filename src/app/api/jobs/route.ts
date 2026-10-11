@@ -17,18 +17,21 @@ export const dynamic = "force-dynamic";
 export async function GET() {
   try {
     const registry = getJobRegistry();
-    const jobs = registry.listJobs().map((job) => ({
-      id: job.id,
-      type: job.type,
-      cron: job.cron,
-      intervalMs: job.intervalMs,
-      enabled: job.enabled,
-      envFlag: job.envFlag,
-      config: job.config,
-      createdAt: job.createdAt,
-      updatedAt: job.updatedAt,
-      lastRun: registry.getRuns(job.id, 1)[0] ?? null,
-    }));
+    const jobs: Record<string, unknown>[] = [];
+    for (const job of await registry.listJobsAsync()) {
+      jobs.push({
+        id: job.id,
+        type: job.type,
+        cron: job.cron,
+        intervalMs: job.intervalMs,
+        enabled: job.enabled,
+        envFlag: job.envFlag,
+        config: job.config,
+        createdAt: job.createdAt,
+        updatedAt: job.updatedAt,
+        lastRun: (await registry.getRunsAsync(job.id, 1))[0] ?? null,
+      });
+    }
     return NextResponse.json({ data: jobs });
   } catch (err) {
     console.error("[API] GET /api/jobs error:", err);

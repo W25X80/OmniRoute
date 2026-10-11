@@ -33,12 +33,12 @@
 
 import { createHmac, randomUUID } from "node:crypto";
 import {
-  createAgenticConversation,
-  findAgenticConversationsByFingerprint,
-  getConversationTurnIndex,
-  insertConversationTurnNodes,
-  touchOrCreateExternalConversation,
-  updateAgenticConversation,
+  createAgenticConversationAsync,
+  findAgenticConversationsByFingerprintAsync,
+  getConversationTurnIndexAsync,
+  insertConversationTurnNodesAsync,
+  touchOrCreateExternalConversationAsync,
+  updateAgenticConversationAsync,
   type ConversationTurnIndex,
 } from "../../src/lib/db/agenticConversations.ts";
 
@@ -464,7 +464,7 @@ export async function resolveConversationId(
   // new prefix so the existing header's contract/format stays unchanged.
   if (input.clientSessionIdHeader && input.clientSessionIdHeader.trim()) {
     const id = input.clientSessionIdHeader.trim().slice(0, MAX_STORED_ID_LENGTH);
-    touchOrCreateExternalConversation(id, { apiKeyId: input.apiKeyId });
+    await touchOrCreateExternalConversationAsync(id, { apiKeyId: input.apiKeyId });
     return { conversationId: id, isNewConversation: false };
   }
 
@@ -491,9 +491,9 @@ export async function resolveConversationId(
   const turnHashes = chainTurns.map(hashTurnContent);
   const walkBudget: ReconnectWalkBudget = { stepsLeft: DEFAULT_RECONNECT_MAX_STEPS, stepsUsed: 0 };
 
-  const candidates = findAgenticConversationsByFingerprint(fingerprintHash);
+  const candidates = await findAgenticConversationsByFingerprintAsync(fingerprintHash);
   for (const candidate of candidates) {
-    const index = getConversationTurnIndex(candidate.id);
+    const index = await getConversationTurnIndexAsync(candidate.id);
     if (index.nodeIds.size === 0) continue;
 
     const { match } = findReconnectMatch(chainTurns, index, {
@@ -512,7 +512,7 @@ export async function resolveConversationId(
       // Every turn from the reconnect point onward already exists on this
       // chain (e.g. an exact retry, or the whole request is already fully
       // recorded) — a real continuation, nothing new to insert.
-      updateAgenticConversation(candidate.id, { turnCount: candidate.turnCount + 1 });
+      await updateAgenticConversationAsync(candidate.id, { turnCount: candidate.turnCount + 1 });
       return { conversationId: candidate.id, isNewConversation: false };
     }
 
@@ -530,8 +530,8 @@ export async function resolveConversationId(
         candidate.id,
         turnHashes
       );
-      insertConversationTurnNodes(candidate.id, input.correlationId, newNodes);
-      updateAgenticConversation(candidate.id, { turnCount: candidate.turnCount + 1 });
+      await insertConversationTurnNodesAsync(candidate.id, input.correlationId, newNodes);
+      await updateAgenticConversationAsync(candidate.id, { turnCount: candidate.turnCount + 1 });
       return { conversationId: candidate.id, isNewConversation: false };
     }
 
@@ -555,8 +555,8 @@ export async function resolveConversationId(
   }
 
   const id = `conv_${randomUUID()}`;
-  createAgenticConversation({ id, apiKeyId: input.apiKeyId, fingerprintHash });
-  insertConversationTurnNodes(
+  await createAgenticConversationAsync({ id, apiKeyId: input.apiKeyId, fingerprintHash });
+  await insertConversationTurnNodesAsync(
     id,
     input.correlationId,
     buildNewNodes(chainTurns, 0, id, id, turnHashes)

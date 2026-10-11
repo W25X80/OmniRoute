@@ -1,3 +1,4 @@
+import { runPersistenceBackgroundWork } from "@/lib/db/persistenceRuntime";
 import { getConsistentMachineId } from "@/shared/utils/machineId";
 import { isCloudEnabled } from "@/lib/db/settings";
 import { getRuntimePorts } from "@/lib/runtime/ports";
@@ -17,6 +18,11 @@ export class CloudSyncScheduler {
   machineId: string | null;
   intervalMinutes: number;
   intervalId: ReturnType<typeof setInterval> | null;
+  private startupTimer: ReturnType<typeof setTimeout> | null = null;
+  private closing = false;
+  private generation = 0;
+  private pending = new Set<Promise<unknown>>();
+  private closePromise: Promise<void> | undefined;
 
   constructor(machineId: string | null = null, intervalMinutes = 15) {
     this.machineId = machineId;
@@ -37,22 +43,28 @@ export class CloudSyncScheduler {
    * Start periodic sync (delays first sync to allow server to be ready)
    */
   async start() {
+    if (this.closing) throw new Error("Cloud sync scheduler is closing");
     if (this.intervalId) {
       return;
     }
 
+    const generation = this.generation;
     await this.initializeMachineId();
+    if (this.closing) throw new Error("Cloud sync scheduler is closing");
+    if (this.intervalId || generation !== this.generation) return;
 
     // Delay first sync by 30 seconds to ensure server is ready
-    const startupTimer = setTimeout(() => {
-      this.syncWithRetry().catch(() => {});
+    this.startupTimer = setTimeout(() => {
+      if (this.closing || generation !== this.generation) return;
+      this.startupTimer = null;
+      this.enqueueSync(generation);
     }, 30000);
-    startupTimer.unref?.();
+    this.startupTimer.unref?.();
 
     // Then sync periodically
     this.intervalId = setInterval(
       () => {
-        this.syncWithRetry().catch(() => {});
+        this.enqueueSync(generation);
       },
       this.intervalMinutes * 60 * 1000
     );
@@ -63,10 +75,35 @@ export class CloudSyncScheduler {
    * Stop periodic sync
    */
   stop() {
+    this.generation++;
+    if (this.startupTimer) {
+      clearTimeout(this.startupTimer);
+      this.startupTimer = null;
+    }
     if (this.intervalId) {
       clearInterval(this.intervalId);
       this.intervalId = null;
     }
+  }
+
+  private enqueueSync(generation: number): void {
+    if (this.closing || generation !== this.generation || this.pending.size) return;
+    const work = runPersistenceBackgroundWork(() => this.syncWithRetry());
+    this.pending.add(work);
+    void work.then(
+      () => this.pending.delete(work),
+      () => this.pending.delete(work)
+    );
+  }
+
+  close(): Promise<void> {
+    if (this.closePromise) return this.closePromise;
+    this.closing = true;
+    this.stop();
+    this.closePromise = (async () => {
+      while (this.pending.size) await Promise.allSettled([...this.pending]);
+    })();
+    return this.closePromise;
   }
 
   /**
@@ -77,7 +114,7 @@ export class CloudSyncScheduler {
       try {
         const result = await this.sync();
         return result;
-      } catch (error) {
+      } catch (_error) {
         if (attempt === maxRetries) {
           return null;
         }
@@ -124,12 +161,18 @@ export class CloudSyncScheduler {
   }
 }
 
-// Export a singleton instance if needed
-let cloudSyncScheduler: CloudSyncScheduler | null = null;
+declare global {
+  var __omnirouteCloudSyncScheduler: CloudSyncScheduler | undefined;
+}
 
 export async function getCloudSyncScheduler(machineId: string | null = null, intervalMinutes = 15) {
-  if (!cloudSyncScheduler) {
-    cloudSyncScheduler = new CloudSyncScheduler(machineId, intervalMinutes);
-  }
-  return cloudSyncScheduler;
+  return (globalThis.__omnirouteCloudSyncScheduler ??= new CloudSyncScheduler(
+    machineId,
+    intervalMinutes
+  ));
+}
+
+/** Shutdown does not instantiate a scheduler that was never started. */
+export function closeCloudSyncScheduler(): Promise<void> {
+  return globalThis.__omnirouteCloudSyncScheduler?.close() ?? Promise.resolve();
 }

@@ -20,6 +20,9 @@
 import { WebSocketServer, WebSocket } from "ws";
 import { createServer, type IncomingMessage, type ServerResponse } from "http";
 import { randomUUID } from "crypto";
+import { parseDatabaseBackend } from "@/lib/db/backendSelection";
+import { ensurePersistenceReady, runPersistenceRequest } from "@/lib/db/persistenceRuntime";
+import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
 import {
   verifyDashboardSessionToken,
   DASHBOARD_SESSION_COOKIE,
@@ -29,9 +32,9 @@ import {
 
 import type { WsClientMessage, WsServerMessage, WsEventMessage, WsAuthResult } from "./types";
 
-import { emit, on, onAny, getEventHistory, type HistoryEntry } from "@/lib/events/eventBus";
+import { onAny, type HistoryEntry } from "@/lib/events/eventBus";
 
-import type { DashboardEventName, DashboardEventMap, DashboardChannel } from "@/lib/events/types";
+import type { DashboardEventName, DashboardChannel } from "@/lib/events/types";
 
 import { CHANNEL_EVENTS, getChannelForEvent } from "@/lib/events/types";
 import { isAutomatedTestProcess, isBuildProcess } from "@/shared/utils/testProcess";
@@ -95,24 +98,31 @@ interface ClientState {
 }
 
 const clients = new Map<string, ClientState>();
+const NATIVE_SERVER_STOPS = Symbol.for("omniroute.live-ws.stops.v1");
+const processState = globalThis as typeof globalThis & {
+  [NATIVE_SERVER_STOPS]?: WeakMap<import("http").Server, () => Promise<void>>;
+};
+const nativeServerStops = (processState[NATIVE_SERVER_STOPS] ??= new WeakMap<
+  import("http").Server,
+  () => Promise<void>
+>());
+
+/** Stop native admission and drain accepted WebSocket work before closing its transports. */
+export function stopLiveDashboardServer(server: import("http").Server): Promise<void> {
+  const stop = nativeServerStops.get(server);
+  if (stop) return stop();
+  return new Promise((resolve, reject) =>
+    server.close((error) => {
+      if (error && (error as NodeJS.ErrnoException).code !== "ERR_SERVER_NOT_RUNNING")
+        reject(error);
+      else resolve();
+    })
+  );
+}
 let eventHistoryBacklog: HistoryEntry[] = [];
 const BACKLOG_MAX = 500;
 
 // ── Auth ──────────────────────────────────────────────────────────────────
-
-function toWebHeaders(headers: import("http").IncomingMessage["headers"]): Headers {
-  const webHeaders = new Headers();
-
-  for (const [name, value] of Object.entries(headers)) {
-    if (typeof value === "string") {
-      webHeaders.set(name, value);
-    } else if (Array.isArray(value)) {
-      webHeaders.set(name, name.toLowerCase() === "cookie" ? value.join("; ") : value.join(", "));
-    }
-  }
-
-  return webHeaders;
-}
 
 // Auth-module warmer. The SSE auth graph is large (hundreds of transitive
 // modules); a cold dynamic import takes several seconds and runs synchronously
@@ -430,8 +440,8 @@ function handleInternalEventRequest(req: IncomingMessage, res: ServerResponse): 
 
 async function seedLatestCompressionRunFromDb(): Promise<void> {
   try {
-    const { getLatestCompressionAnalyticsRun } = await import("@/lib/db/compressionAnalytics");
-    const row = getLatestCompressionAnalyticsRun();
+    const { getLatestCompressionAnalyticsRunAsync } = await import("@/lib/db/compressionAnalytics");
+    const row = await getLatestCompressionAnalyticsRunAsync();
     if (!row) return;
 
     const originalTokens = Number(row.original_tokens) || 0;
@@ -531,6 +541,8 @@ export async function startLiveDashboardServer(
   // becomes an uncaughtException that kills the server. Benign aborts are
   // swallowed; genuine errors still crash loudly (#fix-dev-server-aborted).
   installProcessCrashGuard();
+  const native = parseDatabaseBackend() === "postgres";
+  if (native) await ensurePersistenceReady();
   if (!process.env.JWT_SECRET) {
     console.warn(
       "  \x1b[33m⚠ Warning: JWT_SECRET is not set in the environment.\x1b[0m\n" +
@@ -547,26 +559,123 @@ export async function startLiveDashboardServer(
     handleInternalEventRequest(req, res);
   });
   const wss = new WebSocketServer({ server });
+  const nativeWork = new Set<Promise<unknown>>();
+  const nativeSockets = new Set<WebSocket>();
+  let stopping = false;
+  let stopped: Promise<void> | undefined;
+  const trackNativeWork = <T>(work: Promise<T>): Promise<T> => {
+    nativeWork.add(work);
+    void work.then(
+      () => nativeWork.delete(work),
+      () => nativeWork.delete(work)
+    );
+    return work;
+  };
+  const rejectNativeWork = (ws: WebSocket) => {
+    sendTo(ws, {
+      type: "error",
+      code: "SERVER_ERROR",
+      message: sanitizeErrorMessage("Live dashboard request could not be completed"),
+    });
+    ws.close(1013, "Try again later");
+  };
+  if (native)
+    nativeServerStops.set(server, () => {
+      stopping = true;
+      stopped ??= (async () => {
+        // Accepted auth may enqueue its already-buffered frames while admission is closed.
+        while (nativeWork.size) await Promise.allSettled([...nativeWork]);
+        const websocketClosed = new Promise<void>((resolve, reject) => {
+          wss.close((error) => (error ? reject(error) : resolve()));
+        });
+        for (const ws of nativeSockets) ws.terminate();
+        const httpClosed = new Promise<void>((resolve, reject) => {
+          server.close((error) => {
+            if (error && (error as NodeJS.ErrnoException).code !== "ERR_SERVER_NOT_RUNNING")
+              reject(error);
+            else resolve();
+          });
+          server.closeAllConnections?.();
+        });
+        const closed = await Promise.allSettled([websocketClosed, httpClosed]);
+        const failures = closed.flatMap((result) =>
+          result.status === "rejected" ? [result.reason] : []
+        );
+        if (failures.length)
+          throw new AggregateError(failures, "Live dashboard transport cleanup failed");
+      })();
+      return stopped;
+    });
 
   // Subscribe to EventBus
   const unsubscribe = subscribeToEventBus();
-  await seedLatestCompressionRunFromDb();
+  try {
+    if (native) await runPersistenceRequest(seedLatestCompressionRunFromDb);
+    else await seedLatestCompressionRunFromDb();
 
-  // Warm the auth module before accepting clients so the first API-key connection
-  // does not block the event loop on a cold import — which would starve concurrent
-  // WebSocket handshakes (see loadAuthModule). A failed warm is non-fatal: the
-  // handler retries the import lazily.
-  await loadAuthModule().catch(() => {});
+    // Warm the auth graph before accepting clients; import failure remains non-fatal.
+    if (native) await runPersistenceRequest(() => loadAuthModule().catch(() => {}));
+    else await loadAuthModule().catch(() => {});
+  } catch (error) {
+    // Native scope preparation can fail before listen and before close listeners exist.
+    unsubscribe();
+    if (native) await stopLiveDashboardServer(server).catch(() => {});
+    throw error;
+  }
 
-  wss.on("connection", async (ws, request) => {
+  const handleConnection = async (ws: WebSocket, request: IncomingMessage) => {
     const pendingMessages: string[] = [];
     let activeClientId: string | null = null;
+    let frameQueue: Promise<void> = Promise.resolve();
+    let pendingFrames = 0;
+    const dispatchMessage = (clientId: string, raw: string, alreadyAccepted = false) => {
+      if (!native) {
+        handleMessage(clientId, raw);
+        return;
+      }
+      if (stopping && !alreadyAccepted) {
+        sendTo(ws, {
+          type: "error",
+          code: "SERVER_DRAINING",
+          message: sanitizeErrorMessage("Server is shutting down"),
+        });
+        return;
+      }
+      if (
+        pendingFrames >= MAX_PENDING_MESSAGES_PER_CLIENT ||
+        raw.length > MAX_PENDING_MESSAGE_BYTES
+      ) {
+        sendTo(ws, { type: "error", code: "RATE_LIMITED", message: "Too many pending messages" });
+        ws.close(4008, "Too many pending messages");
+        return;
+      }
+      pendingFrames++;
+      const work = frameQueue.then(() => runPersistenceRequest(() => handleMessage(clientId, raw)));
+      frameQueue = work.catch(() => {});
+      void trackNativeWork(work).then(
+        () => {
+          pendingFrames--;
+        },
+        () => {
+          pendingFrames--;
+          rejectNativeWork(ws);
+        }
+      );
+    };
 
     // Clients can send the subscribe frame immediately after the WS open event,
     // while dashboard cookie/API-key auth is still resolving. Queue those early
     // messages so the first subscribe is not dropped.
     ws.on("message", (data) => {
       const raw = data.toString();
+      if (native && stopping) {
+        sendTo(ws, {
+          type: "error",
+          code: "SERVER_DRAINING",
+          message: sanitizeErrorMessage("Server is shutting down"),
+        });
+        return;
+      }
       if (!activeClientId) {
         if (
           pendingMessages.length >= MAX_PENDING_MESSAGES_PER_CLIENT ||
@@ -579,7 +688,7 @@ export async function startLiveDashboardServer(
         pendingMessages.push(raw);
         return;
       }
-      handleMessage(activeClientId, raw);
+      dispatchMessage(activeClientId, raw);
     });
 
     // Origin check — browsers always send Origin on the WS upgrade; reject
@@ -602,13 +711,16 @@ export async function startLiveDashboardServer(
     }
 
     // Authorize
-    const auth = await authorizeConnection(request);
+    const auth = native
+      ? await runPersistenceRequest(() => authorizeConnection(request))
+      : await authorizeConnection(request);
     if (!auth.authorized) {
       sendTo(ws, { type: "error", code: "UNAUTHORIZED", message: auth.error || "Unauthorized" });
       ws.close(4001, "Unauthorized");
       return;
     }
 
+    if (native && ws.readyState !== WebSocket.OPEN) return;
     const clientId = auth.sessionId;
     activeClientId = clientId;
     const client: ClientState = {
@@ -635,7 +747,7 @@ export async function startLiveDashboardServer(
 
     // Replay any subscribe/ping frames sent while auth was still pending.
     for (const raw of pendingMessages.splice(0)) {
-      handleMessage(clientId, raw);
+      dispatchMessage(clientId, raw, true);
     }
 
     // Handle close
@@ -656,6 +768,21 @@ export async function startLiveDashboardServer(
       const current = clients.get(clientId);
       if (current) current.lastActivity = Date.now();
     });
+  };
+  wss.on("connection", (ws, request) => {
+    if (!native) return handleConnection(ws, request);
+    if (stopping) {
+      ws.close(1001, "Server shutting down");
+      return;
+    }
+    if (nativeSockets.size >= MAX_CLIENTS) {
+      sendTo(ws, { type: "error", code: "SERVER_FULL", message: "Max clients reached" });
+      ws.close(1013, "Server full");
+      return;
+    }
+    nativeSockets.add(ws);
+    ws.once("close", () => nativeSockets.delete(ws));
+    void trackNativeWork(handleConnection(ws, request)).catch(() => rejectNativeWork(ws));
   });
 
   // Heartbeat
@@ -667,7 +794,7 @@ export async function startLiveDashboardServer(
     clients.clear();
   });
 
-  return new Promise((resolve, reject) => {
+  const listening = new Promise<import("http").Server>((resolve, reject) => {
     // Reject on bind failure (e.g. EADDRINUSE when the API bridge already holds
     // 20129) instead of crashing the process — the crash-loop of issue #6324.
     // The listener MUST be on `wss`, not `server`: ws re-emits the server's
@@ -685,6 +812,12 @@ export async function startLiveDashboardServer(
       resolve(server);
     });
   });
+  try {
+    return await listening;
+  } catch (error) {
+    if (native) await stopLiveDashboardServer(server).catch(() => {});
+    throw error;
+  }
 }
 
 // ── Auto-start on import ──────────────────────────────────────────────────
@@ -708,7 +841,7 @@ export function isLiveWsEnabled(): boolean {
   return v === "1" || v.toLowerCase() === "true";
 }
 
-if (!isBuildOrTest() && isLiveWsEnabled()) {
+if (parseDatabaseBackend() !== "postgres" && !isBuildOrTest() && isLiveWsEnabled()) {
   const port = parseInt(process.env.LIVE_WS_PORT || String(DEFAULT_PORT), 10);
   const host = process.env.LIVE_WS_HOST || DEFAULT_HOST;
   warnIfNonLoopbackWithoutApiKey("Live dashboard WebSocket", host);

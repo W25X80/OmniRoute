@@ -1,3 +1,7 @@
+import {
+  getSelectedUsageAggregationRepository,
+  type UsageCleanupReceipt,
+} from "../db/postgres/usageAggregationRepository";
 /**
  * Aggregation utility functions for usage data summarization.
  * Rolls up usage_history (and quota_snapshots) into daily summary tables.
@@ -6,7 +10,7 @@
  */
 
 import { getDbInstance } from "../db/core";
-import { getUserDatabaseSettings } from "../db/databaseSettings";
+import { getUserDatabaseSettingsAsync } from "../db/databaseSettings";
 import { calculateCost } from "./costCalculator";
 
 interface AggregationResult {
@@ -27,6 +31,8 @@ export async function rollupDailyUsage(
   fromDate: string,
   toDate: string
 ): Promise<AggregationResult> {
+  const postgres = getSelectedUsageAggregationRepository();
+  if (postgres) return postgres.rollupQuota("daily", fromDate, toDate);
   const db = getDbInstance();
 
   const result: AggregationResult = {
@@ -84,6 +90,8 @@ export async function rollupHourlyQuota(
   fromDate: string,
   toDate: string
 ): Promise<AggregationResult> {
+  const postgres = getSelectedUsageAggregationRepository();
+  if (postgres) return postgres.rollupQuota("hourly", fromDate, toDate);
   const db = getDbInstance();
 
   const result: AggregationResult = {
@@ -144,6 +152,8 @@ export async function rollupHourlyQuota(
  * @returns Aggregation result with counts
  */
 export async function rollupUsageHistoryBeforeDate(beforeDate: string): Promise<AggregationResult> {
+  if (getSelectedUsageAggregationRepository())
+    throw new Error("PostgreSQL usage retention must archive and delete atomically");
   const db = getDbInstance();
 
   const result: AggregationResult = {
@@ -310,7 +320,7 @@ export async function getRawDataCutoffDate(): Promise<string> {
   // Using rawDataRetentionDays (default 7 per migration 046) creates a gap:
   // analytics floors raw data at day-7 while cleanup doesn't roll up until
   // day-30, so the window [day-30, day-7) is excluded from BOTH UNION legs.
-  const rawDataRetentionDays = getUserDatabaseSettings().retention.usageHistory;
+  const rawDataRetentionDays = (await getUserDatabaseSettingsAsync()).retention.usageHistory;
 
   const cutoffDate = new Date();
   cutoffDate.setDate(cutoffDate.getDate() - rawDataRetentionDays);
@@ -322,5 +332,31 @@ export async function getRawDataCutoffDate(): Promise<string> {
  * Check if aggregation is enabled in settings.
  */
 export async function isAggregationEnabled(): Promise<boolean> {
-  return getUserDatabaseSettings().aggregation.enabled;
+  return (await getUserDatabaseSettingsAsync()).aggregation.enabled;
+}
+
+export async function cleanupUsageHistoryBeforeAsync(
+  beforeDate: string
+): Promise<UsageCleanupReceipt> {
+  const postgres = getSelectedUsageAggregationRepository();
+  if (!postgres) throw new Error("This cleanup entry point requires PostgreSQL");
+  return postgres.prune(beforeDate, (row) =>
+    calculateCost(
+      row.provider ?? "unknown",
+      row.model ?? "unknown",
+      {
+        input: row.tokens_input,
+        output: row.tokens_output,
+        cacheRead: row.tokens_cache_read,
+        cacheCreation: row.tokens_cache_creation,
+        reasoning: row.tokens_reasoning,
+      },
+      {
+        provider: row.provider ?? "unknown",
+        model: row.model ?? "unknown",
+        serviceTier: row.service_tier ?? "standard",
+        flatRateAsZero: false,
+      }
+    )
+  );
 }

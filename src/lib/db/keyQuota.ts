@@ -15,6 +15,8 @@
 import { getDbInstance } from "./core";
 import { aggregateLedgerThisMonth } from "./costLedger";
 import { toNumber } from "@/shared/utils/numeric";
+import { getSelectedPostgresDatabase } from "./controlPlaneContext";
+import type { PostgresDatabase, PostgresTransaction } from "./postgres/database";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -291,5 +293,194 @@ export function getKeyQuotaStatus(
       limits.monthlyAmountUsd !== null &&
       counters.monthlyAmountUsd >= limits.monthlyAmountUsd,
     windowResetAtIso: toIsoWindowStart(nowMs + KEY_QUOTA_WINDOW_MS),
+  };
+}
+
+export async function getKeyQuotaLimitsAsync(apiKeyId: string): Promise<KeyQuotaLimits> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return getKeyQuotaLimits(apiKeyId);
+  const empty = {
+    apiKeyId,
+    tpmLimit: null,
+    rpmLimit: null,
+    monthlyAmountUsd: null,
+  };
+  if (!apiKeyId) return empty;
+  return database.transaction(async (tx) => {
+    const row = (
+      await tx.query("SELECT * FROM omniroute.api_key_quota_limits WHERE api_key_id=$1", [apiKeyId])
+    ).rows[0];
+    return row ? rowToLimits(row) : empty;
+  });
+}
+
+export async function upsertKeyQuotaLimitsAsync(
+  apiKeyId: string,
+  input: UpsertKeyQuotaLimitsInput
+): Promise<KeyQuotaLimits> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return upsertKeyQuotaLimits(apiKeyId, input);
+  const empty = {
+    apiKeyId,
+    tpmLimit: null,
+    rpmLimit: null,
+    monthlyAmountUsd: null,
+  };
+  if (!apiKeyId) return empty;
+  return database.transaction(async (tx) => {
+    await tx.query("SELECT pg_advisory_xact_lock(18765,9)");
+    const row = (
+      await tx.query("SELECT * FROM omniroute.api_key_quota_limits WHERE api_key_id=$1", [apiKeyId])
+    ).rows[0];
+    const existing = row ? rowToLimits(row) : empty;
+    const tpm = limitToDb(input.tpmLimit !== undefined ? input.tpmLimit : existing.tpmLimit);
+    const rpm = limitToDb(input.rpmLimit !== undefined ? input.rpmLimit : existing.rpmLimit);
+    const monthly = limitToDb(
+      input.monthlyAmountUsd !== undefined ? input.monthlyAmountUsd : existing.monthlyAmountUsd
+    );
+    await tx.query(
+      `INSERT INTO omniroute.api_key_quota_limits(api_key_id,tpm_limit,rpm_limit,monthly_amount_usd,updated_at)
+      VALUES($1,$2,$3,$4,$5) ON CONFLICT(api_key_id) DO UPDATE SET tpm_limit=excluded.tpm_limit,
+      rpm_limit=excluded.rpm_limit,monthly_amount_usd=excluded.monthly_amount_usd,updated_at=excluded.updated_at`,
+      [apiKeyId, tpm, rpm, monthly, new Date().toISOString()]
+    );
+    return {
+      apiKeyId,
+      tpmLimit: tpm,
+      rpmLimit: rpm,
+      monthlyAmountUsd: monthly,
+    };
+  });
+}
+
+export async function clearKeyQuotaLimitsAsync(id: string): Promise<void> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return clearKeyQuotaLimits(id);
+  if (!id) return;
+  await database.transaction(async (tx) => {
+    await tx.query("SELECT pg_advisory_xact_lock(18765,9)");
+    await tx.query("DELETE FROM omniroute.api_key_quota_limits WHERE api_key_id=$1", [id]);
+    await tx.query("DELETE FROM omniroute.api_key_quota_counters WHERE api_key_id=$1", [id]);
+  });
+}
+
+async function addKeyQuota(
+  tx: PostgresTransaction,
+  id: string,
+  dimension: KeyQuotaDimension,
+  delta: number,
+  now: number
+): Promise<void> {
+  if (!id || !Number.isFinite(delta) || delta <= 0) return;
+  await tx.query(
+    `INSERT INTO omniroute.api_key_quota_counters(api_key_id,dimension_key,bucket_index,consumed,updated_at)
+    VALUES($1,$2,$3,$4,$5) ON CONFLICT(api_key_id,dimension_key,bucket_index) DO UPDATE SET
+    consumed=api_key_quota_counters.consumed+excluded.consumed,updated_at=excluded.updated_at`,
+    [id, dimension === "tpm" ? DIMENSION_TPM : DIMENSION_RPM, bucketIndex(now), delta, now]
+  );
+}
+
+export async function incrementKeyQuotaCounterAsync(
+  id: string,
+  dimension: KeyQuotaDimension,
+  delta: number,
+  now = Date.now()
+): Promise<void> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return incrementKeyQuotaCounter(id, dimension, delta, now);
+  await database.transaction((tx) => addKeyQuota(tx, id, dimension, delta, now));
+}
+
+export async function recordKeyQuotaUsageAsync(
+  id: string,
+  tokens: number,
+  now = Date.now()
+): Promise<void> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return recordKeyQuotaUsage(id, tokens, now);
+  if (!id) return;
+  await database.transaction(async (tx) => {
+    await addKeyQuota(tx, id, "tpm", tokens, now);
+    await addKeyQuota(tx, id, "rpm", 1, now);
+  });
+}
+
+async function readNativeKeyQuotaState(
+  database: PostgresDatabase,
+  id: string,
+  deps: { now?: () => number; monthTotalUsd?: number } = {}
+) {
+  const now = (deps.now ?? Date.now)(),
+    current = bucketIndex(now),
+    date = new Date(now);
+  const month = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), 1)).toISOString();
+  const row = await database.transaction(async (tx) => {
+    await tx.query("SELECT pg_advisory_xact_lock(18765,9)");
+    return (
+      await tx.query(
+        `SELECT q.tpm_limit,q.rpm_limit,q.monthly_amount_usd,
+      COALESCE((SELECT SUM(consumed) FROM omniroute.api_key_quota_counters
+        WHERE api_key_id=$1 AND dimension_key='key-quota:tpm' AND bucket_index=$2),0) AS tpm_current,
+      COALESCE((SELECT SUM(consumed) FROM omniroute.api_key_quota_counters
+        WHERE api_key_id=$1 AND dimension_key='key-quota:tpm' AND bucket_index=$3),0) AS tpm_previous,
+      COALESCE((SELECT SUM(consumed) FROM omniroute.api_key_quota_counters
+        WHERE api_key_id=$1 AND dimension_key='key-quota:rpm' AND bucket_index=$2),0) AS rpm_current,
+      COALESCE((SELECT SUM(consumed) FROM omniroute.api_key_quota_counters
+        WHERE api_key_id=$1 AND dimension_key='key-quota:rpm' AND bucket_index=$3),0) AS rpm_previous,
+      ${deps.monthTotalUsd === undefined ? "COALESCE((SELECT SUM(amount_usd) FROM omniroute.request_cost_ledger WHERE api_key_id=$1 AND timestamp >= $4 AND success=1),0)" : "$4::double precision"} AS ledger_month
+      FROM (SELECT $1::text AS api_key_id) key_scope LEFT JOIN omniroute.api_key_quota_limits q
+      ON q.api_key_id=key_scope.api_key_id`,
+        [id, current, current - 1, deps.monthTotalUsd ?? month]
+      )
+    ).rows[0];
+  });
+  const weight = Math.max(
+    0,
+    Math.min(1, (now - current * KEY_QUOTA_WINDOW_MS) / KEY_QUOTA_WINDOW_MS)
+  );
+  const limits: KeyQuotaLimits = {
+    apiKeyId: id,
+    tpmLimit: toLimitOrNull(row.tpm_limit),
+    rpmLimit: toLimitOrNull(row.rpm_limit),
+    monthlyAmountUsd: toLimitOrNull(row.monthly_amount_usd),
+  };
+  const counters: KeyQuotaCounters = {
+    tpmUsed: toNumber(row.tpm_current) + toNumber(row.tpm_previous) * (1 - weight),
+    rpmUsed: toNumber(row.rpm_current) + toNumber(row.rpm_previous) * (1 - weight),
+    monthlyAmountUsd: toNumber(row.ledger_month),
+  };
+  return { limits, counters, now };
+}
+
+export async function getKeyQuotaCountersAsync(
+  id: string,
+  deps: { now?: () => number; monthTotalUsd?: number } = {}
+): Promise<KeyQuotaCounters> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? (await readNativeKeyQuotaState(database, id, deps)).counters
+    : getKeyQuotaCounters(id, deps);
+}
+
+export async function getKeyQuotaStatusAsync(
+  id: string,
+  deps: { now?: () => number; monthTotalUsd?: number } = {}
+): Promise<KeyQuotaStatus> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return getKeyQuotaStatus(id, deps);
+  const { limits, counters, now } = await readNativeKeyQuotaState(database, id, deps);
+  const enabled =
+    limits.tpmLimit !== null || limits.rpmLimit !== null || limits.monthlyAmountUsd !== null;
+  return {
+    enabled,
+    limits,
+    counters,
+    tpmExceeded: enabled && limits.tpmLimit !== null && counters.tpmUsed >= limits.tpmLimit,
+    rpmExceeded: enabled && limits.rpmLimit !== null && counters.rpmUsed >= limits.rpmLimit,
+    monthlyExceeded:
+      enabled &&
+      limits.monthlyAmountUsd !== null &&
+      counters.monthlyAmountUsd >= limits.monthlyAmountUsd,
+    windowResetAtIso: toIsoWindowStart(now + KEY_QUOTA_WINDOW_MS),
   };
 }

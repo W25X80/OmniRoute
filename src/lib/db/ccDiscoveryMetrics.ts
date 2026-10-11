@@ -1,3 +1,10 @@
+import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/errorSanitization.ts";
+import { getSelectedPersistenceIdentity } from "./controlPlaneContext";
+import {
+  isApplicationPersistenceIdentity,
+  runPersistenceBackgroundWork,
+} from "./persistenceRuntime";
+import { getSelectedCcDiscoveryRepository } from "./postgres/ccDiscoveryRepository";
 /**
  * cc-discovery usage metrics — aggregate counters for the Claude Code
  * discovery-alias feature (see src/lib/ccDiscoveryAliasResolve.ts and
@@ -106,6 +113,79 @@ export function getCcDiscoveryMetrics(): CcDiscoveryMetrics {
       }
     }
 
+    return { aliasRequests, discoveryHits, byModel };
+  } catch {
+    return { aliasRequests: 0, discoveryHits: 0, byModel: {} };
+  }
+}
+
+export async function incrementCcAliasRequestCountAsync(realModelId: string): Promise<void> {
+  const postgres = getSelectedCcDiscoveryRepository();
+  if (!postgres) {
+    incrementCcAliasRequestCount(realModelId);
+    return;
+  }
+  try {
+    await postgres.increment([
+      TOTAL_KEY,
+      ...(typeof realModelId === "string" && realModelId.length ? [modelKey(realModelId)] : []),
+    ]);
+  } catch {}
+}
+function reportDiscoveryHitFailure(error: unknown): void {
+  console.warn(
+    "[ccDiscoveryMetrics] Discovery-hit persistence failed:",
+    sanitizeErrorMessage(error) || "Discovery-hit metric persistence failed"
+  );
+}
+
+/**
+ * Application metrics acquire a fresh background owner before returning. The promise
+ * settles after the write attempt, including a reported best-effort refusal/failure;
+ * it does not acknowledge a durable count. Standalone/foreign native callers must await
+ * it within their selected scope. SQLite retains the immediate synchronous increment.
+ */
+export function incrementCcDiscoveryHitCountAsync(): Promise<void> {
+  try {
+    const identity = getSelectedPersistenceIdentity();
+    if (isApplicationPersistenceIdentity(identity)) {
+      // Admission precedes catalog-module loading and the originating request's end.
+      return runPersistenceBackgroundWork(() => {
+        if (
+          !isApplicationPersistenceIdentity(identity) ||
+          getSelectedPersistenceIdentity() !== identity
+        ) {
+          throw new Error("Discovery-hit persistence authority changed before execution");
+        }
+        const postgres = getSelectedCcDiscoveryRepository();
+        if (!postgres) throw new Error("Discovery-hit native persistence is unavailable");
+        return postgres.increment([HIT_KEY]);
+      }).catch(reportDiscoveryHitFailure);
+    }
+    // Capture/admit only this standalone authority; never create or route to app runtime.
+    const postgres = getSelectedCcDiscoveryRepository();
+    if (postgres) return postgres.increment([HIT_KEY]).catch(reportDiscoveryHitFailure);
+    incrementCcDiscoveryHitCount();
+  } catch (error) {
+    reportDiscoveryHitFailure(error);
+  }
+  return Promise.resolve();
+}
+export async function getCcDiscoveryMetricsAsync(): Promise<CcDiscoveryMetrics> {
+  const postgres = getSelectedCcDiscoveryRepository();
+  if (!postgres) return getCcDiscoveryMetrics();
+  try {
+    let aliasRequests = 0,
+      discoveryHits = 0;
+    const byModel: Record<string, number> = {};
+    for (const row of await postgres.rows()) {
+      const parsed = Number.parseInt(row.value, 10),
+        count = Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
+      if (row.key === TOTAL_KEY) aliasRequests = count;
+      else if (row.key === HIT_KEY) discoveryHits = count;
+      else if (row.key.startsWith(MODEL_KEY_PREFIX))
+        byModel[row.key.slice(MODEL_KEY_PREFIX.length)] = count;
+    }
     return { aliasRequests, discoveryHits, byModel };
   } catch {
     return { aliasRequests: 0, discoveryHits: 0, byModel: {} };

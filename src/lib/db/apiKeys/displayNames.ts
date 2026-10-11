@@ -1,4 +1,5 @@
 import { getDbInstance } from "../core";
+import { getSelectedPostgresDatabase } from "../controlPlaneContext";
 
 // Bind slots per IN(...) query — keeps the largest caller batch (a 200-row
 // leaderboard page) in one statement while staying far below SQLite's default
@@ -39,4 +40,30 @@ export function getApiKeyDisplayNames(ids: readonly string[]): Map<string, strin
     }
   }
   return names;
+}
+
+/** Async selected-backend lookup with the same sparse, non-secret display contract. */
+export async function getApiKeyDisplayNamesAsync(
+  ids: readonly string[]
+): Promise<Map<string, string>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (!postgres) return getApiKeyDisplayNames(ids);
+  const names = new Map<string, string>();
+  const unique = Array.from(
+    new Set(ids.filter((id) => typeof id === "string" && id.trim() !== ""))
+  );
+  if (unique.length === 0) return names;
+  return postgres.transaction(async (transaction) => {
+    for (let start = 0; start < unique.length; start += DISPLAY_NAME_LOOKUP_CHUNK) {
+      const chunk = unique.slice(start, start + DISPLAY_NAME_LOOKUP_CHUNK);
+      const { rows } = await transaction.query<DisplayNameRow>(
+        "SELECT id, name FROM omniroute.api_keys WHERE id = ANY($1::text[])",
+        [chunk]
+      );
+      for (const row of rows) {
+        if (typeof row.name === "string" && row.name.trim() !== "") names.set(row.id, row.name);
+      }
+    }
+    return names;
+  });
 }

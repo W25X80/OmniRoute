@@ -43,7 +43,8 @@ export type CodexAppServerHealth = {
 export async function testCodexAppServerConnection(
   connection: any
 ): Promise<CodexAppServerHealth | null> {
-  const psd = (connection?.providerSpecificData as Record<string, unknown> | undefined) || undefined;
+  const psd =
+    (connection?.providerSpecificData as Record<string, unknown> | undefined) || undefined;
   // Fire the /readyz probe when EITHER (a) the connection opted into the
   // app-server transport via the per-connection flag (a `codex` provider
   // connection with codexTransport==="app-server"), OR (b) this is the
@@ -56,10 +57,9 @@ export async function testCodexAppServerConnection(
 
   // Dynamic import (not a static top-level import) so this executor-config module
   // stays behind the open-sse boundary the no-restricted-imports lint rule enforces.
-  const { resolveAppServerConfig } = await import(
-    "@omniroute/open-sse/executors/codex/appServerConfig.ts"
-  );
-  const config = resolveAppServerConfig(psd);
+  const { resolveAppServerConfigAsync } =
+    await import("@omniroute/open-sse/executors/codex/appServerConfig.ts");
+  const config = await resolveAppServerConfigAsync(psd);
   if (!config) {
     // Also reached when the credential/URL binding refused (env token + remote
     // psd URL) — the resolve deliberately returns null there so the token can
@@ -75,7 +75,9 @@ export async function testCodexAppServerConnection(
   }
 
   // ws://host:port → http://host:port/readyz ; wss:// → https://.
-  const httpBase = config.url.replace(/^ws(s?):\/\//i, (_m, s) => `http${s}://`).replace(/\/+$/, "");
+  const httpBase = config.url
+    .replace(/^ws(s?):\/\//i, (_m, s) => `http${s}://`)
+    .replace(/\/+$/, "");
   const readyzUrl = `${httpBase}/readyz`;
 
   const controller = new AbortController();
@@ -109,7 +111,11 @@ export async function testCodexAppServerConnection(
           import("@omniroute/open-sse/executors/codex/appServerAuthProbe.ts"),
           import("@omniroute/open-sse/executors/codex.ts"),
         ]);
-      authStatus = await probeCodexAppServerAuth(config, getCodexAppServerWebsocketTransport(), 8000);
+      authStatus = await probeCodexAppServerAuth(
+        config,
+        getCodexAppServerWebsocketTransport(),
+        8000
+      );
     } catch (probeErr: any) {
       // If the auth probe itself fails to load/run, don't fail the whole health
       // check — the server IS reachable. Treat as unknown-but-reachable (valid).

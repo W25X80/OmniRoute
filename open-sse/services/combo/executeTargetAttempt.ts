@@ -1,3 +1,4 @@
+import { parseDatabaseBackend } from "../../../src/lib/db/backendSelection";
 /**
  * Retry loop for a combo target that already passed pre-dispatch gates.
  * Lift-as-is from combo.ts:1533–2616. Classify helpers live in
@@ -23,24 +24,24 @@ import {
   parseRetryAfterHeader,
   readProseRetryAfter,
 } from "../../utils/error.ts";
-import { recordComboFailure, clearComboFailureTracking } from "./failureTracker.ts";
+import { recordComboFailureAsync, clearComboFailureTracking } from "./failureTracker.ts";
 import { recordComboRequest, getComboMetrics } from "../comboMetrics.ts";
 import {
   expandComboSystemPromptIfPresent,
   resolveTargetFingerprint,
 } from "../comboAgentMiddleware.ts";
 import {
-  maybeGenerateHandoff,
-  maybeGenerateUniversalHandoff,
+  maybeGenerateHandoffAsync,
+  maybeGenerateUniversalHandoffAsync,
   injectUniversalHandoffBody,
   SKIP_UNIVERSAL_HANDOFF_FLAG,
   DEFAULT_UNIVERSAL_HANDOFF_CONFIG,
   type MessageLike,
 } from "../contextHandoff.ts";
 import {
-  recordSessionModelUsage,
-  getLastSessionModel,
-  getHandoff,
+  recordSessionModelUsageAsync,
+  getLastSessionModelAsync,
+  getHandoffAsync,
 } from "../../../src/lib/db/contextHandoffs.ts";
 import { resolveModelLockoutSettings } from "../../../src/lib/resilience/modelLockoutSettings";
 import { fetchCodexQuota } from "../codexQuotaFetcher.ts";
@@ -157,7 +158,7 @@ export async function executeTargetAttempt(opts: {
       // Actionable failure instead of an opaque 503 (reasoning budget exhausted /
       // context overflow — see budgetExhaustion.ts). Silent-stop fix: bump the
       // consecutive-failure counter so the pin gets cleared on the 3rd attempt.
-      recordComboFailure(deps.effectiveSessionId, deps.combo.name);
+      await recordComboFailureAsync(deps.effectiveSessionId, deps.combo.name);
       return {
         ok: false,
         response: buildBudgetExhaustedResponse(state, deps.traceInvocationId),
@@ -257,16 +258,21 @@ export async function executeTargetAttempt(opts: {
       // #7847: object, not JSON.stringify — the string branch mis-counts inline images.
       const estimatedTokens = estimateTokens(attemptBody);
       if (estimatedTokens > (deps.config.fallbackCompressionThreshold ?? 1000)) {
-        const { applyCompression } = await import("../compression/strategySelector.ts");
-        const compressionResult = applyCompression(
-          attemptBody,
-          deps.config.fallbackCompressionMode as CompressionMode,
-          // Opt into the TV1 bail-out so a throwing fallback engine is SKIPPED rather than
-          // propagating out of executeTarget and being swallowed as a "Speculative task
-          // error" (which silently drops this combo target). minGainPercent:0 keeps the
-          // advance behavior identical to the default path — this only adds skip-on-throw.
-          { model: modelStr, bailout: { enabled: true, minGainPercent: 0 } }
-        );
+        const { applyCompression, applyCompressionAsync } =
+          await import("../compression/strategySelector.ts");
+        // Opt into the TV1 bail-out so a throwing fallback engine is SKIPPED rather than
+        // propagating out of executeTarget and being swallowed as a "Speculative task
+        // error" (which silently drops this combo target). minGainPercent:0 keeps the
+        // advance behavior identical to the default path — this only adds skip-on-throw.
+        const compressionOptions = {
+          model: modelStr,
+          bailout: { enabled: true, minGainPercent: 0 },
+        };
+        const mode = deps.config.fallbackCompressionMode as CompressionMode;
+        const compressionResult =
+          parseDatabaseBackend() === "postgres"
+            ? await applyCompressionAsync(attemptBody, mode, compressionOptions)
+            : applyCompression(attemptBody, mode, compressionOptions);
         if (compressionResult.compressed) {
           deps.log.info(
             "COMBO",
@@ -290,9 +296,12 @@ export async function executeTargetAttempt(opts: {
       deps.relayOptions?.sessionId &&
       !(deps.body as Record<string, unknown>)?.[SKIP_UNIVERSAL_HANDOFF_FLAG]
     ) {
-      const lastModel = getLastSessionModel(deps.relayOptions.sessionId, deps.combo.name);
+      const lastModel = await getLastSessionModelAsync(
+        deps.relayOptions.sessionId,
+        deps.combo.name
+      );
       if (lastModel && lastModel !== modelStr) {
-        const existingHandoff = getHandoff(deps.relayOptions.sessionId, deps.combo.name);
+        const existingHandoff = await getHandoffAsync(deps.relayOptions.sessionId, deps.combo.name);
         attemptBody = injectUniversalHandoffBody(
           attemptBody, // Use the cloned body to maintain isolation
           lastModel,
@@ -566,7 +575,7 @@ export async function executeTargetAttempt(opts: {
         deps.effectiveSessionId &&
         !(deps.body as Record<string, unknown>)?.[SKIP_UNIVERSAL_HANDOFF_FLAG]
       ) {
-        recordSessionModelUsage(
+        await recordSessionModelUsageAsync(
           deps.effectiveSessionId,
           deps.combo.name,
           modelStr,
@@ -581,8 +590,11 @@ export async function executeTargetAttempt(opts: {
         deps.relayOptions?.sessionId &&
         !(deps.body as Record<string, unknown>)?.[SKIP_UNIVERSAL_HANDOFF_FLAG]
       ) {
-        const prevModel = getLastSessionModel(deps.relayOptions.sessionId, deps.combo.name);
-        recordSessionModelUsage(
+        const prevModel = await getLastSessionModelAsync(
+          deps.relayOptions.sessionId,
+          deps.combo.name
+        );
+        await recordSessionModelUsageAsync(
           deps.relayOptions.sessionId,
           deps.combo.name,
           modelStr,
@@ -604,7 +616,7 @@ export async function executeTargetAttempt(opts: {
                 ? deps.body.input
                 : [];
 
-          maybeGenerateUniversalHandoff({
+          await maybeGenerateUniversalHandoffAsync({
             sessionId: deps.relayOptions.sessionId,
             comboName: deps.combo.name,
             messages: handoffSourceMessages as MessageLike[],
@@ -615,7 +627,7 @@ export async function executeTargetAttempt(opts: {
           });
         }
 
-        recordSessionModelUsage(
+        await recordSessionModelUsageAsync(
           deps.relayOptions.sessionId,
           deps.combo.name,
           modelStr,
@@ -651,7 +663,7 @@ export async function executeTargetAttempt(opts: {
                   ? deps.body.input
                   : [];
 
-            maybeGenerateHandoff({
+            await maybeGenerateHandoffAsync({
               sessionId: deps.relayOptions.sessionId,
               comboName: deps.combo.name,
               connectionId,

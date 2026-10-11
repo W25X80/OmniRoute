@@ -4,6 +4,7 @@ import {
 } from "@/shared/utils/providerBilling";
 import { getDbInstance, isBuildPhase, isCloud } from "./core";
 import { parseCodexPaidCredits, type CodexPaidCredits } from "@/lib/providers/codexPaidCredits";
+import { getSelectedPostgresDatabase } from "./controlPlaneContext";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -157,4 +158,86 @@ export function deleteProviderLimitsCache(connectionId: string): void {
     PROVIDER_LIMITS_CACHE_NAMESPACE,
     connectionId
   );
+}
+
+export async function getProviderLimitsCacheAsync(
+  id: string
+): Promise<ProviderLimitsCacheEntry | null> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return getProviderLimitsCache(id);
+  return database.transaction(async (tx) => {
+    const row = (
+      await tx.query<{ value: string }>(
+        "SELECT value FROM omniroute.key_value WHERE namespace=$1 AND key=$2",
+        [PROVIDER_LIMITS_CACHE_NAMESPACE, id]
+      )
+    ).rows[0];
+    return row ? normalizeCacheEntry(parseJson(row.value)) : null;
+  });
+}
+export async function getAllProviderLimitsCacheAsync(): Promise<
+  Record<string, ProviderLimitsCacheEntry>
+> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return getAllProviderLimitsCache();
+  return database.transaction(async (tx) => {
+    const rows = (
+      await tx.query<{ key: string; value: string }>(
+        "SELECT key,value FROM omniroute.key_value WHERE namespace=$1",
+        [PROVIDER_LIMITS_CACHE_NAMESPACE]
+      )
+    ).rows;
+    const result: Record<string, ProviderLimitsCacheEntry> = {};
+    for (const row of rows) {
+      const parsed = normalizeCacheEntry(parseJson(row.value));
+      if (parsed) result[row.key] = parsed;
+    }
+    return result;
+  });
+}
+export async function setProviderLimitsCacheAsync(
+  id: string,
+  entry: ProviderLimitsCacheEntry
+): Promise<ProviderLimitsCacheEntry> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return setProviderLimitsCache(id, entry);
+  const sanitized = sanitizeCacheEntryForStorage(entry);
+  await database.transaction(async (tx) => {
+    await tx.query(
+      `INSERT INTO omniroute.key_value(namespace,key,value) VALUES($1,$2,$3)
+    ON CONFLICT(namespace,key) DO UPDATE SET value=excluded.value`,
+      [PROVIDER_LIMITS_CACHE_NAMESPACE, id, JSON.stringify(sanitized)]
+    );
+  });
+  return sanitized;
+}
+export async function setProviderLimitsCacheBatchAsync(
+  entries: Array<{ connectionId: string; entry: ProviderLimitsCacheEntry }>
+): Promise<number> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return setProviderLimitsCacheBatch(entries);
+  if (!entries.length) return 0;
+  await database.transaction(async (tx) => {
+    for (const item of entries)
+      await tx.query(
+        `INSERT INTO omniroute.key_value(namespace,key,value)
+    VALUES($1,$2,$3) ON CONFLICT(namespace,key) DO UPDATE SET value=excluded.value`,
+        [
+          PROVIDER_LIMITS_CACHE_NAMESPACE,
+          item.connectionId,
+          JSON.stringify(sanitizeCacheEntryForStorage(item.entry)),
+        ]
+      );
+  });
+  return entries.length;
+}
+export async function deleteProviderLimitsCacheAsync(id: string): Promise<void> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return deleteProviderLimitsCache(id);
+  await database.transaction(async (tx) => {
+    await tx.query("DELETE FROM omniroute.key_value WHERE namespace=$1 AND key=$2", [
+      PROVIDER_LIMITS_CACHE_NAMESPACE,
+      id,
+    ]);
+  });
 }

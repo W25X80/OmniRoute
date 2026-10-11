@@ -1,3 +1,5 @@
+import { validateQuotaEventTimeMs } from "@/lib/quota/eventTime";
+
 /**
  * chatCore streaming quota-share consumption POST-hook (Quality Gate v2 / Fase 9 — chatCore
  * god-file decomposition, #3501).
@@ -51,4 +53,53 @@ export function scheduleStreamingQuotaShareConsumption(args: {
     .catch(() => {
       // Outer fail-open — never throws to caller
     });
+}
+
+export async function scheduleStreamingQuotaShareConsumptionAsync(
+  args: Parameters<typeof scheduleStreamingQuotaShareConsumption>[0] & { completedAtMs?: number }
+): Promise<void> {
+  if (!args.apiKeyId || !args.connectionId || args.streamStatus !== 200) return;
+  try {
+    const eventTimeMs = validateQuotaEventTimeMs(
+      args.completedAtMs === undefined ? Date.now() : args.completedAtMs
+    );
+    const { apiKeyId, connectionId, provider, model, serviceTier, calculateCost } = args;
+    const streamUsage = args.streamUsage;
+    const tokenUsage =
+      streamUsage && typeof streamUsage === "object"
+        ? {
+            prompt_tokens: (streamUsage as Record<string, unknown>).prompt_tokens,
+            completion_tokens: (streamUsage as Record<string, unknown>).completion_tokens,
+          }
+        : null;
+    const [{ buildConsumptionCost }, { recordConsumption }] = await Promise.all([
+      import("@/lib/quota/spendRecorder"),
+      import("@/lib/quota/enforce"),
+    ]);
+    let estimatedCost = 0;
+    if (streamUsage && typeof streamUsage === "object") {
+      try {
+        estimatedCost = await calculateCost(
+          provider ?? "unknown",
+          model ?? "unknown",
+          streamUsage as Record<string, number | undefined>,
+          { serviceTier }
+        );
+      } catch {
+        // Preserve quota share's declared fail-open cost fallback.
+      }
+    }
+    await recordConsumption(
+      {
+        apiKeyId,
+        connectionId,
+        provider: provider ?? "unknown",
+        model: model || undefined,
+        cost: buildConsumptionCost(tokenUsage, estimatedCost),
+      },
+      eventTimeMs
+    );
+  } catch (error) {
+    args.log?.warn?.("QUOTA_SHARE", error instanceof Error ? error.name : "Error");
+  }
 }

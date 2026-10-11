@@ -14,8 +14,8 @@ export async function GET(request: Request) {
     const url = new URL(request.url);
     const params = parsePaginationParams(url.searchParams);
     const apiKeyId = url.searchParams.get("apiKeyId") || undefined;
-    const total = skillExecutor.countExecutions(apiKeyId);
-    const executions = skillExecutor.listExecutions(
+    const total = await skillExecutor.countExecutionsAsync(apiKeyId);
+    const executions = await skillExecutor.listExecutionsAsync(
       apiKeyId,
       params.limit,
       (params.page - 1) * params.limit

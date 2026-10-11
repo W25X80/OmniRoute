@@ -10,7 +10,7 @@
 import { stat } from "fs/promises";
 import { join } from "path";
 import { safeValidateManifest } from "./manifest";
-import { getPluginByName } from "../db/plugins";
+import { getPluginByNameAsync } from "../db/plugins";
 import { readFile } from "fs/promises";
 import { logger } from "../../../open-sse/utils/logger.ts";
 
@@ -31,7 +31,10 @@ export interface DoctorResult {
 /**
  * Run diagnostic checks on a plugin.
  */
-export async function runPluginDoctor(pluginDir: string, pluginName: string): Promise<DoctorResult> {
+export async function runPluginDoctor(
+  pluginDir: string,
+  pluginName: string
+): Promise<DoctorResult> {
   const checks: DoctorCheck[] = [];
 
   // Check 1: directory_exists
@@ -55,7 +58,9 @@ export async function runPluginDoctor(pluginDir: string, pluginName: string): Pr
     checks.push({
       name: "manifest_valid",
       status: result.success ? "pass" : "fail",
-      message: result.success ? undefined : (result as { success: false; errors: string[] }).errors.join("; "),
+      message: result.success
+        ? undefined
+        : (result as { success: false; errors: string[] }).errors.join("; "),
     });
   } catch (err: unknown) {
     checks.push({
@@ -76,13 +81,25 @@ export async function runPluginDoctor(pluginDir: string, pluginName: string): Pr
         await stat(entryPoint);
         checks.push({ name: "entry_point_exists", status: "pass" });
       } catch {
-        checks.push({ name: "entry_point_exists", status: "fail", message: `Entry point not found: ${result.data.main}` });
+        checks.push({
+          name: "entry_point_exists",
+          status: "fail",
+          message: `Entry point not found: ${result.data.main}`,
+        });
       }
     } else {
-      checks.push({ name: "entry_point_exists", status: "warn", message: "Skipped — manifest invalid" });
+      checks.push({
+        name: "entry_point_exists",
+        status: "warn",
+        message: "Skipped — manifest invalid",
+      });
     }
   } catch {
-    checks.push({ name: "entry_point_exists", status: "warn", message: "Skipped — manifest unreadable" });
+    checks.push({
+      name: "entry_point_exists",
+      status: "warn",
+      message: "Skipped — manifest unreadable",
+    });
   }
 
   // Check 4: can_spawn (simplified — check entry point is .js/.mjs)
@@ -106,7 +123,7 @@ export async function runPluginDoctor(pluginDir: string, pluginName: string): Pr
   }
 
   // Check 5: db_status_correct
-  const dbRow = getPluginByName(pluginName);
+  const dbRow = await getPluginByNameAsync(pluginName);
   if (dbRow) {
     checks.push({
       name: "db_status_correct",

@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { getCostSummary, checkBudget } from "@/domain/costRules";
+import { getCostSummaryAsync, checkBudgetAsync } from "@/domain/costRules";
 import { getApiKeys } from "@/lib/db/apiKeys";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 
@@ -20,13 +20,15 @@ export async function GET(request: Request) {
     const keys = await getApiKeys();
     const budgets: Record<
       string,
-      ReturnType<typeof getCostSummary> & { budgetCheck: ReturnType<typeof checkBudget> }
+      Awaited<ReturnType<typeof getCostSummaryAsync>> & {
+        budgetCheck: Awaited<ReturnType<typeof checkBudgetAsync>>;
+      }
     > = {};
     for (const k of keys) {
       const id = (k as { id?: string }).id;
       if (typeof id !== "string" || !id) continue;
-      const summary = getCostSummary(id);
-      budgets[id] = { ...summary, budgetCheck: checkBudget(id) };
+      const summary = await getCostSummaryAsync(id);
+      budgets[id] = { ...summary, budgetCheck: await checkBudgetAsync(id) };
     }
     return NextResponse.json({ budgets });
   } catch (error) {

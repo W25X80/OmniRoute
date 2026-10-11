@@ -10,12 +10,12 @@ import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
 import {
-  createLogExportDestination,
-  getLogExportDestinations,
+  createLogExportDestinationAsync,
+  getLogExportDestinationsAsync,
 } from "@/lib/db/logExportDestinations";
 import { getLogExportDestinationType } from "@/lib/logExport/registry";
 import { encryptDestinationConfig, requiresEncryptionKey } from "@/lib/logExport/secrets";
-import { toDestinationView } from "@/lib/logExport/presenter";
+import { toDestinationViewAsync } from "@/lib/logExport/presenter";
 
 const createDestinationSchema = z.object({
   name: z.string().min(1).max(200),
@@ -34,7 +34,9 @@ export async function GET(request: Request) {
 
   try {
     return NextResponse.json({
-      destinations: getLogExportDestinations().map(toDestinationView),
+      destinations: await Promise.all(
+        (await getLogExportDestinationsAsync()).map(toDestinationViewAsync)
+      ),
     });
   } catch (error: any) {
     return NextResponse.json(
@@ -90,7 +92,7 @@ export async function POST(request: Request) {
       );
     }
 
-    const created = createLogExportDestination({
+    const created = await createLogExportDestinationAsync({
       name: data.name,
       type: data.type,
       enabled: data.enabled,
@@ -101,7 +103,10 @@ export async function POST(request: Request) {
       maxRowsPerRun: data.maxRowsPerRun,
     });
 
-    return NextResponse.json({ destination: toDestinationView(created) }, { status: 201 });
+    return NextResponse.json(
+      { destination: await toDestinationViewAsync(created) },
+      { status: 201 }
+    );
   } catch (error: any) {
     return NextResponse.json(
       { error: sanitizeErrorMessage(error) || "Failed to create log export destination" },

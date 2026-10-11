@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { KeyHealth } from "../services/apiKeyRotator.ts";
+import { getSelectedControlPlane } from "../../src/lib/db/controlPlaneContext.ts";
 
 import { DefaultExecutor } from "./default.ts";
 import {
@@ -29,7 +29,7 @@ import {
   normalizeStainlessPlatform,
 } from "../config/providerHeaderProfiles.ts";
 import { translateNonStreamingResponse } from "../handlers/responseTranslator.ts";
-import { translateRequest } from "../translator/index.ts";
+import { translateRequest, translateRequestAsync } from "../translator/index.ts";
 import { FORMATS } from "../translator/formats.ts";
 import { createSSETransformStreamWithLogger } from "../utils/stream.ts";
 import { ensureStreamReadiness } from "../utils/streamReadiness.ts";
@@ -320,6 +320,32 @@ export class GlmExecutor extends DefaultExecutor {
     credentials: ProviderCredentials,
     transport: GlmTransport
   ) {
+    const steps = this.transformForTransportSteps(model, body, stream, credentials, transport);
+    let step = steps.next();
+    while (step.done === false) step = steps.next(translateRequest(...step.value));
+    return step.value;
+  }
+
+  async transformForTransportAsync(
+    model: string,
+    body: unknown,
+    stream: boolean,
+    credentials: ProviderCredentials,
+    transport: GlmTransport
+  ) {
+    const steps = this.transformForTransportSteps(model, body, stream, credentials, transport);
+    let step = steps.next();
+    while (step.done === false) step = steps.next(await translateRequestAsync(...step.value));
+    return step.value;
+  }
+
+  private *transformForTransportSteps(
+    model: string,
+    body: unknown,
+    stream: boolean,
+    credentials: ProviderCredentials,
+    transport: GlmTransport
+  ): Generator<Parameters<typeof translateRequest>, unknown, unknown> {
     const effortTier = parseGlmEffortTier(model);
     const effectiveModel = effortTier ? effortTier.baseModel : model;
 
@@ -378,7 +404,7 @@ export class GlmExecutor extends DefaultExecutor {
       return transformed;
     }
 
-    const translated = translateRequest(
+    const translated = yield [
       FORMATS.OPENAI,
       FORMATS.CLAUDE,
       effectiveModel,
@@ -387,8 +413,8 @@ export class GlmExecutor extends DefaultExecutor {
       credentials,
       this.provider,
       null,
-      { preserveCacheControl: false }
-    );
+      { preserveCacheControl: false },
+    ];
 
     // Inject effort and thinking for the Anthropic transport.
     // Zhipu's Anthropic endpoint requires thinking.type=enabled to emit
@@ -444,13 +470,10 @@ export class GlmExecutor extends DefaultExecutor {
     applyConfiguredUserAgent(headers, credentials.providerSpecificData);
     mergeUpstreamExtraHeaders(headers, input.upstreamExtraHeaders);
 
-    let transformedBody = this.transformForTransport(
-      input.model,
-      input.body,
-      input.stream,
-      credentials,
-      transport
-    );
+    const transformArgs = [input.model, input.body, input.stream, credentials, transport] as const;
+    let transformedBody = getSelectedControlPlane()
+      ? await this.transformForTransportAsync(...transformArgs)
+      : this.transformForTransport(...transformArgs);
 
     // Reuse only observed OpenAI capabilities; leave unknown first attempts and
     // Anthropic's translated thinking/effort contract untouched.

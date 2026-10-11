@@ -8,14 +8,19 @@
  */
 
 import { getTaskManager } from "@/lib/a2a/taskManager";
-import { getConductorCursor, setConductorCursor } from "@/lib/db/conductorBridge";
+import {
+  getConductorCursorAsync as getConductorCursor,
+  setConductorCursorAsync as setConductorCursor,
+} from "@/lib/db/conductorBridge";
 
 import { createConductorBridge, type ConductorBridge, type ConductorBridgeOptions } from "./bridge";
 
 let bridge: ConductorBridge | null = null;
 
 /** Starts the bridge once (idempotent). Returns null when CONDUCTOR_HUB_URL is unset. */
-export function initConductorBridge(overrides: Partial<ConductorBridgeOptions> = {}): ConductorBridge | null {
+export function initConductorBridge(
+  overrides: Partial<ConductorBridgeOptions> = {}
+): ConductorBridge | null {
   const hubUrl = process.env.CONDUCTOR_HUB_URL?.trim();
   if (!hubUrl) return null;
   if (bridge) return bridge;

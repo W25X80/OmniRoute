@@ -1,3 +1,6 @@
+import fsPromises from "node:fs/promises";
+import { parseDatabaseBackend } from "../../../../../src/lib/db/backendSelection";
+import { getServerLifecyclePhase } from "../../../../../src/lib/serverLifecycle";
 /**
  * LLMLingua-2 worker-thread backend (production path).
  *
@@ -39,7 +42,7 @@ import { notifyCompressionFailOpen } from "../../failOpenNotifier.ts";
 import { sanitizeErrorMessage } from "../../../../utils/errorSanitization.ts";
 import { LLMLINGUA_WORKER_TIMEOUT_MS, LLMLINGUA_WORKER_IDLE_MS } from "./constants.ts";
 import { resolveLlmlinguaModel } from "./modelStore.ts";
-import { packMemberInstalled } from "../../../../utils/optionalPacks.ts";
+import { packMemberInstalled, packMemberInstalledAsync } from "../../../../utils/optionalPacks.ts";
 import type { LlmlinguaBackend } from "./index.ts";
 
 /** One-time model-load budget on the first call for a given model (tinybert ~2s, bert-base ~27s). */
@@ -127,13 +130,24 @@ let workerFactory: (workerFile: URL, options: { execArgv: string[] }) => Worker 
  * by probing `node_modules/@atjsh/llmlingua-2/package.json` from the runtime anchors.
  */
 export function depsAvailable(): boolean {
-  if (_depsAvailable !== null) return _depsAvailable;
+  if (parseDatabaseBackend() === "postgres") {
+    const state = nativeDepsState();
+    if (state.value !== undefined) return state.value;
+    if (state.preparation || getServerLifecyclePhase() === "ready") {
+      throw new Error("Native LLMLingua dependency metadata requires asynchronous lookup");
+    }
+  }
+  if (_depsAvailable !== null) {
+    if (parseDatabaseBackend() === "postgres") nativeDepsState().value = _depsAvailable;
+    return _depsAvailable;
+  }
   // Stage 7 (issue #10321): the desktop bundle ships the LLMLingua closure as an
   // optional pack installed under `${DATA_DIR}/packs/ml-runtime/node_modules`
   // (prepended to NODE_PATH by electron/main.js), so also probe the pack dirs —
   // the ancestor walk only covers bundle-resident installs (npm/Docker).
   _depsAvailable =
     firstAncestorWith(runtimeAnchors(), GATE_DEP_REL) !== null || packMemberInstalled(GATE_DEP_REL);
+  if (parseDatabaseBackend() === "postgres") nativeDepsState().value = _depsAvailable;
   return _depsAvailable;
 }
 
@@ -381,6 +395,10 @@ function pump(): void {
  * (missing deps, spawn error, model-load/inference error, timeout). NEVER throws.
  */
 export const workerBackend: LlmlinguaBackend = async (text, opts) => {
+  if (parseDatabaseBackend() === "postgres") {
+    if (getServerLifecyclePhase() === "stopping") return text;
+    return nativeLlmlinguaOwner().run(text, opts);
+  }
   // Fail-open WITHOUT spawning when the optional deps are not installed (the common case).
   if (!depsAvailable()) {
     return text;
@@ -399,6 +417,10 @@ export const workerBackend: LlmlinguaBackend = async (text, opts) => {
  * process can exit cleanly after tests. Not part of the public contract.
  */
 export function __resetLlmlinguaWorkerForTests(): void {
+  const native = nativeLlmlinguaGlobals[NATIVE_LLMLINGUA_WORKER];
+  delete nativeLlmlinguaGlobals[NATIVE_LLMLINGUA_WORKER];
+  delete nativeDepsGlobals[NATIVE_LLMLINGUA_DEPS];
+  if (native) void native.close();
   // Drain the queue fail-open so no callers hang.
   while (queue.length) {
     const item = queue.shift()!;
@@ -424,4 +446,270 @@ export function __setLlmlinguaWorkerHarnessForTests(harness: {
     workerFactory = harness.factory;
   }
   _depsAvailable = harness.depsAvailable;
+  if (harness.depsAvailable === null) delete nativeDepsGlobals[NATIVE_LLMLINGUA_DEPS];
+  else nativeDepsState().value = harness.depsAvailable;
+  const owner = nativeLlmlinguaGlobals[NATIVE_LLMLINGUA_WORKER];
+  if (owner) owner.factory = workerFactory;
+}
+
+const NATIVE_LLMLINGUA_DEPS = Symbol.for("omniroute.nativeLlmlinguaDependencies");
+interface NativeDepsState {
+  value?: boolean;
+  preparation?: Promise<boolean>;
+}
+const nativeDepsGlobals = globalThis as typeof globalThis & {
+  [NATIVE_LLMLINGUA_DEPS]?: NativeDepsState;
+};
+function nativeDepsState(): NativeDepsState {
+  return (nativeDepsGlobals[NATIVE_LLMLINGUA_DEPS] ??= {});
+}
+
+async function existsAsync(filePath: string): Promise<boolean> {
+  try {
+    await fsPromises.access(filePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function firstAncestorWithAsync(
+  anchors: string[],
+  relPath: string
+): Promise<string | null> {
+  for (const anchor of anchors) {
+    if (!anchor) continue;
+    let dir = path.resolve(anchor);
+    for (let i = 0; i <= MAX_WALK_UP; i++) {
+      if (await existsAsync(path.join(dir, relPath))) return dir;
+      const parent = path.dirname(dir);
+      if (parent === dir) break;
+      dir = parent;
+    }
+  }
+  return null;
+}
+
+export function depsAvailableAsync(): Promise<boolean> {
+  if (parseDatabaseBackend() !== "postgres") return Promise.resolve(depsAvailable());
+  const state = nativeDepsState();
+  if (state.value !== undefined) return Promise.resolve(state.value);
+  if (state.preparation) return state.preparation;
+  const anchors = runtimeAnchors();
+  const dataDir = process.env.DATA_DIR;
+  state.preparation = Promise.resolve().then(async () => {
+    const available =
+      (await firstAncestorWithAsync(anchors, GATE_DEP_REL)) !== null ||
+      (await packMemberInstalledAsync(GATE_DEP_REL, dataDir));
+    if (nativeDepsGlobals[NATIVE_LLMLINGUA_DEPS] === state) state.value = available;
+    return available;
+  });
+  return state.preparation;
+}
+
+export async function resolveWorkerFileAsync(): Promise<{
+  workerFile: string;
+  execArgv: string[];
+}> {
+  const anchors = runtimeAnchors();
+  const cwd = process.cwd();
+  const jsRoot = await firstAncestorWithAsync(anchors, WORKER_JS_REL);
+  if (
+    jsRoot &&
+    (!(await existsAsync(path.join(jsRoot, WORKER_TS_REL))) ||
+      (await existsAsync(
+        path.join(path.dirname(path.join(jsRoot, WORKER_JS_REL)), "package.json")
+      )))
+  ) {
+    return { workerFile: path.join(jsRoot, WORKER_JS_REL), execArgv: [] };
+  }
+  const tsRoot = await firstAncestorWithAsync(anchors, WORKER_TS_REL);
+  return tsRoot
+    ? { workerFile: path.join(tsRoot, WORKER_TS_REL), execArgv: ["--import", "tsx/esm"] }
+    : { workerFile: path.join(cwd, WORKER_JS_REL), execArgv: [] };
+}
+
+interface NativeLlmlinguaItem extends QueueItem {
+  id?: number;
+  timer?: NodeJS.Timeout;
+  modelKey?: string;
+}
+
+class NativeLlmlinguaWorker {
+  factory = workerFactory;
+  private worker: Worker | null = null;
+  private pendingSpawn: Promise<Worker | null> | undefined;
+  private pumpWork: Promise<void> | undefined;
+  private generation = 0;
+  private closing = false;
+  private closingWork: Promise<void> | undefined;
+  private active: NativeLlmlinguaItem | null = null;
+  private readonly queue: NativeLlmlinguaItem[] = [];
+  private readonly warmed = new Set<string>();
+  private nextId = 1;
+  private idle: NodeJS.Timeout | undefined;
+
+  run(text: string, opts: Parameters<LlmlinguaBackend>[1]): Promise<string> {
+    if (this.closing) return Promise.resolve(text);
+    return new Promise((resolve) => {
+      this.queue.push({ text, opts, resolve });
+      this.pump();
+    });
+  }
+
+  close(): Promise<void> {
+    this.closingWork ??= (async () => {
+      this.closing = true;
+      this.generation++;
+      if (this.idle) clearTimeout(this.idle);
+      this.resolveActiveOriginal();
+      for (const item of this.queue.splice(0)) item.resolve(item.text);
+      const current = this.worker;
+      this.worker = null;
+      await this.pendingSpawn;
+      await this.pumpWork;
+      if (current) await current.terminate().catch(() => undefined);
+    })();
+    return this.closingWork;
+  }
+
+  private resolveActiveOriginal(): void {
+    const item = this.active;
+    if (!item) return;
+    if (item.timer) clearTimeout(item.timer);
+    this.active = null;
+    item.resolve(item.text);
+  }
+
+  private resetIdle(): void {
+    if (this.idle) clearTimeout(this.idle);
+    this.idle = setTimeout(() => {
+      this.generation++;
+      this.resolveActiveOriginal();
+      this.warmed.clear();
+      const current = this.worker;
+      this.worker = null;
+      if (current) void current.terminate().catch(() => undefined);
+      this.pump();
+    }, LLMLINGUA_WORKER_IDLE_MS);
+    this.idle.unref?.();
+  }
+
+  private ensureWorker(): Promise<Worker | null> {
+    if (this.worker) return Promise.resolve(this.worker);
+    if (this.pendingSpawn) return this.pendingSpawn;
+    const generation = this.generation;
+    const factory = this.factory;
+    const preparation = Promise.resolve().then(async () => {
+      const { workerFile, execArgv } = await resolveWorkerFileAsync();
+      if (this.closing || generation !== this.generation) return null;
+      const created = factory(llmlinguaWorkerSpecifier(workerFile), { execArgv });
+      this.worker = created;
+      created.on("message", (reply: WorkerReply) => {
+        const item = this.active;
+        if (this.worker !== created || !item || item.id !== reply.id) return;
+        if (reply.ok && item.modelKey) this.warmed.add(item.modelKey);
+        this.complete(item, reply.text);
+      });
+      const fail = (detail: string) => {
+        if (this.worker !== created) return;
+        if (this.active) notifyCompressionFailOpen(detail);
+        this.worker = null;
+        this.generation++;
+        this.resolveActiveOriginal();
+        void created.terminate().catch(() => undefined);
+        this.pump();
+      };
+      created.on("error", (error: Error) =>
+        fail(`llmlingua worker error: ${sanitizeErrorMessage(error.message)}`)
+      );
+      created.on("exit", (code: number) => fail(`llmlingua worker exit: ${code}`));
+      return created;
+    });
+    const pending = preparation.finally(() => {
+      if (this.pendingSpawn === pending) this.pendingSpawn = undefined;
+    });
+    this.pendingSpawn = pending;
+    return pending;
+  }
+
+  private complete(item: NativeLlmlinguaItem, text: string): void {
+    if (this.active !== item) return;
+    if (item.timer) clearTimeout(item.timer);
+    this.active = null;
+    item.resolve(text);
+    this.pump();
+  }
+
+  private pump(): void {
+    if (this.closing || this.active) return;
+    const item = this.queue.shift();
+    if (!item) return;
+    // Reserve FIFO ownership before awaiting dependency/path metadata.
+    this.active = item;
+    if (this.idle) clearTimeout(this.idle);
+    const work = (async () => {
+      try {
+        if (!(await depsAvailableAsync())) {
+          this.complete(item, item.text);
+          return;
+        }
+        if (this.closing || this.active !== item) return;
+        const current = await this.ensureWorker();
+        if (this.closing || this.active !== item) return;
+        if (!current) {
+          this.complete(item, item.text);
+          return;
+        }
+        item.id = this.nextId++;
+        item.modelKey = resolveLlmlinguaModel(item.opts?.model).id;
+        const timeoutMs = this.warmed.has(item.modelKey)
+          ? LLMLINGUA_WORKER_TIMEOUT_MS
+          : FIRST_CALL_TIMEOUT_MS;
+        item.timer = setTimeout(() => this.complete(item, item.text), timeoutMs);
+        item.timer.unref?.();
+        this.resetIdle();
+        try {
+          current.postMessage({
+            id: item.id,
+            text: item.text,
+            model: item.opts?.model,
+            compressionRate: item.opts?.compressionRate,
+            modelPath: item.opts?.modelPath,
+          });
+        } catch (error) {
+          notifyCompressionFailOpen(
+            `llmlingua worker postMessage failed: ${sanitizeErrorMessage(error instanceof Error ? error.message : error)}`
+          );
+          if (this.worker === current) this.worker = null;
+          this.generation++;
+          void current.terminate().catch(() => undefined);
+          this.complete(item, item.text);
+        }
+      } catch (error) {
+        if (this.closing || this.active !== item) return;
+        notifyCompressionFailOpen(
+          `llmlingua worker spawn failed: ${sanitizeErrorMessage(error instanceof Error ? error.message : error)}`
+        );
+        this.complete(item, item.text);
+      }
+    })();
+    this.pumpWork = work;
+    void work.finally(() => {
+      if (this.pumpWork === work) this.pumpWork = undefined;
+    });
+  }
+}
+
+const NATIVE_LLMLINGUA_WORKER = Symbol.for("omniroute.nativeLlmlinguaWorker");
+const nativeLlmlinguaGlobals = globalThis as typeof globalThis & {
+  [NATIVE_LLMLINGUA_WORKER]?: NativeLlmlinguaWorker;
+};
+function nativeLlmlinguaOwner(): NativeLlmlinguaWorker {
+  return (nativeLlmlinguaGlobals[NATIVE_LLMLINGUA_WORKER] ??= new NativeLlmlinguaWorker());
+}
+
+/** Shutdown does not instantiate an optional worker that was never used. */
+export function closeNativeLlmlinguaWorker(): Promise<void> {
+  return nativeLlmlinguaGlobals[NATIVE_LLMLINGUA_WORKER]?.close() ?? Promise.resolve();
 }

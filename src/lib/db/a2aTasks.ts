@@ -1,3 +1,5 @@
+import { getSelectedPostgresDatabase } from "./controlPlaneContext";
+import { createPostgresA2ATasksRepository } from "./postgres/a2aTasksRepository";
 /**
  * db/a2aTasks.ts — A2A task history writer/reader over the tables created by migration
  * `002_mcp_a2a_tables.sql` (`a2a_tasks`, `a2a_task_events`). No new migration: this module only
@@ -142,9 +144,9 @@ export function listA2ATaskHistory(f: A2AHistoryFilter): {
   const db = getDbInstance();
   const { where, params } = buildHistoryWhere(f);
 
-  const total = db
-    .prepare(`SELECT COUNT(*) AS count FROM a2a_tasks ${where}`)
-    .get(params) as { count: number };
+  const total = db.prepare(`SELECT COUNT(*) AS count FROM a2a_tasks ${where}`).get(params) as {
+    count: number;
+  };
 
   const rows = db
     .prepare(
@@ -219,4 +221,76 @@ export function purgeA2AHistory(retentionDays: number): number {
   });
 
   return purge(retentionDays);
+}
+
+export async function upsertA2ATaskAsync(
+  ...args: Parameters<typeof upsertA2ATask>
+): Promise<Awaited<ReturnType<typeof upsertA2ATask>>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresA2ATasksRepository(database).upsertA2ATask(...args)
+    : upsertA2ATask(...args);
+}
+
+export async function appendA2ATaskEventAsync(
+  ...args: Parameters<typeof appendA2ATaskEvent>
+): Promise<Awaited<ReturnType<typeof appendA2ATaskEvent>>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresA2ATasksRepository(database).appendA2ATaskEvent(...args)
+    : appendA2ATaskEvent(...args);
+}
+
+export async function listA2ATaskEventsAsync(
+  ...args: Parameters<typeof listA2ATaskEvents>
+): Promise<Awaited<ReturnType<typeof listA2ATaskEvents>>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresA2ATasksRepository(database).listA2ATaskEvents(...args)
+    : listA2ATaskEvents(...args);
+}
+
+export async function listA2ATaskHistoryAsync(
+  ...args: Parameters<typeof listA2ATaskHistory>
+): Promise<Awaited<ReturnType<typeof listA2ATaskHistory>>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresA2ATasksRepository(database).listA2ATaskHistory(...args)
+    : listA2ATaskHistory(...args);
+}
+
+export async function getA2ATaskHistoryByIdAsync(
+  ...args: Parameters<typeof getA2ATaskHistoryById>
+): Promise<Awaited<ReturnType<typeof getA2ATaskHistoryById>>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresA2ATasksRepository(database).getA2ATaskHistoryById(...args)
+    : getA2ATaskHistoryById(...args);
+}
+
+export async function purgeA2AHistoryAsync(
+  ...args: Parameters<typeof purgeA2AHistory>
+): Promise<Awaited<ReturnType<typeof purgeA2AHistory>>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresA2ATasksRepository(database).purgeA2AHistory(...args)
+    : purgeA2AHistory(...args);
+}
+
+export async function persistA2ATaskHistoryAsync(
+  row: UpsertA2ATaskInput,
+  eventType: string,
+  dataJson?: string
+): Promise<void> {
+  const database = getSelectedPostgresDatabase();
+  if (database) {
+    await createPostgresA2ATasksRepository(database).persistA2ATaskHistory(
+      row,
+      eventType,
+      dataJson
+    );
+    return;
+  }
+  upsertA2ATask(row);
+  appendA2ATaskEvent(row.id, eventType, dataJson);
 }

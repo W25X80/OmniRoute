@@ -1,3 +1,4 @@
+import { getSelectedSemanticCacheRepository } from "./db/semanticCache";
 /**
  * Semantic Cache — Phase 9.1
  *
@@ -108,7 +109,7 @@ function getMemoryCache() {
       maxBytes: parseInt(process.env.SEMANTIC_CACHE_MAX_BYTES || String(2 * 1024 * 1024), 10),
       defaultTTL: parseInt(process.env.SEMANTIC_CACHE_TTL_MS || "1800000", 10),
     });
-    ensureCacheMetricsTable();
+    if (!getSelectedSemanticCacheRepository()) ensureCacheMetricsTable();
   }
   return memoryCache;
 }
@@ -622,4 +623,72 @@ export function isTruncatedStreamBody(streamBody: unknown): boolean {
     }
   }
   return false;
+}
+
+export async function getCachedResponseAsync(signature: string) {
+  const selected = getSelectedSemanticCacheRepository();
+  if (!selected) return getCachedResponse(signature);
+  try {
+    return await selected.get(signature);
+  } catch {
+    return null;
+  }
+}
+
+export async function recordSemanticCacheHitAsync(
+  signature: string,
+  tokensSaved = 0
+): Promise<void> {
+  const selected = getSelectedSemanticCacheRepository();
+  if (!selected) return recordSemanticCacheHit(signature, tokensSaved);
+  try {
+    await selected.hit(signature, tokensSaved);
+  } catch {
+    /* Optional metrics. */
+  }
+}
+
+export async function setCachedResponseAsync(
+  signature: string,
+  model: string,
+  response: unknown,
+  tokensSaved = 0,
+  ttlMs = 3600000
+): Promise<void> {
+  const selected = getSelectedSemanticCacheRepository();
+  if (!selected) return setCachedResponse(signature, model, response, tokensSaved, ttlMs);
+  const ttl = parseInt(process.env.SEMANTIC_CACHE_TTL_MS || String(ttlMs), 10);
+  try {
+    await selected.set(signature, model, response, tokensSaved, ttl);
+  } catch {
+    /* Optional cache. */
+  }
+}
+
+export async function invalidateByModelAsync(model: string): Promise<number> {
+  const selected = getSelectedSemanticCacheRepository();
+  if (!selected) return invalidateByModel(model);
+  return selected.deleteByModel(model);
+}
+
+export async function invalidateBySignatureAsync(signature: string): Promise<boolean> {
+  const selected = getSelectedSemanticCacheRepository();
+  if (!selected) return invalidateBySignature(signature);
+  return (await selected.deleteBySignature(signature)) > 0;
+}
+
+export async function invalidateStaleAsync(maxAgeMs: number): Promise<number> {
+  const selected = getSelectedSemanticCacheRepository();
+  if (!selected) return invalidateStale(maxAgeMs);
+  return selected.deleteOlderThan(new Date(Date.now() - maxAgeMs).toISOString());
+}
+
+export async function clearCacheAsync(): Promise<number> {
+  const selected = getSelectedSemanticCacheRepository();
+  return selected ? selected.clear() : clearCache();
+}
+
+export async function getCacheStatsAsync() {
+  const selected = getSelectedSemanticCacheRepository();
+  return selected ? selected.stats() : getCacheStats();
 }

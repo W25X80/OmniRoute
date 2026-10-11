@@ -8,8 +8,8 @@
  *  - Pure logic functions (resolveVaultPath, verifyBasicAuth, buildPropfindXml,
  *    decryptStored) are exported and unit-tested independently.
  *  - maybeHandleWebdav(req, res) is the thin HTTP+fs binding layer.
- *  - Credentials, enabled flag, and vault path are loaded from the same
- *    SQLite DB the app uses (DATA_DIR/storage.sqlite, key_value table).
+ *  - PostgreSQL reads configuration through the application request scope.
+ *    SQLite uses DATA_DIR/storage.sqlite (key_value table) as before.
  *
  * Security:
  *  - Path traversal guard on every request + Destination header.
@@ -24,6 +24,7 @@ import path from "node:path";
 import { createDecipheriv, scryptSync, createHash, timingSafeEqual } from "node:crypto";
 import { createRequire } from "node:module";
 import os from "node:os";
+import { isSqlitePersistenceRequested } from "./persistence-request-boundary.mjs";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -447,7 +448,7 @@ export function loadWebdavConfig() {
  * @param {string} safeMessage  User-visible message (no internal details).
  * @param {Record<string, string>} [extraHeaders]
  */
-function sendError(res, status, safeMessage, extraHeaders = {}) {
+export function sendError(res, status, safeMessage, extraHeaders = {}) {
   const body = safeMessage;
   res.writeHead(status, {
     "Content-Type": "text/plain; charset=utf-8",
@@ -476,7 +477,7 @@ function sendUnauthorized(res) {
  * @param {boolean} isDir
  * @returns {string}
  */
-function buildEntryHref(baseHref, relativePath, isDir) {
+export function buildEntryHref(baseHref, relativePath, isDir) {
   const normalised = relativePath.replace(/\\/g, "/");
   const encoded = normalised
     .split("/")
@@ -494,8 +495,7 @@ function buildEntryHref(baseHref, relativePath, isDir) {
 function handleOptions(req, res) {
   res.writeHead(200, {
     DAV: "1, 2",
-    Allow:
-      "OPTIONS, GET, HEAD, PUT, DELETE, MKCOL, MOVE, COPY, PROPFIND, LOCK, UNLOCK",
+    Allow: "OPTIONS, GET, HEAD, PUT, DELETE, MKCOL, MOVE, COPY, PROPFIND, LOCK, UNLOCK",
     "MS-Author-Via": "DAV",
     "Content-Length": "0",
   });
@@ -915,7 +915,24 @@ export async function maybeHandleWebdav(req, res) {
   // Load credentials from DB
   let config;
   try {
-    config = loadWebdavConfig();
+    const nativeReader = globalThis.__omnirouteGetWebdavConfigurationAsync;
+    if (typeof nativeReader === "function") {
+      const value = await nativeReader();
+      config =
+        value &&
+        value.enabled !== false &&
+        typeof value.username === "string" &&
+        value.username &&
+        typeof value.password === "string" &&
+        value.password &&
+        typeof value.vaultPath === "string" &&
+        value.vaultPath
+          ? value
+          : null;
+    } else {
+      // Never open the local SQLite file when the application has selected PostgreSQL.
+      config = isSqlitePersistenceRequested() ? loadWebdavConfig() : null;
+    }
   } catch {
     config = null;
   }
@@ -956,6 +973,19 @@ export async function maybeHandleWebdav(req, res) {
 
   // Dispatch method
   try {
+    if (
+      !isSqlitePersistenceRequested() &&
+      ["PROPFIND", "GET", "HEAD", "PUT", "DELETE", "MKCOL", "MOVE", "COPY"].includes(method)
+    ) {
+      const { handleNativeWebdavFileMethod } = await import("./webdav-native-handler.mjs");
+      await handleNativeWebdavFileMethod(req, res, {
+        method,
+        absPath,
+        vaultRoot,
+        requestPath: url,
+      });
+      return true;
+    }
     switch (method) {
       case "OPTIONS":
         handleOptions(req, res);

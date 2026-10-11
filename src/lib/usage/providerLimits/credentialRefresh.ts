@@ -26,7 +26,7 @@ export interface ProviderConnectionLike {
   expiresAt?: string | null;
   tokenExpiresAt?: string | null;
   providerSpecificData?: JsonRecord;
-  testStatus?: string;
+  testStatus?: string | null;
   isActive?: boolean;
   lastError?: string | null;
   lastErrorAt?: string | null;

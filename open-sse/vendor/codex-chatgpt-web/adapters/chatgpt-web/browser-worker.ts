@@ -1,7 +1,10 @@
 /* Adapted from miuuyy/codex-chatgpt-web v4.0.7 commit b59d7dc51b84fb1f465ff1d00f5207f3b2b4a494 (MIT). */
 import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
-import { basename, extname, join, resolve } from "node:path";
+import { access, readFile } from "node:fs/promises";
+import { parseDatabaseBackend } from "../../../../../src/lib/db/backendSelection.ts";
+import { basename, dirname, extname, join, resolve } from "node:path";
+import { protectedConnectionWrite } from "../../storage-state-write";
 import {
   chromium,
   type Browser,
@@ -11,6 +14,7 @@ import {
 } from "playwright-core";
 import {
   atomicWriteFile,
+  atomicWriteFileAsync,
   CHATGPT_CONNECTOR_NAME,
   defaultChromeExecutable,
   DEV_CHATGPT_CONNECTOR_NAME,
@@ -20,7 +24,7 @@ import {
   legacyChatGptConnectorMigrationMessage,
   LEGACY_CHATGPT_CONNECTOR_NAMES,
 } from "../../config";
-import { cdpConnectOptions } from "../../cdp-auth";
+import { cdpConnectOptions, cdpConnectOptionsAsync } from "../../cdp-auth";
 import { estimateTokens } from "../../lib/token-estimate";
 import type { CodexProviderConfig } from "../../types";
 import { parseDataUrl } from "../image";
@@ -129,6 +133,25 @@ function readChatGptBrowserStorageState(path: string): ChatGptBrowserStorageStat
     throw new Error("ChatGPT browser storage state is invalid");
   }
   return parsed as ChatGptBrowserStorageState;
+}
+
+async function readChatGptBrowserStorageStateAsync(
+  path: string
+): Promise<ChatGptBrowserStorageState> {
+  const parsed = JSON.parse(await readFile(path, "utf8")) as Partial<ChatGptBrowserStorageState>;
+  if (!Array.isArray(parsed.cookies) || !Array.isArray(parsed.origins)) {
+    throw new Error("ChatGPT browser storage state is invalid");
+  }
+  return parsed as ChatGptBrowserStorageState;
+}
+
+async function browserControlPathExists(path: string): Promise<boolean> {
+  try {
+    await access(path);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -1788,8 +1811,12 @@ export class ChatGptBrowserWorker {
       return this.page;
     }
     if (
-      !existsSync(this.config.storageStatePath) ||
-      !existsSync(loginVerificationMarkerPath(this.config.storageStatePath))
+      !(parseDatabaseBackend() === "postgres"
+        ? await browserControlPathExists(this.config.storageStatePath)
+        : existsSync(this.config.storageStatePath)) ||
+      !(parseDatabaseBackend() === "postgres"
+        ? await browserControlPathExists(loginVerificationMarkerPath(this.config.storageStatePath))
+        : existsSync(loginVerificationMarkerPath(this.config.storageStatePath)))
     ) {
       throw new Error(`ChatGPT web login state is missing: ${this.config.storageStatePath}`);
     }
@@ -1799,14 +1826,21 @@ export class ChatGptBrowserWorker {
     if (
       !this.config.cdpEndpoint &&
       this.config.chromeExecutablePath &&
-      !existsSync(this.config.chromeExecutablePath)
+      !(parseDatabaseBackend() === "postgres"
+        ? await browserControlPathExists(this.config.chromeExecutablePath)
+        : existsSync(this.config.chromeExecutablePath))
     ) {
       throw new Error(
         `Configured Chrome executable does not exist: ${this.config.chromeExecutablePath}`
       );
     }
     this.browser = this.config.cdpEndpoint
-      ? await chromium.connectOverCDP(this.config.cdpEndpoint, cdpConnectOptions())
+      ? await chromium.connectOverCDP(
+          this.config.cdpEndpoint,
+          parseDatabaseBackend() === "postgres"
+            ? await cdpConnectOptionsAsync()
+            : cdpConnectOptions()
+        )
       : await chromium.launch({
           executablePath: this.config.chromeExecutablePath,
           headless: !this.config.headed,
@@ -1824,8 +1858,14 @@ export class ChatGptBrowserWorker {
     if (this.managedBrowserReady) return this.managedBrowserReady;
     const opening = (async () => {
       if (
-        !existsSync(this.config.storageStatePath) ||
-        !existsSync(loginVerificationMarkerPath(this.config.storageStatePath))
+        !(parseDatabaseBackend() === "postgres"
+          ? await browserControlPathExists(this.config.storageStatePath)
+          : existsSync(this.config.storageStatePath)) ||
+        !(parseDatabaseBackend() === "postgres"
+          ? await browserControlPathExists(
+              loginVerificationMarkerPath(this.config.storageStatePath)
+            )
+          : existsSync(loginVerificationMarkerPath(this.config.storageStatePath)))
       ) {
         throw new Error(`ChatGPT web login state is missing: ${this.config.storageStatePath}`);
       }
@@ -1835,14 +1875,21 @@ export class ChatGptBrowserWorker {
       if (
         !this.config.cdpEndpoint &&
         this.config.chromeExecutablePath &&
-        !existsSync(this.config.chromeExecutablePath)
+        !(parseDatabaseBackend() === "postgres"
+          ? await browserControlPathExists(this.config.chromeExecutablePath)
+          : existsSync(this.config.chromeExecutablePath))
       ) {
         throw new Error(
           `Configured Chrome executable does not exist: ${this.config.chromeExecutablePath}`
         );
       }
       const browser = this.config.cdpEndpoint
-        ? await chromium.connectOverCDP(this.config.cdpEndpoint, cdpConnectOptions())
+        ? await chromium.connectOverCDP(
+            this.config.cdpEndpoint,
+            parseDatabaseBackend() === "postgres"
+              ? await cdpConnectOptionsAsync()
+              : cdpConnectOptions()
+          )
         : await chromium.launch({
             executablePath: this.config.chromeExecutablePath,
             headless: !this.config.headed,
@@ -3795,7 +3842,9 @@ export class ChatGptBrowserWorker {
     );
     const verifiedStorageState =
       this.config.browserHost === "managed-chrome"
-        ? readChatGptBrowserStorageState(this.config.storageStatePath)
+        ? parseDatabaseBackend() === "postgres"
+          ? await readChatGptBrowserStorageStateAsync(this.config.storageStatePath)
+          : readChatGptBrowserStorageState(this.config.storageStatePath)
         : undefined;
     let turnConnection: Browser | undefined;
     let managedPage: Page | undefined;
@@ -4441,7 +4490,11 @@ export class ChatGptBrowserWorker {
             isVerifiedChatGptAuthCookie(cookie.name)
           );
           if (verifiedAuthCookies.length > 0) await context.addCookies(verifiedAuthCookies);
-          atomicWriteFile(this.config.storageStatePath, `${JSON.stringify(mergedState)}\n`);
+          if (parseDatabaseBackend() === "postgres") {
+            await protectedConnectionWrite(dirname(this.config.storageStatePath), () =>
+              atomicWriteFileAsync(this.config.storageStatePath, `${JSON.stringify(mergedState)}\n`)
+            );
+          } else atomicWriteFile(this.config.storageStatePath, `${JSON.stringify(mergedState)}\n`);
         } catch (storageError) {
           console.error(
             `[chatgpt-web] failed to preserve verified browser auth for ${turn.traceId}: ${storageError instanceof Error ? storageError.message : String(storageError)}`

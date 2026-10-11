@@ -1,3 +1,5 @@
+import { getSelectedPostgresDatabase, getSelectedPersistenceIdentity } from "./controlPlaneContext";
+import { createPostgresReasoningCacheRepository } from "./postgres/cacheRepository";
 /**
  * reasoningCache.ts — DB domain module for the Reasoning Replay Cache.
  *
@@ -291,4 +293,59 @@ export function getReasoningCacheEntries(
     createdAt: row.created_at,
     expiresAt: epochSecondsToIso(row.expires_at),
   }));
+}
+
+export function getSelectedReasoningCacheRepository() {
+  const database = getSelectedPostgresDatabase();
+  return database ? createPostgresReasoningCacheRepository(database) : undefined;
+}
+
+export async function setReasoningCacheAsync(
+  toolCallId: string,
+  provider: string,
+  model: string,
+  reasoning: string,
+  ttlMs = DEFAULT_TTL_MS
+): Promise<void> {
+  const selected = getSelectedReasoningCacheRepository();
+  return selected
+    ? selected.set(toolCallId, provider, model, reasoning, ttlMs)
+    : setReasoningCache(toolCallId, provider, model, reasoning, ttlMs);
+}
+
+export async function getReasoningCacheAsync(toolCallId: string) {
+  const selected = getSelectedReasoningCacheRepository();
+  return selected ? selected.get(toolCallId) : getReasoningCache(toolCallId);
+}
+
+export async function deleteReasoningCacheAsync(toolCallId: string) {
+  const selected = getSelectedReasoningCacheRepository();
+  return selected ? selected.delete(toolCallId) : deleteReasoningCache(toolCallId);
+}
+
+export async function cleanupExpiredReasoningAsync() {
+  const selected = getSelectedReasoningCacheRepository();
+  return selected ? selected.cleanup() : cleanupExpiredReasoning();
+}
+
+export async function clearAllReasoningCacheAsync(provider?: string) {
+  const selected = getSelectedReasoningCacheRepository();
+  return selected ? selected.clear(provider) : clearAllReasoningCache(provider);
+}
+
+export async function getReasoningCacheStatsAsync() {
+  const selected = getSelectedReasoningCacheRepository();
+  return selected ? selected.stats() : getReasoningCacheStats();
+}
+
+export async function getReasoningCacheEntriesAsync(
+  opts: Parameters<typeof getReasoningCacheEntries>[0] = {}
+) {
+  const selected = getSelectedReasoningCacheRepository();
+  return selected ? selected.list(opts) : getReasoningCacheEntries(opts);
+}
+
+/** Opaque cache partition identity; no driver or SQL methods are exposed to callers. */
+export function getSelectedReasoningCacheAuthority(): object | undefined {
+  return getSelectedPersistenceIdentity();
 }

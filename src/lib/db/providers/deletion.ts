@@ -1,3 +1,4 @@
+import { getSelectedControlPlane } from "../controlPlaneContext";
 /**
  * db/providers/deletion.ts — Provider connection deletion & reordering.
  *
@@ -94,6 +95,8 @@ function _purgeProviderLimitsCacheForConnections(ids: string[]) {
 }
 
 export async function deleteProviderConnection(id: string) {
+  const selected = getSelectedControlPlane();
+  if (selected) return selected.providers.deleteById(id);
   const db = getDbInstance() as unknown as DbLike;
   const existing = db.prepare("SELECT provider FROM provider_connections WHERE id = ?").get(id);
   if (!existing) return false;
@@ -130,6 +133,8 @@ export async function deleteProviderConnection(id: string) {
 }
 
 export async function deleteProviderConnections(ids: string[]): Promise<number> {
+  const selected = getSelectedControlPlane();
+  if (selected) return selected.providers.deleteByIds(ids);
   if (ids.length === 0) return 0;
 
   const db = getDbInstance() as unknown as DbLike;
@@ -171,6 +176,8 @@ export async function deleteProviderConnections(ids: string[]): Promise<number> 
 }
 
 export async function deleteProviderConnectionsByProvider(providerId: string) {
+  const selected = getSelectedControlPlane();
+  if (selected) return selected.providers.deleteByProvider(providerId);
   const db = getDbInstance() as unknown as DbLike;
   const connectionIds = db
     .prepare("SELECT id FROM provider_connections WHERE provider = ?")
@@ -218,6 +225,8 @@ export async function deleteProviderConnectionsByProvider(providerId: string) {
 }
 
 export async function reorderProviderConnections(providerId: string) {
+  const selected = getSelectedControlPlane();
+  if (selected) return selected.providers.reorder(providerId);
   const db = getDbInstance() as unknown as DbLike;
   reorderConnections(db, providerId);
 }

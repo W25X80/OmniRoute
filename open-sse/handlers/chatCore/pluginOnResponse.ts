@@ -1,3 +1,4 @@
+import { parseDatabaseBackend } from "@/lib/db/backendSelection";
 /**
  * chatCore plugin onResponse hook (Quality Gate v2 / Fase 9 — chatCore god-file decomposition,
  * #3501).
@@ -29,7 +30,7 @@ export async function runPluginOnResponseHook(args: {
 }): Promise<void> {
   try {
     const { runOnResponse } = await import("@/lib/plugins/hooks");
-    runOnResponse(
+    const work = runOnResponse(
       {
         requestId: args.requestId,
         body: args.body,
@@ -41,6 +42,7 @@ export async function runPluginOnResponseHook(args: {
       },
       args.response
     ).catch(() => {});
+    if (parseDatabaseBackend() === "postgres") await work;
   } catch (_) {
     /* plugin onResponse optional */
   }
@@ -85,21 +87,23 @@ export async function runPluginOnStreamCompleteHook(args: {
   errorCode?: string | null | undefined;
   startTime: number;
   requestId?: string;
+  completedAt?: number;
 }): Promise<void> {
   try {
     const { runOnStreamComplete } = await import("@/lib/plugins/hooks");
-    runOnStreamComplete({
+    const work = runOnStreamComplete({
       status: args.status,
       requestId: args.requestId,
       usage: args.usage as PluginOnStreamCompletePayload["usage"],
       timing: {
-        latencyMs: Date.now() - args.startTime,
+        latencyMs: (args.completedAt ?? Date.now()) - args.startTime,
         ttft: args.ttft,
       },
       model: args.model ?? undefined,
       provider: args.provider ?? undefined,
       errorCode: args.errorCode ?? undefined,
     }).catch(() => {});
+    if (parseDatabaseBackend() === "postgres") await work;
   } catch (_) {
     /* plugin onStreamComplete optional */
   }

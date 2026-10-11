@@ -1,3 +1,7 @@
+import {
+  requireSqliteMaintenance,
+  persistenceCapabilityResponse,
+} from "@/lib/db/persistenceCapabilities";
 import { NextResponse } from "next/server";
 import path from "path";
 import fs from "fs";
@@ -21,6 +25,7 @@ export async function GET(request: Request) {
     }
   }
   try {
+    requireSqliteMaintenance("sqlite-file-export");
     if (!SQLITE_FILE || !fs.existsSync(SQLITE_FILE)) {
       return NextResponse.json({ error: "Database file not found" }, { status: 404 });
     }
@@ -79,6 +84,8 @@ export async function GET(request: Request) {
       },
     });
   } catch (error) {
+    const unavailable = persistenceCapabilityResponse(error);
+    if (unavailable) return NextResponse.json(unavailable, { status: 501 });
     console.error("[API] Error exporting database:", error);
     return NextResponse.json({ error: sanitizeErrorMessage(error) }, { status: 500 });
   }

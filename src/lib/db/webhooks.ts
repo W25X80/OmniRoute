@@ -1,3 +1,4 @@
+import { getSelectedPostgresDatabase } from "./controlPlaneContext";
 /**
  * Database module: Webhooks
  * CRUD operations for webhook event subscriptions
@@ -191,4 +192,96 @@ export function disableWebhooksWithHighFailures(threshold = 10): number {
     .prepare(`UPDATE webhooks SET enabled = 0 WHERE failure_count >= ? AND enabled = 1`)
     .run(threshold);
   return (result as any).changes;
+}
+
+export async function getWebhooksAsync(
+  ...args: Parameters<typeof getWebhooks>
+): Promise<ReturnType<typeof getWebhooks>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceWebhooks");
+    return postgres.transaction((transaction) => native.getWebhooks(transaction, ...args));
+  }
+  return getWebhooks(...args);
+}
+
+export async function getWebhookAsync(
+  ...args: Parameters<typeof getWebhook>
+): Promise<ReturnType<typeof getWebhook>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceWebhooks");
+    return postgres.transaction((transaction) => native.getWebhook(transaction, ...args));
+  }
+  return getWebhook(...args);
+}
+
+export async function getEnabledWebhooksAsync(
+  ...args: Parameters<typeof getEnabledWebhooks>
+): Promise<ReturnType<typeof getEnabledWebhooks>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceWebhooks");
+    return postgres.transaction((transaction) => native.getEnabledWebhooks(transaction, ...args));
+  }
+  return getEnabledWebhooks(...args);
+}
+
+export async function createWebhookAsync(
+  ...args: Parameters<typeof createWebhook>
+): Promise<ReturnType<typeof createWebhook>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceWebhooks");
+    return postgres.transaction((transaction) => native.createWebhook(transaction, ...args));
+  }
+  return createWebhook(...args);
+}
+
+export async function updateWebhookAsync(
+  ...args: Parameters<typeof updateWebhook>
+): Promise<ReturnType<typeof updateWebhook>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceWebhooks");
+    return postgres.transaction((transaction) => native.updateWebhook(transaction, ...args));
+  }
+  return updateWebhook(...args);
+}
+
+export async function deleteWebhookAsync(
+  ...args: Parameters<typeof deleteWebhook>
+): Promise<ReturnType<typeof deleteWebhook>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceWebhooks");
+    return postgres.transaction((transaction) => native.deleteWebhook(transaction, ...args));
+  }
+  return deleteWebhook(...args);
+}
+
+export async function recordWebhookDeliveryAsync(
+  ...args: Parameters<typeof recordWebhookDelivery>
+): Promise<ReturnType<typeof recordWebhookDelivery>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceWebhooks");
+    return postgres.transaction((transaction) =>
+      native.recordWebhookDelivery(transaction, ...args)
+    );
+  }
+  return recordWebhookDelivery(...args);
+}
+
+export async function disableWebhooksWithHighFailuresAsync(
+  ...args: Parameters<typeof disableWebhooksWithHighFailures>
+): Promise<ReturnType<typeof disableWebhooksWithHighFailures>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceWebhooks");
+    return postgres.transaction((transaction) =>
+      native.disableWebhooksWithHighFailures(transaction, ...args)
+    );
+  }
+  return disableWebhooksWithHighFailures(...args);
 }

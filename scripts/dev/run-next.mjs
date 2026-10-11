@@ -19,6 +19,7 @@ import { getMainServerTimeoutConfig } from "./main-server-timeouts.mjs";
 import { createSystemdNotifier } from "./systemd-notify.mjs";
 import { attachRequestStreamGuards, installProcessCrashGuard } from "./httpClientAbortGuard.mjs";
 import { listenWithRetry } from "./listen-with-retry.mjs";
+import { wrapRequestListenerWithPersistence } from "./persistence-request-boundary.mjs";
 
 const { maybeHandleDisallowedMethod } = methodGuard;
 const { wrapRequestListenerWithHeadResponseGuard } = headResponseGuard;
@@ -151,6 +152,8 @@ function createNextApp() {
 // registers its cleanup function, but must not install a competing signal
 // listener that can race this runner's async server/Next teardown.
 globalThis.__omnirouteCustomServerOwnsShutdown = true;
+// Registered before prepare(): instrumentation requires the selected runtime's HTTP boundary.
+globalThis.__omniroutePersistenceTransportInstalled = true;
 
 let nextApp = createNextApp();
 
@@ -201,17 +204,19 @@ async function start() {
   });
 
   const server = http.createServer(
-    wrapRequestListenerWithHeadResponseGuard((req, res) => {
-      // Absorb client-abort errors (browser closes the socket during
-      // navigation/HMR/bfcache) on the request/response streams so they never
-      // surface as an uncaughtException that kills the whole server (#fix-dev-server-aborted).
-      attachRequestStreamGuards(req, res);
-      if (maybeHandleDisallowedMethod(req, res)) return;
-      // Stamp the real TCP peer IP before Next sees the request, so the authz
-      // middleware can decide LOCAL_ONLY locality without trusting the Host header.
-      stampPeerIp(req);
-      return requestHandler(req, res);
-    })
+    wrapRequestListenerWithHeadResponseGuard(
+      wrapRequestListenerWithPersistence((req, res) => {
+        // Absorb client-abort errors (browser closes the socket during
+        // navigation/HMR/bfcache) on the request/response streams so they never
+        // surface as an uncaughtException that kills the whole server (#fix-dev-server-aborted).
+        attachRequestStreamGuards(req, res);
+        if (maybeHandleDisallowedMethod(req, res)) return;
+        // Stamp the real TCP peer IP before Next sees the request, so the authz
+        // middleware can decide LOCAL_ONLY locality without trusting the Host header.
+        stampPeerIp(req);
+        return requestHandler(req, res);
+      })
+    )
   );
   // Node's http.Server default keepAliveTimeout (5_000ms) races pooled
   // keep-alive HTTP clients that idle longer than that between requests (e.g.

@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { updateSkill } from "@/lib/db/skills";
+import { updateSkillAsync } from "@/lib/db/skills";
 import { skillRegistry } from "@/lib/skills/registry";
 import { z } from "zod";
 import { validateBody, isValidationFailure } from "@/shared/validation/helpers";
@@ -62,7 +62,7 @@ export async function PUT(request: Request, props: { params: Promise<{ id: strin
       return NextResponse.json({ error: "No update payload provided" }, { status: 400 });
     }
 
-    updateSkill(id, patch);
+    await updateSkillAsync(id, patch);
 
     await skillRegistry.loadFromDatabase();
 

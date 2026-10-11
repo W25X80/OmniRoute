@@ -1,9 +1,9 @@
 import { POST as postChatCompletion } from "@/app/api/v1/chat/completions/route";
 import type { PersistedEvalRun, EvalTargetType } from "@/lib/db/evals";
-import { saveEvalRun } from "@/lib/db/evals";
+import { saveEvalRunAsync } from "@/lib/db/evals";
 import { getApiKeyById } from "@/lib/db/apiKeys";
 import { getCombos } from "@/lib/db/combos";
-import { getSuite, listSuites, runSuite } from "./evalRunner";
+import { getSuiteAsync, listSuitesAsync, runSuiteAsync } from "./evalRunner";
 
 export interface EvalTargetInput {
   type: EvalTargetType;
@@ -48,7 +48,7 @@ export function normalizeEvalTarget(target?: EvalTargetInput | null): EvalTarget
 }
 
 export async function buildEvalTargetOptions(): Promise<EvalTargetOption[]> {
-  const [suites, combos] = await Promise.all([Promise.resolve(listSuites()), getCombos()]);
+  const [suites, combos] = await Promise.all([listSuitesAsync(), getCombos()]);
   const models = [
     ...new Set(
       suites
@@ -285,7 +285,7 @@ export async function runEvalSuiteAgainstTarget(input: {
   apiKeyId?: string;
   runGroupId?: string | null;
 }): Promise<PersistedEvalRun> {
-  const suite = getSuite(input.suiteId);
+  const suite = await getSuiteAsync(input.suiteId);
   if (!suite) {
     throw new Error(`Suite not found: ${input.suiteId}`);
   }
@@ -321,8 +321,8 @@ export async function runEvalSuiteAgainstTarget(input: {
     };
   }
 
-  const evaluated = runSuite(input.suiteId, outputs, caseMetrics);
-  return saveEvalRun({
+  const evaluated = await runSuiteAsync(input.suiteId, outputs, caseMetrics);
+  return await saveEvalRunAsync({
     runGroupId: input.runGroupId || null,
     suiteId: evaluated.suiteId,
     suiteName: evaluated.suiteName,

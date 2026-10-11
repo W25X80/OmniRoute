@@ -155,15 +155,18 @@ export function notifyWebhookEvent(event: WebhookEvent, data: Record<string, any
  * custom uses HMAC-signed deliverWebhook.
  */
 export async function dispatchEvent(event: WebhookEvent, data: Record<string, any>): Promise<void> {
-  const { getEnabledWebhooks, recordWebhookDelivery, disableWebhooksWithHighFailures } =
-    await import("./db/webhooks");
-  const { insertDelivery } = await import("./db/webhookDeliveries");
+  const {
+    getEnabledWebhooksAsync,
+    recordWebhookDeliveryAsync,
+    disableWebhooksWithHighFailuresAsync,
+  } = await import("./db/webhooks");
+  const { insertDeliveryAsync } = await import("./db/webhookDeliveries");
   const { buildSlackPayload } = await import("./webhooks/integrations/slack");
   const { buildTelegramUrl, buildTelegramPayload } =
     await import("./webhooks/integrations/telegram");
   const { buildDiscordPayload } = await import("./webhooks/integrations/discord");
 
-  const webhooks = getEnabledWebhooks();
+  const webhooks = await getEnabledWebhooksAsync();
   const payload: WebhookPayload = {
     event,
     timestamp: new Date().toISOString(),
@@ -205,7 +208,7 @@ export async function dispatchEvent(event: WebhookEvent, data: Record<string, an
       const latencyMs = Date.now() - start;
 
       try {
-        insertDelivery({
+        await insertDeliveryAsync({
           webhookId: wh.id,
           eventType: event,
           status: result.success ? "success" : "failed",
@@ -218,10 +221,10 @@ export async function dispatchEvent(event: WebhookEvent, data: Record<string, an
         // Delivery logging is best-effort
       }
 
-      recordWebhookDelivery(wh.id, result.status, result.success);
+      await recordWebhookDeliveryAsync(wh.id, result.status, result.success);
       return { webhookId: wh.id, ...result };
     });
 
   await Promise.allSettled(deliveries);
-  disableWebhooksWithHighFailures(10);
+  await disableWebhooksWithHighFailuresAsync(10);
 }

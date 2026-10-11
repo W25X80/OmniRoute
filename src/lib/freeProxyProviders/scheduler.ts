@@ -25,6 +25,11 @@ import { getEnabledProviders } from "@/lib/freeProxyProviders";
 import { getFreeProxyStats } from "@/lib/db/freeProxies";
 import { runFreeProxySyncCycle, type FreeProxySyncCycleResult } from "./syncCycle";
 
+import { createPersistencePoller, type PersistencePoller } from "@/lib/config/persistencePoller";
+import { parseDatabaseBackend } from "@/lib/db/backendSelection";
+import { getSelectedPersistenceIdentity } from "@/lib/db/controlPlaneContext";
+import { runPersistenceBackgroundWork } from "@/lib/db/persistenceRuntime";
+
 const STARTUP_DELAY_MS = 5_000;
 const DEFAULT_INTERVAL_MS = 1_800_000;
 const MIN_INTERVAL_MS = 300_000;
@@ -65,13 +70,86 @@ function isBackgroundServicesDisabled(): boolean {
   return ["1", "true", "yes", "on"].includes(raw.trim().toLowerCase());
 }
 
-async function runCycle(): Promise<void> {
-  if (isRunning) {
+interface NativeFreeProxyScheduler {
+  identity: object;
+  poller: PersistencePoller;
+  pending: Set<Promise<unknown>>;
+  isRunning: boolean;
+  stopping?: Promise<void>;
+}
+const NATIVE_FREE_PROXY_SCHEDULERS = Symbol.for("omniroute.nativeFreeProxySchedulers");
+const nativeFreeGlobals = globalThis as typeof globalThis & {
+  [NATIVE_FREE_PROXY_SCHEDULERS]?: WeakMap<object, NativeFreeProxyScheduler>;
+};
+const nativeFreeSchedulers = (nativeFreeGlobals[NATIVE_FREE_PROXY_SCHEDULERS] ??= new WeakMap());
+
+async function runNativeFreeProxyWork<T>(
+  scheduler: NativeFreeProxyScheduler,
+  body: () => Promise<T>
+): Promise<T> {
+  if (scheduler.stopping) throw new Error("Free-proxy scheduler is stopping");
+  const work = runPersistenceBackgroundWork(async () => {
+    if (getSelectedPersistenceIdentity() !== scheduler.identity)
+      throw new Error("Free-proxy persistence authority changed");
+    return body();
+  });
+  scheduler.pending.add(work);
+  try {
+    return await work;
+  } finally {
+    scheduler.pending.delete(work);
+  }
+}
+
+function selectedNativeFreeProxyScheduler(): NativeFreeProxyScheduler {
+  const identity = getSelectedPersistenceIdentity();
+  if (!identity) throw new Error("Free-proxy scheduler requires selected PostgreSQL persistence");
+  let scheduler = nativeFreeSchedulers.get(identity);
+  if (!scheduler) {
+    const intervalMs = getFreeProxyAutoSyncIntervalMs();
+    const created: NativeFreeProxyScheduler = {
+      identity,
+      pending: new Set(),
+      isRunning: false,
+      poller: createPersistencePoller({
+        intervalMs,
+        initialDelayMs: () =>
+          runNativeFreeProxyWork(created, () => computeInitialDelayMs(intervalMs)),
+        check: () => runNativeFreeProxyWork(created, () => runCycle(created)),
+        onBusy: () => console.log(`${LOG_PREFIX} Skipping cycle — previous run still in progress`),
+        onFailure: (phase) => console.error(`${LOG_PREFIX} Scheduler ${phase} failed`),
+      }),
+    };
+    scheduler = created;
+    nativeFreeSchedulers.set(identity, scheduler);
+  }
+  return scheduler;
+}
+
+function stopNativeFreeProxyScheduler(scheduler: NativeFreeProxyScheduler): Promise<void> {
+  if (scheduler.stopping) return scheduler.stopping;
+  const pollerStopped = scheduler.poller.stop();
+  const stopping = (async () => {
+    await Promise.all([
+      pollerStopped,
+      ...[...scheduler.pending].map((work) => work.catch(() => {})),
+    ]);
+  })();
+  scheduler.stopping = stopping;
+  void stopping.finally(() => {
+    if (scheduler.stopping === stopping) scheduler.stopping = undefined;
+  });
+  return stopping;
+}
+
+async function runCycle(scheduler?: NativeFreeProxyScheduler): Promise<void> {
+  if (scheduler ? scheduler.isRunning : isRunning) {
     console.log(`${LOG_PREFIX} Skipping cycle — previous run still in progress`);
     return;
   }
 
-  isRunning = true;
+  if (scheduler) scheduler.isRunning = true;
+  else isRunning = true;
   const start = Date.now();
   try {
     const { results, lastSyncAt } = await _syncCycleRunner();
@@ -82,7 +160,8 @@ async function runCycle(): Promise<void> {
   } catch (error) {
     console.error(`${LOG_PREFIX} Cycle error:`, error);
   } finally {
-    isRunning = false;
+    if (scheduler) scheduler.isRunning = false;
+    else isRunning = false;
   }
 }
 
@@ -107,6 +186,14 @@ async function computeInitialDelayMs(intervalMs: number): Promise<number> {
 
 /** Guarded entrypoint — auto-called at module bottom, matching `proxyHealth/scheduler.ts`. */
 export function initFreeProxyAutoSync(): void {
+  if (parseDatabaseBackend() === "postgres") {
+    if (!isFreeProxyAutoSyncEnabled() || isBuildProcess() || isBackgroundServicesDisabled()) return;
+    if (getEnabledProviders().length === 0) return;
+    const scheduler = selectedNativeFreeProxyScheduler();
+    if (scheduler.stopping) throw new Error("Free-proxy scheduler is stopping");
+    scheduler.poller.start();
+    return;
+  }
   if (!isFreeProxyAutoSyncEnabled() || isBuildProcess() || isBackgroundServicesDisabled()) return;
   if (globalThis.__freeProxyAutoSyncInterval || globalThis.__freeProxyAutoSyncStartupTimer) return;
 
@@ -131,6 +218,10 @@ export function initFreeProxyAutoSync(): void {
 
 /** Test/shutdown seam — clears both the startup timer and the recurring interval. */
 export function stopFreeProxyAutoSync(): void {
+  if (parseDatabaseBackend() === "postgres") {
+    void stopNativeFreeProxyScheduler(selectedNativeFreeProxyScheduler());
+    return;
+  }
   if (globalThis.__freeProxyAutoSyncInterval) {
     clearInterval(globalThis.__freeProxyAutoSyncInterval);
     globalThis.__freeProxyAutoSyncInterval = undefined;
@@ -143,8 +234,18 @@ export function stopFreeProxyAutoSync(): void {
 
 /** Test seam — runs one cycle immediately, still honoring the reentrancy guard. */
 export async function forceFreeProxySyncCycle(): Promise<void> {
-  await runCycle();
+  if (parseDatabaseBackend() === "postgres") {
+    const scheduler = selectedNativeFreeProxyScheduler();
+    await runNativeFreeProxyWork(scheduler, () => runCycle(scheduler));
+  } else await runCycle();
 }
 
-// Auto-initialize on first import
-initFreeProxyAutoSync();
+/** Drain initial metadata preparation, accepted cycles and their callback effects. */
+export async function stopFreeProxyAutoSyncAsync(): Promise<void> {
+  if (parseDatabaseBackend() === "postgres")
+    await stopNativeFreeProxyScheduler(selectedNativeFreeProxyScheduler());
+  else stopFreeProxyAutoSync();
+}
+
+// Native scheduling begins only at the explicit post-readiness boot boundary.
+if (parseDatabaseBackend() === "sqlite") initFreeProxyAutoSync();

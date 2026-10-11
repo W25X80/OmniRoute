@@ -10,7 +10,10 @@
  * encode/decode, storage-state finalization, connection health status).
  */
 export { getChatGptWebCodexDoctorStatus } from "../executors/chatgpt-web-codex/doctor.ts";
-export { finalizeValidatedChatGptWebCodexSecrets } from "../executors/chatgpt-web-codex/storageState.ts";
+export {
+  finalizeValidatedChatGptWebCodexSecrets,
+  finalizeValidatedChatGptWebCodexSecretsAsync,
+} from "../executors/chatgpt-web-codex/storageState.ts";
 export {
   decodeChatGptWebCodexSecrets,
   encodeChatGptWebCodexSecrets,

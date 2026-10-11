@@ -3,7 +3,7 @@ import {
   logProxyEvent,
   settlePendingFirstChunk,
 } from "../../lib/proxyLogger";
-import { updateAttemptTiming } from "../../lib/db/proxyLogs";
+import { updateAttemptTimingAsync as updateAttemptTiming } from "../../lib/db/proxyLogs";
 import {
   isFirstChunkTimingEnabled,
   sanitizeTimingMs,

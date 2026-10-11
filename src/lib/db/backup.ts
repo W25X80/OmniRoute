@@ -1,3 +1,5 @@
+import { getSelectedPostgresDatabase } from "./controlPlaneContext";
+import { requireSqliteMaintenance } from "./persistenceCapabilities";
 /**
  * db/backup.js — Database backup/restore operations.
  */
@@ -85,6 +87,7 @@ export function cleanupDbBackups(options?: {
   retentionDays?: number;
   backupDir?: string;
 }) {
+  requireSqliteMaintenance("sqlite-file-backup");
   const backupDir = options?.backupDir ?? getBackupDir();
   const maxFiles = options?.maxFiles ?? getDbBackupMaxFiles();
   const retentionDays = options?.retentionDays ?? getDbBackupRetentionDays();
@@ -281,6 +284,7 @@ export function isAutoBackupDueByFrequency(options?: {
   const intervalMs = getAutoBackupFrequencyIntervalMs(frequency);
   if (intervalMs === null) return false;
 
+  requireSqliteMaintenance("sqlite-file-backup");
   const backupDir = options?.backupDir ?? getBackupDir();
   if (!fs.existsSync(backupDir)) return true;
 
@@ -340,6 +344,11 @@ export async function unlinkFileWithRetry(
 // ──────────────── Backup ────────────────
 
 export function backupDbFile(reason = "auto") {
+  if (getSelectedPostgresDatabase()) {
+    if (reason === "manual" || reason === "pre-restore")
+      requireSqliteMaintenance("sqlite-file-backup");
+    return null;
+  }
   try {
     if (isBuildPhase || isCloud) return null;
     if (!SQLITE_FILE || !fs.existsSync(SQLITE_FILE)) return null;
@@ -426,6 +435,7 @@ export function backupDbFile(reason = "auto") {
 // ──────────────── List Backups ────────────────
 
 export async function listDbBackups() {
+  requireSqliteMaintenance("sqlite-file-backup");
   const backupDir = getBackupDir();
   try {
     if (!fs.existsSync(backupDir)) return [];
@@ -472,6 +482,7 @@ export async function listDbBackups() {
 // ──────────────── Restore Backup ────────────────
 
 export async function restoreDbBackup(backupId: string) {
+  requireSqliteMaintenance("sqlite-file-restore");
   const backupDir = getBackupDir();
 
   // Validate format: must be db_<timestamp>_<reason>.sqlite, no path separators

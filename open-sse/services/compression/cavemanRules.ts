@@ -394,10 +394,11 @@ const INTENSITY_RANK = { lite: 0, full: 1, ultra: 2 } as const;
 export function getRulesForContext(
   context: string,
   intensity: "lite" | "full" | "ultra" = "full",
-  language = "en"
+  language = "en",
+  preparedRules?: readonly CavemanRule[]
 ): CavemanRule[] {
   const rank = INTENSITY_RANK[intensity] ?? INTENSITY_RANK.full;
-  const fileRules = language ? loadAllRulesForLanguage(language) : [];
+  const fileRules = preparedRules ?? (language ? loadAllRulesForLanguage(language) : []);
   const rules = fileRules.length > 0 ? fileRules : CAVEMAN_RULES;
   const selected = rules.filter((rule) => {
     const minRank = INTENSITY_RANK[rule.minIntensity ?? "lite"];

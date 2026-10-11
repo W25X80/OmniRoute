@@ -8,6 +8,17 @@
 
 import { FEATURE_FLAG_DEFINITIONS } from "@/shared/constants/featureFlagDefinitions";
 import { getDbInstance } from "./core";
+import { getSelectedPostgresDatabase } from "./controlPlaneContext";
+import { getPostgresKeyValue, listPostgresKeyValueNamespace } from "./postgres/keyValueRepository";
+import {
+  readPostgresCatalogNamespace,
+  hasPostgresCatalogSnapshot,
+  mutatePostgresCatalog,
+  putCatalogValue,
+  deleteCatalogValue,
+  deleteCatalogMatchingKeys,
+  afterPostgresCatalogCommit,
+} from "./postgres/catalogSnapshot";
 import { finishModelCatalogWriteWithoutBackup } from "./models/modelCatalogWriteSignals";
 
 const NAMESPACE = "feature_flags";
@@ -32,6 +43,7 @@ function overrideCacheFor(db: object): Map<string, OverrideCacheEntry> {
 }
 
 export function clearFeatureFlagOverrideCache(key?: string): void {
+  if (getSelectedPostgresDatabase()) return;
   const cache = overrideCaches.get(getDbInstance());
   if (!cache) return;
   if (key === undefined) cache.clear();
@@ -50,6 +62,8 @@ const CATALOG_RELEVANT_FEATURE_FLAGS = new Set([
  * Returns all feature flag overrides as a key→value map.
  */
 export function getFeatureFlagOverrides(): Record<string, string> {
+  const selectedRows = readPostgresCatalogNamespace(NAMESPACE);
+  if (selectedRows) return Object.fromEntries(selectedRows.map((row) => [row.key, row.value]));
   const db = getDbInstance();
   const rows = db
     .prepare("SELECT key, value FROM key_value WHERE namespace = ?")
@@ -67,6 +81,8 @@ export function getFeatureFlagOverrides(): Record<string, string> {
  * is stored.
  */
 export function getFeatureFlagOverride(key: string): string | undefined {
+  const selectedRows = readPostgresCatalogNamespace(NAMESPACE);
+  if (selectedRows) return selectedRows.find((row) => row.key === key)?.value;
   const db = getDbInstance();
   const cache = overrideCacheFor(db);
   const now = Date.now();
@@ -79,10 +95,7 @@ export function getFeatureFlagOverride(key: string): string | undefined {
   return row?.value;
 }
 
-/**
- * Persists (or replaces) an override for a single flag.
- */
-export function setFeatureFlagOverride(key: string, value: string): void {
+function validateOverride(key: string, value: string): void {
   const definition = FEATURE_FLAG_DEFINITIONS.find((d) => d.key === key);
   if (!definition) {
     throw new Error(`Unknown feature flag key: ${key}`);
@@ -96,6 +109,13 @@ export function setFeatureFlagOverride(key: string, value: string): void {
       `Invalid value "${value}" for enum flag ${key}. Allowed: ${definition.enumValues.join(", ")}`
     );
   }
+}
+
+/**
+ * Persists (or replaces) an override for a single flag.
+ */
+export function setFeatureFlagOverride(key: string, value: string): void {
+  validateOverride(key, value);
   const db = getDbInstance();
   db.prepare("INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES (?, ?, ?)").run(
     NAMESPACE,
@@ -140,4 +160,52 @@ export function clearAllFeatureFlagOverrides(): void {
   if (hadRelevantOverride) {
     finishModelCatalogWriteWithoutBackup();
   }
+}
+
+/** Async entry points also work during initialization before a request snapshot exists. */
+export async function getFeatureFlagOverrideAsync(key: string): Promise<string | undefined> {
+  const postgres = getSelectedPostgresDatabase();
+  if (!postgres || hasPostgresCatalogSnapshot(postgres)) return getFeatureFlagOverride(key);
+  return getPostgresKeyValue(postgres, NAMESPACE, key);
+}
+
+export async function getFeatureFlagOverridesAsync(): Promise<Record<string, string>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (!postgres || hasPostgresCatalogSnapshot(postgres)) return getFeatureFlagOverrides();
+  const rows = await listPostgresKeyValueNamespace(postgres, NAMESPACE);
+  return Object.fromEntries(rows.map((row) => [row.key, row.value]));
+}
+
+export async function setFeatureFlagOverrideAsync(key: string, value: string): Promise<void> {
+  const postgres = getSelectedPostgresDatabase();
+  if (!postgres) return setFeatureFlagOverride(key, value);
+  validateOverride(key, value);
+  await mutatePostgresCatalog(postgres, async () => {
+    await putCatalogValue(NAMESPACE, key, value);
+    if (CATALOG_RELEVANT_FEATURE_FLAGS.has(key)) {
+      afterPostgresCatalogCommit(finishModelCatalogWriteWithoutBackup);
+    }
+  });
+}
+
+export async function removeFeatureFlagOverrideAsync(key: string): Promise<void> {
+  const postgres = getSelectedPostgresDatabase();
+  if (!postgres) return removeFeatureFlagOverride(key);
+  await mutatePostgresCatalog(postgres, async () => {
+    await deleteCatalogValue(NAMESPACE, key);
+    if (CATALOG_RELEVANT_FEATURE_FLAGS.has(key)) {
+      afterPostgresCatalogCommit(finishModelCatalogWriteWithoutBackup);
+    }
+  });
+}
+
+export async function clearAllFeatureFlagOverridesAsync(): Promise<void> {
+  const postgres = getSelectedPostgresDatabase();
+  if (!postgres) return clearAllFeatureFlagOverrides();
+  await mutatePostgresCatalog(postgres, async () => {
+    const rows = readPostgresCatalogNamespace(NAMESPACE) ?? [];
+    const hadRelevantOverride = rows.some((row) => CATALOG_RELEVANT_FEATURE_FLAGS.has(row.key));
+    await deleteCatalogMatchingKeys(NAMESPACE, () => true);
+    if (hadRelevantOverride) afterPostgresCatalogCommit(finishModelCatalogWriteWithoutBackup);
+  });
 }

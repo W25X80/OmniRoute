@@ -1,11 +1,11 @@
+import { getAgentRuntimeAuthority } from "../db/agentRuntimeState";
 import { canonicalJsonSha256 } from "./stableJson";
 import {
-  claimServerToolExecution,
-  finalizeServerToolExecution,
-  readRow,
+  claimServerToolExecutionAsync,
+  finalizeServerToolExecutionAsync,
+  readRowAsync,
 } from "../db/skillExecutionFence";
 import type { SqliteAdapter } from "../db/adapters/types";
-import { getDbInstance } from "../db/core";
 
 export type RunWithServerToolFenceResult<T> =
   | { kind: "executed"; value: T }
@@ -22,21 +22,19 @@ export type RunWithServerToolFenceResult<T> =
 
 type ExecutionKey = string;
 
-const activePromises = new Map<
-  ExecutionKey,
-  { promise: Promise<unknown>; status: "pending" | "resolved" | "rejected" }
->();
+type ActiveExecution = { promise: Promise<unknown>; status: "pending" | "resolved" | "rejected" };
+const activeByAuthority = new WeakMap<object, Map<ExecutionKey, ActiveExecution>>();
+function activeFor(authority: object): Map<ExecutionKey, ActiveExecution> {
+  let executions = activeByAuthority.get(authority);
+  if (!executions) {
+    executions = new Map();
+    activeByAuthority.set(authority, executions);
+  }
+  return executions;
+}
 
 const POLL_INTERVAL_MS = 50;
 const MAX_POLL_MS = 2_000;
-
-function buildExecutionKey(
-  apiKeyId: string,
-  requestIdentity: string,
-  toolCallId: string
-): ExecutionKey {
-  return `${apiKeyId}:${requestIdentity}:${toolCallId}`;
-}
 
 export interface RunWithServerToolFenceOptions<T> {
   apiKeyId: string;
@@ -54,13 +52,14 @@ export interface RunWithServerToolFenceOptions<T> {
 export async function runWithServerToolFence<T>(
   input: RunWithServerToolFenceOptions<T>
 ): Promise<RunWithServerToolFenceResult<T>> {
-  const db = input.db ?? getDbInstance();
+  const db = input.db;
+  const activePromises = activeFor(db ?? getAgentRuntimeAuthority());
   const now = input.now ?? (() => Date.now());
   const sleep = input.sleep ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
   const inputDigest = canonicalJsonSha256(input.arguments);
   const leaseExpiresAt = new Date(now() + input.leaseDurationMs).toISOString();
 
-  const claim = claimServerToolExecution(
+  const claim = await claimServerToolExecutionAsync(
     {
       apiKeyId: input.apiKeyId,
       requestIdentity: input.requestIdentity,
@@ -75,39 +74,39 @@ export async function runWithServerToolFence<T>(
 
   switch (claim.kind) {
     case "claimed": {
-      const key = buildExecutionKey(input.apiKeyId, input.requestIdentity, input.toolCallId);
+      const key = claim.executionId;
       const claimStartTime = now();
       const wrapperPromise = (async () => {
+        let value: T;
         try {
-          const value = await input.execute(claim.executionId);
-          const durationMs = now() - claimStartTime;
-          finalizeServerToolExecution(
-            {
-              executionId: claim.executionId,
-              status: "success",
-              output: value,
-              errorMessage: null,
-              durationMs,
-            },
-            db
-          );
-          return { kind: "success" as const, value, errorMessage: null };
+          value = await input.execute(claim.executionId);
         } catch (err: unknown) {
           const message = err instanceof Error ? err.message : String(err);
           const safeMessage = message.replace(/\bat\s+\/[^\s"']+/g, "[stack-redacted]");
-          const durationMs = now() - claimStartTime;
-          finalizeServerToolExecution(
+          await finalizeServerToolExecutionAsync(
             {
               executionId: claim.executionId,
               status: "error",
               output: null,
               errorMessage: safeMessage,
-              durationMs,
+              durationMs: now() - claimStartTime,
             },
             db
           );
           return { kind: "error" as const, value: null, errorMessage: safeMessage };
         }
+        // A rejected/unknown finalization never enters the handler-error branch or retries a write.
+        await finalizeServerToolExecutionAsync(
+          {
+            executionId: claim.executionId,
+            status: "success",
+            output: value,
+            errorMessage: null,
+            durationMs: now() - claimStartTime,
+          },
+          db
+        );
+        return { kind: "success" as const, value, errorMessage: null };
       })();
 
       const entry: { promise: Promise<unknown>; status: "pending" | "resolved" | "rejected" } = {
@@ -154,7 +153,7 @@ export async function runWithServerToolFence<T>(
     }
 
     case "in_progress": {
-      const key = buildExecutionKey(input.apiKeyId, input.requestIdentity, input.toolCallId);
+      const key = claim.executionId;
       const deadline = now() + MAX_POLL_MS;
       while (now() < deadline) {
         // Check process-internal promise first
@@ -196,7 +195,7 @@ export async function runWithServerToolFence<T>(
           }
         }
         // Also check DB — another process may have finalized
-        const row = readRow(db, claim.executionId);
+        const row = await readRowAsync(db, claim.executionId);
         if (row && row.status !== "running") {
           if (row.status === "success" || row.status === "error" || row.status === "timeout") {
             let parsedOutput: unknown = null;

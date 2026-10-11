@@ -1,5 +1,6 @@
 import { randomUUID } from "crypto";
 import fs from "fs";
+import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
 import { hostname, release } from "os";
 import path from "path";
 import {
@@ -7,8 +8,13 @@ import {
   normalizeKimiDeviceId,
   sanitizeKimiHeaderValue,
 } from "@omniroute/open-sse/config/providers/registry/kimi/coding/runtime.ts";
-import { getKimiDeviceModel } from "@omniroute/open-sse/utils/kimiDevice.ts";
-import { resolveDataDir } from "../../dataPaths";
+import {
+  getKimiDeviceModel,
+  getKimiDeviceModelAsync,
+} from "@omniroute/open-sse/utils/kimiDevice.ts";
+import { withNativeThreadCacheFile } from "@omniroute/open-sse/utils/nativeThreadCacheFile.ts";
+import { parseDatabaseBackend } from "@/lib/db/backendSelection";
+import { resolveDataDir, resolveDataDirAsync } from "../../dataPaths";
 import { KIMI_CODING_CONFIG } from "../constants/oauth";
 
 const DEVICE_ID_FILE = "kimi-coding-device-id";
@@ -41,6 +47,64 @@ function getKimiDeviceId() {
   }
 }
 
+async function getKimiDeviceIdAsync(): Promise<string> {
+  const configured = process.env.KIMI_CODING_DEVICE_ID?.trim();
+  if (configured) return configured;
+  try {
+    const oauthDir = path.join(await resolveDataDirAsync(), "oauth");
+    const devicePath = path.join(oauthDir, DEVICE_ID_FILE);
+    return await withNativeThreadCacheFile(devicePath, async () => {
+      try {
+        const existing = (await readFile(devicePath, "utf8")).trim();
+        if (existing) return normalizeKimiDeviceId(existing);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+      await mkdir(oauthDir, { recursive: true });
+      const deviceId = generateDeviceId();
+      await writeFile(devicePath, deviceId, { encoding: "utf8", mode: 0o600 });
+      try {
+        await chmod(devicePath, 0o600);
+      } catch {
+        /* source best effort */
+      }
+      return deviceId;
+    });
+  } catch {
+    return generateDeviceId();
+  }
+}
+
+async function getKimiOAuthHeadersAsync() {
+  if (parseDatabaseBackend() === "sqlite") return getKimiOAuthHeaders();
+  return {
+    "Content-Type": "application/x-www-form-urlencoded",
+    Accept: "application/json",
+    ...buildKimiCodeIdentityHeaders({
+      deviceId: await getKimiDeviceIdAsync(),
+      deviceName: hostname(),
+      deviceModel: await getKimiDeviceModelAsync(),
+      osVersion: release(),
+    }),
+  };
+}
+
+function mapKimiTokens(tokens: Record<string, unknown>, deviceId: string, deviceModel: string) {
+  return {
+    accessToken: tokens.access_token,
+    refreshToken: tokens.refresh_token,
+    expiresIn: tokens.expires_in,
+    tokenType: tokens.token_type,
+    scope: tokens.scope,
+    providerSpecificData: {
+      deviceId,
+      deviceName: sanitizeKimiHeaderValue(hostname()),
+      deviceModel: sanitizeKimiHeaderValue(deviceModel),
+      osVersion: sanitizeKimiHeaderValue(release()),
+    },
+  };
+}
+
 // Custom headers required by Kimi OAuth
 function getKimiOAuthHeaders() {
   return {
@@ -61,7 +125,7 @@ export const kimiCoding = {
   requestDeviceCode: async (config) => {
     const response = await fetch(config.deviceCodeUrl, {
       method: "POST",
-      headers: getKimiOAuthHeaders(),
+      headers: await getKimiOAuthHeadersAsync(),
       body: new URLSearchParams({
         client_id: config.clientId,
       }),
@@ -90,7 +154,7 @@ export const kimiCoding = {
   pollToken: async (config, deviceCode) => {
     const response = await fetch(config.tokenUrl, {
       method: "POST",
-      headers: getKimiOAuthHeaders(),
+      headers: await getKimiOAuthHeadersAsync(),
       body: new URLSearchParams({
         client_id: config.clientId,
         device_code: deviceCode,
@@ -114,22 +178,10 @@ export const kimiCoding = {
       data: data,
     };
   },
-  mapTokens: (tokens) => ({
-    accessToken: tokens.access_token,
-    refreshToken: tokens.refresh_token,
-    expiresIn: tokens.expires_in,
-    tokenType: tokens.token_type,
-    scope: tokens.scope,
-    // Persist the device identity at login so refreshes use the SAME deviceId
-    // the device-code grant was issued against. Without this, tokenRefresh.ts
-    // falls back to pbkdf2(refresh_token, ...) — and Kimi rotates refresh_tokens
-    // per refresh, so the derived id changes every cycle and the anti-bot
-    // pipeline treats each refresh as a new device.
-    providerSpecificData: {
-      deviceId: getKimiDeviceId(),
-      deviceName: sanitizeKimiHeaderValue(hostname()),
-      deviceModel: sanitizeKimiHeaderValue(getKimiDeviceModel()),
-      osVersion: sanitizeKimiHeaderValue(release()),
-    },
-  }),
+  // Keep the grant's device identity on refresh even when the refresh token rotates.
+  mapTokens: (tokens) => mapKimiTokens(tokens, getKimiDeviceId(), getKimiDeviceModel()),
+  mapTokensAsync: async (tokens: Record<string, unknown>) => {
+    if (parseDatabaseBackend() === "sqlite") return kimiCoding.mapTokens(tokens);
+    return mapKimiTokens(tokens, await getKimiDeviceIdAsync(), await getKimiDeviceModelAsync());
+  },
 };

@@ -40,6 +40,7 @@ export type ResilienceActionsAccumulator = {
 export const RESILIENCE_NOTE_CAP = 200;
 
 const resilienceActionsContext = new AsyncLocalStorage<ResilienceActionsAccumulator>();
+const captureVersions = new WeakMap<ResilienceActionsAccumulator, number>();
 
 function freshAccumulator(): ResilienceActionsAccumulator {
   return {
@@ -86,6 +87,7 @@ export function noteResilienceAction(partial: ResilienceActionsPartial): void {
   try {
     const store = resilienceActionsContext.getStore();
     if (!store || partial === null || typeof partial !== "object") return;
+    captureVersions.set(store, (captureVersions.get(store) ?? 0) + 1);
     const notes = (store as { __notes?: number }).__notes ?? 0;
     if (notes >= RESILIENCE_NOTE_CAP) {
       store.droppedNotes += 1;
@@ -174,4 +176,27 @@ export function serializeResilienceActions(): string | null {
   } catch {
     return null;
   }
+}
+
+export interface CapturedResilienceActions {
+  readonly serialized: string | null;
+  /** Consume only this unchanged accumulator after the sink acknowledges its insert. */
+  consume(): void;
+}
+
+/** Native deferred sinks capture before enqueueing, without consuming failure/retry state. */
+export function captureResilienceActions(): CapturedResilienceActions {
+  const store = resilienceActionsContext.getStore();
+  const version = store ? (captureVersions.get(store) ?? 0) : 0;
+  const serialized = serializeResilienceActions();
+  return {
+    serialized,
+    consume() {
+      if (!store || (captureVersions.get(store) ?? 0) !== version) return;
+      // New notes retain the whole accumulator: duplicates are preferable to lost actions.
+      Object.assign(store, freshAccumulator());
+      (store as { __notes?: number }).__notes = 0;
+      captureVersions.set(store, version + 1);
+    },
+  };
 }

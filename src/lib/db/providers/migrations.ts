@@ -1,3 +1,5 @@
+import { getSelectedPostgresDatabase } from "../controlPlaneContext";
+import { afterProviderRuntimeWrite, writeProviderRuntime } from "../postgres/providerRuntime";
 /**
  * db/providers/migrations — Connection-level migration utilities and GHE Copilot host discovery.
  *
@@ -115,6 +117,86 @@ export function getGheCopilotHosts(): string[] {
     }
   } catch (err) {
     console.error("[DB] getGheCopilotHosts: failed to read GHE Copilot connections", err);
+  }
+  return [...hosts];
+}
+
+/** Selected-backend counterpart; preserve ciphertext and do not double-encrypt migrated fields. */
+export async function autoMigrateLegacyEncryptedConnectionsAsync(): Promise<number> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return autoMigrateLegacyEncryptedConnections();
+  const count = await writeProviderRuntime(database, async (transaction) => {
+    const { rows } = await transaction.query<Record<string, unknown>>(
+      "SELECT * FROM omniroute.provider_connections ORDER BY insertion_order FOR UPDATE"
+    );
+    let count = 0;
+    for (const row of rows) {
+      const connection = rowToCamel(row);
+      if (!connection) continue;
+      let changed = false;
+      for (const field of ["apiKey", "idToken", "accessToken", "refreshToken"]) {
+        if (typeof connection[field] !== "string") continue;
+        const migrated = migrateLegacyEncryptedString(connection[field] as string);
+        if (migrated.updated) {
+          connection[field] = migrated.value;
+          changed = true;
+        }
+      }
+      if (!changed) continue;
+      await transaction.query(
+        `UPDATE omniroute.provider_connections SET api_key=$1,id_token=$2,access_token=$3,
+         refresh_token=$4,updated_at=$5 WHERE id=$6`,
+        [
+          connection.apiKey ?? null,
+          connection.idToken ?? null,
+          connection.accessToken ?? null,
+          connection.refreshToken ?? null,
+          new Date().toISOString(),
+          connection.id,
+        ]
+      );
+      count++;
+    }
+    return count;
+  });
+  if (count > 0)
+    await afterProviderRuntimeWrite("legacy_encryption", () => {
+      invalidateDbCache("connections");
+      console.log(`[DB] Auto-migrated ${count} connection(s) to new static-salt encryption.`);
+    });
+  return count;
+}
+
+export async function getGheCopilotHostsAsync(): Promise<string[]> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return getGheCopilotHosts();
+  const hosts = new Set<string>();
+  try {
+    const { rows } = await database.transaction((transaction) =>
+      transaction.query<{ provider_specific_data: string | null }>(
+        `SELECT provider_specific_data FROM omniroute.provider_connections
+       WHERE provider='ghe-copilot' AND is_active=1 ORDER BY insertion_order`
+      )
+    );
+    for (const row of rows) {
+      if (!row.provider_specific_data) continue;
+      try {
+        const data = JSON.parse(row.provider_specific_data) as Record<string, unknown>;
+        for (const raw of [data.gheUrl, data.copilotApiUrl, data.copilotProxyUrl]) {
+          if (typeof raw !== "string" || !raw.trim()) continue;
+          try {
+            const hostname = new URL(raw).hostname;
+            if (hostname) hosts.add(hostname.toLowerCase());
+          } catch {
+            /* Ignore source-invalid URLs. */
+          }
+        }
+      } catch {
+        /* Ignore source-invalid JSON. */
+      }
+    }
+  } catch {
+    console.error("[DB] getGheCopilotHosts: failed to read GHE Copilot connections");
   }
   return [...hosts];
 }

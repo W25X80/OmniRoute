@@ -11,9 +11,9 @@ import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
 import {
-  deleteLogExportDestination,
-  getLogExportDestination,
-  updateLogExportDestination,
+  deleteLogExportDestinationAsync,
+  getLogExportDestinationAsync,
+  updateLogExportDestinationAsync,
 } from "@/lib/db/logExportDestinations";
 import { getLogExportDestinationType } from "@/lib/logExport/registry";
 import {
@@ -21,7 +21,7 @@ import {
   mergeDestinationConfig,
   requiresEncryptionKey,
 } from "@/lib/logExport/secrets";
-import { toDestinationView } from "@/lib/logExport/presenter";
+import { toDestinationViewAsync } from "@/lib/logExport/presenter";
 
 const updateDestinationSchema = z.object({
   name: z.string().min(1).max(200).optional(),
@@ -39,11 +39,11 @@ export async function GET(request: Request, { params }: { params: Promise<{ id: 
 
   try {
     const { id } = await params;
-    const destination = getLogExportDestination(id);
+    const destination = await getLogExportDestinationAsync(id);
     if (!destination) {
       return NextResponse.json({ error: "Log export destination not found" }, { status: 404 });
     }
-    return NextResponse.json({ destination: toDestinationView(destination) });
+    return NextResponse.json({ destination: await toDestinationViewAsync(destination) });
   } catch (error: any) {
     return NextResponse.json(
       { error: sanitizeErrorMessage(error) || "Failed to read log export destination" },
@@ -58,7 +58,7 @@ export async function PUT(request: Request, { params }: { params: Promise<{ id: 
 
   try {
     const { id } = await params;
-    const existing = getLogExportDestination(id);
+    const existing = await getLogExportDestinationAsync(id);
     if (!existing) {
       return NextResponse.json({ error: "Log export destination not found" }, { status: 404 });
     }
@@ -114,7 +114,7 @@ export async function PUT(request: Request, { params }: { params: Promise<{ id: 
       );
     }
 
-    const updated = updateLogExportDestination(id, {
+    const updated = await updateLogExportDestinationAsync(id, {
       name: data.name,
       enabled: data.enabled,
       config: nextConfig,
@@ -126,7 +126,7 @@ export async function PUT(request: Request, { params }: { params: Promise<{ id: 
     if (!updated) {
       return NextResponse.json({ error: "Log export destination not found" }, { status: 404 });
     }
-    return NextResponse.json({ destination: toDestinationView(updated) });
+    return NextResponse.json({ destination: await toDestinationViewAsync(updated) });
   } catch (error: any) {
     return NextResponse.json(
       { error: sanitizeErrorMessage(error) || "Failed to update log export destination" },
@@ -141,7 +141,7 @@ export async function DELETE(request: Request, { params }: { params: Promise<{ i
 
   try {
     const { id } = await params;
-    if (!deleteLogExportDestination(id)) {
+    if (!(await deleteLogExportDestinationAsync(id))) {
       return NextResponse.json({ error: "Log export destination not found" }, { status: 404 });
     }
     return NextResponse.json({ deleted: true });

@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import {
   discoverRepeatedNoise,
-  listRtkCommandSamples,
+  listRtkCommandSamplesAsync as listRtkCommandSamples,
 } from "@omniroute/open-sse/services/compression/engines/rtk";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 
@@ -22,7 +22,7 @@ export async function GET(request: Request) {
   if (authError) return authError;
 
   const limit = parseLimit(new URL(request.url).searchParams.get("limit"));
-  const samples = listRtkCommandSamples({ limit });
+  const samples = await listRtkCommandSamples({ limit });
   const candidates = discoverRepeatedNoise(samples);
 
   return NextResponse.json({ sampleCount: samples.length, candidates });

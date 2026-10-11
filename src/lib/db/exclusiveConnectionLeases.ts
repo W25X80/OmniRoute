@@ -1,3 +1,5 @@
+import { getSelectedPostgresDatabase } from "./controlPlaneContext";
+import { createPostgresLeaseRepository } from "./postgres/leaseRepository";
 import { createHash } from "node:crypto";
 
 import { getDbInstance, rowToCamel } from "./core";
@@ -469,4 +471,103 @@ export function isExclusiveConnectionActivelyLeased(connectionId: string, now?: 
   if (!connectionId) return false;
   reconcileExpiredExclusiveConnectionLeases(now);
   return active("connection_id", connectionId) !== undefined;
+}
+
+export async function reconcileExpiredExclusiveConnectionLeasesAsync(
+  ...args: Parameters<typeof reconcileExpiredExclusiveConnectionLeases>
+): Promise<ReturnType<typeof reconcileExpiredExclusiveConnectionLeases>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresLeaseRepository(database).reconcileExpiredExclusiveConnectionLeases(...args)
+    : reconcileExpiredExclusiveConnectionLeases(...args);
+}
+
+export async function getExclusiveConnectionLeaseStatusAsync(
+  ...args: Parameters<typeof getExclusiveConnectionLeaseStatus>
+): Promise<ReturnType<typeof getExclusiveConnectionLeaseStatus>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresLeaseRepository(database).getExclusiveConnectionLeaseStatus(...args)
+    : getExclusiveConnectionLeaseStatus(...args);
+}
+
+export async function acquireExclusiveConnectionLeaseAsync(
+  ...args: Parameters<typeof acquireExclusiveConnectionLease>
+): Promise<ReturnType<typeof acquireExclusiveConnectionLease>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresLeaseRepository(database).acquireExclusiveConnectionLease(...args)
+    : acquireExclusiveConnectionLease(...args);
+}
+
+export async function transitionExclusiveConnectionLeaseAsync(
+  ...args: Parameters<typeof transitionExclusiveConnectionLease>
+): Promise<ReturnType<typeof transitionExclusiveConnectionLease>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresLeaseRepository(database).transitionExclusiveConnectionLease(...args)
+    : transitionExclusiveConnectionLease(...args);
+}
+
+export async function invalidateExclusiveConnectionLeaseAsync(
+  ...args: Parameters<typeof invalidateExclusiveConnectionLease>
+): Promise<ReturnType<typeof invalidateExclusiveConnectionLease>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresLeaseRepository(database).invalidateExclusiveConnectionLease(...args)
+    : invalidateExclusiveConnectionLease(...args);
+}
+
+export async function renewExclusiveConnectionLeaseAsync(
+  ...args: Parameters<typeof renewExclusiveConnectionLease>
+): Promise<ReturnType<typeof renewExclusiveConnectionLease>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresLeaseRepository(database).renewExclusiveConnectionLease(...args)
+    : renewExclusiveConnectionLease(...args);
+}
+
+export async function releaseExclusiveConnectionLeaseAsync(
+  ...args: Parameters<typeof releaseExclusiveConnectionLease>
+): Promise<ReturnType<typeof releaseExclusiveConnectionLease>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresLeaseRepository(database).releaseExclusiveConnectionLease(...args)
+    : releaseExclusiveConnectionLease(...args);
+}
+
+export async function assertExclusiveConnectionLeaseFenceAsync(
+  ...args: Parameters<typeof assertExclusiveConnectionLeaseFence>
+): Promise<ReturnType<typeof assertExclusiveConnectionLeaseFence>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresLeaseRepository(database).assertExclusiveConnectionLeaseFence(...args)
+    : assertExclusiveConnectionLeaseFence(...args);
+}
+
+export async function getActiveExclusiveConnectionLeaseAsync(
+  ...args: Parameters<typeof getActiveExclusiveConnectionLease>
+): Promise<ReturnType<typeof getActiveExclusiveConnectionLease>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresLeaseRepository(database).getActiveExclusiveConnectionLease(...args)
+    : getActiveExclusiveConnectionLease(...args);
+}
+
+export async function getExclusiveLeaseOccupancyAsync(
+  ...args: Parameters<typeof getExclusiveLeaseOccupancy>
+): Promise<ReturnType<typeof getExclusiveLeaseOccupancy>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresLeaseRepository(database).getExclusiveLeaseOccupancy(...args)
+    : getExclusiveLeaseOccupancy(...args);
+}
+
+export async function isExclusiveConnectionActivelyLeasedAsync(
+  ...args: Parameters<typeof isExclusiveConnectionActivelyLeased>
+): Promise<ReturnType<typeof isExclusiveConnectionActivelyLeased>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresLeaseRepository(database).isExclusiveConnectionActivelyLeased(...args)
+    : isExclusiveConnectionActivelyLeased(...args);
 }

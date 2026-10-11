@@ -1,3 +1,21 @@
+import { getSelectedPostgresDatabase } from "./controlPlaneContext";
+import { createPostgresCompressionRepository } from "./postgres/compressionRepository";
+import {
+  DEFAULT_COMPRESSION_COMBO_ID,
+  DEFAULT_COMPRESSION_COMBO_NAME,
+  DEFAULT_COMPRESSION_COMBO_DESCRIPTION,
+  LEGACY_RTK_CAVEMAN_DESCRIPTION,
+  LEGACY_DEFAULT_COMPRESSION_COMBO_DESCRIPTION,
+  defaultCompressionComboPipeline,
+  isPreviousLossySeedPipeline,
+  KNOWN_ENGINE_IDS,
+  normalizePipeline,
+  isLegacySeededDefaultPipeline,
+  rowToCompressionCombo,
+  rowToAssignment,
+  buildComboPayload,
+  ENGINE_STACK_PRIORITY,
+} from "./compressionCombos/persistenceSemantics";
 import { v4 as uuidv4 } from "uuid";
 import type {
   CompressionEngineId,
@@ -5,7 +23,7 @@ import type {
 } from "@omniroute/open-sse/services/compression/types.ts";
 
 import { backupDbFile } from "./backup";
-import { getDbInstance, rowToCamel } from "./core";
+import { getDbInstance } from "./core";
 
 export interface CompressionCombo {
   id: string;
@@ -27,72 +45,7 @@ export interface CompressionComboAssignment {
   createdAt: string;
 }
 
-type JsonRecord = Record<string, unknown>;
-
-const DEFAULT_COMPRESSION_COMBO_ID = "default-caveman";
-const DEFAULT_COMPRESSION_COMBO_NAME = "Standard Savings";
-const DEFAULT_COMPRESSION_COMBO_DESCRIPTION = "Default lossless dedup and whitespace compression";
-const LEGACY_RTK_CAVEMAN_DESCRIPTION = "Default RTK + Caveman compression pipeline";
-const LEGACY_DEFAULT_COMPRESSION_COMBO_DESCRIPTION = "Default Caveman compression pipeline";
-
-function defaultCompressionComboPipeline(): CompressionPipelineStep[] {
-  return [{ engine: "session-dedup" }, { engine: "lite" }];
-}
-
-function isPreviousLossySeedPipeline(pipeline: CompressionPipelineStep[]): boolean {
-  return (
-    pipeline.length === 2 &&
-    pipeline[0]?.engine === "rtk" &&
-    pipeline[0]?.intensity === "standard" &&
-    pipeline[1]?.engine === "caveman" &&
-    pipeline[1]?.intensity === "full"
-  );
-}
-
-function parseJsonArray<T>(value: unknown, fallback: T[]): T[] {
-  if (Array.isArray(value)) return value as T[];
-  if (typeof value !== "string") return fallback;
-  try {
-    const parsed = JSON.parse(value);
-    return Array.isArray(parsed) ? (parsed as T[]) : fallback;
-  } catch {
-    return fallback;
-  }
-}
-
 // Keep in sync with stackedPipelineStepSchema + ENGINE_CATALOG (#6747).
-const KNOWN_ENGINE_IDS = [
-  "lite",
-  "caveman",
-  "aggressive",
-  "ultra",
-  "rtk",
-  "headroom",
-  "session-dedup",
-  "ccr",
-  "llmlingua",
-  "relevance",
-  "codex-responses",
-];
-
-function normalizePipeline(value: unknown): CompressionPipelineStep[] {
-  return parseJsonArray<CompressionPipelineStep>(value, []).filter((step) => {
-    return step && typeof step === "object" && KNOWN_ENGINE_IDS.includes(String(step.engine));
-  });
-}
-
-function normalizeLanguagePacks(value: unknown): string[] {
-  const packs = parseJsonArray<string>(value, ["en"]).filter(
-    (pack): pack is string => typeof pack === "string" && pack.trim().length > 0
-  );
-  return [...new Set(packs.length > 0 ? packs.map((pack) => pack.trim()) : ["en"])];
-}
-
-function isLegacySeededDefaultPipeline(pipeline: CompressionPipelineStep[]): boolean {
-  if (pipeline.length !== 1) return false;
-  const [step] = pipeline;
-  return step.engine === "caveman" && (step.intensity === undefined || step.intensity === "full");
-}
 
 function upgradeLegacySeededDefaultCompressionCombo(): void {
   const db = getDbInstance();
@@ -178,60 +131,6 @@ function ensureCompressionComboTables(): void {
     1
   );
   upgradeLegacySeededDefaultCompressionCombo();
-}
-
-function rowToCompressionCombo(row: unknown): CompressionCombo | null {
-  if (!row) return null;
-  const camel = rowToCamel(row as Record<string, unknown>) as JsonRecord;
-  return {
-    id: String(camel.id),
-    name: String(camel.name ?? ""),
-    description: String(camel.description ?? ""),
-    pipeline: normalizePipeline(camel.pipeline),
-    languagePacks: normalizeLanguagePacks(camel.languagePacks),
-    outputMode: Boolean(camel.outputMode),
-    outputModeIntensity: String(camel.outputModeIntensity ?? "full"),
-    isDefault: Boolean(camel.isDefault),
-    createdAt: String(camel.createdAt ?? ""),
-    updatedAt: String(camel.updatedAt ?? ""),
-  };
-}
-
-function rowToAssignment(row: unknown): CompressionComboAssignment | null {
-  if (!row) return null;
-  const camel = rowToCamel(row as Record<string, unknown>) as JsonRecord;
-  return {
-    id: String(camel.id),
-    compressionComboId: String(camel.compressionComboId),
-    routingComboId: String(camel.routingComboId),
-    createdAt: String(camel.createdAt ?? ""),
-  };
-}
-
-function buildComboPayload(data: Partial<CompressionCombo>, existing?: CompressionCombo) {
-  const now = new Date().toISOString();
-  return {
-    id: existing?.id ?? data.id ?? uuidv4(),
-    name: data.name?.trim() || existing?.name || "Compression Combo",
-    description: data.description ?? existing?.description ?? "",
-    pipeline:
-      data.pipeline && data.pipeline.length > 0
-        ? data.pipeline
-        : existing?.pipeline && existing.pipeline.length > 0
-          ? existing.pipeline
-          : defaultCompressionComboPipeline(),
-    languagePacks:
-      data.languagePacks && data.languagePacks.length > 0
-        ? data.languagePacks
-        : existing?.languagePacks && existing.languagePacks.length > 0
-          ? existing.languagePacks
-          : ["en"],
-    outputMode: data.outputMode ?? existing?.outputMode ?? false,
-    outputModeIntensity: data.outputModeIntensity ?? existing?.outputModeIntensity ?? "full",
-    isDefault: data.isDefault ?? existing?.isDefault ?? false,
-    createdAt: existing?.createdAt ?? now,
-    updatedAt: now,
-  };
 }
 
 export function listCompressionCombos(): CompressionCombo[] {
@@ -400,18 +299,6 @@ export function assignRoutingCombo(compressionComboId: string, routingComboId: s
 // Static stackPriority map — mirrors the values defined in each engine file.
 // Using a static map avoids cross-workspace imports (open-sse → src/lib/db) that
 // would introduce a circular dependency detected by check:cycles.
-const ENGINE_STACK_PRIORITY: Record<string, number> = {
-  "session-dedup": 3,
-  ccr: 4,
-  lite: 5,
-  rtk: 10,
-  headroom: 15,
-  caveman: 20,
-  aggressive: 30,
-  llmlingua: 35,
-  ultra: 40,
-  "codex-responses": 12,
-};
 
 export function setEngineInDefaultCombo(
   engineId: string,
@@ -487,4 +374,84 @@ export function updateAssignments(compressionComboId: string, routingComboIds: s
   })();
   backupDbFile("pre-write");
   return true;
+}
+
+export function getSelectedCompressionRepository() {
+  const database = getSelectedPostgresDatabase();
+  return database ? createPostgresCompressionRepository(database) : undefined;
+}
+
+export async function listCompressionCombosAsync() {
+  const selected = getSelectedCompressionRepository();
+  return selected ? selected.list() : listCompressionCombos();
+}
+
+export async function getCompressionComboAsync(id: string) {
+  const selected = getSelectedCompressionRepository();
+  return selected ? selected.findById(id) : getCompressionCombo(id);
+}
+
+export async function getDefaultCompressionComboAsync() {
+  const selected = getSelectedCompressionRepository();
+  return selected ? selected.findDefault() : getDefaultCompressionCombo();
+}
+
+export async function createCompressionComboAsync(data: Partial<CompressionCombo>) {
+  const selected = getSelectedCompressionRepository();
+  return selected ? selected.create(data) : createCompressionCombo(data);
+}
+
+export async function updateCompressionComboAsync(id: string, data: Partial<CompressionCombo>) {
+  const selected = getSelectedCompressionRepository();
+  return selected ? selected.update(id, data) : updateCompressionCombo(id, data);
+}
+
+export async function deleteCompressionComboAsync(id: string) {
+  const selected = getSelectedCompressionRepository();
+  return selected ? selected.delete(id) : deleteCompressionCombo(id);
+}
+
+export async function setDefaultCompressionComboAsync(id: string) {
+  const selected = getSelectedCompressionRepository();
+  return selected ? selected.setDefault(id) : setDefaultCompressionCombo(id);
+}
+
+export async function getAssignmentsForCompressionComboAsync(id: string) {
+  const selected = getSelectedCompressionRepository();
+  return selected ? selected.assignments(id) : getAssignmentsForCompressionCombo(id);
+}
+
+export async function getCompressionComboForRoutingComboAsync(routingComboId: string) {
+  const selected = getSelectedCompressionRepository();
+  return selected
+    ? selected.forRoutingCombo(routingComboId)
+    : getCompressionComboForRoutingCombo(routingComboId);
+}
+
+export async function assignRoutingComboAsync(compressionComboId: string, routingComboId: string) {
+  const selected = getSelectedCompressionRepository();
+  return selected
+    ? selected.assign(compressionComboId, routingComboId)
+    : assignRoutingCombo(compressionComboId, routingComboId);
+}
+
+export async function setEngineInDefaultComboAsync(
+  engineId: string,
+  enabled: boolean,
+  config?: Record<string, unknown>
+) {
+  const selected = getSelectedCompressionRepository();
+  return selected
+    ? selected.setEngine(engineId, enabled, config)
+    : setEngineInDefaultCombo(engineId, enabled, config);
+}
+
+export async function updateAssignmentsAsync(
+  compressionComboId: string,
+  routingComboIds: string[]
+) {
+  const selected = getSelectedCompressionRepository();
+  return selected
+    ? selected.updateAssignments(compressionComboId, routingComboIds)
+    : updateAssignments(compressionComboId, routingComboIds);
 }

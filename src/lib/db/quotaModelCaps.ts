@@ -13,6 +13,8 @@
  */
 
 import { getDbInstance } from "./core";
+import { getSelectedPostgresDatabase } from "./controlPlaneContext";
+import { PostgresQuotaRepository } from "./postgres/quotaRepository";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -93,4 +95,26 @@ export function setModelCap(cap: ModelCap): void {
          cap_unit  = excluded.cap_unit`
     )
     .run(cap.poolId, cap.apiKeyId, cap.model, cap.capValue, cap.capUnit);
+}
+
+function selectedQuotaRepository(): PostgresQuotaRepository | undefined {
+  const database = getSelectedPostgresDatabase();
+  return database ? new PostgresQuotaRepository(database) : undefined;
+}
+
+export async function getModelCapAsync(
+  poolId: string,
+  apiKeyId: string,
+  model: string
+): Promise<ModelCap | null> {
+  const repository = selectedQuotaRepository();
+  return repository
+    ? repository.getModelCap(poolId, apiKeyId, model)
+    : getModelCap(poolId, apiKeyId, model);
+}
+
+export async function setModelCapAsync(cap: ModelCap): Promise<void> {
+  const repository = selectedQuotaRepository();
+  if (repository) await repository.setModelCap(cap);
+  else setModelCap(cap);
 }

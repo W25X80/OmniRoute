@@ -175,6 +175,21 @@ export const EXTRA_MODULE_ENTRIES = [
     src: ["node_modules", "pino-pretty"],
     dest: ["node_modules", "pino-pretty"],
   },
+  {
+    label: "CodeGraph child external: better-sqlite3",
+    src: ["node_modules", "better-sqlite3"],
+    dest: ["node_modules", "better-sqlite3"],
+  },
+  {
+    label: "CodeGraph child external: bindings",
+    src: ["node_modules", "bindings"],
+    dest: ["node_modules", "bindings"],
+  },
+  {
+    label: "CodeGraph child external: file-uri-to-path",
+    src: ["node_modules", "file-uri-to-path"],
+    dest: ["node_modules", "file-uri-to-path"],
+  },
   { label: "split2", src: ["node_modules", "split2"], dest: ["node_modules", "split2"] },
   {
     // The esbuild-bundled compression worker (colocate-standalone.mjs,
@@ -335,6 +350,11 @@ export const EXTRA_MODULE_ENTRIES = [
     label: "WS/peer-stamp standalone server wrapper",
     src: ["scripts", "dev", "standalone-server-ws.mjs"],
     dest: ["server-ws.mjs"],
+  },
+  {
+    label: "persistence request boundary (server-ws.mjs dependency)",
+    src: ["scripts", "dev", "persistence-request-boundary.mjs"],
+    dest: ["persistence-request-boundary.mjs"],
   },
   {
     label: "peer-stamp helper (server-ws.mjs dependency)",

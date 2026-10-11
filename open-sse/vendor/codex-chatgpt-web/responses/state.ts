@@ -119,7 +119,10 @@ function readSnapshot(path: string): Map<string, Omit<StoredResponseState, "size
   const entries = new Map<string, Omit<StoredResponseState, "sizeBytes">>();
   try {
     if (!existsSync(path)) return entries;
-    const raw = JSON.parse(readFileSync(path, "utf-8")) as { version?: unknown; states?: unknown };
+    const raw = JSON.parse(readFileSync(path, "utf-8")) as {
+      version?: unknown;
+      states?: unknown;
+    };
     if (raw.version !== 1 || !Array.isArray(raw.states)) return entries;
     for (const entry of raw.states) {
       if (!Array.isArray(entry) || entry.length !== 2) continue;
@@ -432,7 +435,12 @@ export function previousResponseReplayPrefixLength(body: unknown): number {
  */
 export function rememberResponseState(
   requestBody: unknown,
-  response: { id?: unknown; output?: unknown; status?: unknown; incomplete_details?: unknown },
+  response: {
+    id?: unknown;
+    output?: unknown;
+    status?: unknown;
+    incomplete_details?: unknown;
+  },
   opts?: ResponseStateOptions
 ): void {
   if (!requestBody || typeof requestBody !== "object" || Array.isArray(requestBody)) return;
@@ -480,4 +488,67 @@ export function resetResponseStateForTests(): void {
   pendingPersistPath = null;
   loaded = true;
   dirtyStateIds.clear();
+}
+
+/** Native gateway cache access; the source cache algorithm runs on its dedicated worker. */
+export async function expandPreviousResponseInputAsync(
+  body: unknown,
+  namespace?: string
+): Promise<unknown> {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return body;
+  const request = body as Record<string, unknown>;
+  if (typeof request.previous_response_id !== "string") return body;
+  try {
+    const { runResponseStateOperation } = await import("./stateWorkerClient");
+    const result = await runResponseStateOperation({
+      kind: "lookup",
+      responseId: request.previous_response_id,
+      namespace,
+    });
+    if (result.kind !== "lookup" || result.items === null) return body;
+    const expanded = {
+      ...request,
+      input: [...result.items, ...inputItems(request.input)],
+    };
+    replayedInputPrefixLengths.set(expanded, result.prefixLength);
+    return expanded;
+  } catch {
+    console.warn("[chatgpt-web] continuation cache lookup is unavailable");
+    return body;
+  }
+}
+
+export async function rememberResponseStateAsync(
+  requestBody: unknown,
+  response: {
+    id?: unknown;
+    output?: unknown;
+    status?: unknown;
+    incomplete_details?: unknown;
+  },
+  opts?: ResponseStateOptions
+): Promise<void> {
+  if (!requestBody || typeof requestBody !== "object" || Array.isArray(requestBody)) return;
+  const request = requestBody as Record<string, unknown>;
+  try {
+    const { runResponseStateOperation } = await import("./stateWorkerClient");
+    await runResponseStateOperation({
+      kind: "remember",
+      request: { input: request.input, store: request.store },
+      response: {
+        id: response.id,
+        output: response.output,
+        status: response.status,
+        incomplete_details: response.incomplete_details,
+      },
+      options: opts,
+    });
+  } catch {
+    console.warn("[chatgpt-web] continuation cache persistence is unavailable");
+  }
+}
+
+export async function flushResponseStateAsync(): Promise<void> {
+  const { runResponseStateOperation } = await import("./stateWorkerClient");
+  await runResponseStateOperation({ kind: "flush" });
 }

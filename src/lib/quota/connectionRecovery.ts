@@ -23,6 +23,9 @@
 
 import { cooldownUntilMs } from "@omniroute/open-sse/services/accountFallback.ts";
 import { isAutomatedTestProcess } from "@/shared/utils/testProcess";
+import { parseDatabaseBackend } from "@/lib/db/backendSelection";
+import { runPersistenceBackgroundWork } from "@/lib/db/persistenceRuntime";
+import { createPersistencePoller, type PersistencePoller } from "@/lib/config/persistencePoller";
 
 /**
  * The transient-cooldown status written by `markAccountUnavailable()` for a
@@ -333,7 +336,12 @@ const TRUE_ENV_VALUES = new Set(["1", "true", "yes", "on"]);
 
 declare global {
   var __omnirouteConnRecovery:
-    { initialized: boolean; interval: ReturnType<typeof setInterval> | null } | undefined;
+    | {
+        initialized: boolean;
+        interval: ReturnType<typeof setInterval> | null;
+        postgresPoller?: PersistencePoller;
+      }
+    | undefined;
 }
 
 function getRecoveryState() {
@@ -381,10 +389,38 @@ export function resolveConnectionRecoveryIntervalMs(
  * build/test processes or when disabled via env. Each tick runs
  * runConnectionRecoveryTick() against the real DB.
  */
+function initPostgresConnectionRecoveryScheduler(): void {
+  const state = getRecoveryState();
+  const tickMs = resolveConnectionRecoveryIntervalMs();
+  state.postgresPoller = createPersistencePoller({
+    intervalMs: tickMs,
+    initialDelayMs: 15_000,
+    check: () =>
+      runPersistenceBackgroundWork(async () => {
+        await runConnectionRecoveryTick({
+          logger: {
+            info: (message) => console.log(message),
+            warn: () =>
+              console.warn(`${RECOVERY_LOG_PREFIX} PostgreSQL recovery failed (non-fatal)`),
+          },
+        });
+      }),
+    onFailure: () => console.warn(`${RECOVERY_LOG_PREFIX} PostgreSQL tick failed (non-fatal)`),
+  });
+  state.postgresPoller.start();
+  console.log(
+    `${RECOVERY_LOG_PREFIX} Starting proactive cooldown recovery (tick every ${Math.round(tickMs / 1000)}s)`
+  );
+}
+
 export function initConnectionRecoveryScheduler(): void {
   const state = getRecoveryState();
   if (state.initialized || isRecoverySchedulerDisabled()) return;
   state.initialized = true;
+  if (parseDatabaseBackend() === "postgres") {
+    initPostgresConnectionRecoveryScheduler();
+    return;
+  }
 
   const tickMs = resolveConnectionRecoveryIntervalMs();
   const tickLogger = {
@@ -413,8 +449,17 @@ export function initConnectionRecoveryScheduler(): void {
 }
 
 /** Stop the scheduler (tests / hot-reload). */
-export function stopConnectionRecoveryScheduler(): void {
+export function stopConnectionRecoveryScheduler(): void | Promise<void> {
   const state = getRecoveryState();
+  if (state.postgresPoller) {
+    const poller = state.postgresPoller;
+    return poller.stop().finally(() => {
+      if (state.postgresPoller === poller) {
+        state.postgresPoller = undefined;
+        state.initialized = false;
+      }
+    });
+  }
   if (state.interval) {
     clearInterval(state.interval);
     state.interval = null;

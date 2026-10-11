@@ -309,6 +309,25 @@ runBuildTool(
   { cwd: ROOT, stdio: "inherit" }
 );
 
+const codeGraphWorkerSource = join(ROOT, "src/lib/copilot/codegraphQueryWorker.ts");
+if (!existsSync(codeGraphWorkerSource))
+  throw new Error("Required CodeGraph child source is missing");
+const codeGraphWorkerDestination = join(DIST_DIR, "src/lib/copilot/codegraphQueryWorker.cjs");
+mkdirSync(dirname(codeGraphWorkerDestination), { recursive: true });
+runBuildTool(
+  "esbuild",
+  "esbuild",
+  [
+    "src/lib/copilot/codegraphQueryWorker.ts",
+    "--bundle",
+    "--platform=node",
+    "--packages=external",
+    "--format=cjs",
+    `--outfile=${codeGraphWorkerDestination}`,
+  ],
+  { cwd: ROOT, stdio: "inherit" }
+);
+
 const callLogWorkerSrc = join(ROOT, "src", "lib", "usage", "callLogArtifactWorker.ts");
 const callLogWorkerDest = join(DIST_DIR, "src", "lib", "usage", "callLogArtifactWorker.js");
 if (!existsSync(callLogWorkerSrc)) {
@@ -329,6 +348,29 @@ runBuildTool(
   ],
   { cwd: ROOT, stdio: "inherit" }
 );
+
+for (const relative of [
+  "open-sse/vendor/codex-chatgpt-web/responses/stateWorker",
+  "open-sse/executors/chatgpt-web-codex/tunnelZipWorker",
+]) {
+  const destination = join(DIST_DIR, `${relative}.js`);
+  mkdirSync(dirname(destination), { recursive: true });
+  runBuildTool(
+    "esbuild",
+    "esbuild",
+    [
+      `${relative}.ts`,
+      "--bundle",
+      "--platform=node",
+      "--packages=external",
+      "--format=esm",
+      `--outfile=${destination}`,
+    ],
+    { cwd: ROOT, stdio: "inherit" }
+  );
+  const scope = join(dirname(destination), "package.json");
+  if (!existsSync(scope)) writeFileSync(scope, JSON.stringify({ type: "module" }) + "\n");
+}
 
 // ── Step 8.6a: Bundle LLMLingua ONNX worker ───────────────────────────
 // The worker is spawned via worker_threads at a path the Next.js bundler cannot

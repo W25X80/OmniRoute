@@ -1,3 +1,4 @@
+import { getSelectedControlPlane } from "@/lib/db/controlPlaneContext";
 /**
  * Request-level finalization for non-streaming chat.
  * Success and failure each write usage/cost/quota/attempt/pending once.
@@ -31,7 +32,7 @@ export interface NonStreamingFinalizationDeps {
   writeUsage: (plan: NonStreamingFinalizationPlan) => void | Promise<void>;
   writeCost: (totalCostUsd: number) => void;
   scheduleQuota: (plan: NonStreamingFinalizationPlan) => void | Promise<void>;
-  writeAttempt: (plan: NonStreamingFinalizationPlan) => void;
+  writeAttempt: (plan: NonStreamingFinalizationPlan) => void | Promise<void>;
   finalizePending: (plan: NonStreamingFinalizationPlan) => void;
 }
 
@@ -77,7 +78,8 @@ export async function finalizeNonStreamingRequest(
   if (plan.kind === "success") {
     await deps.scheduleQuota(plan);
   }
-  deps.writeAttempt(plan);
+  const attemptPersistence = deps.writeAttempt(plan);
+  if (getSelectedControlPlane()) await attemptPersistence;
   deps.finalizePending(plan);
 }
 
@@ -91,8 +93,8 @@ export async function finalizeToolLoopError(input: {
     status: number,
     errorCode: string,
     usage?: FailureUsageAggregate | null
-  ) => void;
-  persistAttemptLogs: (params: PersistAttemptLogsArgs) => void;
+  ) => void | Promise<void>;
+  persistAttemptLogs: (params: PersistAttemptLogsArgs) => void | Promise<void>;
   trackPendingRequest: (
     model: string,
     provider: string,
@@ -107,7 +109,7 @@ export async function finalizeToolLoopError(input: {
   const err = plan.kind === "failure" ? plan.error : missingError();
   await finalizeNonStreamingRequest(plan, {
     writeUsage: () => {
-      input.persistFailureUsage(
+      return input.persistFailureUsage(
         err.status,
         err.errorCode || `upstream_${err.status}`,
         toFailureUsageAggregate(plan.usage)
@@ -116,7 +118,7 @@ export async function finalizeToolLoopError(input: {
     writeCost: () => {},
     scheduleQuota: () => {},
     writeAttempt: () => {
-      input.persistAttemptLogs({
+      return input.persistAttemptLogs({
         status: err.status,
         error: err.error || "Provider request failed",
         providerRequest: input.providerRequest,

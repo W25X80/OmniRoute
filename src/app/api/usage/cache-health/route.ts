@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 
-import { buildCacheHealthResponse } from "@/lib/usage/cacheHealth";
+import { buildCacheHealthResponseAsync as buildCacheHealthResponse } from "@/lib/usage/cacheHealth";
 
 const querySchema = z.object({
   range: z.enum(["1h", "24h", "7d", "30d"]).default("24h"),
@@ -23,7 +23,7 @@ export async function GET(request: Request) {
       );
     }
 
-    return NextResponse.json(buildCacheHealthResponse(parsed.data));
+    return NextResponse.json(await buildCacheHealthResponse(parsed.data));
   } catch (error) {
     // Never echo the error: the message can carry the DATA_DIR path and the
     // SQL text. Details go to the server log, the caller gets a fixed string.

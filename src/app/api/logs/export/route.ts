@@ -1,6 +1,12 @@
-import { countCallLogsSince, iterateCallLogsSince } from "@/lib/usage/callLogs";
+import {
+  countCallLogsSinceAsync as countCallLogsSince,
+  iterateCallLogsSince,
+} from "@/lib/usage/callLogs";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
-import { countProxyLogsSince, iterateProxyLogsSince } from "@/lib/db/proxyLogs";
+import {
+  countProxyLogsSinceAsync as countProxyLogsSince,
+  iterateProxyLogsSinceAsync as iterateProxyLogsSince,
+} from "@/lib/db/proxyLogs";
 import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
 import { logger } from "@/shared/utils/logger";
 import {
@@ -133,7 +139,7 @@ export async function GET(request: Request) {
 
     if (logType === "call-logs" || logType === "request-logs") {
       tableName = "call_logs";
-      totalAvailable = countCallLogsSince(since);
+      totalAvailable = await countCallLogsSince(since);
       rows = iterateCallLogsSince(since, limit);
     } else if (logType === "proxy-logs") {
       tableName = "proxy_logs";
@@ -142,8 +148,8 @@ export async function GET(request: Request) {
       // exposes the value as `clientIp`. Callers of this export endpoint should read
       // `public_ip`. This inconsistency will be resolved in a future DB migration
       // (#2880).
-      totalAvailable = countProxyLogsSince(since);
-      rows = iterateProxyLogsSince(since, limit);
+      totalAvailable = await countProxyLogsSince(since);
+      rows = await iterateProxyLogsSince(since, limit);
     }
 
     const capped = totalAvailable > limit;

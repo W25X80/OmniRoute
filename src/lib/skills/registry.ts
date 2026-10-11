@@ -1,6 +1,13 @@
 import type { Skill, SkillSchema } from "./types";
 import { SkillCreateInputSchema } from "./schemas";
-import { getDbInstance } from "../db/core";
+import {
+  getSkillStorageAuthority,
+  insertSkillRowAsync,
+  deleteSkillRowAsync,
+  deleteSkillsByNameAsync,
+  listSkillRowsAsync,
+  updateSkillEnabledByOwnerAsync,
+} from "../db/skillStorage";
 import { randomUUID } from "crypto";
 import { logger } from "../../../open-sse/utils/logger.ts";
 
@@ -11,7 +18,7 @@ const GLOBAL_SKILL_OWNER_IDS = [GLOBAL_SKILL_OWNER_ID, "skillsmp", "skillssh"] a
 const GLOBAL_SKILL_OWNER_ID_SET = new Set<string>(GLOBAL_SKILL_OWNER_IDS);
 
 class SkillRegistry {
-  private static instance: SkillRegistry;
+  private static instances = new WeakMap<object, SkillRegistry>();
   private registeredSkills: Map<string, Skill> = new Map();
   private versionCache: Map<string, Map<string, Skill>> = new Map();
   private lastLoaded: number = 0;
@@ -23,10 +30,13 @@ class SkillRegistry {
   private constructor() {}
 
   static getInstance(): SkillRegistry {
-    if (!SkillRegistry.instance) {
-      SkillRegistry.instance = new SkillRegistry();
+    const authority = getSkillStorageAuthority();
+    let instance = SkillRegistry.instances.get(authority);
+    if (!instance) {
+      instance = new SkillRegistry();
+      SkillRegistry.instances.set(authority, instance);
     }
-    return SkillRegistry.instance;
+    return instance;
   }
 
   private isCacheStale(): boolean {
@@ -111,29 +121,25 @@ class SkillRegistry {
       ...parseableData
     } = skillData;
     const parsed = SkillCreateInputSchema.parse(parseableData);
-    const db = getDbInstance();
     const id = randomUUID();
     const now = new Date();
-
-    db.prepare(
-      `INSERT INTO skills (id, api_key_id, name, version, description, schema, handler, enabled, mode, source_provider, tags, install_count, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    ).run(
+    await insertSkillRowAsync({
       id,
-      skillData.apiKeyId,
-      parsed.name,
-      parsed.version,
-      parsed.description || null,
-      JSON.stringify(parsed.schema),
-      parsed.handler,
-      parsed.enabled ? 1 : 0,
-      skillData.mode || (parsed.enabled ? "on" : "off"),
-      skillData.sourceProvider || null,
-      JSON.stringify(skillData.tags || []),
-      typeof skillData.installCount === "number" ? Math.max(0, skillData.installCount) : 0,
-      now.toISOString(),
-      now.toISOString()
-    );
+      api_key_id: skillData.apiKeyId,
+      name: parsed.name,
+      version: parsed.version,
+      description: parsed.description || null,
+      schema: JSON.stringify(parsed.schema),
+      handler: parsed.handler,
+      enabled: parsed.enabled ? 1 : 0,
+      mode: skillData.mode || (parsed.enabled ? "on" : "off"),
+      source_provider: skillData.sourceProvider || null,
+      tags: JSON.stringify(skillData.tags || []),
+      install_count:
+        typeof skillData.installCount === "number" ? Math.max(0, skillData.installCount) : 0,
+      created_at: now.toISOString(),
+      updated_at: now.toISOString(),
+    });
 
     const skill: Skill = {
       id,
@@ -160,8 +166,6 @@ class SkillRegistry {
   }
 
   async unregister(name: string, version?: string, apiKeyId?: string): Promise<boolean> {
-    const db = getDbInstance();
-
     if (version) {
       const skill = Array.from(this.registeredSkills.values()).find(
         (candidate) =>
@@ -170,18 +174,15 @@ class SkillRegistry {
           (!apiKeyId || candidate.apiKeyId === apiKeyId)
       );
       if (skill && (!apiKeyId || skill.apiKeyId === apiKeyId)) {
-        db.prepare("DELETE FROM skills WHERE id = ?").run(skill.id);
+        await deleteSkillRowAsync(skill.id);
         this.registeredSkills.delete(this.cacheKey(skill));
         this.rebuildVersionCache(name);
         this.invalidateCache();
         return true;
       }
     } else {
-      const deleted = db
-        .prepare("DELETE FROM skills WHERE name = ? AND (? IS NULL OR api_key_id = ?)")
-        .run(name, apiKeyId || null, apiKeyId || null);
-
-      if (deleted.changes > 0) {
+      const deleted = await deleteSkillsByNameAsync(name, apiKeyId);
+      if (deleted > 0) {
         this.removeCachedSkills(
           (skill) => skill.name === name && (!apiKeyId || skill.apiKeyId === apiKeyId)
         );
@@ -194,9 +195,8 @@ class SkillRegistry {
   }
 
   async unregisterById(id: string): Promise<boolean> {
-    const db = getDbInstance();
-    const deleted = db.prepare("DELETE FROM skills WHERE id = ?").run(id);
-    if (deleted.changes > 0) {
+    const deleted = await deleteSkillRowAsync(id);
+    if (deleted > 0) {
       const affectedNames = new Set<string>();
       const keysToDelete = Array.from(this.registeredSkills.entries())
         .filter(([, skill]) => skill.id === id)
@@ -322,7 +322,7 @@ class SkillRegistry {
   async loadFromDatabase(apiKeyId?: string): Promise<void> {
     if (this.pendingLoad) {
       await this.pendingLoad;
-      return;
+      // A concurrent load may cover another principal. Re-check this requested scope below.
     }
     const cacheHasScope = apiKeyId
       ? this.loadedAll || this.loadedApiKeyIds.has(apiKeyId)
@@ -332,19 +332,13 @@ class SkillRegistry {
     this.pendingLoad = (async () => {
       try {
         log.debug("skills.registry.loadFromDatabase", { cached: false });
-        const db = getDbInstance();
-        let rows: unknown[];
-        if (!apiKeyId) {
-          rows = db.prepare("SELECT * FROM skills").all();
-        } else if (this.isGlobalOwner(apiKeyId)) {
-          rows = db
-            .prepare("SELECT * FROM skills WHERE api_key_id IN (?, ?, ?)")
-            .all(...GLOBAL_SKILL_OWNER_IDS);
-        } else {
-          rows = db
-            .prepare("SELECT * FROM skills WHERE api_key_id IN (?, ?, ?, ?)")
-            .all(apiKeyId, ...GLOBAL_SKILL_OWNER_IDS);
-        }
+        const rows = await listSkillRowsAsync(
+          !apiKeyId
+            ? undefined
+            : this.isGlobalOwner(apiKeyId)
+              ? GLOBAL_SKILL_OWNER_IDS
+              : [apiKeyId, ...GLOBAL_SKILL_OWNER_IDS]
+        );
 
         if (apiKeyId) {
           this.removeCachedSkills(
@@ -411,15 +405,10 @@ class SkillRegistry {
   }
 
   async setEnabledById(id: string, apiKeyId: string, enabled: boolean): Promise<Skill | undefined> {
-    const db = getDbInstance();
     const now = new Date();
-    const updated = db
-      .prepare(
-        "UPDATE skills SET enabled = ?, mode = ?, updated_at = ? WHERE id = ? AND api_key_id = ?"
-      )
-      .run(enabled ? 1 : 0, enabled ? "on" : "off", now.toISOString(), id, apiKeyId);
+    const updated = await updateSkillEnabledByOwnerAsync(id, apiKeyId, enabled, now.toISOString());
 
-    if (updated.changes === 0) return undefined;
+    if (updated === 0) return undefined;
 
     const skill = this.getSkill(id, apiKeyId);
     if (skill) {
@@ -435,4 +424,10 @@ class SkillRegistry {
   }
 }
 
-export const skillRegistry = SkillRegistry.getInstance();
+export const skillRegistry = new Proxy({} as SkillRegistry, {
+  get(_target, property) {
+    const registry = SkillRegistry.getInstance();
+    const value = Reflect.get(registry, property);
+    return typeof value === "function" ? value.bind(registry) : value;
+  },
+});

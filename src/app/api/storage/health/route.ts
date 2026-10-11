@@ -1,3 +1,5 @@
+import { isDatabaseFileMaintenanceAvailable } from "@/lib/db/persistenceCapabilities";
+import { getDatabaseSettingsAsync } from "@/lib/db/databaseSettings";
 import { NextResponse } from "next/server";
 import path from "path";
 import fs from "fs";
@@ -17,6 +19,24 @@ import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
  */
 export async function GET() {
   try {
+    if (!isDatabaseFileMaintenanceAvailable()) {
+      const settings = await getDatabaseSettingsAsync();
+      return NextResponse.json({
+        driver: "postgresql",
+        dbPath: settings.location.databasePath,
+        sizeBytes: settings.stats.databaseSizeBytes,
+        lastBackupAt: null,
+        backupCount: null,
+        backupRetention: null,
+        capabilities: settings.capabilities,
+        retentionDays: { app: getAppLogRetentionDays(), call: getCallLogRetentionDays() },
+        tableMaxRows: {
+          callLogs: getCallLogsTableMaxRows(),
+          proxyLogs: getProxyLogsTableMaxRows(),
+        },
+        dataDir: null,
+      });
+    }
     const dataDir = resolveDataDir({});
     const dbFilePath = path.join(dataDir, "storage.sqlite");
     const backupsDir = path.join(dataDir, "db_backups");

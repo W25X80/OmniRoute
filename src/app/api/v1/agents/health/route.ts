@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getAgent, getAvailableAgents } from "@/lib/cloudAgent/registry";
-import { getCloudAgentCredentialFromDb } from "@/lib/cloudAgent/credentials";
+import { getCloudAgentCredentialFromDbAsync } from "@/lib/cloudAgent/credentials";
 import { getCloudAgentCorsHeaders, requireCloudAgentManagementAuth } from "@/lib/cloudAgent/api";
 import pino from "pino";
 import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
@@ -30,7 +30,7 @@ async function checkProviderHealth(providerId: string): Promise<ProviderHealth> 
     return { id: providerId, name, connected: false, latencyMs: 0, error: "Unknown provider" };
   }
 
-  const credentials = getCloudAgentCredentialFromDb(providerId);
+  const credentials = await getCloudAgentCredentialFromDbAsync(providerId);
   if (!credentials) {
     return {
       id: providerId,

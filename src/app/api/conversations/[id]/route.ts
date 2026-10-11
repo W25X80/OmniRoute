@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
-import { getMultiTurnConversationById } from "@/lib/db/agenticConversations";
-import { annotateConversationRow, buildActiveCallLogIdByConversation } from "../route";
+import { getMultiTurnConversationByIdAsync } from "@/lib/db/agenticConversations";
+import { annotateConversationRowAsync, buildActiveCallLogIdByConversation } from "../route";
 
 export const dynamic = "force-dynamic";
 
@@ -22,11 +22,11 @@ export async function GET(req: Request, { params }: { params: Promise<{ id: stri
     const { id } = await params;
     if (!id) return NextResponse.json({ error: "Missing id" }, { status: 400 });
 
-    const row = getMultiTurnConversationById(id);
+    const row = await getMultiTurnConversationByIdAsync(id);
     if (!row) return NextResponse.json({ error: "Not found" }, { status: 404 });
 
     const activeCallLogIdByConversation = buildActiveCallLogIdByConversation();
-    const conversation = annotateConversationRow(row, activeCallLogIdByConversation);
+    const conversation = await annotateConversationRowAsync(row, activeCallLogIdByConversation);
 
     return NextResponse.json({ conversation });
   } catch (err) {

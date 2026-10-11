@@ -1,3 +1,5 @@
+import { getSelectedPostgresDatabase } from "./controlPlaneContext";
+import { createPostgresSessionRepository } from "./postgres/sessionRepository";
 import { getDbInstance } from "./core";
 
 export interface ConnectionRuntimeState {
@@ -42,6 +44,9 @@ export async function upsertWarmupState(
   connectionId: string,
   state: { lastWarmupAt: string; lastResult: string; tokensUsed: number }
 ): Promise<void> {
+  const database = getSelectedPostgresDatabase();
+  if (database)
+    return createPostgresSessionRepository(database).upsertWarmupState(connectionId, state);
   const db = getDbInstance();
   db.prepare(
     `INSERT INTO connection_runtime_state (connection_id, last_warmup_at, last_warmup_result, warmup_tokens_used, updated_at)
@@ -58,6 +63,9 @@ export async function upsertWarmupCircuit(
   connectionId: string,
   circuit: { streak: number; until: string; lastFailAt: string }
 ): Promise<void> {
+  const database = getSelectedPostgresDatabase();
+  if (database)
+    return createPostgresSessionRepository(database).upsertWarmupCircuit(connectionId, circuit);
   const db = getDbInstance();
   db.prepare(
     `INSERT INTO connection_runtime_state (connection_id, warmup_circuit_streak, warmup_circuit_until, warmup_last_fail_at, updated_at)
@@ -71,6 +79,8 @@ export async function upsertWarmupCircuit(
 }
 
 export async function clearWarmupCircuit(connectionId: string): Promise<void> {
+  const database = getSelectedPostgresDatabase();
+  if (database) return createPostgresSessionRepository(database).clearWarmupCircuit(connectionId);
   const db = getDbInstance();
   db.prepare(
     `UPDATE connection_runtime_state
@@ -80,6 +90,8 @@ export async function clearWarmupCircuit(connectionId: string): Promise<void> {
 }
 
 export async function markForbidden(connectionId: string, at: string): Promise<void> {
+  const database = getSelectedPostgresDatabase();
+  if (database) return createPostgresSessionRepository(database).markForbidden(connectionId, at);
   const db = getDbInstance();
   db.prepare(
     `INSERT INTO connection_runtime_state (connection_id, last_warmup_result, last_warmup_at, updated_at)
@@ -89,4 +101,13 @@ export async function markForbidden(connectionId: string, at: string): Promise<v
        last_warmup_at = excluded.last_warmup_at,
        updated_at = datetime('now')`
   ).run(connectionId, at);
+}
+
+export async function getConnectionRuntimeStateAsync(
+  ...args: Parameters<typeof getConnectionRuntimeState>
+): Promise<ReturnType<typeof getConnectionRuntimeState>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresSessionRepository(database).getConnectionRuntimeState(...args)
+    : getConnectionRuntimeState(...args);
 }

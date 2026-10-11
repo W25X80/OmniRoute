@@ -103,9 +103,11 @@ export function registerSemanticCacheConfigResolver(resolver: DynamicConfigResol
  * with optional dynamic database settings and explicit overrides.
  */
 export function resolveSemanticCacheConfig(
-  overrides?: Partial<SemanticCacheConfig>
+  overrides?: Partial<SemanticCacheConfig>,
+  dynamicOverride?: Partial<SemanticCacheConfig> | null
 ): SemanticCacheConfig {
-  const dynamic = dynamicResolver ? dynamicResolver() : null;
+  const dynamic =
+    dynamicOverride === undefined ? (dynamicResolver ? dynamicResolver() : null) : dynamicOverride;
   const env = process.env;
 
   const backendEnv = (env.OMNIROUTE_SEMANTIC_CACHE_BACKEND || "").toLowerCase().trim();
@@ -207,4 +209,22 @@ export function resolveSemanticCacheConfig(
   if (resolved.similarityThreshold > 1) resolved.similarityThreshold = 1;
 
   return resolved;
+}
+
+type AsyncDynamicConfigResolver = () => Promise<Partial<SemanticCacheConfig> | null | undefined>;
+let asyncDynamicResolver: AsyncDynamicConfigResolver | null = null;
+
+export function registerSemanticCacheAsyncConfigResolver(
+  resolver: AsyncDynamicConfigResolver
+): void {
+  asyncDynamicResolver = resolver;
+}
+
+export async function resolveSemanticCacheConfigAsync(
+  overrides?: Partial<SemanticCacheConfig>
+): Promise<SemanticCacheConfig> {
+  return resolveSemanticCacheConfig(
+    overrides,
+    asyncDynamicResolver ? ((await asyncDynamicResolver()) ?? null) : undefined
+  );
 }

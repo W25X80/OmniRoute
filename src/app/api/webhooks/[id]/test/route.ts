@@ -5,13 +5,13 @@
 
 import { NextResponse } from "next/server";
 import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
-import { getWebhook, recordWebhookDelivery } from "@/lib/db/webhooks";
+import { getWebhookAsync, recordWebhookDeliveryAsync } from "@/lib/db/webhooks";
 import { decryptMetadata } from "@/lib/webhookDispatcher";
 import { buildSlackPayload } from "@/lib/webhooks/integrations/slack";
 import { buildTelegramUrl, buildTelegramPayload } from "@/lib/webhooks/integrations/telegram";
 import { buildDiscordPayload } from "@/lib/webhooks/integrations/discord";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
-import { insertDelivery } from "@/lib/db/webhookDeliveries";
+import { insertDeliveryAsync } from "@/lib/db/webhookDeliveries";
 import { fetchWebhookUrl } from "@/shared/network/webhookFetch";
 import crypto from "crypto";
 
@@ -87,7 +87,7 @@ export async function POST(_: Request, { params }: { params: Promise<{ id: strin
 
   try {
     const { id } = await params;
-    const webhook = getWebhook(id);
+    const webhook = await getWebhookAsync(id);
     if (!webhook) {
       return NextResponse.json({ error: "Webhook not found" }, { status: 404 });
     }
@@ -104,10 +104,13 @@ export async function POST(_: Request, { params }: { params: Promise<{ id: strin
     let extraHeaders: Record<string, string> = {};
 
     if (kind === "slack") {
-      payloadSent = buildSlackPayload("test.ping", testData) as Record<string, unknown>;
+      payloadSent = buildSlackPayload("test.ping", testData) as unknown as Record<string, unknown>;
       fetchUrl = webhook.url;
     } else if (kind === "discord") {
-      payloadSent = buildDiscordPayload("test.ping", testData) as Record<string, unknown>;
+      payloadSent = buildDiscordPayload("test.ping", testData) as unknown as Record<
+        string,
+        unknown
+      >;
       fetchUrl = webhook.url;
     } else if (kind === "telegram") {
       const meta = decryptMetadata(webhook.metadata_encrypted ?? null);
@@ -116,12 +119,12 @@ export async function POST(_: Request, { params }: { params: Promise<{ id: strin
         return NextResponse.json({ error: "Missing Telegram botToken" }, { status: 422 });
       }
       fetchUrl = buildTelegramUrl(botToken);
-      payloadSent = buildTelegramPayload("test.ping", testData, webhook.url) as Record<
+      payloadSent = buildTelegramPayload("test.ping", testData, webhook.url) as unknown as Record<
         string,
         unknown
       >;
     } else {
-      payloadSent = testPayload as Record<string, unknown>;
+      payloadSent = testPayload as unknown as Record<string, unknown>;
       fetchUrl = webhook.url;
       if (webhook.secret) {
         const bodyStr = JSON.stringify(testPayload);
@@ -135,7 +138,7 @@ export async function POST(_: Request, { params }: { params: Promise<{ id: strin
     const result = await testFetch(fetchUrl, payloadSent, extraHeaders);
 
     try {
-      insertDelivery({
+      await insertDeliveryAsync({
         webhookId: webhook.id,
         eventType: "test.ping",
         status: result.success ? "success" : "failed",
@@ -147,7 +150,7 @@ export async function POST(_: Request, { params }: { params: Promise<{ id: strin
     } catch {
       // delivery logging is best-effort
     }
-    recordWebhookDelivery(webhook.id, result.status, result.success);
+    await recordWebhookDeliveryAsync(webhook.id, result.status, result.success);
 
     return NextResponse.json({
       delivered: result.success,

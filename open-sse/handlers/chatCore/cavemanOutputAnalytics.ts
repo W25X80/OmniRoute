@@ -22,8 +22,8 @@ export function writeCavemanOutputAnalytics(args: {
 }): Promise<void> {
   return (async () => {
     try {
-      const { insertCompressionAnalyticsRow } = await import("@/lib/db/compressionAnalytics");
-      insertCompressionAnalyticsRow({
+      const { insertCompressionAnalyticsRowAsync } = await import("@/lib/db/compressionAnalytics");
+      await insertCompressionAnalyticsRowAsync({
         timestamp: new Date().toISOString(),
         combo_id: args.comboName ?? null,
         provider: args.provider ?? null,

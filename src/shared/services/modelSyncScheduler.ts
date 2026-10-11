@@ -10,6 +10,10 @@
 
 import { randomUUID } from "node:crypto";
 import { Agent, buildConnector, fetch as undiciFetch, type Dispatcher } from "undici";
+import { parseDatabaseBackend } from "@/lib/db/backendSelection";
+import { getSelectedPersistenceIdentity } from "@/lib/db/controlPlaneContext";
+import { runPersistenceBackgroundWork } from "@/lib/db/persistenceRuntime";
+import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error.ts";
 import { getSettings, updateSettings } from "@/lib/db/settings";
 import { isConnectionUnavailableToAuxiliaryActivity } from "@/lib/exclusiveLeaseIsolation";
 import { getRuntimePorts } from "@/lib/runtime/ports";
@@ -65,7 +69,9 @@ export function resolveModelSyncInternalBaseUrl(_candidate?: string): string {
 }
 
 export function createPinnedModelSyncTlsConnector(
-  connect: buildConnector.connector = buildConnector({ servername: "localhost" })
+  connect: buildConnector.connector = buildConnector({
+    servername: "localhost",
+  })
 ): buildConnector.connector {
   return (options, callback) =>
     connect(
@@ -188,7 +194,11 @@ async function getAutoSyncConnections(): Promise<
   try {
     const { getProviderConnections } = await import("@/lib/db/providers");
     const connections = await getProviderConnections();
-    const autoSyncConnections: Array<{ id: string; provider: string; name?: string }> = [];
+    const autoSyncConnections: Array<{
+      id: string;
+      provider: string;
+      name?: string;
+    }> = [];
     for (const conn of connections) {
       if (!conn.isActive && conn.isActive !== undefined) continue;
       if (
@@ -316,12 +326,114 @@ async function runSyncCycle(apiBaseUrl: string): Promise<void> {
 
     // Record last sync time
     try {
-      await updateSettings({ [MODEL_SYNC_SETTING_KEY]: new Date().toISOString() });
+      await updateSettings({
+        [MODEL_SYNC_SETTING_KEY]: new Date().toISOString(),
+      });
     } catch {
       // Non-critical
     }
   } finally {
     isRunning = false;
+  }
+}
+
+interface NativeModelSyncScheduler {
+  readonly identity: object;
+  stopped: boolean;
+  startup?: ReturnType<typeof setTimeout>;
+  phase?: ReturnType<typeof setTimeout>;
+  recurring?: ReturnType<typeof setInterval>;
+  pending: Set<Promise<void>>;
+  cycle?: Promise<void>;
+  stopping?: Promise<void>;
+}
+
+const NATIVE_MODEL_SCHEDULER = Symbol.for("omniroute.postgresModelSyncScheduler");
+const nativeModelGlobals = globalThis as typeof globalThis & {
+  [NATIVE_MODEL_SCHEDULER]?: NativeModelSyncScheduler;
+};
+
+function startNativeModelSyncScheduler(apiBaseUrl: string, intervalMs: number): void {
+  const identity = getSelectedPersistenceIdentity();
+  if (!identity) throw new Error("Model sync requires selected PostgreSQL persistence");
+  const existing = nativeModelGlobals[NATIVE_MODEL_SCHEDULER];
+  if (existing) {
+    if (existing.identity !== identity || existing.stopped)
+      throw new Error("Model sync persistence authority changed or is draining");
+    return;
+  }
+  const state: NativeModelSyncScheduler = {
+    identity,
+    stopped: false,
+    pending: new Set(),
+  };
+  nativeModelGlobals[NATIVE_MODEL_SCHEDULER] = state;
+  const envHours = parseInt(process.env.MODEL_SYNC_INTERVAL_HOURS ?? "", 10);
+  const effectiveIntervalMs = !isNaN(envHours) && envHours > 0 ? envHours * 3_600_000 : intervalMs;
+  const trustedApiBaseUrl = resolveModelSyncInternalBaseUrl(apiBaseUrl);
+  const accept = (body: () => Promise<void>): Promise<void> | undefined => {
+    if (state.stopped) return;
+    const work = runPersistenceBackgroundWork(async () => {
+      if (getSelectedPersistenceIdentity() !== state.identity)
+        throw new Error("Model sync persistence identity changed");
+      await body();
+    });
+    state.pending.add(work);
+    void work
+      .catch((error) => {
+        console.warn("[ModelSync] Native background cycle failed:", sanitizeErrorMessage(error));
+      })
+      .finally(() => state.pending.delete(work));
+    return work;
+  };
+  const cycle = () => {
+    if (state.stopped || state.cycle) return;
+    const work = accept(() => runSyncCycle(trustedApiBaseUrl));
+    state.cycle = work;
+    void work
+      ?.finally(() => {
+        if (state.cycle === work) state.cycle = undefined;
+      })
+      .catch(() => {});
+  };
+  state.startup = setTimeout(() => {
+    state.startup = undefined;
+    cycle();
+  }, MODEL_SYNC_STARTUP_DELAY_MS);
+  state.startup.unref?.();
+  state.phase = setTimeout(() => {
+    state.phase = undefined;
+    if (state.stopped) return;
+    state.recurring = setInterval(cycle, effectiveIntervalMs);
+    state.recurring.unref?.();
+  }, MODEL_SYNC_STAGGER_OFFSET_MS);
+  state.phase.unref?.();
+  accept(async () => {
+    const { scheduleCodexCatalogRevalidation } = await import("./codexCatalogRevalidation");
+    await scheduleCodexCatalogRevalidation({ apiBaseUrl: trustedApiBaseUrl });
+  });
+}
+
+function stopNativeModelSyncScheduler(): NativeModelSyncScheduler | undefined {
+  const state = nativeModelGlobals[NATIVE_MODEL_SCHEDULER];
+  if (!state) return;
+  state.stopped = true;
+  if (state.startup) clearTimeout(state.startup);
+  if (state.phase) clearTimeout(state.phase);
+  if (state.recurring) clearInterval(state.recurring);
+  state.startup = state.phase = state.recurring = undefined;
+  return state;
+}
+
+export async function stopModelSyncSchedulerAsync(): Promise<void> {
+  if (parseDatabaseBackend() !== "postgres") return stopModelSyncScheduler();
+  const state = stopNativeModelSyncScheduler();
+  if (state) {
+    state.stopping ??= Promise.allSettled([...state.pending]).then(() => {
+      if (nativeModelGlobals[NATIVE_MODEL_SCHEDULER] === state)
+        nativeModelGlobals[NATIVE_MODEL_SCHEDULER] = undefined;
+    });
+    await state.stopping;
   }
 }
 
@@ -334,6 +446,10 @@ export function startModelSyncScheduler(
   apiBaseUrl = getModelSyncInternalBaseUrl(),
   intervalMs = DEFAULT_INTERVAL_MS
 ): void {
+  if (parseDatabaseBackend() === "postgres") {
+    startNativeModelSyncScheduler(apiBaseUrl, intervalMs);
+    return;
+  }
   if (schedulerTimer || phaseTimer) {
     console.log("[ModelSync] Scheduler already running — skipping start");
     return;
@@ -381,6 +497,10 @@ export function startModelSyncScheduler(
  * Stop the model sync scheduler.
  */
 export function stopModelSyncScheduler(): void {
+  if (parseDatabaseBackend() === "postgres") {
+    void stopModelSyncSchedulerAsync().catch(() => {});
+    return;
+  }
   if (phaseTimer) {
     clearTimeout(phaseTimer);
     phaseTimer = null;

@@ -9,6 +9,7 @@
 
 import fs from "fs";
 import path from "path";
+import { parseDatabaseBackend } from "@/lib/db/backendSelection";
 import { invalidateModelCatalogCache } from "@/lib/db/readCache";
 
 const OPENROUTER_API_URL = "https://openrouter.ai/api/v1/models";
@@ -85,6 +86,63 @@ function writeCache(data: CatalogEntry[]): void {
   }
 }
 
+interface NativeFileIO {
+  tail: Promise<void>;
+}
+const NATIVE_FILE_IO = Symbol.for("omniroute.openrouterCatalog.nativeFileIO");
+const fileIOGlobals = globalThis as typeof globalThis & {
+  [NATIVE_FILE_IO]?: NativeFileIO;
+};
+
+/** Serialize file sections across duplicate server bundles; no cached data values. */
+function runNativeFileIO<T>(body: () => Promise<T>): Promise<T> {
+  const state = (fileIOGlobals[NATIVE_FILE_IO] ??= { tail: Promise.resolve() });
+  const operation = state.tail.then(body);
+  state.tail = operation.then(
+    (): void => undefined,
+    (): void => undefined
+  );
+  return operation;
+}
+
+function getNativeCacheFilePath(): string {
+  const dataDir = process.env.DATA_DIR || path.join(process.cwd(), "data");
+  return path.join(dataDir, "cache", "openrouter-catalog.json");
+}
+
+async function ensureNativeCacheDirectory(filePath: string): Promise<void> {
+  const cacheDir = path.dirname(filePath);
+  try {
+    await fs.promises.access(cacheDir);
+  } catch {
+    await fs.promises.mkdir(cacheDir, { recursive: true });
+  }
+}
+
+function readCacheAsync(filePath: string): Promise<CacheFile | null> {
+  return runNativeFileIO(async () => {
+    // Directory creation preserves the source failure boundary outside read recovery.
+    await ensureNativeCacheDirectory(filePath);
+    try {
+      return JSON.parse(await fs.promises.readFile(filePath, "utf8")) as CacheFile;
+    } catch {
+      return null;
+    }
+  });
+}
+
+function writeCacheAsync(filePath: string, data: CatalogEntry[]): Promise<void> {
+  return runNativeFileIO(async () => {
+    await ensureNativeCacheDirectory(filePath);
+    const cache: CacheFile = { fetchedAt: new Date().toISOString(), data };
+    try {
+      await fs.promises.writeFile(filePath, JSON.stringify(cache, null, 2), "utf8");
+    } catch (err) {
+      console.warn("[OpenRouterCatalog] Failed to write cache:", err);
+    }
+  });
+}
+
 /** Fetch fresh catalog from OpenRouter API. */
 async function fetchFromAPI(): Promise<CatalogEntry[]> {
   const res = await fetch(OPENROUTER_API_URL, {
@@ -118,8 +176,10 @@ export async function getOpenRouterCatalog(): Promise<{
   cachedAt: string | null;
   fromCache: boolean;
 }> {
+  const native = parseDatabaseBackend() === "postgres";
+  const filePath = native ? getNativeCacheFilePath() : "";
   const ttl = getTTL();
-  const cache = readCache();
+  const cache = native ? await readCacheAsync(filePath) : readCache();
   const now = Date.now();
 
   // Return cached data if still within TTL
@@ -138,7 +198,8 @@ export async function getOpenRouterCatalog(): Promise<{
   // Cache expired or missing — attempt fresh fetch
   try {
     const data = await fetchFromAPI();
-    writeCache(data);
+    if (native) await writeCacheAsync(filePath, data);
+    else writeCache(data);
     return { data, stale: false, cachedAt: null, fromCache: false };
   } catch (err) {
     console.warn("[OpenRouterCatalog] Fetch failed, using stale cache:", err);
@@ -168,8 +229,11 @@ export async function refreshOpenRouterCatalog(): Promise<{
   error?: string;
 }> {
   try {
+    const native = parseDatabaseBackend() === "postgres";
+    const filePath = native ? getNativeCacheFilePath() : "";
     const data = await fetchFromAPI();
-    writeCache(data);
+    if (native) await writeCacheAsync(filePath, data);
+    else writeCache(data);
     invalidateModelCatalogCache();
     return { data, ok: true };
   } catch (err) {

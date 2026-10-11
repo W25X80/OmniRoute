@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { buildErrorBody } from "@omniroute/open-sse/utils/error";
-import { getCcDiscoveryMetrics } from "@/lib/db/ccDiscoveryMetrics";
+import { getCcDiscoveryMetricsAsync as getCcDiscoveryMetrics } from "@/lib/db/ccDiscoveryMetrics";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 
 /**
@@ -14,7 +14,7 @@ export async function GET(request: Request) {
   if (authError) return authError;
 
   try {
-    const metrics = getCcDiscoveryMetrics();
+    const metrics = await getCcDiscoveryMetrics();
     return NextResponse.json(metrics);
   } catch (error) {
     return NextResponse.json(

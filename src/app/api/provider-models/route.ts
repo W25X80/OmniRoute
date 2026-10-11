@@ -1,7 +1,7 @@
-import {
-  listProviderOutputOverrides,
-  persistOutputTokenOverride,
-} from "@/lib/providerModels/outputTokenOverrides";
+import { persistOutputTokenOverrideAsync } from "@/lib/providerModels/outputTokenOverrides";
+import { setModelContextOverrideAsync } from "@/lib/db/modelContextOverrides";
+import { removeModelContextOverrideAsync } from "@/lib/db/modelContextOverrides";
+import { listProviderOutputOverrides } from "@/lib/providerModels/outputTokenOverrides";
 import {
   getCustomModels,
   getAllCustomModels,
@@ -12,14 +12,12 @@ import {
   removeSyncedAvailableModel,
   updateCustomModel,
   getModelCompatOverrides,
-  mergeModelCompatOverride,
+  mergeModelCompatOverrideAsync as mergeModelCompatOverride,
   getHiddenModelsByProvider,
   type ModelCompatPatch,
 } from "@/lib/db/models";
 import {
   getModelContextOverrideRecord,
-  setModelContextOverride,
-  removeModelContextOverride,
   listModelContextOverrides,
 } from "@/lib/db/modelContextOverrides";
 import {
@@ -279,10 +277,10 @@ export async function PUT(request) {
     let contextWindowOverrideResult: number | null | undefined;
     if ("contextWindowOverride" in raw) {
       if (contextWindowOverride == null) {
-        removeModelContextOverride(provider, modelId);
+        await removeModelContextOverrideAsync(provider, modelId);
         contextWindowOverrideResult = null;
       } else {
-        setModelContextOverride(provider, modelId, contextWindowOverride, "manual");
+        await setModelContextOverrideAsync(provider, modelId, contextWindowOverride, "manual");
         contextWindowOverrideResult = contextWindowOverride;
       }
     }
@@ -370,11 +368,11 @@ export async function PUT(request) {
               : undefined;
         }
         if (Object.keys(patch).length > 0) {
-          mergeModelCompatOverride(provider, modelId, patch);
+          await mergeModelCompatOverride(provider, modelId, patch);
         }
         return Response.json({
           ok: true,
-          ...persistOutputTokenOverride(provider, modelId, maxOutputTokenOverride),
+          ...(await persistOutputTokenOverrideAsync(provider, modelId, maxOutputTokenOverride)),
           modelCompatOverrides: getModelCompatOverrides(provider),
           ...(contextWindowOverrideResult !== undefined
             ? { contextWindowOverride: contextWindowOverrideResult }
@@ -389,7 +387,7 @@ export async function PUT(request) {
 
     return Response.json({
       model,
-      ...persistOutputTokenOverride(provider, modelId, maxOutputTokenOverride),
+      ...(await persistOutputTokenOverrideAsync(provider, modelId, maxOutputTokenOverride)),
       ...(contextWindowOverrideResult !== undefined
         ? { contextWindowOverride: contextWindowOverrideResult }
         : {}),
@@ -470,7 +468,7 @@ export async function PATCH(request) {
     for (const modelId of modelIds) {
       const updatedModel = await updateCustomModel(provider, modelId, { isHidden: body.isHidden });
       if (!updatedModel) {
-        mergeModelCompatOverride(provider, modelId, { isHidden: body.isHidden, modality });
+        await mergeModelCompatOverride(provider, modelId, { isHidden: body.isHidden, modality });
       }
     }
 
@@ -559,7 +557,7 @@ export async function DELETE(request) {
       removedCustom || resetOverride ? false : await removeSyncedAvailableModel(provider, modelId);
     const removed = removedCustom || removedSynced;
     if (resetOverride && removedCustom) {
-      removeModelContextOverride(provider, modelId);
+      await removeModelContextOverrideAsync(provider, modelId);
       const aliasChanges = await syncManagedAvailableModelAliases(provider, [modelId], {
         pruneMissing: false,
       });

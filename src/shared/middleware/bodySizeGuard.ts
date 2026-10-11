@@ -100,25 +100,30 @@ export function checkBodySize(request: Request, limit: number = MAX_BODY_BYTES):
   if (contentLength) {
     const bytes = Number.parseInt(contentLength, 10);
     if (!Number.isNaN(bytes) && bytes > limit) {
-      return new Response(
-        JSON.stringify({
-          error: {
-            message: `Request body too large. Maximum allowed: ${formatBytes(limit)}`,
-            type: "payload_too_large",
-            code: "PAYLOAD_TOO_LARGE",
-          },
-        }),
-        {
-          status: 413,
-          headers: {
-            "Content-Type": "application/json",
-          },
-        }
-      );
+      return createBodyTooLargeResponse(limit);
     }
   }
 
   return null;
+}
+
+/** Shared header/stream rejection; callers retain their existing CORS stamping. */
+export function createBodyTooLargeResponse(limit: number): Response {
+  return new Response(
+    JSON.stringify({
+      error: {
+        message: `Request body too large. Maximum allowed: ${formatBytes(limit)}`,
+        type: "payload_too_large",
+        code: "PAYLOAD_TOO_LARGE",
+      },
+    }),
+    {
+      status: 413,
+      headers: {
+        "Content-Type": "application/json",
+      },
+    }
+  );
 }
 
 export class RequestBodyTooLargeError extends Error {
@@ -167,6 +172,93 @@ export async function readRequestBodyWithLimit(
     offset += chunk.byteLength;
   }
   return output;
+}
+
+/** Count bytes before multipart parsing without retaining a second full request buffer. */
+export async function readFormDataWithLimit(request: Request, limit: number): Promise<FormData> {
+  const declared = Number.parseInt(request.headers.get("content-length") || "", 10);
+  if (!Number.isNaN(declared) && declared > limit) {
+    await request.body?.cancel("request body too large").catch(() => {});
+    throw new RequestBodyTooLargeError(limit);
+  }
+  if (!request.body) return request.formData();
+  const reader = request.body.getReader();
+  let total = 0;
+  let stopped = false;
+  let consumerCanceled = false;
+  let released = false;
+  let cancellation: Promise<void> | undefined;
+  let controller: ReadableStreamDefaultController<Uint8Array>;
+  const release = () => {
+    if (released) return;
+    released = true;
+    request.signal.removeEventListener("abort", abort);
+    reader.releaseLock();
+  };
+  const cancelInput = (reason: unknown): Promise<void> => {
+    stopped = true;
+    if (released) return Promise.resolve();
+    return (cancellation ??= reader
+      .cancel(reason)
+      .catch(() => {})
+      .then(release));
+  };
+  const abort = () => {
+    if (stopped) return;
+    const reason = request.signal.reason ?? new DOMException("Request aborted", "AbortError");
+    controller.error(reason);
+    void cancelInput(reason);
+  };
+  const stream = new ReadableStream<Uint8Array>(
+    {
+      start(value) {
+        controller = value;
+        if (request.signal.aborted) abort();
+        else request.signal.addEventListener("abort", abort, { once: true });
+      },
+      async pull(value) {
+        if (stopped) return;
+        try {
+          const chunk = await reader.read();
+          if (stopped) return;
+          if (chunk.done) {
+            stopped = true;
+            release();
+            value.close();
+            return;
+          }
+          total += chunk.value.byteLength;
+          if (total > limit) {
+            const error = new RequestBodyTooLargeError(limit);
+            await cancelInput(error);
+            if (!consumerCanceled) value.error(error);
+            return;
+          }
+          value.enqueue(chunk.value);
+        } catch (error) {
+          if (!stopped) {
+            stopped = true;
+            release();
+            value.error(error);
+          }
+        }
+      },
+      async cancel(reason) {
+        consumerCanceled = true;
+        await cancelInput(reason);
+      },
+    },
+    { highWaterMark: 0 }
+  );
+  try {
+    const bounded = new Request(request, { body: stream, duplex: "half" } as RequestInit & {
+      duplex: "half";
+    });
+    return await bounded.formData();
+  } catch (error) {
+    await cancelInput(error);
+    throw error;
+  }
 }
 
 /** Format bytes as human-readable string */

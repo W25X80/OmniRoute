@@ -1,3 +1,4 @@
+import { getSelectedUsageStatsRepository } from "../db/postgres/usageStatsRepository";
 /**
  * Usage Stats — extracted from usageDb.js (T-15)
  *
@@ -232,10 +233,13 @@ export async function getConnectionSpendUsdSinceAdded(
 ): Promise<{ costUsd: number; requests: number }> {
   if (!provider || !connectionId) return { costUsd: 0, requests: 0 };
 
-  const db = getDbInstance();
-  const rows = db
-    .prepare(
-      `SELECT model,
+  const postgres = getSelectedUsageStatsRepository();
+  const db = postgres ? undefined : getDbInstance();
+  const rows = postgres
+    ? await postgres.connectionSpend(provider, connectionId)
+    : (db!
+        .prepare(
+          `SELECT model,
           COALESCE(SUM(tokens_input), 0) AS input,
           COALESCE(SUM(tokens_output), 0) AS output,
           COALESCE(SUM(tokens_cache_read), 0) AS cacheRead,
@@ -245,16 +249,16 @@ export async function getConnectionSpendUsdSinceAdded(
        FROM usage_history
        WHERE connection_id = ? AND provider = ? AND success = 1
        GROUP BY model`
-    )
-    .all(connectionId, provider) as Array<{
-    model?: string;
-    input?: number;
-    output?: number;
-    cacheRead?: number;
-    cacheCreation?: number;
-    reasoning?: number;
-    requests?: number;
-  }>;
+        )
+        .all(connectionId, provider) as Array<{
+        model?: string;
+        input?: number;
+        output?: number;
+        cacheRead?: number;
+        cacheCreation?: number;
+        reasoning?: number;
+        requests?: number;
+      }>);
 
   let costUsd = 0;
   let requests = 0;
@@ -283,7 +287,8 @@ export async function getConnectionSpendUsdSinceAdded(
  * Uses UNION of recent raw data and older aggregated data when aggregation is enabled.
  */
 export async function getUsageStats() {
-  const db = getDbInstance();
+  const postgres = getSelectedUsageStatsRepository();
+  const db = postgres ? undefined : getDbInstance();
   const aggregationEnabled = await isAggregationEnabled();
   const cutoffDate = aggregationEnabled ? await getRawDataCutoffDate() : null;
   const sourceSql = buildUsageSourceSql(aggregationEnabled);
@@ -380,16 +385,18 @@ export async function getUsageStats() {
 
   const tenMinutesAgo = new Date(currentMinuteStart.getTime() - 9 * 60 * 1000);
 
-  const modelRows = db
-    .prepare(
-      `
+  const modelRows = postgres
+    ? await postgres.aggregates("model", aggregationEnabled, cutoffDate)
+    : (db!
+        .prepare(
+          `
         WITH usage_source AS (${sourceSql})
         SELECT provider, model, service_tier, ${AGGREGATE_FIELDS}
         FROM usage_source
         GROUP BY provider, model, service_tier
       `
-    )
-    .all(...sourceParams) as unknown[];
+        )
+        .all(...sourceParams) as unknown[]);
 
   for (const rowRaw of modelRows) {
     const row = asRecord(rowRaw);
@@ -436,17 +443,19 @@ export async function getUsageStats() {
     }
   }
 
-  const accountRows = db
-    .prepare(
-      `
+  const accountRows = postgres
+    ? await postgres.aggregates("account", aggregationEnabled, cutoffDate)
+    : (db!
+        .prepare(
+          `
         WITH usage_source AS (${sourceSql})
         SELECT provider, model, connection_id, service_tier, ${AGGREGATE_FIELDS}
         FROM usage_source
         WHERE connection_id IS NOT NULL AND connection_id != ''
         GROUP BY provider, model, connection_id, service_tier
       `
-    )
-    .all(...sourceParams) as unknown[];
+        )
+        .all(...sourceParams) as unknown[]);
 
   for (const rowRaw of accountRows) {
     const row = asRecord(rowRaw);
@@ -489,9 +498,11 @@ export async function getUsageStats() {
     }
   }
 
-  const apiKeyRows = db
-    .prepare(
-      `
+  const apiKeyRows = postgres
+    ? await postgres.aggregates("key", aggregationEnabled, cutoffDate)
+    : (db!
+        .prepare(
+          `
         WITH usage_source AS (${sourceSql})
         SELECT provider, model, api_key_id, api_key_name, service_tier, ${AGGREGATE_FIELDS}
         FROM usage_source
@@ -499,8 +510,8 @@ export async function getUsageStats() {
            OR (api_key_name IS NOT NULL AND api_key_name != '')
         GROUP BY provider, model, api_key_id, api_key_name, service_tier
       `
-    )
-    .all(...sourceParams) as unknown[];
+        )
+        .all(...sourceParams) as unknown[]);
 
   for (const rowRaw of apiKeyRows) {
     const row = asRecord(rowRaw);
@@ -543,9 +554,11 @@ export async function getUsageStats() {
     }
   }
 
-  const recentRows = db
-    .prepare(
-      `
+  const recentRows = postgres
+    ? await postgres.recent(tenMinutesAgo.toISOString(), now.toISOString())
+    : (db!
+        .prepare(
+          `
         SELECT
           strftime('%Y-%m-%dT%H:%M:00.000Z', timestamp) as minute,
           provider,
@@ -561,8 +574,8 @@ export async function getUsageStats() {
         WHERE timestamp >= ? AND timestamp <= ?
         GROUP BY minute, provider, model, service_tier
       `
-    )
-    .all(tenMinutesAgo.toISOString(), now.toISOString()) as unknown[];
+        )
+        .all(tenMinutesAgo.toISOString(), now.toISOString()) as unknown[]);
 
   for (const rowRaw of recentRows) {
     const row = asRecord(rowRaw);
@@ -578,4 +591,19 @@ export async function getUsageStats() {
   }
 
   return stats;
+}
+
+export async function getMonthlyProviderTokensForConnectionAsync(
+  provider: string,
+  connectionId: string
+): Promise<number> {
+  if (!provider || !connectionId) return 0;
+  const postgres = getSelectedUsageStatsRepository();
+  if (!postgres) return getMonthlyProviderTokensForConnection(provider, connectionId);
+  const now = new Date();
+  return postgres.monthlyTokens(
+    provider,
+    connectionId,
+    new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)).toISOString()
+  );
 }

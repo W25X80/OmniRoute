@@ -17,8 +17,11 @@ import {
   realpathSync,
   writeFileSync,
 } from "node:fs";
+import * as asyncFs from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { parseDatabaseBackend } from "../../src/lib/db/backendSelection.ts";
+import { createKeyedMutex } from "../../src/shared/utils/keyedMutex.ts";
 import { CURSOR_AGENT_CLI_VERSION } from "./cursorAgentCliVersionPin.ts";
 
 export { CURSOR_AGENT_CLI_VERSION };
@@ -32,6 +35,9 @@ const VERSION_CACHE_FILE = "cursor-agent-cli-version.json";
 let cachedVersion: string | null = null;
 let cachedAt = 0;
 let remoteRefreshInFlight: Promise<string | null> | null = null;
+let asyncLookupInFlight: Promise<string> | null = null;
+let asyncRemoteRefreshInFlight: Promise<string | null> | null = null;
+let cacheEpoch = 0;
 
 /** Test seam: override fetch for installer scrape. */
 let fetchImpl: typeof fetch = fetch;
@@ -136,6 +142,17 @@ export function detectCursorAgentCliVersionFromFs(home: string = homedir()): str
 }
 
 type DiskVersionCache = { version: string; fetchedAt: number };
+
+const VERSION_CACHE_FILE_IO = Symbol.for("omniroute.cursorAgentCliVersion.fileIO");
+const fileIOGlobals = globalThis as typeof globalThis & {
+  [VERSION_CACHE_FILE_IO]?: ReturnType<typeof createKeyedMutex>;
+};
+
+/** Serialize complete file sections across server bundles without holding network work. */
+function runVersionCacheFileIO<T>(filePath: string, body: () => Promise<T>): Promise<T> {
+  const mutex = (fileIOGlobals[VERSION_CACHE_FILE_IO] ??= createKeyedMutex());
+  return mutex.run(filePath, body) as Promise<T>;
+}
 
 function resolveCacheDir(): string {
   if (cacheDirOverride) return cacheDirOverride;
@@ -261,14 +278,126 @@ export function getCursorAgentCliVersionSync(): string {
   return resolved;
 }
 
-/**
- * Async form of {@link getCursorAgentCliVersionSync}. Nothing here awaits: the
- * lookup answers from env, a local install, the disk cache or the pin, and the
- * installer scrape runs in the background. Prefer the sync form wherever a
- * synchronous contract applies (e.g. `buildHeaders`).
- */
+async function newestVersionInDirAsync(versionsDir: string): Promise<string | null> {
+  try {
+    let newest: { name: string; mtimeMs: number } | null = null;
+    for (const name of await asyncFs.readdir(versionsDir)) {
+      if (!isCursorAgentCliVersionId(name)) continue;
+      try {
+        const st = await asyncFs.lstat(join(versionsDir, name));
+        if (!st.isDirectory()) continue;
+        if (
+          !newest ||
+          st.mtimeMs > newest.mtimeMs ||
+          (st.mtimeMs === newest.mtimeMs && name > newest.name)
+        ) {
+          newest = { name, mtimeMs: st.mtimeMs };
+        }
+      } catch {
+        /* skip vanished entries */
+      }
+    }
+    return newest?.name ?? null;
+  } catch {
+    return null;
+  }
+}
+
+async function detectCursorAgentCliVersionAsync(home: string): Promise<string | null> {
+  for (const name of ["agent", "cursor-agent"]) {
+    try {
+      const resolved = await asyncFs.realpath(join(home, ".local", "bin", name));
+      const version = extractVersionIdFromResolvedPath(resolved);
+      if (version) return version;
+    } catch {
+      /* absent or unresolved shim */
+    }
+  }
+  const dataDir = process.env.CURSOR_DATA_DIR;
+  return newestVersionInDirAsync(dataDir ? join(dataDir, "versions") : defaultVersionsDir(home));
+}
+
+async function readDiskVersionCacheAsync(): Promise<DiskVersionCache | null> {
+  try {
+    const filePath = resolve(versionCachePath());
+    return await runVersionCacheFileIO(filePath, async () => {
+      const raw = JSON.parse(await asyncFs.readFile(filePath, "utf8")) as Record<string, unknown>;
+      if (typeof raw.version !== "string" || !isCursorAgentCliVersionId(raw.version)) return null;
+      if (typeof raw.fetchedAt !== "number" || !Number.isFinite(raw.fetchedAt)) return null;
+      return { version: raw.version, fetchedAt: raw.fetchedAt };
+    });
+  } catch {
+    return null;
+  }
+}
+
+async function writeDiskVersionCacheAsync(cache: DiskVersionCache): Promise<void> {
+  try {
+    const filePath = resolve(versionCachePath());
+    await runVersionCacheFileIO(filePath, async () => {
+      await asyncFs.mkdir(dirname(filePath), { recursive: true });
+      await asyncFs.writeFile(filePath, JSON.stringify(cache, null, 2));
+    });
+  } catch {
+    // Cache writes are best-effort.
+  }
+}
+
+function ensureRemoteVersionAsync(): Promise<string | null> {
+  if (asyncRemoteRefreshInFlight) return asyncRemoteRefreshInFlight;
+  const refresh = (async () => {
+    const id = await fetchInstallerVersionId();
+    if (id) await writeDiskVersionCacheAsync({ version: id, fetchedAt: Date.now() });
+    return id;
+  })().finally(() => {
+    if (asyncRemoteRefreshInFlight === refresh) asyncRemoteRefreshInFlight = null;
+  });
+  asyncRemoteRefreshInFlight = refresh;
+  return refresh;
+}
+
+/** Native serving awaits filesystem I/O; installer refresh remains stale-while-revalidate. */
 export async function getCursorAgentCliVersion(): Promise<string> {
-  return getCursorAgentCliVersionSync();
+  if (parseDatabaseBackend() === "sqlite") return getCursorAgentCliVersionSync();
+  const now = Date.now();
+  if (cachedVersion && now - cachedAt < CACHE_TTL_MS) return cachedVersion;
+  if (asyncLookupInFlight) return asyncLookupInFlight;
+  const epoch = cacheEpoch;
+  const lookup = (async () => {
+    const fromEnv = process.env.CURSOR_AGENT_CLI_VERSION?.trim();
+    const local =
+      fromEnv && isCursorAgentCliVersionId(fromEnv)
+        ? fromEnv
+        : await detectCursorAgentCliVersionAsync(
+            process.env.HOME || process.env.USERPROFILE || homedir()
+          );
+    let resolved = local && local !== CURSOR_AGENT_CLI_VERSION ? local : null;
+    let resolvedAt = now;
+    if (!resolved) {
+      const disk = await readDiskVersionCacheAsync();
+      if (disk && now - disk.fetchedAt < CACHE_TTL_MS) {
+        const fresh = preferNewerCursorAgentCliVersion(CURSOR_AGENT_CLI_VERSION, disk.version);
+        if (fresh !== CURSOR_AGENT_CLI_VERSION) resolved = fresh;
+      }
+      if (!resolved) {
+        if (!process.env.NODE_TEST_CONTEXT) void ensureRemoteVersionAsync().catch(() => null);
+        resolved = preferNewerCursorAgentCliVersion(
+          CURSOR_AGENT_CLI_VERSION,
+          disk?.version ?? null
+        );
+        resolvedAt = Date.now();
+      }
+    }
+    if (cacheEpoch === epoch) {
+      cachedVersion = resolved;
+      cachedAt = resolvedAt;
+    }
+    return resolved;
+  })().finally(() => {
+    if (asyncLookupInFlight === lookup) asyncLookupInFlight = null;
+  });
+  asyncLookupInFlight = lookup;
+  return lookup;
 }
 
 /**
@@ -278,7 +407,9 @@ export async function refreshCursorAgentCliVersionFromInstaller(): Promise<strin
   const id = await fetchInstallerVersionId();
   if (!id) return null;
   const resolved = preferNewerCursorAgentCliVersion(CURSOR_AGENT_CLI_VERSION, id);
-  writeDiskVersionCache({ version: resolved, fetchedAt: Date.now() });
+  const cache = { version: resolved, fetchedAt: Date.now() };
+  if (parseDatabaseBackend() === "postgres") await writeDiskVersionCacheAsync(cache);
+  else writeDiskVersionCache(cache);
   cachedVersion = resolved;
   cachedAt = Date.now();
   return resolved;
@@ -289,6 +420,9 @@ export function resetCursorAgentCliVersionCache(): void {
   cachedVersion = null;
   cachedAt = 0;
   remoteRefreshInFlight = null;
+  asyncLookupInFlight = null;
+  asyncRemoteRefreshInFlight = null;
+  cacheEpoch++;
 }
 
 /** Exposed for testing: inject fetch + cache dir. */

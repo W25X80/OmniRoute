@@ -1,3 +1,5 @@
+import { getSelectedPostgresDatabase } from "../controlPlaneContext";
+import { catalogValue, requirePostgresCatalogSnapshot } from "../postgres/catalogSnapshot";
 /**
  * modelPreserveVideoUrl.ts — preserveVideoUrl resolver for model-compat overrides.
  *
@@ -11,13 +13,18 @@ import { type CompatByProtocolMap, readCompatList, isCompatProtocolKey } from ".
 /** The model-compat override key for the preserveVideoUrl flag. */
 const KEY = "preserveVideoUrl";
 
-function getCustomModelRow(providerId: string, modelId: string): Record<string, unknown> | undefined {
-  const db = getDbInstance();
-  const row = db
-    .prepare(
-      "SELECT value FROM key_value WHERE namespace = 'modelCompatOverrides' AND key = ?"
-    )
-    .get(`${providerId}::${modelId}`);
+function getCustomModelRow(
+  providerId: string,
+  modelId: string
+): Record<string, unknown> | undefined {
+  requirePostgresCatalogSnapshot();
+
+  const db = getSelectedPostgresDatabase() ? undefined : getDbInstance();
+  const row = getSelectedPostgresDatabase()
+    ? catalogValue("modelCompatOverrides", `${providerId}::${modelId}`)
+    : db
+        .prepare("SELECT value FROM key_value WHERE namespace = 'modelCompatOverrides' AND key = ?")
+        .get(`${providerId}::${modelId}`);
   if (!row) return undefined;
   try {
     const v = JSON.parse((row as { value: string }).value);

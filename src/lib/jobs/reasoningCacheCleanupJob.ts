@@ -1,4 +1,5 @@
-import { cleanupReasoningCache } from "../../../open-sse/services/reasoningCache.ts";
+import { runPersistenceBackgroundWork } from "../db/persistenceRuntime";
+import { cleanupReasoningCacheAsync } from "../../../open-sse/services/reasoningCache.ts";
 
 const DEFAULT_INTERVAL_MS = 30 * 60 * 1000;
 
@@ -15,9 +16,9 @@ export function startReasoningCacheCleanupJob() {
     return timer;
   }
 
-  const run = () => {
+  const run = async () => {
     try {
-      const deleted = cleanupReasoningCache();
+      const deleted = await runPersistenceBackgroundWork(cleanupReasoningCacheAsync);
       if (deleted > 0) {
         console.log(`[ReasoningCache] expired entries removed=${deleted}`);
       }

@@ -1,3 +1,5 @@
+import { setCachedResponseAsync } from "@/lib/semanticCache";
+import { getSelectedSemanticCacheRepository } from "@/lib/db/semanticCache";
 /**
  * chatCore semantic-cache store (Quality Gate v2 / Fase 9 — chatCore god-file decomposition,
  * #3501).
@@ -16,7 +18,10 @@ import {
   isTruncatedCompletion as defaultIsTruncatedCompletion,
 } from "@/lib/semanticCache";
 import { isSmallEnoughForSemanticCache as defaultIsSmallEnough } from "../../utils/estimateSize.ts";
-import { getSemanticCacheManager } from "../../services/cache/semanticCacheManager.ts";
+import {
+  getSemanticCacheManager,
+  getSemanticCacheManagerAsync,
+} from "../../services/cache/semanticCacheManager.ts";
 
 type LoggerLike = { debug?: (...args: unknown[]) => void } | null | undefined;
 
@@ -99,4 +104,43 @@ export function storeSemanticCacheResponse(
       })
       .catch(() => {});
   }
+}
+
+export async function storeSemanticCacheResponseAsync(
+  args: Parameters<typeof storeSemanticCacheResponse>[0]
+): Promise<void> {
+  if (!getSelectedSemanticCacheRepository()) return storeSemanticCacheResponse(args);
+  if (
+    args.videoTranscriptSensitive ||
+    !args.enabled ||
+    !defaultIsCacheableForWrite(args.body, args.headers) ||
+    defaultIsTruncatedCompletion(args.translatedResponse) ||
+    !defaultIsSmallEnough(args.translatedResponse)
+  )
+    return;
+  const signature = defaultGenerateSignature(
+    args.model,
+    args.body.messages ?? args.body.input,
+    args.body.temperature,
+    args.body.top_p,
+    args.apiKeyId,
+    outputContractOf(args.body)
+  );
+  const tokensSaved = args.usage?.prompt_tokens + args.usage?.completion_tokens || 0;
+  await setCachedResponseAsync(signature, args.model, args.translatedResponse, tokensSaved);
+  if (args.translatedResponse && typeof args.translatedResponse === "object")
+    await (
+      await getSemanticCacheManagerAsync()
+    )
+      .store({
+        body: args.body as Record<string, unknown>,
+        headers: args.headers,
+        response: args.translatedResponse as Record<string, unknown>,
+        model: args.model,
+        provider: args.provider || "",
+        apiKeyId: args.apiKeyId,
+        signature,
+        tokensSaved,
+      })
+      .catch(() => {});
 }

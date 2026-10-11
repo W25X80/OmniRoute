@@ -1,10 +1,7 @@
+import { setCcAliasProviderSettingAsync } from "@/lib/db/ccDiscoveryAliases";
+import { setCcAliasModelSettingAsync } from "@/lib/db/ccDiscoveryAliases";
 import { NextResponse } from "next/server";
-import {
-  getCcAliasProviderSetting,
-  setCcAliasProviderSetting,
-  setCcAliasModelSetting,
-  getCcAliasSettingsBulk,
-} from "@/lib/db/ccDiscoveryAliases";
+import { getCcAliasProviderSetting, getCcAliasSettingsBulk } from "@/lib/db/ccDiscoveryAliases";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 import { updateCcAliasSettingSchema } from "@/shared/validation/schemas";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
@@ -70,9 +67,9 @@ export async function PUT(request: Request, { params }: { params: Promise<{ id: 
     const body = validation.data;
 
     if (body.scope === "provider") {
-      setCcAliasProviderSetting(id, body.value);
+      await setCcAliasProviderSettingAsync(id, body.value);
     } else {
-      setCcAliasModelSetting(id, body.modelId, body.value);
+      await setCcAliasModelSettingAsync(id, body.modelId, body.value);
     }
 
     return NextResponse.json({ success: true });

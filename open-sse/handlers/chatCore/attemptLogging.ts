@@ -1,3 +1,4 @@
+import type { StreamCompletionClock } from "./streamingCompletion.ts";
 /**
  * chatCore per-attempt logging persistence (Quality Gate v2 / Fase 9 — chatCore god-file
  * decomposition, #3501).
@@ -26,7 +27,9 @@ import { cloneBoundedChatLogPayload, truncateForLog } from "./logTruncation.ts";
 import { attachLogMeta } from "./cacheUsageMeta.ts";
 import { readAddedWait } from "../../utils/proxyFetch.ts";
 
-const OMITTED_VIDEO_TRANSCRIPT_REQUEST = { _omniroute_omitted: "video-transcript" };
+const OMITTED_VIDEO_TRANSCRIPT_REQUEST = {
+  _omniroute_omitted: "video-transcript",
+};
 
 interface VideoLogCloneState {
   source: Record<string, unknown>;
@@ -244,6 +247,7 @@ export function extractResponsesId(sourceFormat: unknown, clientResponse: unknow
 
 export type PersistAttemptLogsArgs = {
   status: number;
+  completionClock?: StreamCompletionClock;
   tokens?: unknown;
   usageEstimated?: boolean | null;
   responseBody?: unknown;
@@ -566,7 +570,7 @@ export function persistAttemptLogs(args: PersistAttemptLogsArgs, ctx: PersistAtt
   // capture sink by the executor. Fail-soft: null outside a capture or when
   // nothing was published — the row stores NULL (no wait), never throws.
   const addedWait = readAddedWait();
-  saveCallLog({
+  const persisted = saveCallLog({
     pendingRequestId: ctx.pendingRequestId,
     method: "POST",
     path: clientRawRequest?.endpoint || "/v1/chat/completions",
@@ -575,7 +579,8 @@ export function persistAttemptLogs(args: PersistAttemptLogsArgs, ctx: PersistAtt
     requestedModel,
     provider,
     connectionId: finalConnectionId || undefined,
-    duration: Date.now() - startTime,
+    duration: args.completionClock?.latencyMs ?? Date.now() - startTime,
+    timestamp: args.completionClock?.timestamp,
     ttftMs: typeof ttft === "number" && Number.isFinite(ttft) && ttft >= 0 ? ttft : null,
     tokens: tokens || {},
     // Estimated-token flag, computed here where tokens still carry the marker
@@ -644,7 +649,7 @@ export function persistAttemptLogs(args: PersistAttemptLogsArgs, ctx: PersistAtt
       provider,
       comboName,
       tokens,
-      latencyMs: Date.now() - startTime,
+      latencyMs: args.completionClock?.latencyMs ?? Date.now() - startTime,
     });
     if (lifecycle.name === "request.completed") {
       emit("request.completed", lifecycle.payload);
@@ -652,4 +657,5 @@ export function persistAttemptLogs(args: PersistAttemptLogsArgs, ctx: PersistAtt
       emit("request.failed", lifecycle.payload);
     }
   });
+  return persisted;
 }

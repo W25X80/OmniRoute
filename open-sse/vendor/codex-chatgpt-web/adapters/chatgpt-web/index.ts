@@ -1,5 +1,7 @@
 /* Adapted from miuuyy/codex-chatgpt-web v4.0.7 commit b59d7dc51b84fb1f465ff1d00f5207f3b2b4a494 (MIT). */
 import { createHash } from "node:crypto";
+import { parseDatabaseBackend } from "../../../../../src/lib/db/backendSelection";
+import { protectedConnectionWrite } from "../../storage-state-write";
 import { resolve } from "node:path";
 import { defaultBrokerEndpoint, expandUserPath, resolveBrokerEndpoint } from "../../config";
 import { releaseLauncherRetainedConversation } from "../../launcher-browser-host";
@@ -343,26 +345,52 @@ export function createChatGptWebAdapter(
     provider.chatgptWeb?.browserHost === "launcher" && provider.chatgptWeb.browserHostDescriptorPath
       ? resolve(expandUserPath(provider.chatgptWeb.browserHostDescriptorPath))
       : undefined;
+  const nativeStateFiles = parseDatabaseBackend() === "postgres";
+  const environmentStatePath = provider.chatgptWeb?.threadEnvironmentStatePath
+    ? resolve(expandUserPath(provider.chatgptWeb.threadEnvironmentStatePath))
+    : undefined;
+  const lunaCheckpointStatePath = provider.chatgptWeb?.lunaCheckpointStatePath
+    ? resolve(expandUserPath(provider.chatgptWeb.lunaCheckpointStatePath))
+    : undefined;
   const environmentStore = new ChatGptThreadEnvironmentStore(
-    provider.chatgptWeb?.threadEnvironmentStatePath
-      ? resolve(expandUserPath(provider.chatgptWeb.threadEnvironmentStatePath))
-      : undefined
+    environmentStatePath,
+    Date.now,
+    nativeStateFiles ? "async" : "sync"
   );
   const lunaCheckpointStore = new ChatGptLunaCheckpointStore(
-    provider.chatgptWeb?.lunaCheckpointStatePath
-      ? resolve(expandUserPath(provider.chatgptWeb.lunaCheckpointStatePath))
-      : undefined
+    lunaCheckpointStatePath,
+    Date.now,
+    nativeStateFiles ? "async" : "sync"
   );
+  const withMetadataFile = <T>(
+    path: string | undefined,
+    operation: () => Promise<T>
+  ): Promise<T> => (path ? protectedConnectionWrite(path, operation) : operation());
   const currentUsageInput = (parsed: CodexParsedRequest): CodexParsedRequest =>
     parsed.modelId === CHATGPT_WEB_LUNA_MODEL_ID && !parsed._compactionRequest
       ? lunaCheckpointStore.apply(parsed).parsed
+      : parsed;
+
+  const prepareLunaInput = (
+    parsed: CodexParsedRequest
+  ): Promise<ReturnType<ChatGptLunaCheckpointStore["apply"]>> =>
+    withMetadataFile(lunaCheckpointStatePath, async () => {
+      await lunaCheckpointStore.prepareAsync();
+      const result = lunaCheckpointStore.apply(parsed);
+      await lunaCheckpointStore.flushAsync();
+      return result;
+    });
+  const currentUsageInputAsync = async (parsed: CodexParsedRequest): Promise<CodexParsedRequest> =>
+    parsed.modelId === CHATGPT_WEB_LUNA_MODEL_ID && !parsed._compactionRequest
+      ? (await prepareLunaInput(parsed)).parsed
       : parsed;
 
   const startRuntime = (
     parsed: CodexParsedRequest,
     environment: ReturnType<typeof extractChatGptTurnEnvironment> | undefined,
     traceId: string,
-    turnCapabilities: ChatGptWebCapabilities
+    turnCapabilities: ChatGptWebCapabilities,
+    preparedCheckpointInput?: ReturnType<ChatGptLunaCheckpointStore["apply"]>
   ): ChatGptTurnRuntime => {
     const mode = resolveChatGptWebModelMode(
       parsed.modelId,
@@ -375,7 +403,7 @@ export function createChatGptWebAdapter(
       !parsed._compactionRequest &&
       Boolean(identity.threadId && identity.turnId);
     const checkpointInput = captureLunaCheckpoint
-      ? lunaCheckpointStore.apply(parsed)
+      ? (preparedCheckpointInput ?? lunaCheckpointStore.apply(parsed))
       : { parsed, applied: false };
     const conversationKey =
       !parsed._compactionRequest &&
@@ -421,7 +449,18 @@ export function createChatGptWebAdapter(
       browser.then((answer) => {
         if (!captureLunaCheckpoint) return answer;
         if (checkpointCaptureError) throw checkpointCaptureError;
-        if (capturedCheckpoint) lunaCheckpointStore.commit(parsed, capturedCheckpoint, answer);
+        if (capturedCheckpoint) {
+          if (nativeStateFiles) {
+            const checkpoint = capturedCheckpoint;
+            return withMetadataFile(lunaCheckpointStatePath, async () => {
+              await lunaCheckpointStore.prepareAsync();
+              lunaCheckpointStore.commit(parsed, checkpoint, answer);
+              await lunaCheckpointStore.flushAsync();
+              return answer;
+            });
+          }
+          lunaCheckpointStore.commit(parsed, capturedCheckpoint, answer);
+        }
         return answer;
       });
     const browserAbort = new AbortController();
@@ -630,7 +669,14 @@ export function createChatGptWebAdapter(
         let environment: ReturnType<typeof extractChatGptTurnEnvironment> | undefined;
         if (mode.localTools) {
           try {
-            environment = environmentStore.resolve(parsed);
+            if (nativeStateFiles)
+              environment = await withMetadataFile(environmentStatePath, async () => {
+                await environmentStore.prepareAsync();
+                const resolved = environmentStore.resolve(parsed);
+                await environmentStore.flushAsync();
+                return resolved;
+              });
+            else environment = environmentStore.resolve(parsed);
           } catch (error) {
             const identity = extractChatGptTurnIdentity(parsed);
             console.warn(
@@ -795,7 +841,23 @@ export function createChatGptWebAdapter(
           ownerKey,
           () => startRuntime(parsed, environment, traceId, turnCapabilities),
           traceId,
-          incoming.abortSignal
+          incoming.abortSignal,
+          nativeStateFiles
+            ? {
+                prepareStart: async () => {
+                  const identity = extractChatGptTurnIdentity(parsed);
+                  const prepared =
+                    parsed.modelId === CHATGPT_WEB_LUNA_MODEL_ID &&
+                    !parsed._compactionRequest &&
+                    identity.threadId &&
+                    identity.turnId
+                      ? await prepareLunaInput(parsed)
+                      : undefined;
+                  return () =>
+                    startRuntime(parsed, environment, traceId, turnCapabilities, prepared);
+                },
+              }
+            : undefined
         );
         const roundKey = chatGptTurnRoundKey(parsed);
         const emitRoundEvents = (events: readonly AdapterEvent[]): void => {
@@ -854,11 +916,14 @@ export function createChatGptWebAdapter(
               const reasoning = session.roundReasoning(roundKey);
               session.setFinalReasoning(reasoning);
               session.setFinalEvents(session.roundEvents(roundKey));
+              const usageInput = nativeStateFiles
+                ? await currentUsageInputAsync(parsed)
+                : currentUsageInput(parsed);
               emitRoundBatch((buffer) =>
                 emitBrowserCompletion(
                   settled,
                   estimateChatGptWebUsage(
-                    currentUsageInput(parsed),
+                    usageInput,
                     { answer: settled.answer, reasoning },
                     turnCapabilities
                   ),
@@ -883,11 +948,14 @@ export function createChatGptWebAdapter(
                 if (results.length === 0) {
                   const reasoning = session.reasoningForOutstandingReplay();
                   if (replay.length === 0) emitRoundEvents(session.eventsForOutstandingReplay());
+                  const usageInput = nativeStateFiles
+                    ? await currentUsageInputAsync(parsed)
+                    : currentUsageInput(parsed);
                   emitRoundBatch((buffer) =>
                     emitToolBatch(
                       outstanding,
                       estimateChatGptWebUsage(
-                        currentUsageInput(parsed),
+                        usageInput,
                         { reasoning, toolRequests: outstanding },
                         turnCapabilities
                       ),
@@ -996,11 +1064,14 @@ export function createChatGptWebAdapter(
                   if (bufferStructuredOutput) {
                     emitRoundBatch((buffer) => emitTextDeltas([completedOutcome.answer], buffer));
                   }
+                  const usageInput = nativeStateFiles
+                    ? await currentUsageInputAsync(parsed)
+                    : currentUsageInput(parsed);
                   emitRoundBatch((buffer) =>
                     emitBrowserCompletion(
                       completedOutcome,
                       estimateChatGptWebUsage(
-                        currentUsageInput(parsed),
+                        usageInput,
                         { answer: completedOutcome.answer, reasoning: roundReasoning },
                         turnCapabilities
                       ),
@@ -1022,11 +1093,14 @@ export function createChatGptWebAdapter(
                   roundReasoning,
                   session.roundEvents(roundKey)
                 );
+                const usageInput = nativeStateFiles
+                  ? await currentUsageInputAsync(parsed)
+                  : currentUsageInput(parsed);
                 emitRoundBatch((buffer) =>
                   emitToolBatch(
                     next.requests,
                     estimateChatGptWebUsage(
-                      currentUsageInput(parsed),
+                      usageInput,
                       { reasoning: roundReasoning, toolRequests: next.requests },
                       turnCapabilities
                     ),

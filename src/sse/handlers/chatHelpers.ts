@@ -41,10 +41,10 @@ import {
   type AppliedProxySink,
 } from "@omniroute/open-sse/utils/proxyFetch.ts";
 import { resolveProxyForConnection } from "@/lib/db/settings";
-import { hasBlockingProxyAssignment } from "@/lib/db/proxies";
+import { hasBlockingProxyAssignmentAsync } from "@/lib/db/proxies";
 import {
   type CircuitBreaker,
-  CircuitBreakerOpenError,
+  isCircuitBreakerOpenError,
   getCircuitBreaker,
   isLocalStreamLifecycleError,
 } from "../../shared/utils/circuitBreaker";
@@ -655,7 +655,7 @@ export async function executeChatWithBreaker({
     if (wasProviderProbe) markProviderProbeResponse(tracked.result.response);
     return { ...tracked, wasProviderProbe };
   } catch (cbErr: any) {
-    if (cbErr instanceof CircuitBreakerOpenError) {
+    if (isCircuitBreakerOpenError(cbErr)) {
       log.warn("CIRCUIT", `${provider} circuit open during retry: ${cbErr.message}`);
       return {
         result: {
@@ -1034,7 +1034,7 @@ export async function safeResolveProxy(
     // opts back into direct). Explicit "proxy off" is not a leak (see the guard).
     if (
       !(resolved as { proxy?: unknown } | null)?.proxy &&
-      hasBlockingProxyAssignment(connectionId, providerId, comboName)
+      (await hasBlockingProxyAssignmentAsync(connectionId, providerId, comboName))
     ) {
       return decideProxyResolutionFailure(
         Object.assign(

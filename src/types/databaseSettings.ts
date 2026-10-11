@@ -4,11 +4,23 @@
  */
 
 export interface DatabaseSettings {
+  backend?: "sqlite" | "postgresql";
+  capabilities?: {
+    backend: "postgresql";
+    settings: boolean;
+    statistics: boolean;
+    applicationDiagnostics: boolean;
+    databaseFileBackup: boolean;
+    databaseFileRestore: boolean;
+    databaseFileImport: boolean;
+    sqliteOptimization: boolean;
+    backupAuthority: string;
+  };
   /** 1. Location (read-only display) */
   location: {
     databasePath: string;
     dataDir: string;
-    walSizeBytes: number;
+    walSizeBytes: number | null;
     schemaVersion: number;
   };
 
@@ -93,8 +105,8 @@ export interface DatabaseSettings {
   /** Read-only stats */
   stats: {
     databaseSizeBytes: number;
-    pageCount: number;
-    freelistCount: number;
+    pageCount: number | null;
+    freelistCount: number | null;
     lastVacuumAt: string | null;
     lastOptimizationAt: string | null;
     integrityCheck: "ok" | "error" | null;
@@ -110,7 +122,10 @@ export interface DatabaseSettings {
 }
 
 /** Default database settings */
-export const DEFAULT_DATABASE_SETTINGS: Omit<DatabaseSettings, "location" | "stats"> = {
+export const DEFAULT_DATABASE_SETTINGS: Omit<
+  DatabaseSettings,
+  "location" | "stats" | "backend" | "capabilities"
+> = {
   logs: {
     detailedLogsEnabled: false,
     callLogPipelineEnabled: false,

@@ -1,3 +1,10 @@
+import { getSelectedPostgresDatabase } from "@/lib/db/controlPlaneContext";
+import { readUserPricingMemoized } from "@/lib/catalogUserPricing";
+import {
+  hasPostgresCatalogSnapshot,
+  withPostgresCatalogSnapshot,
+  assertPostgresCatalogSnapshotCurrent,
+} from "@/lib/db/postgres/catalogSnapshot";
 import { PROVIDER_MODELS, PROVIDER_ID_TO_ALIAS } from "@/shared/constants/models";
 import { NOAUTH_PROVIDERS } from "@/shared/constants/providers";
 import { getCombos } from "@/lib/db/combos";
@@ -49,11 +56,7 @@ import {
   getHiddenModelsByProvider,
 } from "@/lib/db/models";
 import { getAllActiveSyncedModels } from "@/lib/db/models/activeSyncedCatalog";
-import {
-  getModelCatalogCacheVersion,
-  getCachedRawProviderConnections,
-  getCachedProviderNodes,
-} from "@/lib/db/readCache";
+import { getCachedRawProviderConnections, getCachedProviderNodes } from "@/lib/db/readCache";
 import { getCompatibleFallbackModels } from "@/lib/providers/managedAvailableModels";
 import {
   providerUsesCuratedModelsOnly,
@@ -74,7 +77,7 @@ import {
   getModelsDevPricing,
   getSyncedCapability,
   peekCachedReasoningEfforts,
-  upsertSyncedCapabilities,
+  upsertSyncedCapabilitiesAsync,
 } from "@/lib/modelsDevSync";
 import type { ModelCapabilityEntry } from "@/lib/modelsDevSync";
 import { getModelSpec } from "@/shared/constants/modelSpecs";
@@ -93,7 +96,7 @@ import {
 } from "@/shared/utils/noAuthProviders";
 import { getSourcedTokenLimit, getTokenLimit } from "@omniroute/open-sse/services/contextManager";
 import { extractApiKey } from "@/sse/services/auth";
-import type { ComboModelStep } from "@/lib/combos/steps";
+
 import {
   type CustomModelEntry,
   type ComboCatalogTarget,
@@ -102,7 +105,6 @@ import {
   parseJsonStringArray,
   intersectKnownStringArrays,
   minKnownNumber,
-  maybeOmitCatalogModelName,
   getThinkingCapabilityFields,
   mergeComboCapabilities,
   visionDerivedModalities,
@@ -127,12 +129,8 @@ import {
   getComboTargetModelId as getComboTargetModelIdFromMaps,
 } from "./catalogProviderMaps";
 import { indexNodeApiTypes, nodeModelEndpoints, overlayEndpoints } from "./catalogNodeModality";
-import {
-  getModelCatalogAuthRejection,
-  isCodexModelCatalogClient,
-  isCcDiscoveryModelCatalogClient,
-} from "./catalogRequest";
-import { incrementCcDiscoveryHitCount } from "@/lib/db/ccDiscoveryMetrics";
+import { getModelCatalogAuthRejection, isCcDiscoveryModelCatalogClient } from "./catalogRequest";
+import { incrementCcDiscoveryHitCountAsync } from "@/lib/db/ccDiscoveryMetrics";
 import { isUnifiedChatSourceModelSelectable } from "./catalogModelPolicy";
 import { decideHidePaid } from "./catalogPaidFilter";
 import { isModelExposureAllowed } from "@/shared/utils/modelExposureList";
@@ -199,62 +197,74 @@ export async function getUnifiedModelsResponse(
   corsHeaders: Record<string, string> = {},
   options: { scheduleBackgroundRefresh?: BackgroundRefreshScheduler } = {}
 ) {
-  const diagnosticHeaders = getCatalogDiagnosticsHeaders({ request });
+  const catalogDatabase = getSelectedPostgresDatabase();
+  const execute = async () => {
+    if (catalogDatabase) {
+      const response = await buildUnifiedModelsResponseCore(request, corsHeaders);
+      await assertPostgresCatalogSnapshotCurrent();
+      return response;
+    }
+    const diagnosticHeaders = getCatalogDiagnosticsHeaders({ request });
 
-  // #6408 fast path: reject unauthorized callers first (auth state is per-request
-  // and MUST NOT be cached), then coalesce identical concurrent requests + short-
-  // TTL memoize the serialized JSON body.
-  let settingsForAuth: Record<string, any> = {};
-  try {
+    // #6408 fast path: reject unauthorized callers first (auth state is per-request
+    // and MUST NOT be cached), then coalesce identical concurrent requests + short-
+    // TTL memoize the serialized JSON body.
+    let settingsForAuth: Record<string, any> = {};
     try {
-      settingsForAuth = await getSettings();
-    } catch {}
-    // #9147: yield before auth check to allow event loop tick
-    await yieldCatalogBuildTurn();
-    const authRejection = await getModelCatalogAuthRejection(request, settingsForAuth, {
-      ...corsHeaders,
-      ...diagnosticHeaders,
-    });
-    if (authRejection) return authRejection;
-  } catch {
-    // Fall through to full builder on auth-check failure; core handles errors.
-  }
+      try {
+        settingsForAuth = await getSettings();
+      } catch {}
+      // #9147: yield before auth check to allow event loop tick
+      await yieldCatalogBuildTurn();
+      const authRejection = await getModelCatalogAuthRejection(request, settingsForAuth, {
+        ...corsHeaders,
+        ...diagnosticHeaders,
+      });
+      if (authRejection) return authRejection;
+    } catch {
+      // Fall through to full builder on auth-check failure; core handles errors.
+    }
 
-  // Best-effort cc-discovery usage metric — count every authorized GET /v1/models
-  // hit from a Claude Code client, cache hit or not. Never blocks/slows the
-  // request (incrementCcDiscoveryHitCount already swallows its own errors).
-  if (isCcDiscoveryModelCatalogClient(request)) {
-    incrementCcDiscoveryHitCount();
-  }
+    // Best-effort cc-discovery usage metric — count every authorized GET /v1/models
+    // hit from a Claude Code client, cache hit or not. Never blocks/slows the
+    // request; the async owner reports and absorbs optional persistence failures.
+    if (isCcDiscoveryModelCatalogClient(request)) {
+      void incrementCcDiscoveryHitCountAsync();
+    }
 
-  try {
-    return await resolveCachedCatalogResponse(
-      request,
-      { corsHeaders, diagnosticHeaders },
-      buildCatalogPayload,
-      {
-        // #10831: a disabled router hides auto/* just as hideAutoCombos does, so
-        // the two collapse into one cache dimension — the resulting catalogs are
-        // identical and do not need separate entries.
-        hideAutoCombos:
-          settingsForAuth?.hideAutoCombos === true || settingsForAuth?.autoRoutingEnabled === false,
-        hideNoThinkVariants: settingsForAuth?.hideNoThinkVariants === true,
-        scheduleBackgroundRefresh: options.scheduleBackgroundRefresh,
-      }
-    );
-  } catch (err) {
-    // Hard rule #12: never put a raw err.message/err.stack in a response body.
-    // Route it through the shared sanitizer instead — same status/type/code as
-    // before, minus the stack-trace/path leak.
-    const message = err instanceof Error ? err.message : String(err);
-    return Response.json(
-      buildErrorBody(500, message, undefined, {
-        type: "server_error",
-        code: INTERNAL_PROXY_ERROR,
-      }),
-      { status: 500, headers: { ...corsHeaders, ...diagnosticHeaders } }
-    );
-  }
+    try {
+      return await resolveCachedCatalogResponse(
+        request,
+        { corsHeaders, diagnosticHeaders },
+        buildCatalogPayload,
+        {
+          // #10831: a disabled router hides auto/* just as hideAutoCombos does, so
+          // the two collapse into one cache dimension — the resulting catalogs are
+          // identical and do not need separate entries.
+          hideAutoCombos:
+            settingsForAuth?.hideAutoCombos === true ||
+            settingsForAuth?.autoRoutingEnabled === false,
+          hideNoThinkVariants: settingsForAuth?.hideNoThinkVariants === true,
+          scheduleBackgroundRefresh: options.scheduleBackgroundRefresh,
+        }
+      );
+    } catch (err) {
+      // Hard rule #12: never put a raw err.message/err.stack in a response body.
+      // Route it through the shared sanitizer instead — same status/type/code as
+      // before, minus the stack-trace/path leak.
+      const message = err instanceof Error ? err.message : String(err);
+      return Response.json(
+        buildErrorBody(500, message, undefined, {
+          type: "server_error",
+          code: INTERNAL_PROXY_ERROR,
+        }),
+        { status: 500, headers: { ...corsHeaders, ...diagnosticHeaders } }
+      );
+    }
+  };
+  if (catalogDatabase && !hasPostgresCatalogSnapshot(catalogDatabase))
+    return withPostgresCatalogSnapshot(catalogDatabase, execute);
+  return execute();
 }
 
 async function buildCatalogPayload(
@@ -1450,7 +1460,7 @@ async function buildUnifiedModelsResponseCore(
           );
           if (capEntry) openRouterCaps[openRouterModel.id] = capEntry;
         }
-        upsertSyncedCapabilities("openrouter", openRouterCaps);
+        await upsertSyncedCapabilitiesAsync("openrouter", openRouterCaps);
       } catch (err) {
         console.error("[catalog] Error loading OpenRouter catalog:", err);
       }
@@ -2091,6 +2101,7 @@ async function buildUnifiedModelsResponseCore(
       }
       enrichmentSnapshot = {
         modelsDevPricing,
+        ...(getSelectedPostgresDatabase() ? { userPricing: readUserPricingMemoized() } : {}),
         capabilityResolutionSnapshot,
         providerNodeIdsByPrefix: providerNodeIdByPrefix,
       };

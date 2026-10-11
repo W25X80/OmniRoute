@@ -1,12 +1,13 @@
+import { getSelectedMemoryRepository } from "../db/memory";
 import { getDbInstance } from "../db/core";
 import { Memory, MemoryConfig } from "./types";
 import { MemoryConfigSchema } from "./schemas";
 import { logger } from "../../../open-sse/utils/logger.ts";
 import { sanitizeErrorMessage } from "../../../open-sse/utils/error.ts";
-import { resolveEmbeddingSource, embed } from "./embedding";
+import { resolveEmbeddingSource, embed, withMeasuredDimensions } from "./embedding";
 import { getVectorStore } from "./vectorStore";
 import { getMemorySettings } from "./settings";
-import { recordMemoryAccess } from "./store";
+import { recordMemoryAccessAsync } from "./store";
 import { stats as embeddingCacheStats } from "./embedding/cache";
 import { getQdrantConfig, checkQdrantHealth, searchSemanticMemory } from "./qdrant";
 import type { MemoryEngineStatus } from "@/shared/schemas/memory";
@@ -16,7 +17,6 @@ import { pickApiKeyForInternalUse } from "../db/apiKeys";
 import { getRuntimePorts } from "../runtime/ports";
 import {
   estimateTokens,
-  parseMetadata,
   rowToMemory,
   getRelevanceScore,
   sanitizeFts5Query,
@@ -36,7 +36,7 @@ export interface RetrievePreviewItem {
   memory: Memory;
   score: number;
   tokens: number;
-  tier: "fts5" | "vector" | "hybrid-rrf" | "qdrant";
+  tier: "fts5" | "postgres-fulltext" | "vector" | "hybrid-rrf" | "qdrant";
   vecScore: number | null;
   ftsScore: number | null;
 }
@@ -44,7 +44,7 @@ export interface RetrievePreviewItem {
 export interface RetrievePreviewResolution {
   embeddingSource: "remote" | "static" | "transformers" | null;
   embeddingModel: string | null;
-  vectorStore: "sqlite-vec" | "qdrant" | "none";
+  vectorStore: "sqlite-vec" | "postgres-array" | "qdrant" | "none";
   strategyUsed: "exact" | "semantic" | "hybrid";
   rerankApplied: boolean;
   fallbackReason: string | null;
@@ -260,7 +260,7 @@ export async function retrieveMemories(
 ): Promise<Memory[]> {
   const result = await retrieveMemoriesInternal(apiKeyId, config);
   if (result.length > 0) {
-    recordMemoryAccess(result.map((m) => m.id));
+    await recordMemoryAccessAsync(result.map((m) => m.id));
   }
   return result;
 }
@@ -290,13 +290,24 @@ async function retrieveMemoriesInternal(
   const maxTokens = Math.min(Math.max(normalizedConfig.maxTokens, 1), 8000);
   const strategy = normalizedConfig.retrievalStrategy;
 
+  if (getSelectedMemoryRepository()) {
+    const bundle = await retrieveSelectedBundle(apiKeyId, config.query ?? "", {
+      strategy: strategy ?? "exact",
+      maxTokens,
+      limit: 100,
+      sessionId: normalizedConfig.scope === "session" ? config.sessionId : undefined,
+      retentionDays: normalizedConfig.retentionDays,
+      production: true,
+    });
+    return bundle.items.map((item) => item.memory);
+  }
   const db = getDbInstance();
   // Plan 21 FAIL #2 fix: include "qdrant" in the tier union so that the
   // Qdrant tier-2 branch in semantic/hybrid below can push hits with that tier.
   const memories: Array<{
     memory: Memory;
     score: number;
-    tier: "fts5" | "vector" | "hybrid-rrf" | "qdrant";
+    tier: "fts5" | "postgres-fulltext" | "vector" | "hybrid-rrf" | "qdrant";
   }> = [];
   let totalTokens = 0;
 
@@ -687,6 +698,7 @@ export async function retrievePreview(
   query: string,
   options: { strategy: "exact" | "semantic" | "hybrid"; maxTokens: number; limit: number }
 ): Promise<RetrievePreviewBundle> {
+  if (getSelectedMemoryRepository()) return retrieveSelectedBundle(apiKeyId, query, options);
   const { strategy, maxTokens, limit } = options;
 
   const settings = await getMemorySettings();
@@ -708,7 +720,7 @@ export async function retrievePreview(
   const createdCol = useModernTable ? "created_at" : "createdAt";
 
   // Determine vector store backend
-  let vectorStoreBackend: "sqlite-vec" | "qdrant" | "none" = "none";
+  let vectorStoreBackend: "sqlite-vec" | "postgres-array" | "qdrant" | "none" = "none";
   const vec = getVectorStore();
   if (vec) vectorStoreBackend = "sqlite-vec";
 
@@ -1028,20 +1040,21 @@ export async function engineStatus(): Promise<MemoryEngineStatus> {
 
   // Vector store
   const vec = getVectorStore();
-  let vecBackend: "sqlite-vec" | "qdrant" | "none" = "none";
+  let vecBackend: "sqlite-vec" | "postgres-array" | "qdrant" | "none" = "none";
   let vecAvailable = false;
   let vecRowCount = 0;
   let vecNeedsReindex = 0;
+  const selected = getSelectedMemoryRepository();
   let vecReason = "sqlite-vec not available";
 
   if (vec) {
-    vecBackend = "sqlite-vec";
+    vecBackend = selected ? "postgres-array" : "sqlite-vec";
     vecAvailable = true;
     try {
       const s = await vec.stats();
       vecRowCount = s.rowCount;
       vecNeedsReindex = s.needsReindex;
-      vecReason = `sqlite-vec active, dim=${s.activeDim ?? "null"}`;
+      vecReason = `${vecBackend} active, dim=${s.activeDim ?? "null"}`;
     } catch {
       vecReason = "sqlite-vec active but stats failed";
     }
@@ -1096,7 +1109,9 @@ export async function engineStatus(): Promise<MemoryEngineStatus> {
       : (settings.rerankProviderModel ?? null);
 
   return {
-    keyword: keywordEngineStatus(getDbInstance()),
+    keyword: selected
+      ? { available: true, backend: "PostgreSQL", reason: "PostgreSQL full text search active" }
+      : keywordEngineStatus(getDbInstance()),
     embedding: {
       source: resolution.source,
       model: resolution.model,
@@ -1125,5 +1140,185 @@ export async function engineStatus(): Promise<MemoryEngineStatus> {
       available: rerankAvailable,
       reason: rerankReason,
     },
+  };
+}
+
+async function retrieveSelectedBundle(
+  apiKeyId: string | null,
+  query: string,
+  options: {
+    strategy: "exact" | "semantic" | "hybrid";
+    maxTokens: number;
+    limit: number;
+    sessionId?: string;
+    retentionDays?: number;
+    production?: boolean;
+  }
+): Promise<RetrievePreviewBundle> {
+  const repository = getSelectedMemoryRepository();
+  if (!repository) throw new Error("PostgreSQL memory repository is unavailable");
+  const settings = await getMemorySettings();
+  const resolution = resolveEmbeddingSource(settings);
+  let fallbackReason: string | null = null;
+  let vectorBackend: RetrievePreviewResolution["vectorStore"] = "postgres-array";
+  let rerankApplied = false;
+  let items: Omit<RetrievePreviewItem, "tokens">[] = [];
+  const eligible = (memory: Memory) =>
+    (!apiKeyId || memory.apiKeyId === apiKeyId) &&
+    (!options.sessionId || memory.sessionId === options.sessionId) &&
+    (!memory.expiresAt || memory.expiresAt.getTime() > Date.now()) &&
+    (!options.retentionDays ||
+      options.retentionDays <= 0 ||
+      memory.createdAt.getTime() >= Date.now() - options.retentionDays * 86400000);
+  if (options.strategy !== "exact" && query && resolution.source) {
+    if (settings.vectorStore === "qdrant") {
+      try {
+        const result = await searchSemanticMemory(
+          query,
+          options.limit,
+          apiKeyId ? { apiKeyId } : undefined
+        );
+        if (result.ok && result.results?.length) {
+          const scores = new Map(result.results.map((r) => [r.id, r.score]));
+          const memories = await repository.findByIds(
+            result.results.map((r) => r.id),
+            apiKeyId
+          );
+          items = memories.filter(eligible).map((memory) => ({
+            memory,
+            score: scores.get(memory.id) ?? 0,
+            tier: "qdrant",
+            vecScore: scores.get(memory.id) ?? null,
+            ftsScore: null,
+          }));
+          if (items.length) vectorBackend = "qdrant";
+        }
+        if (!items.length)
+          fallbackReason = "Qdrant returned no eligible results; using PostgreSQL vector search";
+      } catch (error) {
+        fallbackReason = sanitizeErrorMessage(
+          error instanceof Error ? error.message : String(error)
+        );
+      }
+    }
+    if (!items.length) {
+      try {
+        const embedded = await embed(query, settings);
+        const vector = getVectorStore();
+        if ("vector" in embedded && vector) {
+          const ready = await vector.ensureReady(
+            withMeasuredDimensions(resolution, embedded.vector.length)
+          );
+          if (ready.ready) {
+            if (options.strategy === "hybrid") {
+              const hits = await vector.searchHybrid(
+                embedded.vector,
+                query,
+                options.limit,
+                apiKeyId ?? undefined
+              );
+              const byId = new Map(hits.map((hit) => [hit.memoryId, hit]));
+              const memories = await repository.findByIds(
+                hits.map((hit) => hit.memoryId),
+                apiKeyId
+              );
+              items = memories.filter(eligible).map((memory) => {
+                const hit = byId.get(memory.id)!;
+                return {
+                  memory,
+                  score: hit.rrfScore,
+                  tier: "hybrid-rrf",
+                  vecScore: hit.vecDistance === null ? null : 1 / (1 + hit.vecDistance),
+                  ftsScore: hit.ftsScore,
+                };
+              });
+            } else {
+              const hits = await vector.searchVector(
+                embedded.vector,
+                options.limit,
+                apiKeyId ?? undefined
+              );
+              const byId = new Map(hits.map((hit) => [hit.memoryId, hit.score]));
+              const memories = await repository.findByIds(
+                hits.map((hit) => hit.memoryId),
+                apiKeyId
+              );
+              items = memories.filter(eligible).map((memory) => ({
+                memory,
+                score: byId.get(memory.id) ?? 0,
+                tier: "vector",
+                vecScore: byId.get(memory.id) ?? null,
+                ftsScore: null,
+              }));
+            }
+          } else fallbackReason = ready.reason;
+        } else fallbackReason = "Embedding source could not generate a vector";
+      } catch (error) {
+        fallbackReason = sanitizeErrorMessage(
+          error instanceof Error ? error.message : String(error)
+        );
+      }
+    }
+  }
+  if (!items.length) {
+    const filters = {
+      apiKeyId,
+      sessionId: options.sessionId,
+      retentionDays: options.retentionDays,
+      query,
+      limit: options.limit,
+    };
+    let memories: Memory[] = [];
+    if (query && options.strategy !== "exact")
+      memories = await repository.candidates({ ...filters, lexical: true });
+    if (options.strategy === "hybrid" || !memories.length) {
+      const chronological = await repository.candidates(filters);
+      memories = [...new Map([...memories, ...chronological].map((m) => [m.id, m])).values()];
+    }
+    items = memories.map((memory) => ({
+      memory,
+      score: query ? getRelevanceScore(memory, query) : 0,
+      tier: "postgres-fulltext",
+      vecScore: null,
+      ftsScore: null,
+    }));
+    if (options.production)
+      items = items
+        .filter((item) => !query || item.score > 0)
+        .sort(
+          (a, b) => b.score - a.score || b.memory.createdAt.getTime() - a.memory.createdAt.getTime()
+        );
+  }
+  if (
+    settings.rerankEnabled &&
+    settings.rerankProviderModel &&
+    query &&
+    items.some((item) => item.tier !== "postgres-fulltext")
+  ) {
+    items = await applyRerank(items, query, settings.rerankProviderModel);
+    rerankApplied = true;
+  }
+  const selected: RetrievePreviewItem[] = [];
+  let totalTokens = 0;
+  for (const item of items) {
+    if (selected.length >= options.limit) break;
+    const tokens = estimateTokens(item.memory.content);
+    if (totalTokens + tokens > options.maxTokens && selected.length) break;
+    selected.push({ ...item, tokens });
+    totalTokens += tokens;
+    if (totalTokens > options.maxTokens) break;
+  }
+  return {
+    items: selected,
+    resolution: {
+      embeddingSource: resolution.source,
+      embeddingModel: resolution.model,
+      vectorStore: vectorBackend,
+      strategyUsed: options.strategy,
+      rerankApplied,
+      fallbackReason,
+    },
+    totalTokens,
+    budgetMaxTokens: options.maxTokens,
   };
 }

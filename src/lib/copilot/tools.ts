@@ -11,7 +11,7 @@ import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
 
 const execFileAsync = promisify(execFile);
 import { classifyCommand } from "./commandClassification";
-import { createCombo, getCombos, updateCombo } from "@/lib/db/combos";
+import { createCombo, getCombos } from "@/lib/db/combos";
 import { getProviderConnections } from "@/lib/db/providers";
 import { createApiKey, revokeApiKey, getApiKeys } from "@/lib/db/apiKeys";
 import {
@@ -21,10 +21,11 @@ import {
   getFileContext,
   listFiles,
   getCodeGraphStats,
-  isCodeGraphAvailable,
-  type CodeGraphQueryResult,
 } from "./codegraphKnowledge";
-import { getAllKeyGroups } from "@/lib/db/apiKeyGroups";
+import { getAllKeyGroupsAsync } from "@/lib/db/apiKeyGroups";
+import { findOmniRouteCliPathAsync, usesNativeHostProfile } from "../nativeHostProbes";
+import { formatCodeGraphResult } from "./codegraphResult";
+import { runCodeGraphToolAsync } from "./codegraphQueryClient";
 
 // ── Tool Types ───────────────────────────────────────────────────────────────
 
@@ -43,23 +44,6 @@ export interface CopilotTool {
 }
 
 // ── Helper: format CodeGraph results ─────────────────────────────────────────
-
-function formatCodeGraphResult(result: CodeGraphQueryResult): string {
-  if (!result.success) {
-    if (result.engine === "none") {
-      return `CodeGraph not available: ${result.error || "DB not found"}. The app runs without the development code index in production.`;
-    }
-    return `CodeGraph query error: ${result.error}`;
-  }
-
-  const rows = result.data as Record<string, unknown>[];
-  if (!rows || rows.length === 0) return "No results found.";
-
-  return (
-    JSON.stringify(rows.slice(0, 30), null, 2) +
-    (rows.length > 30 ? `\n... and ${rows.length - 30} more` : "")
-  );
-}
 
 // ── Helper: check if omniroute CLI is available ──────────────────────────────
 
@@ -230,7 +214,7 @@ export const COPILOT_TOOLS: CopilotTool[] = [
     description: "List all API key groups with their model permissions",
     parameters: [],
     handler: async () => {
-      const groups = await getAllKeyGroups();
+      const groups = await getAllKeyGroupsAsync();
       const gArr = groups as any[];
       if (!gArr || gArr.length === 0) return "No key groups configured.";
       let output = `**${gArr.length} key group(s)**\n\n`;
@@ -266,6 +250,7 @@ export const COPILOT_TOOLS: CopilotTool[] = [
       const q = args.query as string;
       const limit = (args.limit as number) || 20;
       if (!q) return "Please provide a search query.";
+      if (usesNativeHostProfile()) return await runCodeGraphToolAsync("searchSymbols", [q, limit]);
       const result = searchSymbols(q, limit);
       return formatCodeGraphResult(result);
     },
@@ -287,6 +272,8 @@ export const COPILOT_TOOLS: CopilotTool[] = [
       const symbol = args.symbol as string;
       const limit = (args.limit as number) || 20;
       if (!symbol) return "Please provide a symbol name.";
+      if (usesNativeHostProfile())
+        return await runCodeGraphToolAsync("findCallers", [symbol, limit]);
       const result = findCallers(symbol, limit);
       return formatCodeGraphResult(result);
     },
@@ -308,6 +295,8 @@ export const COPILOT_TOOLS: CopilotTool[] = [
       const symbol = args.symbol as string;
       const limit = (args.limit as number) || 20;
       if (!symbol) return "Please provide a symbol name.";
+      if (usesNativeHostProfile())
+        return await runCodeGraphToolAsync("findCallees", [symbol, limit]);
       const result = findCallees(symbol, limit);
       return formatCodeGraphResult(result);
     },
@@ -327,6 +316,7 @@ export const COPILOT_TOOLS: CopilotTool[] = [
     handler: async (args) => {
       const fp = args.filePath as string;
       if (!fp) return "Please provide a file path.";
+      if (usesNativeHostProfile()) return await runCodeGraphToolAsync("getFileContext", [fp]);
       const result = getFileContext(fp);
       return formatCodeGraphResult(result);
     },
@@ -345,6 +335,7 @@ export const COPILOT_TOOLS: CopilotTool[] = [
     ],
     handler: async (args) => {
       const lang = args.language as string | undefined;
+      if (usesNativeHostProfile()) return await runCodeGraphToolAsync("listFiles", [lang]);
       const result = listFiles(lang);
       return formatCodeGraphResult(result);
     },
@@ -355,6 +346,7 @@ export const COPILOT_TOOLS: CopilotTool[] = [
       "Get summary stats about the CodeGraph index: total nodes, edges, files, languages, and node kinds indexed.",
     parameters: [],
     handler: async () => {
+      if (usesNativeHostProfile()) return await runCodeGraphToolAsync("getCodeGraphStats", []);
       const result = getCodeGraphStats();
       return formatCodeGraphResult(result);
     },
@@ -378,7 +370,9 @@ export const COPILOT_TOOLS: CopilotTool[] = [
       const cmd = args.command as string;
       if (!cmd) return "Please provide a command to execute.";
 
-      const cliPath = getOmniRouteCliPath();
+      const cliPath = usesNativeHostProfile()
+        ? await findOmniRouteCliPathAsync()
+        : getOmniRouteCliPath();
       if (!cliPath) return "omniroute CLI not found in PATH. Install OmniRoute first.";
 
       try {

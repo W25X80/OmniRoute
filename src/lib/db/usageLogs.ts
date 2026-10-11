@@ -1,3 +1,5 @@
+import * as postgres from "./postgres/usageLogsRepository";
+import { getPostgresUsageDatabase } from "./postgres/usageQueries";
 /**
  * Read-only auto-routing aggregations over `call_logs`.
  * `requested_model` keeps the client auto/* id after routing resolves a target.
@@ -83,4 +85,21 @@ export function getAutoRoutingTopProviders(): AutoRoutingTopProviderRow[] {
       `
     )
     .all() as AutoRoutingTopProviderRow[];
+}
+
+export async function getAutoRoutingTotalCountAsync(): Promise<AutoRoutingTotalResult> {
+  const database = getPostgresUsageDatabase();
+  return database ? postgres.getAutoRoutingTotalCount(database) : getAutoRoutingTotalCount();
+}
+
+export async function getAutoRoutingVariantBreakdownAsync(): Promise<AutoRoutingVariantRow[]> {
+  const database = getPostgresUsageDatabase();
+  return database
+    ? postgres.getAutoRoutingVariantBreakdown(database)
+    : getAutoRoutingVariantBreakdown();
+}
+
+export async function getAutoRoutingTopProvidersAsync(): Promise<AutoRoutingTopProviderRow[]> {
+  const database = getPostgresUsageDatabase();
+  return database ? postgres.getAutoRoutingTopProviders(database) : getAutoRoutingTopProviders();
 }

@@ -10,7 +10,10 @@ import {
   getCliRuntimeStatus,
 } from "@/shared/services/cliRuntime";
 import { createMultiBackup } from "@/shared/services/backupService";
-import { saveCliToolLastConfigured, deleteCliToolLastConfigured } from "@/lib/db/cliToolState";
+import {
+  saveCliToolLastConfiguredAsync,
+  deleteCliToolLastConfiguredAsync,
+} from "@/lib/db/cliToolState";
 import { cliModelConfigSchema } from "@/shared/validation/schemas";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
 import { resolveApiKey } from "@/shared/services/apiKeyResolver";
@@ -293,7 +296,7 @@ export async function POST(request: Request) {
 
     // Persist last-configured timestamp
     try {
-      saveCliToolLastConfigured("codex");
+      await saveCliToolLastConfiguredAsync("codex");
     } catch {
       /* non-critical */
     }
@@ -377,7 +380,7 @@ export async function DELETE(request: Request) {
 
     // Clear last-configured timestamp
     try {
-      deleteCliToolLastConfigured("codex");
+      await deleteCliToolLastConfiguredAsync("codex");
     } catch {
       /* non-critical */
     }

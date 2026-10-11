@@ -218,7 +218,7 @@ export async function adobeFireflyGenerateImage(opts: {
 
   const {
     withAdobeFireflySubmitGate,
-    markAdobeFireflyArpSuccess,
+    markAdobeFireflyArpSuccessAsync,
     noteAdobeFireflySubmitFailure,
     rotateAdobeFireflySessionOnError,
     resolveAdobeArpSessionIdSmart,
@@ -379,7 +379,7 @@ export async function adobeFireflyGenerateImage(opts: {
     submitData = await submitResp.json().catch(() => ({}));
     submitHeaders = submitResp.headers;
     // Sticky: remember ARP that colligo accepted so the next batch image reuses it.
-    markAdobeFireflyArpSuccess(fingerprint, arpSessionId);
+    await markAdobeFireflyArpSuccessAsync(fingerprint, arpSessionId);
     submitOk = true;
     break;
   }
@@ -496,7 +496,7 @@ export async function adobeFireflyGenerateVideo(opts: {
 
   const {
     withAdobeFireflySubmitGate,
-    markAdobeFireflyArpSuccess,
+    markAdobeFireflyArpSuccessAsync,
     noteAdobeFireflySubmitFailure,
     rotateAdobeFireflySessionOnError,
     resolveAdobeArpSessionIdSmart,
@@ -649,7 +649,7 @@ export async function adobeFireflyGenerateVideo(opts: {
 
     submitData = await submitResp.json().catch(() => ({}));
     submitHeaders = submitResp.headers;
-    markAdobeFireflyArpSuccess(fingerprint, arpSessionId);
+    await markAdobeFireflyArpSuccessAsync(fingerprint, arpSessionId);
     videoSubmitOk = true;
     break;
   }

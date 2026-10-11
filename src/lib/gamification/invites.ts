@@ -1,3 +1,4 @@
+import { listInvitesAsync } from "../db/gamificationRuntime";
 /**
  * Invite/redeem tokens for server connection.
  *
@@ -39,8 +40,8 @@ export async function createInvite(
   const tokenHash = hashToken(token);
   const id = crypto.randomUUID();
 
-  const { createInviteToken } = await import("../db/gamification");
-  createInviteToken(id, code, tokenHash, createdByApiKeyId, serverUrl, maxUses);
+  const { createInviteTokenAsync: createInviteToken } = await import("../db/gamification");
+  await createInviteToken(id, code, tokenHash, createdByApiKeyId, serverUrl, maxUses);
 
   return { code, token };
 }
@@ -52,9 +53,10 @@ export async function redeemInvite(
   code: string,
   usedByApiKeyId: string
 ): Promise<{ success: boolean; serverUrl?: string; error?: string }> {
-  const { getInviteByCode, redeemInvite: dbRedeem } = await import("../db/gamification");
+  const { getInviteByCodeAsync: getInviteByCode, redeemInviteAsync: dbRedeem } =
+    await import("../db/gamification");
 
-  const invite = getInviteByCode(code);
+  const invite = await getInviteByCode(code);
   if (!invite) {
     return { success: false, error: "Invalid invite code" };
   }
@@ -75,7 +77,7 @@ export async function redeemInvite(
     return { success: false, error: "Cannot redeem your own invite" };
   }
 
-  const redeemed = dbRedeem(code, usedByApiKeyId);
+  const redeemed = await dbRedeem(code, usedByApiKeyId);
   if (!redeemed) {
     return { success: false, error: "Failed to redeem invite" };
   }
@@ -87,41 +89,14 @@ export async function redeemInvite(
  * List invites created by an API key.
  */
 export async function listInvites(apiKeyId: string) {
-  const db = (await import("../db/core")).getDbInstance();
-
-  const rows = db
-    .prepare(
-      `SELECT id, code, server_url, max_uses, use_count, expires_at, revoked_at, created_at
-       FROM invite_tokens WHERE created_by = ? ORDER BY created_at DESC`
-    )
-    .all(apiKeyId) as Array<{
-    id: string;
-    code: string;
-    server_url: string | null;
-    max_uses: number;
-    use_count: number;
-    expires_at: string | null;
-    revoked_at: string | null;
-    created_at: string;
-  }>;
-
-  return rows.map((r) => ({
-    id: r.id,
-    code: r.code,
-    serverUrl: r.server_url,
-    maxUses: r.max_uses,
-    useCount: r.use_count,
-    expiresAt: r.expires_at,
-    revokedAt: r.revoked_at,
-    createdAt: r.created_at,
-  }));
+  return listInvitesAsync(apiKeyId);
 }
 
 /**
  * Revoke an invite token.
  */
 export async function revokeInvite(inviteId: string): Promise<boolean> {
-  const { revokeInvite: dbRevoke } = await import("../db/gamification");
-  dbRevoke(inviteId);
+  const { revokeInviteAsync: dbRevoke } = await import("../db/gamification");
+  await dbRevoke(inviteId);
   return true;
 }

@@ -1,3 +1,4 @@
+import { getSelectedSemanticCacheAuthority } from "@/lib/db/semanticCache";
 /**
  * Semantic Cache Manager
  *
@@ -17,6 +18,7 @@ import {
   type SemanticCacheConfig,
   type SemanticCacheType,
   resolveSemanticCacheConfig,
+  resolveSemanticCacheConfigAsync,
 } from "../../config/semanticCacheConfig.ts";
 import { type CacheEntry, type IVectorStore, type StoreFilter } from "./vectorStore.ts";
 import { MemoryVectorStore } from "./memoryVectorStore.ts";
@@ -166,9 +168,10 @@ export class SemanticCacheManager {
   constructor(
     config?: Partial<SemanticCacheConfig>,
     customStore?: IVectorStore,
-    customEmbeddingGenerator?: EmbeddingGenerator
+    customEmbeddingGenerator?: EmbeddingGenerator,
+    resolvedConfiguration = false
   ) {
-    this.config = resolveSemanticCacheConfig(config);
+    this.config = resolveSemanticCacheConfig(config, resolvedConfiguration ? config : undefined);
     if (customStore) {
       this.vectorStore = customStore;
     } else if (this.config.backend === "redis") {
@@ -509,4 +512,27 @@ export function getSemanticCacheManager(): SemanticCacheManager {
 
 export function resetSemanticCacheManager(custom?: SemanticCacheManager | null): void {
   defaultManager = custom ?? null;
+  authorityManagers = new WeakMap();
+}
+
+let authorityManagers = new WeakMap<
+  object,
+  { fingerprint: string; manager: SemanticCacheManager }
+>();
+
+/** Capture immutable configuration per operation rather than mutating an in-flight manager. */
+export async function getSemanticCacheManagerAsync(): Promise<SemanticCacheManager> {
+  const authority = getSelectedSemanticCacheAuthority();
+  if (!authority) return getSemanticCacheManager();
+  const config = await resolveSemanticCacheConfigAsync();
+  const fingerprint = crypto.createHash("sha256").update(JSON.stringify(config)).digest("hex");
+  let captured = authorityManagers.get(authority);
+  if (!captured || captured.fingerprint !== fingerprint) {
+    captured = {
+      fingerprint,
+      manager: new SemanticCacheManager(config, undefined, undefined, true),
+    };
+    authorityManagers.set(authority, captured);
+  }
+  return captured.manager;
 }

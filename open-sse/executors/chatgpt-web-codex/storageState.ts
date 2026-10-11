@@ -1,8 +1,14 @@
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, rmSync } from "node:fs";
+import { access, readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
+import { protectedConnectionWrite } from "../../vendor/codex-chatgpt-web/storage-state-write.ts";
 
-import { atomicWriteFile, getConfigDir } from "../../vendor/codex-chatgpt-web/config.ts";
+import {
+  atomicWriteFile,
+  atomicWriteFileAsync,
+  getConfigDir,
+} from "../../vendor/codex-chatgpt-web/config.ts";
 import { loginVerificationMarkerPath } from "../../vendor/codex-chatgpt-web/browser-login.ts";
 
 function connectionSegment(connectionId: string): string {
@@ -206,4 +212,145 @@ export function finalizeValidatedChatGptWebCodexSecrets(
   });
   rmSync(paths.root, { recursive: true, force: true });
   return { encodedCredential: next, storageState };
+}
+
+async function pathExistsAsync(path: string): Promise<boolean> {
+  try {
+    await access(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function readConnectionStorageStateAsync(
+  path: string
+): Promise<Record<string, unknown>> {
+  const parsed = JSON.parse(await readFile(path, "utf8")) as unknown;
+  if (!validStorageState(parsed)) throw new Error("ChatGPT browser storage state is invalid");
+  return normalizeStorageStateForPlaywright(parsed);
+}
+
+export async function ensureConnectionStorageStateAsync(
+  connectionId: string,
+  rawCookie: string
+): Promise<string> {
+  const paths = connectionRuntimePaths(connectionId);
+  return protectedConnectionWrite(paths.root, async () => {
+    const markerPath = loginVerificationMarkerPath(paths.storageStatePath);
+    const fingerprint = cookieFingerprint(rawCookie);
+    if ((await pathExistsAsync(paths.storageStatePath)) && (await pathExistsAsync(markerPath))) {
+      try {
+        const marker = JSON.parse(await readFile(markerPath, "utf8")) as Record<string, unknown>;
+        if (
+          marker.version === 1 &&
+          marker.authenticated === true &&
+          marker.cookieFingerprint === fingerprint
+        ) {
+          return paths.storageStatePath;
+        }
+      } catch {
+        // Rebuild the state below.
+      }
+    }
+    await atomicWriteFileAsync(
+      paths.storageStatePath,
+      `${JSON.stringify({ cookies: parseCookies(rawCookie), origins: [] })}\n`
+    );
+    await atomicWriteFileAsync(
+      markerPath,
+      `${JSON.stringify({
+        version: 1,
+        authenticated: true,
+        verifiedAt: new Date().toISOString(),
+        cookieFingerprint: fingerprint,
+        pendingBrowserVerification: true,
+      })}\n`
+    );
+    return paths.storageStatePath;
+  });
+}
+
+export async function ensureConnectionStorageStateFromCredentialAsync(
+  connectionId: string,
+  credential: { cookie?: string; storageState?: Record<string, unknown> }
+): Promise<string> {
+  if (!credential.storageState) {
+    if (!credential.cookie) throw new Error("ChatGPT browser credentials are missing");
+    return ensureConnectionStorageStateAsync(connectionId, credential.cookie);
+  }
+  if (!validStorageState(credential.storageState)) {
+    throw new Error("Encrypted ChatGPT browser storage state is invalid");
+  }
+  const paths = connectionRuntimePaths(connectionId);
+  const storageState = credential.storageState;
+  return protectedConnectionWrite(paths.root, async () => {
+    const markerPath = loginVerificationMarkerPath(paths.storageStatePath);
+    const fingerprint = stateFingerprint(storageState);
+    if ((await pathExistsAsync(paths.storageStatePath)) && (await pathExistsAsync(markerPath))) {
+      try {
+        const marker = JSON.parse(await readFile(markerPath, "utf8")) as Record<string, unknown>;
+        if (
+          marker.version === 1 &&
+          marker.authenticated === true &&
+          marker.pendingBrowserVerification !== true &&
+          marker.storageStateFingerprint === fingerprint
+        ) {
+          return paths.storageStatePath;
+        }
+      } catch {
+        // Rebuild the protected local working copy below.
+      }
+    }
+    const normalizedStorageState = normalizeStorageStateForPlaywright(storageState);
+    await atomicWriteFileAsync(
+      paths.storageStatePath,
+      `${JSON.stringify(normalizedStorageState)}\n`
+    );
+    await atomicWriteFileAsync(
+      markerPath,
+      `${JSON.stringify({
+        version: 1,
+        authenticated: true,
+        verifiedAt: new Date().toISOString(),
+        storageStateFingerprint: fingerprint,
+        pendingBrowserVerification: false,
+      })}\n`
+    );
+    return paths.storageStatePath;
+  });
+}
+
+export async function finalizeValidatedChatGptWebCodexSecretsAsync(
+  encodedCredential: string,
+  validationId: string
+): Promise<{ encodedCredential: string; storageState: Record<string, unknown> }> {
+  const parsed = JSON.parse(encodedCredential) as Record<string, unknown>;
+  const rawCookie = typeof parsed.cookie === "string" ? cookieHeaderValue(parsed.cookie) : "";
+  if (!rawCookie) throw new Error("A fresh ChatGPT Cookie is required for browser validation");
+  if (!/^validation-[a-f0-9]{24}$/.test(validationId)) {
+    throw new Error("ChatGPT browser validation reference is invalid");
+  }
+  const paths = connectionRuntimePaths(validationId);
+  return protectedConnectionWrite(paths.root, async () => {
+    const markerPath = loginVerificationMarkerPath(paths.storageStatePath);
+    const marker = JSON.parse(await readFile(markerPath, "utf8")) as Record<string, unknown>;
+    if (
+      marker.version !== 1 ||
+      marker.authenticated !== true ||
+      marker.pendingBrowserVerification === true ||
+      marker.cookieFingerprint !== cookieFingerprint(rawCookie)
+    ) {
+      throw new Error("ChatGPT browser validation does not match the supplied Cookie");
+    }
+    const storageState = await readConnectionStorageStateAsync(paths.storageStatePath);
+    const runtimeKey = typeof parsed.runtimeKey === "string" ? parsed.runtimeKey.trim() : "";
+    const next = JSON.stringify({
+      version: 2,
+      storageState,
+      ...(runtimeKey ? { runtimeKey } : {}),
+    });
+    await rm(paths.root, { recursive: true, force: true });
+    return { encodedCredential: next, storageState };
+  });
 }

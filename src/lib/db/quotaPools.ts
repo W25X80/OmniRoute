@@ -9,6 +9,13 @@
  */
 
 import { getDbInstance } from "./core";
+import { getSelectedPostgresDatabase, getSelectedPersistenceIdentity } from "./controlPlaneContext";
+import { PostgresQuotaRepository } from "./postgres/quotaRepository";
+import {
+  rowToQuotaAllocation as rowToAllocation,
+  quotaAllocationFingerprint as allocationFingerprint,
+  type QuotaAllocationRow as AllocationRow,
+} from "./quotaSemantics";
 import { clearApiKeyCaches } from "./apiKeys";
 import { getCachedProviderConnectionById, invalidateModelCatalogCache } from "./readCache";
 import { deleteSchedulesForPool } from "./quotaSchedules";
@@ -20,15 +27,40 @@ import { deleteSchedulesForPool } from "./quotaSchedules";
 const quotaComboMaintenance = new Map<string, Promise<unknown>>();
 const deletingPools = new Set<string>();
 
+interface NativeQuotaPoolMaintenance {
+  readonly maintenance: Map<string, Promise<unknown>>;
+  readonly deleting: Set<string>;
+}
+const nativeMaintenanceKey = Symbol.for("omniroute.postgres.quotaPoolMaintenance.v1");
+const processQuotaMaintenance = globalThis as typeof globalThis & {
+  [nativeMaintenanceKey]?: WeakMap<object, NativeQuotaPoolMaintenance>;
+};
+const nativeQuotaPoolMaintenance = (processQuotaMaintenance[nativeMaintenanceKey] ??= new WeakMap<
+  object,
+  NativeQuotaPoolMaintenance
+>());
+
+function selectedNativeQuotaPoolMaintenance(): NativeQuotaPoolMaintenance {
+  const identity = getSelectedPersistenceIdentity();
+  if (!identity) throw new Error("Native quota maintenance requires selected persistence");
+  let state = nativeQuotaPoolMaintenance.get(identity);
+  if (!state) {
+    state = { maintenance: new Map(), deleting: new Set() };
+    nativeQuotaPoolMaintenance.set(identity, state);
+  }
+  return state;
+}
+
 function serializeQuotaComboMaintenance<T>(
   poolId: string,
-  operation: () => Promise<T>
+  operation: () => Promise<T>,
+  maintenance = quotaComboMaintenance
 ): Promise<T> {
-  const previous = quotaComboMaintenance.get(poolId);
+  const previous = maintenance.get(poolId);
   const current = previous ? previous.catch(() => undefined).then(operation) : operation();
-  quotaComboMaintenance.set(poolId, current);
+  maintenance.set(poolId, current);
   const cleanup = () => {
-    if (quotaComboMaintenance.get(poolId) === current) quotaComboMaintenance.delete(poolId);
+    if (maintenance.get(poolId) === current) maintenance.delete(poolId);
   };
   void current.then(cleanup, cleanup);
   return current;
@@ -163,40 +195,6 @@ interface PoolRow {
   name: string;
   group_id: string | null;
   created_at: string;
-}
-
-interface AllocationRow {
-  pool_id: string;
-  api_key_id: string;
-  weight: number;
-  cap_value: number | null;
-  cap_unit: string | null;
-  policy: string;
-}
-
-const VALID_POLICIES: ReadonlySet<string> = new Set<Policy>(["hard", "soft", "burst"]);
-
-/**
- * Fail-safe policy normalization at the DB read boundary. A column value outside
- * `hard | soft | burst` (corrupted/legacy row, or a value inserted while the
- * table CHECK constraint was bypassed) is coerced to the most restrictive
- * policy, `hard`, instead of being trusted via a raw `as Policy` cast. This
- * prevents an unknown policy from reaching the fair-share engine, where it would
- * otherwise be a silent fail-OPEN (issue #10).
- */
-function normalizePolicy(value: string): Policy {
-  return VALID_POLICIES.has(value) ? (value as Policy) : "hard";
-}
-
-function rowToAllocation(row: AllocationRow): PoolAllocation {
-  const alloc: PoolAllocation = {
-    apiKeyId: row.api_key_id,
-    weight: row.weight,
-    policy: normalizePolicy(row.policy),
-  };
-  if (row.cap_value != null) alloc.capValue = row.cap_value;
-  if (row.cap_unit != null) alloc.capUnit = row.cap_unit as QuotaUnit;
-  return alloc;
 }
 
 interface PoolConnectionRow {
@@ -434,20 +432,6 @@ export function createPool(input: PoolCreate): QuotaPool {
   return result;
 }
 
-function allocationFingerprint(allocations: PoolAllocation[] = []): string {
-  return JSON.stringify(
-    allocations
-      .map((allocation) => ({
-        apiKeyId: allocation.apiKeyId,
-        weight: allocation.weight,
-        capValue: allocation.capValue ?? null,
-        capUnit: allocation.capUnit ?? null,
-        policy: allocation.policy,
-      }))
-      .sort((left, right) => left.apiKeyId.localeCompare(right.apiKeyId))
-  );
-}
-
 /** Idempotent pool management for automation and bounded CLI callers. */
 export function ensurePool(input: PoolCreate): EnsurePoolResult {
   const members =
@@ -568,6 +552,8 @@ export function updatePool(id: string, input: PoolUpdate): QuotaPool | null {
  * Returns true if a row was deleted, false if not found.
  */
 export async function deletePool(id: string): Promise<boolean> {
+  const repository = selectedQuotaRepository();
+  if (repository) return deletePostgresPool(repository, id);
   if (deletingPools.has(id)) return false;
   const exists = getDb().prepare<{ id: string }>("SELECT id FROM quota_pools WHERE id = ?").get(id);
   if (!exists) return false;
@@ -729,7 +715,10 @@ export function listAllocationsForApiKey(
  */
 export async function syncQuotaCombosForProvider(providerId: string): Promise<void> {
   try {
-    const { items: pools } = listPools();
+    const nativeState = getSelectedPostgresDatabase()
+      ? selectedNativeQuotaPoolMaintenance()
+      : undefined;
+    const { items: pools } = await listPoolsAsync();
     for (const pool of pools) {
       let matches = false;
       const connectionIds = pool.connectionIds?.length ? pool.connectionIds : [pool.connectionId];
@@ -744,7 +733,15 @@ export async function syncQuotaCombosForProvider(providerId: string): Promise<vo
         }
       }
       if (matches) {
-        void serializeQuotaComboMaintenance(pool.id, () => syncQuotaCombosGuarded(pool.id));
+        if (nativeState) {
+          await serializeQuotaComboMaintenance(
+            pool.id,
+            () => syncQuotaCombosGuarded(pool.id),
+            nativeState.maintenance
+          );
+        } else {
+          void serializeQuotaComboMaintenance(pool.id, () => syncQuotaCombosGuarded(pool.id));
+        }
       }
     }
   } catch (err) {
@@ -753,4 +750,130 @@ export async function syncQuotaCombosForProvider(providerId: string): Promise<vo
       (err as Error)?.message
     );
   }
+}
+
+function selectedQuotaRepository(): PostgresQuotaRepository | undefined {
+  const database = getSelectedPostgresDatabase();
+  return database ? new PostgresQuotaRepository(database) : undefined;
+}
+
+function invalidateQuotaMetadata(): void {
+  clearApiKeyCaches();
+  invalidateModelCatalogCache();
+}
+
+export async function getPoolsByGroupAsync(
+  groupId: string,
+  limit?: number,
+  offset?: number
+): Promise<QuotaPool[]> {
+  const repository = selectedQuotaRepository();
+  return repository
+    ? repository.getPoolsByGroup(groupId, limit, offset)
+    : getPoolsByGroup(groupId, limit, offset);
+}
+
+export async function listPoolsAsync(options?: {
+  limit?: number;
+  offset?: number;
+}): Promise<{ items: QuotaPool[]; total: number }> {
+  const repository = selectedQuotaRepository();
+  return repository ? repository.listPools(options) : listPools(options);
+}
+
+export async function getPoolAsync(id: string): Promise<QuotaPool | null> {
+  const repository = selectedQuotaRepository();
+  return repository ? repository.getPool(id) : getPool(id);
+}
+
+export async function createPoolAsync(input: PoolCreate): Promise<QuotaPool> {
+  const repository = selectedQuotaRepository();
+  if (!repository) return createPool(input);
+  const state = selectedNativeQuotaPoolMaintenance();
+  const pool = await repository.createPool(input);
+  invalidateQuotaMetadata();
+  await serializeQuotaComboMaintenance(
+    pool.id,
+    () => syncQuotaCombosGuarded(pool.id),
+    state.maintenance
+  );
+  return pool;
+}
+
+export async function ensurePoolAsync(input: PoolCreate): Promise<EnsurePoolResult> {
+  const repository = selectedQuotaRepository();
+  if (!repository) return ensurePool(input);
+  const state = selectedNativeQuotaPoolMaintenance();
+  const result = await repository.ensurePool(input);
+  if (result.created || result.updated) {
+    invalidateQuotaMetadata();
+    await serializeQuotaComboMaintenance(
+      result.pool.id,
+      () => syncQuotaCombosGuarded(result.pool.id),
+      state.maintenance
+    );
+  }
+  return result;
+}
+
+export async function updatePoolAsync(id: string, input: PoolUpdate): Promise<QuotaPool | null> {
+  const repository = selectedQuotaRepository();
+  if (!repository) return updatePool(id, input);
+  const state = selectedNativeQuotaPoolMaintenance();
+  if (state.deleting.has(id)) return null;
+  const pool = await repository.updatePool(id, input);
+  if (pool) {
+    invalidateQuotaMetadata();
+    await serializeQuotaComboMaintenance(id, () => syncQuotaCombosGuarded(id), state.maintenance);
+  }
+  return pool;
+}
+
+async function deletePostgresPool(
+  repository: PostgresQuotaRepository,
+  id: string
+): Promise<boolean> {
+  const state = selectedNativeQuotaPoolMaintenance();
+  if (state.deleting.has(id) || !(await repository.getPool(id))) return false;
+  state.deleting.add(id);
+  try {
+    return await serializeQuotaComboMaintenance(
+      id,
+      async () => {
+        await removeQuotaCombosGuarded(id);
+        const changed = await repository.deletePool(id);
+        if (changed) invalidateQuotaMetadata();
+        return changed;
+      },
+      state.maintenance
+    );
+  } finally {
+    state.deleting.delete(id);
+  }
+}
+
+export async function upsertAllocationsAsync(
+  poolId: string,
+  allocations: PoolAllocation[]
+): Promise<void> {
+  const repository = selectedQuotaRepository();
+  if (!repository) return upsertAllocations(poolId, allocations);
+  const state = selectedNativeQuotaPoolMaintenance();
+  if (state.deleting.has(poolId)) return;
+  await repository.upsertAllocations(poolId, allocations);
+  invalidateQuotaMetadata();
+  await serializeQuotaComboMaintenance(
+    poolId,
+    () => syncQuotaCombosGuarded(poolId),
+    state.maintenance
+  );
+}
+
+export async function listAllocationsForApiKeyAsync(
+  apiKeyId: string
+): Promise<Array<{ poolId: string; allocation: PoolAllocation }>> {
+  const repository = selectedQuotaRepository();
+  return repository
+    ? repository.listAllocationsForApiKey(apiKeyId)
+    : listAllocationsForApiKey(apiKeyId);
 }

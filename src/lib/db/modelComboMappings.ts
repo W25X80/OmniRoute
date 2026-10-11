@@ -8,40 +8,49 @@ import type {
   ModelComboMappingPage,
   UpdateModelComboMappingInput,
 } from "@/domain/persistence/comboRepositories";
+import { refreshSelectedPostgresCatalogAfterCommit } from "./postgres/catalogSnapshot";
 import { routingConfigRepositories } from "./repositories/routingConfigRepositories";
 
 export type { ModelComboMapping } from "@/domain/persistence/comboRepositories";
 
-const repository = routingConfigRepositories.modelComboMappings;
+function selectedRepository() {
+  return routingConfigRepositories.modelComboMappings;
+}
 
 export function getModelComboMappings(options?: {
   limit?: number;
   offset?: number;
 }): Promise<ModelComboMappingPage> {
-  return repository.list(options);
+  return selectedRepository().list(options);
 }
 
 export function getModelComboMappingById(id: string): Promise<ModelComboMapping | null> {
-  return repository.findById(id);
+  return selectedRepository().findById(id);
 }
 
-export function createModelComboMapping(
+export async function createModelComboMapping(
   data: CreateModelComboMappingInput
 ): Promise<ModelComboMapping> {
-  return repository.create(data);
+  const result = await selectedRepository().create(data);
+  if (result) await refreshSelectedPostgresCatalogAfterCommit();
+  return result;
 }
 
-export function updateModelComboMapping(
+export async function updateModelComboMapping(
   id: string,
   data: UpdateModelComboMappingInput
 ): Promise<ModelComboMapping | null> {
-  return repository.update(id, data);
+  const result = await selectedRepository().update(id, data);
+  if (result) await refreshSelectedPostgresCatalogAfterCommit();
+  return result;
 }
 
-export function deleteModelComboMapping(id: string): Promise<boolean> {
-  return repository.deleteById(id);
+export async function deleteModelComboMapping(id: string): Promise<boolean> {
+  const result = await selectedRepository().deleteById(id);
+  if (result) await refreshSelectedPostgresCatalogAfterCommit();
+  return result;
 }
 
 export function resolveComboForModel(model: string): Promise<Record<string, unknown> | null> {
-  return repository.resolveForModel(model);
+  return selectedRepository().resolveForModel(model);
 }

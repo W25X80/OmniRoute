@@ -1,3 +1,6 @@
+import fsPromises from "node:fs/promises";
+import { parseDatabaseBackend } from "../../src/lib/db/backendSelection";
+import { getServerLifecyclePhase } from "../../src/lib/serverLifecycle";
 /**
  * @file alibabaFreeTierAllowlist.ts
  * @description Offline fallback allowlist for Alibaba Model Studio free-tier text models.
@@ -108,9 +111,52 @@ const EMBEDDED_ALLOWLIST_PACK: AlibabaFreeTierAllowlistPack = {
 };
 
 let cachedPack: AlibabaFreeTierAllowlistPack | null | undefined;
+const NATIVE_ALIBABA_ALLOWLIST = Symbol.for("omniroute.nativeAlibabaFreeTierAllowlist");
+interface NativeAlibabaAllowlistState {
+  loaded: boolean;
+  value?: AlibabaFreeTierAllowlistPack | null;
+  preparation?: Promise<void>;
+}
+const allowlistGlobals = globalThis as typeof globalThis & {
+  [NATIVE_ALIBABA_ALLOWLIST]?: NativeAlibabaAllowlistState;
+};
+function nativeAllowlistState(): NativeAlibabaAllowlistState {
+  return (allowlistGlobals[NATIVE_ALIBABA_ALLOWLIST] ??= { loaded: false });
+}
+
+export function prepareNativeAlibabaFreeTierAllowlist(): Promise<void> {
+  if (parseDatabaseBackend() !== "postgres") return Promise.resolve();
+  const state = nativeAllowlistState();
+  if (state.loaded) return Promise.resolve();
+  if (state.preparation) return state.preparation;
+  const paths = resolveAllowlistPaths();
+  state.preparation = Promise.resolve().then(async () => {
+    let value: AlibabaFreeTierAllowlistPack | null = null;
+    for (const candidatePath of paths) {
+      try {
+        const parsed = parseAllowlistPack(
+          JSON.parse(await fsPromises.readFile(candidatePath, "utf8"))
+        );
+        if (parsed && isAlibabaFreeTierAllowlistPackValid(parsed)) {
+          value = parsed;
+          break;
+        }
+      } catch {
+        // Match the legacy next-candidate behavior on missing/unreadable/corrupt files.
+      }
+    }
+    // An explicit reset while preparation awaited must not republish the superseded state.
+    if (allowlistGlobals[NATIVE_ALIBABA_ALLOWLIST] === state) {
+      state.value = value;
+      state.loaded = true;
+    }
+  });
+  return state.preparation;
+}
 
 export function resetAlibabaFreeTierAllowlistCache(): void {
   cachedPack = undefined;
+  if (parseDatabaseBackend() === "postgres") delete allowlistGlobals[NATIVE_ALIBABA_ALLOWLIST];
 }
 
 function resolveAllowlistPaths(): string[] {
@@ -162,7 +208,19 @@ export function isAlibabaFreeTierAllowlistPackValid(
 }
 
 export function loadAlibabaFreeTierAllowlistPack(): AlibabaFreeTierAllowlistPack | null {
-  if (cachedPack !== undefined) return cachedPack;
+  if (parseDatabaseBackend() === "postgres") {
+    const state = nativeAllowlistState();
+    if (state.loaded) return state.value ?? null;
+    if (state.preparation || getServerLifecyclePhase() === "ready") {
+      throw new Error("Native Alibaba free-tier allowlist is not prepared");
+    }
+  }
+  if (cachedPack !== undefined) {
+    if (parseDatabaseBackend() === "postgres") {
+      Object.assign(nativeAllowlistState(), { value: cachedPack, loaded: true });
+    }
+    return cachedPack;
+  }
 
   for (const candidatePath of resolveAllowlistPaths()) {
     try {
@@ -170,6 +228,9 @@ export function loadAlibabaFreeTierAllowlistPack(): AlibabaFreeTierAllowlistPack
       const parsed = parseAllowlistPack(JSON.parse(fs.readFileSync(candidatePath, "utf8")));
       if (parsed && isAlibabaFreeTierAllowlistPackValid(parsed)) {
         cachedPack = parsed;
+        if (parseDatabaseBackend() === "postgres") {
+          Object.assign(nativeAllowlistState(), { value: cachedPack, loaded: true });
+        }
         return cachedPack;
       }
     } catch {
@@ -178,6 +239,9 @@ export function loadAlibabaFreeTierAllowlistPack(): AlibabaFreeTierAllowlistPack
   }
 
   cachedPack = null;
+  if (parseDatabaseBackend() === "postgres") {
+    Object.assign(nativeAllowlistState(), { value: cachedPack, loaded: true });
+  }
   return cachedPack;
 }
 

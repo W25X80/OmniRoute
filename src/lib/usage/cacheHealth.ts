@@ -1,3 +1,4 @@
+import { getSelectedUsageReadRepository } from "../db/postgres/usageReadRepository";
 /**
  * Prompt-cache health — turns the raw cache columns of `call_logs` into a
  * summary an operator can act on.
@@ -287,4 +288,28 @@ export function buildCacheHealthResponse(opts: {
   );
 
   return { ...summary, timeRange: opts.range, since, truncated };
+}
+
+export async function buildCacheHealthResponseAsync(opts: {
+  range: UtilizationTimeRange;
+  model?: string;
+  now?: number;
+}): Promise<CacheHealthResponse> {
+  const postgres = getSelectedUsageReadRepository();
+  if (!postgres) return buildCacheHealthResponse(opts);
+  const since = new Date((opts.now ?? Date.now()) - RANGE_MS[opts.range]).toISOString();
+  const rows = (await postgres.cacheHealth(
+    since,
+    opts.model,
+    MAX_ROWS + 1
+  )) as unknown as CacheHealthDbRow[];
+  const summary = summarizeCacheHealth(
+    rows.slice(0, MAX_ROWS).map((row) => ({
+      model: row.requested_model || row.model || "unknown",
+      cacheRead: row.tokens_cache_read,
+      cacheCreation: row.tokens_cache_creation,
+      timestamp: row.timestamp || "",
+    }))
+  );
+  return { ...summary, timeRange: opts.range, since, truncated: rows.length > MAX_ROWS };
 }

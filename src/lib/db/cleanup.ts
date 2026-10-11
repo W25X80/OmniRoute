@@ -1,3 +1,12 @@
+import { parseDatabaseBackend } from "./backendSelection";
+import {
+  startPostgresCleanupScheduler,
+  stopPostgresCleanupScheduler,
+  stopPostgresCleanupSchedulerAsync,
+} from "./cleanupScheduler";
+import { getSelectedPostgresDatabase } from "./controlPlaneContext";
+import { createPostgresCleanupRepository } from "./postgres/cleanupRepository";
+import { deleteCallArtifactAsync } from "@/lib/usage/callLogArtifacts";
 /**
  * Database cleanup functions for removing old data based on retention policies.
  *
@@ -8,7 +17,7 @@ import { rollupUsageHistoryBeforeDate } from "@/lib/usage/aggregateHistory";
 import { purgeCallLogArtifactDirectory } from "@/lib/usage/callLogArtifacts";
 
 import { getDbInstance } from "./core";
-import { getUserDatabaseSettings } from "./databaseSettings";
+import { getUserDatabaseSettingsAsync } from "./databaseSettings";
 import {
   describeReclaim,
   reclaimFreedPages,
@@ -26,24 +35,27 @@ import {
   type DeleteByPeriodTarget,
 } from "./cleanup/usagePurge";
 import { ensureCompressionRunTelemetryTable } from "./compressionRunTelemetry";
-import { isFeatureFlagEnabled } from "@/shared/utils/featureFlags";
+import { isFeatureFlagEnabledAsync } from "@/shared/utils/featureFlags";
 
 interface CleanupResult {
   deleted: number;
   deletedArtifacts?: number;
+  pendingArtifactDeletions?: number;
   errors: number;
 }
 
-function getRetentionSettings() {
-  return getUserDatabaseSettings().retention;
+async function getRetentionSettings() {
+  return (await getUserDatabaseSettingsAsync()).retention;
 }
 
 /**
  * Clean up old quota_snapshots based on retention settings.
  */
 export async function cleanupQuotaSnapshots(): Promise<CleanupResult> {
+  if (getSelectedPostgresDatabase())
+    return cleanupPostgresTable("quota_snapshots", "created_at", "quotaSnapshots", "iso");
   const db = getDbInstance();
-  const retention = getRetentionSettings();
+  const retention = await getRetentionSettings();
 
   const retentionDays = retention.quotaSnapshots;
   const cutoffDate = new Date();
@@ -72,8 +84,10 @@ export async function cleanupQuotaSnapshots(): Promise<CleanupResult> {
  * Clean up old call_logs based on retention settings.
  */
 export async function cleanupCallLogs(): Promise<CleanupResult> {
+  if (getSelectedPostgresDatabase())
+    return cleanupPostgresTable("call_logs", "timestamp", "callLogs", "iso");
   const db = getDbInstance();
-  const retention = getRetentionSettings();
+  const retention = await getRetentionSettings();
 
   const retentionDays = retention.callLogs;
   const cutoffDate = new Date();
@@ -99,15 +113,31 @@ export async function cleanupCallLogs(): Promise<CleanupResult> {
 /**
  * Clean up old usage_history based on retention settings.
  */
-export async function cleanupUsageHistory(): Promise<CleanupResult> {
+export async function cleanupUsageHistory(cutoffOverride?: string): Promise<CleanupResult> {
+  if (getSelectedPostgresDatabase()) {
+    const result: CleanupResult = { deleted: 0, errors: 0 };
+    try {
+      const retention = await getRetentionSettings();
+      const cutoffDate = new Date(Date.now() - retention.usageHistory * 86_400_000);
+      const cutoff = cutoffOverride ?? cutoffDate.toISOString().slice(0, 10);
+      const { cleanupUsageHistoryBeforeAsync } = await import("@/lib/usage/aggregateHistory");
+      const rolled = await cleanupUsageHistoryBeforeAsync(cutoff);
+      result.errors = rolled.errors;
+      if (rolled.errors === 0) result.deleted = rolled.deleted;
+    } catch (error) {
+      console.error("[Cleanup] PostgreSQL usage retention failed:", error);
+      result.errors++;
+    }
+    return result;
+  }
   const db = getDbInstance();
-  const retention = getRetentionSettings();
+  const retention = await getRetentionSettings();
 
   const retentionDays = retention.usageHistory;
   const cutoffDate = new Date();
   cutoffDate.setDate(cutoffDate.getDate() - retentionDays);
   const cutoffISO = cutoffDate.toISOString();
-  const cutoffDateStr = cutoffISO.split("T")[0];
+  const cutoffDateStr = cutoffOverride ?? cutoffISO.split("T")[0];
 
   const result: CleanupResult = { deleted: 0, errors: 0 };
 
@@ -149,8 +179,15 @@ export async function cleanupUsageHistory(): Promise<CleanupResult> {
  * Clean up old compression_analytics based on retention settings.
  */
 export async function cleanupCompressionAnalytics(): Promise<CleanupResult> {
+  if (getSelectedPostgresDatabase())
+    return cleanupPostgresTable(
+      "compression_analytics",
+      "timestamp",
+      "compressionAnalytics",
+      "iso"
+    );
   const db = getDbInstance();
-  const retention = getRetentionSettings();
+  const retention = await getRetentionSettings();
 
   const retentionDays = retention.compressionAnalytics;
   const cutoffDate = new Date();
@@ -180,8 +217,15 @@ export async function cleanupCompressionAnalytics(): Promise<CleanupResult> {
  * Uses retention.compressionAnalytics (same retention window as compression_analytics).
  */
 export async function cleanupCompressionEngineBreakdown(): Promise<CleanupResult> {
+  if (getSelectedPostgresDatabase())
+    return cleanupPostgresTable(
+      "compression_engine_breakdown",
+      "timestamp",
+      "compressionAnalytics",
+      "iso"
+    );
   const db = getDbInstance();
-  const retention = getRetentionSettings();
+  const retention = await getRetentionSettings();
 
   const retentionDays = retention.compressionAnalytics;
   const cutoffDate = new Date();
@@ -212,8 +256,10 @@ export async function cleanupCompressionEngineBreakdown(): Promise<CleanupResult
  * Clean up old mcp_tool_audit based on retention settings.
  */
 export async function cleanupMcpAudit(): Promise<CleanupResult> {
+  if (getSelectedPostgresDatabase())
+    return cleanupPostgresTable("mcp_tool_audit", "created_at", "mcpAudit", "iso");
   const db = getDbInstance();
-  const retention = getRetentionSettings();
+  const retention = await getRetentionSettings();
 
   const retentionDays = retention.mcpAudit;
   const cutoffDate = new Date();
@@ -241,9 +287,17 @@ export async function cleanupMcpAudit(): Promise<CleanupResult> {
 /**
  * Clean up old config_audit_log based on retention settings.
  */
-export async function cleanupConfigAudit(
-  retentionDays = getRetentionSettings().configAudit
-): Promise<CleanupResult> {
+export async function cleanupConfigAudit(retentionDays?: number): Promise<CleanupResult> {
+  if (getSelectedPostgresDatabase()) {
+    return cleanupPostgresTable(
+      "config_audit_log",
+      "timestamp",
+      "configAudit",
+      "iso",
+      retentionDays
+    );
+  }
+  retentionDays ??= (await getRetentionSettings()).configAudit;
   const db = getDbInstance();
   const result: CleanupResult = { deleted: 0, errors: 0 };
 
@@ -269,8 +323,10 @@ export async function cleanupConfigAudit(
  * Clean up old a2a_task_events based on retention settings.
  */
 export async function cleanupA2aEvents(): Promise<CleanupResult> {
+  if (getSelectedPostgresDatabase())
+    return cleanupPostgresTable("a2a_task_events", "created_at", "a2aEvents", "iso");
   const db = getDbInstance();
-  const retention = getRetentionSettings();
+  const retention = await getRetentionSettings();
 
   const retentionDays = retention.a2aEvents;
   const cutoffDate = new Date();
@@ -299,8 +355,10 @@ export async function cleanupA2aEvents(): Promise<CleanupResult> {
  * Clean up old memory_entries based on retention settings.
  */
 export async function cleanupMemoryEntries(): Promise<CleanupResult> {
+  if (getSelectedPostgresDatabase())
+    return cleanupPostgresTable("memories", "created_at", "memoryEntries", "iso");
   const db = getDbInstance();
-  const retention = getRetentionSettings();
+  const retention = await getRetentionSettings();
 
   const retentionDays = retention.memoryEntries;
   const cutoffDate = new Date();
@@ -342,8 +400,10 @@ export async function cleanupMemoryEntries(): Promise<CleanupResult> {
  * is Date.now()), so the cutoff must be in milliseconds to match. (#9625)
  */
 export async function cleanupDomainCostHistory(): Promise<CleanupResult> {
+  if (getSelectedPostgresDatabase())
+    return cleanupPostgresTable("domain_cost_history", "timestamp", "domainCostHistory", "epochMs");
   const db = getDbInstance();
-  const retention = getRetentionSettings();
+  const retention = await getRetentionSettings();
 
   const retentionDays = retention.domainCostHistory;
   const cutoffEpoch = Date.now() - retentionDays * 86_400_000;
@@ -371,8 +431,15 @@ export async function cleanupDomainCostHistory(): Promise<CleanupResult> {
  * Uses `created_at` column (DATETIME string).
  */
 export async function cleanupCompressionCacheStats(): Promise<CleanupResult> {
+  if (getSelectedPostgresDatabase())
+    return cleanupPostgresTable(
+      "compression_cache_stats",
+      "created_at",
+      "compressionCacheStats",
+      "iso"
+    );
   const db = getDbInstance();
-  const retention = getRetentionSettings();
+  const retention = await getRetentionSettings();
 
   const retentionDays = retention.compressionCacheStats;
   const cutoffDate = new Date();
@@ -401,8 +468,10 @@ export async function cleanupCompressionCacheStats(): Promise<CleanupResult> {
  * Clean up old xp_audit_log based on retention settings.
  */
 export async function cleanupXpAuditLog(): Promise<CleanupResult> {
+  if (getSelectedPostgresDatabase())
+    return cleanupPostgresTable("xp_audit_log", "created_at", "xpAuditLog", "iso");
   const db = getDbInstance();
-  const retention = getRetentionSettings();
+  const retention = await getRetentionSettings();
 
   const retentionDays = retention.xpAuditLog;
   const cutoffDate = new Date();
@@ -434,9 +503,16 @@ export async function cleanupXpAuditLog(): Promise<CleanupResult> {
  * domain_cost_history (#9625), which this function was missed by.
  */
 export async function cleanupCompressionRunTelemetry(): Promise<CleanupResult> {
+  if (getSelectedPostgresDatabase())
+    return cleanupPostgresTable(
+      "compression_run_telemetry",
+      "timestamp",
+      "compressionRunTelemetry",
+      "epochMs"
+    );
   const db = getDbInstance();
   ensureCompressionRunTelemetryTable();
-  const retention = getRetentionSettings();
+  const retention = await getRetentionSettings();
 
   const retentionDays = retention.compressionRunTelemetry;
   const cutoffEpoch = Date.now() - retentionDays * 86_400_000;
@@ -473,8 +549,8 @@ export async function cleanupCcrBlocks(): Promise<CleanupResult> {
   const result: CleanupResult = { deleted: 0, errors: 0 };
 
   try {
-    const { pruneExpiredCcrBlocks } = await import("./ccrBlocks");
-    result.deleted = pruneExpiredCcrBlocks(Date.now());
+    const { pruneExpiredCcrBlocksAsync } = await import("./ccrBlocks");
+    result.deleted = await pruneExpiredCcrBlocksAsync(Date.now());
     console.log(`[Cleanup] Deleted ${result.deleted} expired ccr_blocks`);
   } catch (err: unknown) {
     console.error("[Cleanup] Error cleaning ccr_blocks:", err);
@@ -512,7 +588,7 @@ function getBatchRetentionDays(): number {
 export async function cleanupOldBatches(): Promise<CleanupResult> {
   const result: CleanupResult = { deleted: 0, errors: 0 };
 
-  if (!isFeatureFlagEnabled("BATCH_AND_FILE_AUTO_CLEANUP_ENABLED")) {
+  if (!(await isFeatureFlagEnabledAsync("BATCH_AND_FILE_AUTO_CLEANUP_ENABLED"))) {
     console.log(
       "[Cleanup] Batch auto-cleanup disabled (BATCH_AND_FILE_AUTO_CLEANUP_ENABLED=false); skipping."
     );
@@ -520,9 +596,9 @@ export async function cleanupOldBatches(): Promise<CleanupResult> {
   }
 
   try {
-    const { deleteTerminalBatchesOlderThan } = await import("./batches");
+    const { deleteTerminalBatchesOlderThanAsync } = await import("./batches");
     const retentionDays = getBatchRetentionDays();
-    const { deletedBatches, hasMore } = deleteTerminalBatchesOlderThan(retentionDays);
+    const { deletedBatches, hasMore } = await deleteTerminalBatchesOlderThanAsync(retentionDays);
     result.deleted = deletedBatches;
     console.log(
       `[Cleanup] Deleted ${result.deleted} terminal batches older than ${retentionDays} days` +
@@ -551,7 +627,7 @@ export async function cleanupOldBatches(): Promise<CleanupResult> {
 export async function cleanupExpiredFiles(): Promise<CleanupResult> {
   const result: CleanupResult = { deleted: 0, errors: 0 };
 
-  if (!isFeatureFlagEnabled("BATCH_AND_FILE_AUTO_CLEANUP_ENABLED")) {
+  if (!(await isFeatureFlagEnabledAsync("BATCH_AND_FILE_AUTO_CLEANUP_ENABLED"))) {
     console.log(
       "[Cleanup] Expired-file auto-cleanup disabled (BATCH_AND_FILE_AUTO_CLEANUP_ENABLED=false); skipping."
     );
@@ -559,8 +635,8 @@ export async function cleanupExpiredFiles(): Promise<CleanupResult> {
   }
 
   try {
-    const { pruneExpiredFiles } = await import("./files");
-    result.deleted = pruneExpiredFiles(Math.floor(Date.now() / 1000));
+    const { pruneExpiredFilesAsync } = await import("./files");
+    result.deleted = await pruneExpiredFilesAsync(Math.floor(Date.now() / 1000));
     console.log(`[Cleanup] Deleted ${result.deleted} expired files`);
   } catch (err: unknown) {
     console.error("[Cleanup] Error cleaning expired files:", err);
@@ -589,7 +665,14 @@ export async function cleanupExpiredFiles(): Promise<CleanupResult> {
  * event loop for the whole cleanup pass.
  */
 export async function cleanupConversationTurnNodes(): Promise<CleanupResult> {
-  const retention = getRetentionSettings();
+  if (getSelectedPostgresDatabase())
+    return cleanupPostgresTable(
+      "conversation_turn_nodes",
+      "last_seen_at",
+      "conversationTurnNodes",
+      "iso"
+    );
+  const retention = await getRetentionSettings();
 
   const retentionDays = retention.conversationTurnNodes;
   const cutoffDate = new Date();
@@ -623,8 +706,25 @@ export async function cleanupConversationTurnNodes(): Promise<CleanupResult> {
  * preceding node cleanup.
  */
 export async function cleanupAgenticConversations(): Promise<CleanupResult> {
+  const database = getSelectedPostgresDatabase();
+  if (database) {
+    try {
+      const retention = await getRetentionSettings();
+      const cutoff = new Date(
+        Date.now() - retention.conversationTurnNodes * 86_400_000
+      ).toISOString();
+      return {
+        deleted: await createPostgresCleanupRepository(database).deleteOrphanConversations(cutoff),
+        errors: 0,
+      };
+    } catch (error) {
+      console.error("[Cleanup] PostgreSQL conversation retention failed:", error);
+      return { deleted: 0, errors: 1 };
+    }
+  }
+
   const db = getDbInstance();
-  const retention = getRetentionSettings();
+  const retention = await getRetentionSettings();
   const retentionDays = retention.conversationTurnNodes;
   const cutoffDate = new Date();
   cutoffDate.setDate(cutoffDate.getDate() - retentionDays);
@@ -672,17 +772,28 @@ export async function runAutoCleanup(): Promise<{
   totalErrors: number;
   results: Record<string, CleanupResult>;
 }> {
-  const retention = getRetentionSettings();
+  const database = getSelectedPostgresDatabase();
+  let artifactDeletions: CleanupResult | undefined;
+  if (database) {
+    const pending = await createPostgresCleanupRepository(database).pendingArtifactDeletions();
+    artifactDeletions = { deleted: 0, ...(await deletePostgresArtifacts(pending)) };
+  }
+  const retention = await getRetentionSettings();
   const autoCleanupEnabled = retention.autoCleanupEnabled;
 
   if (!autoCleanupEnabled) {
     console.log("[Cleanup] Auto-cleanup is disabled");
-    return { totalDeleted: 0, totalErrors: 0, results: {} };
+    return {
+      totalDeleted: 0,
+      totalErrors: artifactDeletions?.errors ?? 0,
+      results: artifactDeletions ? { artifactDeletions } : {},
+    };
   }
 
   console.log("[Cleanup] Starting auto-cleanup...");
 
   const results: Record<string, CleanupResult> = {
+    ...(artifactDeletions ? { artifactDeletions } : {}),
     quotaSnapshots: await cleanupQuotaSnapshots(),
     callLogs: await cleanupCallLogs(),
     usageHistory: await cleanupUsageHistory(),
@@ -716,6 +827,12 @@ export async function runAutoCleanup(): Promise<{
  * Purge ALL quota_snapshots immediately (no retention check).
  */
 export async function purgeQuotaSnapshots(): Promise<CleanupResult> {
+  const database = getSelectedPostgresDatabase();
+  if (database)
+    return {
+      deleted: await createPostgresCleanupRepository(database).deleteAll("quota_snapshots"),
+      errors: 0,
+    };
   const db = getDbInstance();
   const result: CleanupResult = { deleted: 0, errors: 0 };
 
@@ -737,6 +854,13 @@ export async function purgeQuotaSnapshots(): Promise<CleanupResult> {
  * Purge ALL call_logs immediately (no retention check).
  */
 export async function purgeCallLogs(): Promise<CleanupResult> {
+  const database = getSelectedPostgresDatabase();
+  if (database) {
+    const result = await createPostgresCleanupRepository(database).deleteCallLogs();
+    const artifacts = await deletePostgresArtifacts(result.artifacts);
+    return { deleted: result.deleted, ...artifacts };
+  }
+
   const db = getDbInstance();
   const result: CleanupResult = { deleted: 0, deletedArtifacts: 0, errors: 0 };
 
@@ -765,6 +889,12 @@ export async function purgeCallLogs(): Promise<CleanupResult> {
  * Purge ALL request_detail_logs immediately (no retention check).
  */
 export async function purgeDetailedLogs(): Promise<CleanupResult> {
+  const database = getSelectedPostgresDatabase();
+  if (database)
+    return {
+      deleted: await createPostgresCleanupRepository(database).deleteAll("request_detail_logs"),
+      errors: 0,
+    };
   const db = getDbInstance();
   const result: CleanupResult = { deleted: 0, errors: 0 };
 
@@ -936,6 +1066,35 @@ export async function resetUsageHistory(period: string): Promise<ResetUsageHisto
     throw new Error(`Invalid reset period: ${period}`);
   }
 
+  const database = getSelectedPostgresDatabase();
+  if (database) {
+    const empty = Object.fromEntries(RESET_TARGETS.map((target) => [target.resultKey, 0]));
+    const result = {
+      ...empty,
+      deleted: 0,
+      deletedCallLogArtifacts: 0,
+      deletedTokenLedger: 0,
+      deletedArtifacts: 0,
+      errors: 0,
+    } as unknown as ResetUsageHistoryResult;
+    const cutoff =
+      period === "all"
+        ? undefined
+        : new Date(Date.now() - RESET_USAGE_HISTORY_PERIOD_MS[period]).toISOString();
+    try {
+      const reset = await createPostgresCleanupRepository(database).reset(RESET_TARGETS, cutoff);
+      Object.assign(result, reset.counts);
+      result.deleted = Object.values(reset.counts).reduce((sum, count) => sum + count, 0);
+      const artifacts = await deletePostgresArtifacts(reset.artifacts);
+      result.deletedArtifacts = artifacts.deletedArtifacts;
+      result.deletedCallLogArtifacts = artifacts.deletedArtifacts;
+      result.errors += artifacts.errors;
+    } catch (error) {
+      console.error("[Cleanup] PostgreSQL usage reset failed:", error);
+      result.errors++;
+    }
+    return result;
+  }
   const db = getDbInstance();
   ensureCompressionRunTelemetryTable();
   const result: ResetUsageHistoryResult = {
@@ -1010,8 +1169,10 @@ export async function resetUsageHistory(period: string): Promise<ResetUsageHisto
  * Uses the same retention period as call_logs (30 days default).
  */
 export async function cleanupProxyLogs(): Promise<CleanupResult> {
+  if (getSelectedPostgresDatabase())
+    return cleanupPostgresTable("proxy_logs", "timestamp", "callLogs", "iso");
   const db = getDbInstance();
-  const retention = getRetentionSettings();
+  const retention = await getRetentionSettings();
 
   const retentionDays = retention.callLogs;
   const cutoffDate = new Date();
@@ -1047,6 +1208,8 @@ export {
 
 const CLEANUP_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6 hours
 let _cleanupSchedulerTimer: ReturnType<typeof setInterval> | null = null;
+let _cleanupStartupTimer: ReturnType<typeof setTimeout> | null = null;
+let _scheduledCleanupRunning = false;
 
 /**
  * One scheduled pass: retention cleanup (`runAutoCleanup` already covers
@@ -1059,6 +1222,8 @@ export async function runScheduledCleanupPass(phase: "startup" | "periodic"): Pr
   if (result.totalDeleted > 0) {
     console.log(`[Cleanup] ${label} cleanup freed ${result.totalDeleted} rows.`);
   }
+
+  if (getSelectedPostgresDatabase()) return;
 
   // Always run: it also drains pages left over from a previous capped pass or
   // from deletes made outside this scheduler. Costs a few PRAGMA reads when idle.
@@ -1088,23 +1253,37 @@ export async function runScheduledCleanupPass(phase: "startup" | "periodic"): Pr
  * 3-8GB RSS from better-sqlite3 memory mapping.
  */
 export function startCleanupScheduler(): void {
+  if (parseDatabaseBackend() === "postgres") {
+    startPostgresCleanupScheduler(runScheduledCleanupPass, CLEANUP_INTERVAL_MS);
+    return;
+  }
   if (_cleanupSchedulerTimer) return;
 
   // Run cleanup 30s after startup (let the server initialize first).
-  setTimeout(async () => {
+  _cleanupStartupTimer = setTimeout(async () => {
+    _cleanupStartupTimer = null;
+    if (_scheduledCleanupRunning) return;
+    _scheduledCleanupRunning = true;
     try {
       await runScheduledCleanupPass("startup");
     } catch (err) {
       console.error("[Cleanup] Startup cleanup failed:", err);
+    } finally {
+      _scheduledCleanupRunning = false;
     }
   }, 30_000);
+  _cleanupStartupTimer.unref?.();
 
   // Schedule periodic cleanup every 6 hours.
   _cleanupSchedulerTimer = setInterval(async () => {
+    if (_scheduledCleanupRunning) return;
+    _scheduledCleanupRunning = true;
     try {
       await runScheduledCleanupPass("periodic");
     } catch (err) {
       console.error("[Cleanup] Periodic cleanup failed:", err);
+    } finally {
+      _scheduledCleanupRunning = false;
     }
   }, CLEANUP_INTERVAL_MS);
 
@@ -1120,8 +1299,76 @@ export function startCleanupScheduler(): void {
  * Stop the background cleanup scheduler (for tests).
  */
 export function stopCleanupScheduler(): void {
+  stopPostgresCleanupScheduler();
+  if (_cleanupStartupTimer) {
+    clearTimeout(_cleanupStartupTimer);
+    _cleanupStartupTimer = null;
+  }
   if (_cleanupSchedulerTimer) {
     clearInterval(_cleanupSchedulerTimer);
     _cleanupSchedulerTimer = null;
   }
+}
+
+/** Stop dispatch immediately; native shutdown also drains the complete admitted cleanup pass. */
+export async function stopCleanupSchedulerAsync(): Promise<void> {
+  stopCleanupScheduler();
+  await stopPostgresCleanupSchedulerAsync();
+}
+
+async function deletePostgresArtifacts(paths: string[]): Promise<{
+  deletedArtifacts: number;
+  pendingArtifactDeletions: number;
+  errors: number;
+}> {
+  const unique = [...new Set(paths)];
+  const result = { deletedArtifacts: 0, pendingArtifactDeletions: unique.length, errors: 0 };
+  const startedAt = Date.now();
+  for (const path of unique) {
+    if (Date.now() - startedAt >= 30_000) break;
+    try {
+      if (await deleteCallArtifactAsync(path)) result.deletedArtifacts++;
+      const database = getSelectedPostgresDatabase();
+      if (database)
+        await createPostgresCleanupRepository(database).acknowledgeArtifactDeletion(path);
+      result.pendingArtifactDeletions--;
+    } catch (error) {
+      console.error("[Cleanup] Call log artifact deletion failed:", error);
+      result.errors++;
+      // Leave durable references queued; one storage outage must not stall the entire pass.
+      break;
+    }
+  }
+  return result;
+}
+
+async function cleanupPostgresTable(
+  table: string,
+  column: string,
+  retentionKey: keyof Awaited<ReturnType<typeof getRetentionSettings>>,
+  cutoffKind: DeleteByPeriodTarget["cutoff"],
+  retentionOverride?: number
+): Promise<CleanupResult> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) throw new Error("PostgreSQL cleanup requires a selected database");
+  const result: CleanupResult = { deleted: 0, errors: 0 };
+  try {
+    const retention = await getRetentionSettings();
+    const days = retentionOverride ?? Number(retention[retentionKey]);
+    const cutoff = new Date(Date.now() - days * 86_400_000).toISOString();
+    const repository = createPostgresCleanupRepository(database);
+    if (table === "call_logs") {
+      const rows = await repository.deleteCallLogs(cutoff);
+      result.deleted = rows.deleted;
+      const artifacts = await deletePostgresArtifacts(rows.artifacts);
+      result.deletedArtifacts = artifacts.deletedArtifacts;
+      result.pendingArtifactDeletions = artifacts.pendingArtifactDeletions;
+      result.errors += artifacts.errors;
+    } else
+      result.deleted = await repository.deleteBefore({ table, column, cutoff: cutoffKind }, cutoff);
+  } catch (error) {
+    console.error("[Cleanup] PostgreSQL retention failed:", error);
+    result.errors++;
+  }
+  return result;
 }

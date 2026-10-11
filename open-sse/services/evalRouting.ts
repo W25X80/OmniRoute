@@ -1,5 +1,9 @@
+import { getSelectedPersistenceIdentity } from "../../src/lib/db/controlPlaneContext.ts";
 import type { PersistedEvalRun } from "../../src/lib/db/evals.ts";
-import { listModelEvalRunsForRouting } from "../../src/lib/db/evals.ts";
+import {
+  listModelEvalRunsForRouting,
+  listModelEvalRunsForRoutingAsync,
+} from "../../src/lib/db/evals.ts";
 import { parseModel } from "./model.ts";
 
 type EvalRoutingLogger = {
@@ -41,17 +45,19 @@ const DEFAULT_EVAL_ROUTING_CONFIG: EvalRoutingConfig = {
 };
 
 const MAX_EVAL_ROUTING_CACHE_ENTRIES = 200;
-const evalRoutingCache = new Map<string, { expiresAt: number; runs: PersistedEvalRun[] }>();
+type EvalRoutingCache = Map<string, { expiresAt: number; runs: PersistedEvalRun[] }>;
+const evalRoutingCache: EvalRoutingCache = new Map();
+let nativeEvalRoutingCaches = new WeakMap<object, EvalRoutingCache>();
 
-function pruneEvalRoutingCache(now = Date.now()): void {
+function pruneEvalRoutingCache(now = Date.now(), cache = evalRoutingCache): void {
   for (const [key, entry] of evalRoutingCache) {
-    if (entry.expiresAt <= now) evalRoutingCache.delete(key);
+    if (entry.expiresAt <= now) cache.delete(key);
   }
 
-  while (evalRoutingCache.size > MAX_EVAL_ROUTING_CACHE_ENTRIES) {
-    const oldestKey = evalRoutingCache.keys().next().value;
+  while (cache.size > MAX_EVAL_ROUTING_CACHE_ENTRIES) {
+    const oldestKey = cache.keys().next().value;
     if (!oldestKey) break;
-    evalRoutingCache.delete(oldestKey);
+    cache.delete(oldestKey);
   }
 }
 
@@ -137,6 +143,32 @@ function getEvalRuns(targetIds: string[], config: EvalRoutingConfig): PersistedE
   return runs;
 }
 
+async function getEvalRunsAsync(
+  targetIds: string[],
+  config: EvalRoutingConfig
+): Promise<PersistedEvalRun[]> {
+  const identity = getSelectedPersistenceIdentity();
+  if (!identity) return getEvalRuns(targetIds, config);
+  let cache = nativeEvalRoutingCaches.get(identity);
+  if (!cache) {
+    cache = new Map();
+    nativeEvalRoutingCaches.set(identity, cache);
+  }
+  const now = Date.now();
+  pruneEvalRoutingCache(now, cache);
+  const cacheKey = buildCacheKey(targetIds, config);
+  const cached = cache.get(cacheKey);
+  if (cached && cached.expiresAt > now) return cached.runs;
+  const runs = await listModelEvalRunsForRoutingAsync({
+    targetIds,
+    suiteIds: config.suiteIds,
+    maxAgeHours: config.maxAgeHours,
+  });
+  cache.set(cacheKey, { expiresAt: now + config.cacheTtlMs, runs });
+  pruneEvalRoutingCache(now, cache);
+  return runs;
+}
+
 function dedupeLatestRunsBySuite(runs: PersistedEvalRun[]): PersistedEvalRun[] {
   const latest = new Map<string, PersistedEvalRun>();
   for (const run of runs) {
@@ -207,6 +239,41 @@ export function orderTargetsByEvalScores<T extends EvalRoutingTarget>(
     return targets;
   }
 
+  return rankTargetsByRuns(targets, aliasesByIndex, config, runs, log);
+}
+
+export async function orderTargetsByEvalScoresAsync<T extends EvalRoutingTarget>(
+  targets: T[],
+  rawConfig: unknown,
+  log: EvalRoutingLogger = {}
+): Promise<T[]> {
+  const config = normalizeEvalRoutingConfig(rawConfig);
+  if (!config.enabled || targets.length <= 1) return targets;
+
+  const aliasesByIndex = targets.map((target) => getTargetAliases(target.modelStr));
+  const targetIds = [...new Set(aliasesByIndex.flat())];
+  if (targetIds.length === 0) return targets;
+
+  let runs: PersistedEvalRun[];
+  try {
+    runs = await getEvalRunsAsync(targetIds, config);
+  } catch (error) {
+    log.warn?.("COMBO", "Eval-driven routing skipped because eval history could not be loaded", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return targets;
+  }
+
+  return rankTargetsByRuns(targets, aliasesByIndex, config, runs, log);
+}
+
+function rankTargetsByRuns<T extends EvalRoutingTarget>(
+  targets: T[],
+  aliasesByIndex: string[][],
+  config: EvalRoutingConfig,
+  runs: PersistedEvalRun[],
+  log: EvalRoutingLogger
+): T[] {
   if (runs.length === 0) return targets;
 
   const runsByTargetId = new Map<string, PersistedEvalRun[]>();
@@ -273,4 +340,5 @@ export function orderTargetsByEvalScores<T extends EvalRoutingTarget>(
 
 export function resetEvalRoutingCache(): void {
   evalRoutingCache.clear();
+  nativeEvalRoutingCaches = new WeakMap();
 }

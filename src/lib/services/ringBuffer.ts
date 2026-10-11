@@ -1,6 +1,9 @@
 /** In-memory ring buffer for service log lines with optional file flush. */
 
 import fs from "node:fs";
+import { writeFile } from "node:fs/promises";
+import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
+import { captureNativeEmbeddedServices, runNativeServiceWork } from "./nativeLifecycle";
 import type { LogLine } from "./types";
 
 const DEFAULT_MAX_BYTES = 5_242_880; // 5 MB
@@ -14,6 +17,9 @@ export class RingBuffer {
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
   private flushPath: string | null = null;
   private flushWarnedOnce = false;
+  private readonly nativeOwner = captureNativeEmbeddedServices();
+  private nativeFlushTail: Promise<void> = Promise.resolve();
+  private nativeFlushClosing = false;
 
   constructor(maxBytes: number = DEFAULT_MAX_BYTES) {
     this.maxBytes = maxBytes;
@@ -59,6 +65,7 @@ export class RingBuffer {
 
   private scheduleFlush(): void {
     if (!this.flushPath) return;
+    if (this.nativeOwner && (this.nativeFlushClosing || this.nativeOwner.closing)) return;
     if (this.flushTimer) return;
     this.flushTimer = setTimeout(() => {
       this.flushTimer = null;
@@ -68,6 +75,10 @@ export class RingBuffer {
 
   private flushToDisk(): void {
     if (!this.flushPath) return;
+    if (this.nativeOwner) {
+      this.flushNativeToDisk();
+      return;
+    }
     try {
       const content = this.entries.map((e) => `${e.ts} [${e.stream}] ${e.line}`).join("\n");
       fs.writeFileSync(this.flushPath, content, "utf8");
@@ -79,6 +90,42 @@ export class RingBuffer {
         console.warn(`[RingBuffer] flush to ${this.flushPath} failed: ${msg}`);
       }
     }
+  }
+
+  private flushNativeToDisk(): void {
+    if (!this.flushPath || this.nativeFlushClosing || this.nativeOwner!.closing) return;
+    const file = this.flushPath;
+    const content = this.entries
+      .map((entry) => `${entry.ts} [${entry.stream}] ${entry.line}`)
+      .join("\n");
+    const previous = this.nativeFlushTail;
+    const work = runNativeServiceWork(this.nativeOwner!, async () => {
+      await previous;
+      await writeFile(file, content, "utf8");
+    });
+    this.nativeFlushTail = work.catch((error: unknown) => {
+      if (!this.flushWarnedOnce) {
+        this.flushWarnedOnce = true;
+        console.warn(
+          `[RingBuffer] flush failed: ${sanitizeErrorMessage(error instanceof Error ? error.message : String(error))}`
+        );
+      }
+    });
+  }
+
+  stopFlushScheduling(): void {
+    if (!this.nativeOwner) return;
+    this.nativeFlushClosing = true;
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
+  }
+
+  async disposeAsync(): Promise<void> {
+    this.stopFlushScheduling();
+    this.dispose();
+    await this.nativeFlushTail;
   }
 
   dispose(): void {

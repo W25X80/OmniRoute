@@ -6,6 +6,13 @@
  * and emit spurious "not supported in Edge Runtime" warnings.
  */
 
+import { parseDatabaseBackend } from "@/lib/db/backendSelection";
+import { runPersistenceRequest } from "@/lib/db/persistenceRuntime";
+import {
+  assertPostgresBootstrapActive,
+  runPostgresBootstrap,
+} from "@/lib/startup/postgresBootstrap";
+import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error.ts";
 import { markServerReady, markServerStarting } from "@/lib/serverLifecycle";
 import { normalizeBootError } from "@/lib/instrumentationBootError";
 import { isHeadless, skipInHeadless } from "@/lib/system/headless";
@@ -351,12 +358,17 @@ export interface OptionalBootSubsystem {
  * injects and queries memory) and the backup schedule — stays inline in
  * `registerNodejs()` and runs in both modes.
  */
+function assertNativeBootstrapActive(): void {
+  if (parseDatabaseBackend() === "postgres") assertPostgresBootstrapActive();
+}
+
 export const OPTIONAL_BOOT_SUBSYSTEMS: ReadonlyArray<OptionalBootSubsystem> = [
   {
     name: "embedded-services",
     start: () =>
       import("@/lib/services/bootstrap")
         .then(async (m) => {
+          assertNativeBootstrapActive();
           await m.bootstrapEmbeddedServices();
           console.log("[STARTUP] Embedded services bootstrap complete");
         })
@@ -369,7 +381,10 @@ export const OPTIONAL_BOOT_SUBSYSTEMS: ReadonlyArray<OptionalBootSubsystem> = [
     name: "embed-ws-proxy",
     start: () =>
       import("@/lib/services/embedWsProxy")
-        .then((m) => m.initEmbedWsProxy())
+        .then((m) => {
+          assertNativeBootstrapActive();
+          return m.initEmbedWsProxy();
+        })
         .catch((err: unknown) => {
           const msg = err instanceof Error ? err.message : String(err);
           console.warn("[STARTUP] Embed WS proxy failed to start (non-fatal):", msg);
@@ -382,6 +397,7 @@ export const OPTIONAL_BOOT_SUBSYSTEMS: ReadonlyArray<OptionalBootSubsystem> = [
     start: () =>
       import("@/lib/conductor/boot")
         .then((m) => {
+          assertNativeBootstrapActive();
           if (m.initConductorBridge()) console.log("[STARTUP] Conductor bridge started");
         })
         .catch((err: unknown) => {
@@ -396,6 +412,7 @@ export const OPTIONAL_BOOT_SUBSYSTEMS: ReadonlyArray<OptionalBootSubsystem> = [
     start: () =>
       import("@/lib/arenaEloSync")
         .then(async (m) => {
+          assertNativeBootstrapActive();
           const started = await m.initArenaEloSync();
           if (started) console.log("[STARTUP] Arena ELO sync initialized");
         })
@@ -411,8 +428,12 @@ export const OPTIONAL_BOOT_SUBSYSTEMS: ReadonlyArray<OptionalBootSubsystem> = [
     name: "radar-sync",
     start: () =>
       import("@/lib/radar/scheduler")
-        .then((m) => {
-          const started = m.initRadarSyncScheduler();
+        .then(async (m) => {
+          assertNativeBootstrapActive();
+          const started =
+            parseDatabaseBackend() === "postgres"
+              ? await m.initRadarSyncSchedulerAsync()
+              : m.initRadarSyncScheduler();
           if (started) console.log("[STARTUP] Radar sync scheduler initialized");
         })
         .catch((err: unknown) => {
@@ -426,7 +447,10 @@ export const OPTIONAL_BOOT_SUBSYSTEMS: ReadonlyArray<OptionalBootSubsystem> = [
     name: "pricing-sync",
     start: () =>
       import("@/lib/pricingSync")
-        .then((m) => m.initPricingSync())
+        .then((m) => {
+          assertNativeBootstrapActive();
+          return m.initPricingSync();
+        })
         .catch((err: unknown) => {
           const msg = err instanceof Error ? err.message : String(err);
           console.warn("[STARTUP] Pricing sync failed to start (non-fatal):", msg);
@@ -440,6 +464,7 @@ export const OPTIONAL_BOOT_SUBSYSTEMS: ReadonlyArray<OptionalBootSubsystem> = [
     start: () =>
       import("@/lib/catalog/openrouterProviderStats")
         .then((m) => {
+          assertNativeBootstrapActive();
           const started = m.initOpenRouterProviderStatsSync();
           if (started) console.log("[STARTUP] OpenRouter provider stats sync initialized");
         })
@@ -457,19 +482,28 @@ export const OPTIONAL_BOOT_SUBSYSTEMS: ReadonlyArray<OptionalBootSubsystem> = [
     name: "models-dev-sync",
     start: () =>
       import("@/lib/modelsDevSync")
-        .then((m) => m.initModelsDevSync())
+        .then((m) => {
+          assertNativeBootstrapActive();
+          return m.initModelsDevSync();
+        })
         .catch((err: unknown) => {
           const msg = err instanceof Error ? err.message : String(err);
           console.warn("[STARTUP] models.dev sync failed to start (non-fatal):", msg);
         }),
   },
   // Real-time dashboard WebSocket daemon (port 20132): powers Combo Studio Live,
-  // the Home live-pulse, and Live Compression. Side-effect import triggers the
-  // flag-gated auto-start (OMNIROUTE_ENABLE_LIVE_WS, default ON).
+  // the Home live-pulse, and Live Compression. SQLite retains its flag-gated
+  // auto-start on import; PostgreSQL awaits the owned listener's readiness.
   {
     name: "live-dashboard-ws",
     start: () =>
-      import("@/server/ws/liveServer")
+      (parseDatabaseBackend() === "postgres"
+        ? import("@/lib/startup/liveDashboard").then((module) => {
+            assertPostgresBootstrapActive();
+            return module.startPostgresLiveDashboard();
+          })
+        : import("@/server/ws/liveServer")
+      )
         .then(() => {
           console.log("[STARTUP] Live dashboard WebSocket daemon bootstrap invoked");
         })
@@ -493,7 +527,10 @@ export async function startOptionalBootSubsystems(
   {
     env = process.env,
     log = console.log,
-  }: { env?: Readonly<Record<string, string | undefined>>; log?: (line: string) => void } = {}
+  }: {
+    env?: Readonly<Record<string, string | undefined>>;
+    log?: (line: string) => void;
+  } = {}
 ): Promise<string[]> {
   if (isHeadless(env)) {
     log(
@@ -503,14 +540,69 @@ export async function startOptionalBootSubsystems(
     );
     return [];
   }
-  const results = await Promise.allSettled(subsystems.map((subsystem) => subsystem.start()));
+  const pending =
+    parseDatabaseBackend() === "postgres"
+      ? subsystems.map(async (subsystem) => {
+          assertPostgresBootstrapActive();
+          return subsystem.start();
+        })
+      : subsystems.map((subsystem) => subsystem.start());
+  const results = await Promise.allSettled(pending);
   return subsystems
     .filter((_, index) => results[index].status === "fulfilled")
     .map((subsystem) => subsystem.name);
 }
 
+declare global {
+  var __omniroutePersistenceTransportInstalled: boolean | undefined;
+  var __omniroutePersistenceRequest:
+    | ((run: () => unknown | Promise<unknown>, httpLifetime: Promise<void>) => Promise<void>)
+    | undefined;
+  var __omnirouteGetWebdavConfigurationAsync:
+    (() => ReturnType<typeof import("@/lib/db/obsidian").getWebdavConfigurationAsync>) | undefined;
+}
+
 export async function registerNodejs(): Promise<void> {
+  if (parseDatabaseBackend() !== "postgres") return registerNodejsSelectedBackend(false);
+  if (process.env.NEXT_PHASE === "phase-production-build" || process.env.OMNIROUTE_BUILDING === "1")
+    return;
+  if (globalThis.__omniroutePersistenceTransportInstalled !== true) {
+    throw new Error("PostgreSQL requires the supported OmniRoute HTTP transport");
+  }
+  try {
+    await runPostgresBootstrap(async () => {
+      globalThis.__omniroutePersistenceRequest = async (run, httpLifetime) => {
+        await runPersistenceRequest(async () => {
+          await run();
+          await httpLifetime;
+        });
+      };
+      globalThis.__omnirouteGetWebdavConfigurationAsync = () =>
+        runPersistenceRequest(async () =>
+          (await import("@/lib/db/obsidian")).getWebdavConfigurationAsync()
+        );
+      await registerNodejsSelectedBackend(true);
+    });
+  } catch (error) {
+    globalThis.__omniroutePersistenceRequest = undefined;
+    globalThis.__omnirouteGetWebdavConfigurationAsync = undefined;
+    try {
+      await (await import("@/lib/startup/postgresShutdown")).shutdownPostgresApplication();
+    } catch {
+      console.error("[STARTUP] PostgreSQL startup cleanup failed.");
+    }
+    throw normalizeBootError(error);
+  }
+}
+
+async function registerNodejsSelectedBackend(postgres: boolean): Promise<void> {
+  if (postgres) assertPostgresBootstrapActive();
   markServerStarting();
+  if (postgres) {
+    const { preparePostgresServingFileCaches } = await import("@/lib/startup/nativeFileCaches");
+    await preparePostgresServingFileCaches();
+    assertPostgresBootstrapActive();
+  }
 
   // Rename the process title so OmniRoute is identifiable in ps/htop instead
   // of the generic "next-server" standalone server name.
@@ -535,6 +627,7 @@ export async function registerNodejs(): Promise<void> {
   // refusal kind (explicit idempotent registration; safe to call twice).
   const { registerSelectorTransitionSubscriber } =
     await import("@/lib/proxySubscription/proxyTransitionSubscriber");
+  if (postgres) assertPostgresBootstrapActive();
   registerSelectorTransitionSubscriber();
 
   // Register quota fetchers early so combo routing can use real quota-aware
@@ -552,9 +645,10 @@ export async function registerNodejs(): Promise<void> {
   // failed (#7288 / #7494). ensureDbInitialized() itself is idempotent and
   // caches the singleton, so every later getDbInstance() call below is a
   // free no-op re-read of the same connection — no double-init cost.
-  await ensureDbReadyForBoot();
-
-  await ensureSecrets();
+  if (!postgres) {
+    await ensureDbReadyForBoot();
+    await ensureSecrets();
+  }
   await Promise.all([
     import("@/lib/env/runtimeEnv").then(({ enforceWebRuntimeEnv }) => enforceWebRuntimeEnv()),
     // Warn loudly at boot if STORAGE_ENCRYPTION_KEY is missing in production.
@@ -562,7 +656,7 @@ export async function registerNodejs(): Promise<void> {
     import("@/lib/db/encryption").then(({ assertEncryptionKeyConfiguredForProduction }) =>
       assertEncryptionKeyConfiguredForProduction()
     ),
-    import("@/lib/usage/migrations"),
+    ...(postgres ? [] : [import("@/lib/usage/migrations")]),
     import("@/lib/consoleInterceptor").then(({ initConsoleInterceptor }) =>
       initConsoleInterceptor()
     ),
@@ -575,8 +669,10 @@ export async function registerNodejs(): Promise<void> {
   // Terminal states (banned / expired / credits_exhausted) are intentionally kept.
   // See: https://github.com/diegosouzapw/OmniRoute/issues/3625 (Part A)
   try {
-    const { clearStaleCrashCooldowns } = await import("@/lib/db/providers");
-    const { cleared } = clearStaleCrashCooldowns();
+    const providers = await import("@/lib/db/providers");
+    const { cleared } = postgres
+      ? await providers.clearStaleCrashCooldownsAsync()
+      : providers.clearStaleCrashCooldowns();
     if (cleared > 0) {
       console.log(
         `[STARTUP] Cleared ${cleared} stale transient connection cooldown(s) from prior crash (#3625)`
@@ -584,6 +680,7 @@ export async function registerNodejs(): Promise<void> {
     }
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
+    if (postgres) throw new Error(sanitizeErrorMessage(msg));
     console.warn("[STARTUP] Could not clear stale crash cooldowns (non-fatal):", msg);
   }
 
@@ -623,38 +720,60 @@ export async function registerNodejs(): Promise<void> {
   ]);
 
   // Proxy health scheduler (auto-removes dead proxies on interval)
-  await import("@/lib/proxyHealth/scheduler");
+  const proxyHealthScheduler = await import("@/lib/proxyHealth/scheduler");
+  if (postgres) {
+    assertPostgresBootstrapActive();
+    proxyHealthScheduler.initProxyHealthCheck();
+  }
 
   // Free-proxy auto-sync scheduler (re-fetches free-proxy sources on interval, #7079).
   // Optional: skipped in headless mode (src/lib/system/headless.ts).
   if (!skipInHeadless("free-proxy-sync")) {
-    await import("@/lib/freeProxyProviders/scheduler");
+    const freeProxyScheduler = await import("@/lib/freeProxyProviders/scheduler");
+    if (postgres) {
+      assertPostgresBootstrapActive();
+      freeProxyScheduler.initFreeProxyAutoSync();
+    }
   }
 
+  if (postgres) assertPostgresBootstrapActive();
   initGracefulShutdown();
+  if (postgres) assertPostgresBootstrapActive();
   initApiBridgeServer();
+  if (postgres) assertPostgresBootstrapActive();
   startSpendBatchWriter();
+  if (postgres) assertPostgresBootstrapActive();
   registerDefaultGuardrails();
+  if (postgres) assertPostgresBootstrapActive();
   registerBuiltinSkills(skillExecutor);
   console.log("[STARTUP] Spend batch writer started");
   console.log("[STARTUP] Guardrail registry initialized");
   console.log("[STARTUP] Builtin skill handlers registered");
   if (!isBackgroundServicesDisabled()) {
+    if (postgres) assertPostgresBootstrapActive();
     startBackgroundRefresh();
     console.log("[STARTUP] Quota cache background refresh started");
+    if (postgres) assertPostgresBootstrapActive();
     startProviderLimitsSyncScheduler();
     console.log("[STARTUP] Provider limits sync scheduler started");
     const { startQuotaAutoPing } = await import("@/lib/services/quotaAutoPing");
+    if (postgres) assertPostgresBootstrapActive();
     startQuotaAutoPing();
     console.log("[STARTUP] Quota auto-ping scheduler started (opt-in, no-op until enabled)");
     // Optional: cloud/model sync is skipped in headless mode (src/lib/system/headless.ts).
-    if (!skipInHeadless("cloud-sync")) {
+    if (postgres) {
+      const { startPostgresRuntimeJobs } = await import("@/lib/startup/postgresJobs");
+      assertPostgresBootstrapActive();
+      await startPostgresRuntimeJobs();
+      console.log("[STARTUP] PostgreSQL background jobs initialized");
+    } else if (!skipInHeadless("cloud-sync")) {
       const cloudSyncInitialized = await ensureCloudSyncInitialized();
       console.log(
         `[STARTUP] Cloud/model sync background bootstrap ${cloudSyncInitialized ? "initialized" : "skipped"}`
       );
     }
     const { initBatchProcessor } = await import("@omniroute/open-sse/services/batchProcessor");
+    if (postgres) assertPostgresBootstrapActive();
     initBatchProcessor();
     console.log("[STARTUP] Batch processor started");
   }
@@ -676,7 +795,11 @@ export async function registerNodejs(): Promise<void> {
       source: "startup",
     });
     settings = passwordState.settings;
-    const runtimeChanges = await applyRuntimeSettings(settings, { force: true, source: "startup" });
+    if (postgres) assertPostgresBootstrapActive();
+    const runtimeChanges = await applyRuntimeSettings(settings, {
+      force: true,
+      source: "startup",
+    });
     if (runtimeChanges.length > 0) {
       console.log(
         `[STARTUP] Runtime settings hydrated: ${runtimeChanges
@@ -719,14 +842,21 @@ export async function registerNodejs(): Promise<void> {
     console.log(
       `[STARTUP] Model alias seed: applied=${seededModelAliases.applied.length}, skipped=${seededModelAliases.skipped.length}, removed=${seededModelAliases.removed.length}, failed=${seededModelAliases.failed.length}`
     );
-    startSessionAccountAffinityCleanup();
+    if (postgres) {
+      const { startSessionAccountAffinityCleanupAsync } =
+        await import("@/lib/db/sessionAccountAffinity");
+      assertPostgresBootstrapActive();
+      await startSessionAccountAffinityCleanupAsync();
+    } else {
+      startSessionAccountAffinityCleanup();
+    }
 
     const migration = await migrateCodexConnectionDefaultsFromLegacySettings();
     if (migration.migrated) {
       console.log(
         `[STARTUP] Migrated Codex connection defaults for ${migration.updatedConnectionIds.length} connection(s)`
       );
-      if (settings.cloudEnabled === true) {
+      if (!postgres && settings.cloudEnabled === true) {
         const [{ syncToCloud }, { getConsistentMachineId }] = await Promise.all([
           import("@/lib/cloudSync"),
           import("@/shared/utils/machineId"),
@@ -737,9 +867,11 @@ export async function registerNodejs(): Promise<void> {
       }
     }
 
+    if (postgres) assertPostgresBootstrapActive();
     startRuntimeConfigHotReload();
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
+    if (postgres) throw new Error(sanitizeErrorMessage(msg));
     console.warn("[STARTUP] Could not restore runtime settings:", msg);
   }
 
@@ -752,6 +884,7 @@ export async function registerNodejs(): Promise<void> {
   // instrumentation startup), NOT in the unused src/server-init.ts.
   try {
     const { initCredentialHealthCheck } = await import("@/lib/credentialHealth/scheduler");
+    if (postgres) assertPostgresBootstrapActive();
     const started = initCredentialHealthCheck();
     console.log(
       started
@@ -765,6 +898,7 @@ export async function registerNodejs(): Promise<void> {
 
   try {
     const { initAuditLog, cleanupExpiredLogs } = await import("@/lib/compliance/index");
+    if (postgres) assertPostgresBootstrapActive();
     initAuditLog();
     console.log("[COMPLIANCE] Audit log table initialized");
 
@@ -786,20 +920,22 @@ export async function registerNodejs(): Promise<void> {
 
   // Storage-configured scheduled VACUUM (#4437): registers the timer from
   // Settings > System & Storage and persists lastVacuumAt for the UI.
-  try {
-    const { initVacuumScheduler } = await import("@/lib/db/vacuumScheduler");
-    initVacuumScheduler();
-    console.log("[STARTUP] Scheduled VACUUM initialized (#4437)");
-  } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.warn("[STARTUP] Could not initialize vacuum scheduler (non-fatal):", msg);
-  }
+  if (!postgres)
+    try {
+      const { initVacuumScheduler } = await import("@/lib/db/vacuumScheduler");
+      initVacuumScheduler();
+      console.log("[STARTUP] Scheduled VACUUM initialized (#4437)");
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn("[STARTUP] Could not initialize vacuum scheduler (non-fatal):", msg);
+    }
 
   // Retention cleanup scheduler (#4691/#6988, #9624): runs the general retention
   // cleanup once after startup and then every 6 hours. Previously this was only
   // wired into the unused src/server-init.ts, so telemetry tables grew unboundedly
   // even with retention.autoCleanupEnabled=true. Idempotent (guarded internally).
   try {
+    if (postgres) assertPostgresBootstrapActive();
     startCleanupScheduler();
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -810,12 +946,23 @@ export async function registerNodejs(): Promise<void> {
     // Warm the model catalog's durable, apiKey-independent sub-caches at
     // startup — see warmModelCatalogCache() for why the top-level Response
     // cache alone doesn't deliver this. Fire-and-forget, non-fatal.
-    void warmModelCatalogCache();
+    if (postgres) {
+      const { runPersistenceBackgroundWork } = await import("@/lib/db/persistenceRuntime");
+      assertPostgresBootstrapActive();
+      void runPersistenceBackgroundWork(warmModelCatalogCache).catch(() => {
+        console.warn("[STARTUP] Model catalog warmup was not admitted.");
+      });
+    } else {
+      void warmModelCatalogCache();
+    }
 
     // All services are independent — run in parallel for faster cold start.
     await Promise.allSettled([
       import("@omniroute/open-sse/services/autoRefreshDaemon")
-        .then((m) => m.autoRefreshDaemon.start())
+        .then((m) => {
+          if (postgres) assertPostgresBootstrapActive();
+          return m.autoRefreshDaemon.start();
+        })
         .catch((err: unknown) => {
           const msg = err instanceof Error ? err.message : String(err);
           console.warn("[STARTUP] Auto-refresh daemon failed to start (non-fatal):", msg);
@@ -825,7 +972,10 @@ export async function registerNodejs(): Promise<void> {
       // transient `rate_limited_until` window has elapsed OUTSIDE the request hot path,
       // so the first request after a cooldown does not pay the probe latency.
       import("@/lib/quota/connectionRecovery")
-        .then((m) => m.initConnectionRecoveryScheduler())
+        .then((m) => {
+          if (postgres) assertPostgresBootstrapActive();
+          return m.initConnectionRecoveryScheduler();
+        })
         .catch((err: unknown) => {
           const msg = err instanceof Error ? err.message : String(err);
           console.warn("[STARTUP] Connection recovery scheduler failed to start (non-fatal):", msg);
@@ -834,7 +984,10 @@ export async function registerNodejs(): Promise<void> {
       // Context-window self-correction (5004): periodically reconcile provider-declared
       // windows (from /models discovery) into auto:discovery overrides. Never fatal.
       import("@/lib/contextWindowResolver")
-        .then((m) => m.startContextWindowReconcile())
+        .then((m) => {
+          if (postgres) assertPostgresBootstrapActive();
+          return m.startContextWindowReconcile();
+        })
         .catch((err: unknown) => {
           const msg = err instanceof Error ? err.message : String(err);
           console.warn("[STARTUP] context-window reconcile failed to start (non-fatal):", msg);
@@ -844,7 +997,10 @@ export async function registerNodejs(): Promise<void> {
       // Doubly opt-in (no-op unless MEMORY_TYPED_DECAY_ENABLED=true AND
       // MEMORY_TYPED_DECAY_SWEEP_INTERVAL>0). Never deletes by default. Never fatal.
       import("@/lib/memory/typedDecay")
-        .then((m) => m.startMemoryDecaySweep())
+        .then((m) => {
+          if (postgres) assertPostgresBootstrapActive();
+          return m.startMemoryDecaySweep();
+        })
         .catch((err: unknown) => {
           const msg = err instanceof Error ? err.message : String(err);
           console.warn("[STARTUP] memory decay sweep failed to start (non-fatal):", msg);
@@ -856,7 +1012,10 @@ export async function registerNodejs(): Promise<void> {
       // run after the DB is ready AND after getSettings/applyRuntimeSettings so
       // memory backend config is hydrated.
       import("@/lib/memory/index")
-        .then((m) => m.initMemoryBackends())
+        .then((m) => {
+          if (postgres) assertPostgresBootstrapActive();
+          return m.initMemoryBackends();
+        })
         .catch((err: unknown) => {
           const msg = err instanceof Error ? err.message : String(err);
           console.warn("[STARTUP] memory backend initialization failed (non-fatal):", msg);
@@ -866,12 +1025,16 @@ export async function registerNodejs(): Promise<void> {
       // Reads the schedule written by `omniroute backup auto enable` and fires
       // `runBackupCommand` when the cron expression matches. Self-gated: no-op
       // when no schedule file exists or the schedule is disabled. Never fatal.
-      import("@/lib/jobs/backupScheduleJob")
-        .then((m) => m.startBackupScheduleJob())
-        .catch((err: unknown) => {
-          const msg = err instanceof Error ? err.message : String(err);
-          console.warn("[STARTUP] backup schedule job failed to start (non-fatal):", msg);
-        }),
+      ...(postgres
+        ? []
+        : [
+            import("@/lib/jobs/backupScheduleJob")
+              .then((m) => m.startBackupScheduleJob())
+              .catch((err: unknown) => {
+                const msg = err instanceof Error ? err.message : String(err);
+                console.warn("[STARTUP] backup schedule job failed to start (non-fatal):", msg);
+              }),
+          ]),
 
       // Optional subsystems (dashboard, catalog enrichment, embedded
       // services…): skipped entirely in headless mode — see OPTIONAL_BOOT_SUBSYSTEMS.
@@ -879,5 +1042,6 @@ export async function registerNodejs(): Promise<void> {
     ]);
   }
 
+  if (postgres) assertPostgresBootstrapActive();
   markServerReady();
 }

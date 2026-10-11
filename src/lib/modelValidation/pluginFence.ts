@@ -1,4 +1,4 @@
-import { listPlugins } from "../db/plugins";
+import { listPlugins, listPluginsAsync } from "../db/plugins";
 import { getActiveEvents } from "../plugins/hooks";
 import { ModelValidationError } from "./http";
 
@@ -15,6 +15,10 @@ export function createValidationPluginFence() {
   };
   return {
     reject,
+    async assertIdleAsync(): Promise<void> {
+      if (violated || (await listPluginsAsync("active")).length || getActiveEvents().length)
+        reject();
+    },
     assertIdle() {
       if (violated || listPlugins("active").length || getActiveEvents().length) reject();
     },

@@ -1,12 +1,13 @@
+import { persistenceCapabilityResponse } from "@/lib/db/persistenceCapabilities";
 import { NextRequest, NextResponse } from "next/server";
 import { isAuthenticated } from "@/shared/utils/apiAuth";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
 import { databaseSettingsSchema } from "@/shared/validation/settingsSchemas";
-import { getDatabaseSettings, updateDatabaseSettings } from "@/lib/db/databaseSettings";
+import { getDatabaseSettingsAsync, updateDatabaseSettingsAsync } from "@/lib/db/databaseSettings";
 import { redactCacheSecrets } from "@/lib/db/cacheSecrets";
 
-function publicDatabaseSettings() {
-  const settings = getDatabaseSettings();
+async function publicDatabaseSettings() {
+  const settings = await getDatabaseSettingsAsync();
   return { ...settings, cache: redactCacheSecrets(settings.cache) };
 }
 
@@ -18,8 +19,10 @@ export async function GET(request: NextRequest) {
   }
 
   try {
-    return NextResponse.json(publicDatabaseSettings());
+    return NextResponse.json(await publicDatabaseSettings());
   } catch (error) {
+    const unavailable = persistenceCapabilityResponse(error);
+    if (unavailable) return NextResponse.json(unavailable, { status: 501 });
     console.error("Error getting database settings:", error);
     return NextResponse.json({ error: "Failed to load database settings" }, { status: 500 });
   }
@@ -38,11 +41,13 @@ export async function PATCH(request: NextRequest) {
       return NextResponse.json({ error: validation.error }, { status: 400 });
     }
 
-    updateDatabaseSettings(validation.data);
+    await updateDatabaseSettingsAsync(validation.data);
 
     // Return merged settings (GET response pattern)
-    return NextResponse.json(publicDatabaseSettings());
+    return NextResponse.json(await publicDatabaseSettings());
   } catch (error) {
+    const unavailable = persistenceCapabilityResponse(error);
+    if (unavailable) return NextResponse.json(unavailable, { status: 501 });
     console.error("Error updating database settings:", error);
     return NextResponse.json({ error: "Failed to update database settings" }, { status: 500 });
   }

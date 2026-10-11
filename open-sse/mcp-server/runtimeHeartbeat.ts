@@ -8,6 +8,7 @@
 import { promises as fs } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { runPersistenceRequest } from "../../src/lib/db/persistenceRuntime.ts";
 
 export type McpHeartbeatSnapshot = {
   pid: number;
@@ -50,23 +51,28 @@ export function startMcpHeartbeat(config: {
   allowedScopes: string[];
   toolCount: number;
   intervalMs?: number;
-}): () => void {
+}): () => Promise<void> {
   const startedAt = new Date().toISOString();
   let timer: ReturnType<typeof setInterval> | null = null;
   let stopped = false;
+  let pendingTick: Promise<void> | null = null;
   const intervalMs =
     typeof config.intervalMs === "number" && config.intervalMs > 0
       ? config.intervalMs
       : DEFAULT_INTERVAL_MS;
 
-  const tick = async () => {
-    if (stopped) return;
-    try {
-      await writeHeartbeat(buildSnapshot());
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      console.error("[MCP Heartbeat] Failed to write heartbeat:", message);
-    }
+  const tick = () => {
+    if (stopped || pendingTick) return;
+    pendingTick = Promise.resolve().then(async () => {
+      try {
+        await runPersistenceRequest(() => writeHeartbeat(buildSnapshot()));
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.error("[MCP Heartbeat] Failed to write heartbeat:", message);
+      } finally {
+        pendingTick = null;
+      }
+    });
   };
 
   const buildSnapshot = (): McpHeartbeatSnapshot => {
@@ -92,14 +98,12 @@ export function startMcpHeartbeat(config: {
   if (typeof timer === "object" && "unref" in timer) timer.unref?.();
 
   return () => {
-    if (stopped) return;
     stopped = true;
     if (timer) {
       clearInterval(timer);
       timer = null;
     }
-    // Keep last snapshot on disk for post-mortem/offline reporting.
-    void tick();
+    return pendingTick ?? Promise.resolve();
   };
 }
 

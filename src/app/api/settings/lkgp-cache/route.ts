@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { clearAllLKGP } from "@/lib/db/settings";
+import { clearAllLKGPAsync } from "@/lib/db/settings/lkgp";
 import { isAuthenticated } from "@/shared/utils/apiAuth";
 
 export async function DELETE(request: Request) {
@@ -7,7 +7,7 @@ export async function DELETE(request: Request) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
   try {
-    clearAllLKGP();
+    await clearAllLKGPAsync();
     return NextResponse.json({ cleared: true });
   } catch (err: unknown) {
     const error = err instanceof Error ? err.message : String(err);

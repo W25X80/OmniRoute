@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { isAuthenticated } from "@/shared/utils/apiAuth";
-import { getCompressionRunTelemetrySummary } from "@/lib/db/compressionRunTelemetry";
+import { getCompressionRunTelemetrySummaryAsync } from "@/lib/db/compressionRunTelemetry";
 
 export const dynamic = "force-dynamic";
 
@@ -10,7 +10,7 @@ export async function GET(request: NextRequest) {
   }
 
   try {
-    const summary = getCompressionRunTelemetrySummary();
+    const summary = await getCompressionRunTelemetrySummaryAsync();
     return NextResponse.json(summary);
   } catch {
     return NextResponse.json(

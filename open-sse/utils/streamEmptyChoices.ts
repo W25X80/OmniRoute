@@ -61,7 +61,7 @@ type EmptyChoicesRejectContext = {
         clientPayload?: unknown;
         error?: string | null;
         errorCode?: string | null;
-      }) => void)
+      }) => void | Promise<void>)
     | null;
   clearPendingRequestFromStream?: () => void;
 };
@@ -91,7 +91,14 @@ export function rejectEmptyChoicesStream(ctx: EmptyChoicesRejectContext): boolea
 
   if (ctx.onFailure) {
     try {
-      ctx.onFailure({ status: 502, message: error.message, code: "empty_content" });
+      const result = ctx.onFailure({ status: 502, message: error.message, code: "empty_content" });
+      if (result && typeof result !== "boolean")
+        void result.catch((failure: unknown) =>
+          console.debug(
+            "[STREAM] Failure callback failed:",
+            failure instanceof Error ? failure.name : "Error"
+          )
+        );
     } catch {
       // best-effort — must never break the stream error path
     }
@@ -100,7 +107,7 @@ export function rejectEmptyChoicesStream(ctx: EmptyChoicesRejectContext): boolea
   const errorBody = buildErrorBody(502, error.message);
   if (ctx.onComplete) {
     try {
-      ctx.onComplete({
+      const completion = ctx.onComplete({
         status: 502,
         usage: ctx.usage,
         responseBody: errorBody,
@@ -116,6 +123,13 @@ export function rejectEmptyChoicesStream(ctx: EmptyChoicesRejectContext): boolea
         ),
         clientPayload: ctx.clientPayloadCollector.build(errorBody, { includeEvents: false }),
       });
+      if (completion)
+        void completion.catch((error: unknown) =>
+          console.debug(
+            "[STREAM] Completion callback failed:",
+            error instanceof Error ? error.name : "Error"
+          )
+        );
     } catch {
       // best-effort
     }

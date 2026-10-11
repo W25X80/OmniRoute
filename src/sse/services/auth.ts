@@ -24,11 +24,14 @@ import {
   touchConnectionLastUsed,
   clearConnectionErrorIfUnchanged,
 } from "@/lib/db/providers";
-import { getDbInstance } from "@/lib/db/core";
-import { getRecentEgressIpForConnection, EGRESS_IP_LOOKUP_WINDOW_MS } from "@/lib/db/proxyLogs";
+import {
+  getRecentEgressIpForConnectionAsync as getRecentEgressIpForConnection,
+  getEgressSiblingConnectionIdsAsync,
+  EGRESS_IP_LOOKUP_WINDOW_MS,
+} from "@/lib/db/proxyLogs";
 import { validateApiKey } from "@/lib/db/apiKeys";
 import {
-  getActiveExclusiveConnectionLease,
+  getActiveExclusiveConnectionLeaseAsync,
   hashLeaseOwnerId,
   type ExclusiveConnectionLease,
 } from "@/lib/db/exclusiveConnectionLeases";
@@ -160,13 +163,13 @@ import {
 } from "@/lib/db/models";
 import { isCatalogFreeModel } from "@/shared/utils/freeModels";
 import {
-  applySessionAffinityPin,
+  applySessionAffinityPinAsync,
   formatSessionKeyForLog,
   isForcedConnectionMissingFromPool,
   resolveForcedConnectionForCredentialPool,
   resolveSessionAffinityTtlMs,
   selectSessionAffinityConnection,
-  planSessionAffinityConnection,
+  planSessionAffinityConnectionAsync,
   syncSessionAffinityRuntimeFields,
 } from "./sessionAffinityPin";
 import {
@@ -925,11 +928,11 @@ export { fisherYatesShuffle, getNextFromDeckSync as getNextFromDeck };
 export { readHeaderValue, type AuthRequestHeaders } from "./headerReader.ts";
 export { extractSessionAffinityKey } from "./sessionAffinityPin";
 
-function invalidateManagedLease(
+async function invalidateManagedLease(
   options: CredentialSelectionOptions,
   reason: Parameters<typeof invalidateManagedConnectionLease>[1]
 ) {
-  invalidateManagedConnectionLease(options.lease, reason);
+  await invalidateManagedConnectionLease(options.lease, reason);
 }
 
 type DeferredLeaseSelection = {
@@ -1061,13 +1064,13 @@ export async function getProviderCredentials(
   options: CredentialSelectionOptions = {}
 ) {
   if (isMicrosoftDesignerWebRetiredProviderId(provider)) {
-    invalidateManagedLease(options, "AUTHORIZATION_CHANGED");
+    await invalidateManagedLease(options, "AUTHORIZATION_CHANGED");
     log.warn("AUTH", "Retired provider credential selection denied");
     return null;
   }
 
   if (isRuntimeRetiredProviderId(provider)) {
-    invalidateManagedLease(options, "CONNECTION_INELIGIBLE");
+    await invalidateManagedLease(options, "CONNECTION_INELIGIBLE");
     log.warn("AUTH", "Retired provider rejected before credential selection");
     return null;
   }
@@ -1207,7 +1210,9 @@ export async function getProviderCredentials(
     const forcedConnectionEligible = connections.some((conn) => conn.id === forcedConnectionId);
     if (options.lease && forcedConnectionId && !forcedConnectionEligible) return null;
     if (options.lease?.mode === "request" && forcedConnectionId) {
-      const activeLease = getActiveExclusiveConnectionLease(options.lease.context.leaseOwnerId);
+      const activeLease = await getActiveExclusiveConnectionLeaseAsync(
+        options.lease.context.leaseOwnerId
+      );
       if (activeLease && activeLease.connectionId !== forcedConnectionId) {
         return { leaseConnectionMismatch: true };
       }
@@ -1222,7 +1227,7 @@ export async function getProviderCredentials(
     // forcedConnectionId (see sessionAffinityPin leaf for the full rationale).
     if (!options.lease) {
       forcedConnectionId =
-        applySessionAffinityPin({
+        (await applySessionAffinityPinAsync({
           forcedConnectionId,
           options,
           sessionAffinityTtlMs,
@@ -1234,7 +1239,7 @@ export async function getProviderCredentials(
           isCodexScopeUnavailable,
           isQuotaPolicyBlocked: (c) =>
             evaluateQuotaLimitPolicy(provider, c as ProviderConnectionView, requestedModel).blocked,
-        }) ?? forcedConnectionId;
+        })) ?? forcedConnectionId;
     }
 
     // A forced connection (combo step `connectionId` / `x-omniroute-connection`) is an
@@ -1348,7 +1353,7 @@ export async function getProviderCredentials(
             "AUTH",
             `${provider} | all ${allConnections.length} accounts rate limited (${formatRetryAfter(earliest)})`
           );
-          invalidateManagedLease(options, "HEALTH_OR_COOLDOWN");
+          await invalidateManagedLease(options, "HEALTH_OR_COOLDOWN");
           return {
             allRateLimited: true,
             retryAfter: earliest,
@@ -1371,7 +1376,7 @@ export async function getProviderCredentials(
         // the dashboard sees a misleading "bad_request" code.
         const terminalConnections = allConnections.filter(isTerminalConnectionStatus);
         if (terminalConnections.length === allConnections.length) {
-          invalidateManagedLease(options, "AUTHORIZATION_CHANGED");
+          await invalidateManagedLease(options, "AUTHORIZATION_CHANGED");
           const syntheticFallback = await maybeSyntheticNoAuthFallback(
             resolvedId,
             excludedConnectionIds,
@@ -1409,7 +1414,7 @@ export async function getProviderCredentials(
         log.info("AUTH", `${provider} | using ${geminiEnvCredentials.connectionId} env fallback`);
         return geminiEnvCredentials;
       }
-      invalidateManagedLease(options, "CONNECTION_INELIGIBLE");
+      await invalidateManagedLease(options, "CONNECTION_INELIGIBLE");
       if (blockedByKeyPolicyCount > 0 && keyPolicyDeniesTarget) {
         // #13832: the pool is empty only because the calling key's allowlist /
         // quota scope removed every connection. Say so instead of returning the
@@ -1633,7 +1638,7 @@ export async function getProviderCredentials(
             ? `${provider} | all ${connections.length} active accounts cooling down for model ${requestedModel} (${formatRetryAfter(earliest)}) | lastErrorCode=${earliestConn?.errorCode}, lastError=${earliestConn?.lastError?.slice(0, 50)}`
             : `${provider} | all ${connections.length} active accounts rate limited (${formatRetryAfter(earliest)}) | lastErrorCode=${earliestConn?.errorCode}, lastError=${earliestConn?.lastError?.slice(0, 50)}`
         );
-        invalidateManagedLease(
+        await invalidateManagedLease(
           options,
           allBlockedByModelCooldown ? "MODEL_INELIGIBLE" : "HEALTH_OR_COOLDOWN"
         );
@@ -1662,7 +1667,7 @@ export async function getProviderCredentials(
       if (terminalConnections.length === connections.length) {
         return buildAllExpiredCredentials(terminalConnections);
       }
-      invalidateManagedLease(options, "CONNECTION_INELIGIBLE");
+      await invalidateManagedLease(options, "CONNECTION_INELIGIBLE");
       log.warn("AUTH", `${provider} | all ${connections.length} accounts unavailable`);
       return null;
     }
@@ -1694,7 +1699,7 @@ export async function getProviderCredentials(
     }
 
     if (peakHourEligibleConnections.length === 0 && availableConnections.length > 0) {
-      invalidateManagedLease(options, "QUOTA_UNAVAILABLE");
+      await invalidateManagedLease(options, "QUOTA_UNAVAILABLE");
       return buildPeakHourProtectionRateLimitedResult(provider, blockedByPeakHour);
     }
 
@@ -1755,7 +1760,7 @@ export async function getProviderCredentials(
           getEarliestFutureDate(
             transportUnavailable.map((connection) => connection.rateLimitedUntil || null)
           ) || new Date(Date.now() + 3000).toISOString();
-        invalidateManagedLease(options, "HEALTH_OR_COOLDOWN");
+        await invalidateManagedLease(options, "HEALTH_OR_COOLDOWN");
         return {
           allRateLimited: true,
           retryAfter,
@@ -1772,7 +1777,7 @@ export async function getProviderCredentials(
         ? new Date(earliestResetMs).toISOString()
         : new Date(Date.now() + 5 * 60 * 1000).toISOString();
 
-      invalidateManagedLease(options, "QUOTA_UNAVAILABLE");
+      await invalidateManagedLease(options, "QUOTA_UNAVAILABLE");
       return {
         allRateLimited: true,
         retryAfter,
@@ -1826,7 +1831,7 @@ export async function getProviderCredentials(
         ? new Date(earliestResetMs).toISOString()
         : new Date(Date.now() + 5 * 60 * 1000).toISOString();
 
-      invalidateManagedLease(options, "QUOTA_UNAVAILABLE");
+      await invalidateManagedLease(options, "QUOTA_UNAVAILABLE");
       return {
         allRateLimited: true,
         retryAfter,
@@ -1847,7 +1852,7 @@ export async function getProviderCredentials(
     if (leasePolicy.error) return { [leasePolicy.error]: true };
     if (leasePolicy.connections.length === 0) {
       if (options.lease?.mode === "request" && leasePolicy.activeLease) {
-        invalidateManagedLease(options, "CONNECTION_INELIGIBLE");
+        await invalidateManagedLease(options, "CONNECTION_INELIGIBLE");
       }
       return options.lease
         ? {
@@ -1884,7 +1889,7 @@ export async function getProviderCredentials(
       : undefined;
     const affinityPlan =
       options.lease && !connection
-        ? planSessionAffinityConnection(
+        ? await planSessionAffinityConnectionAsync(
             provider,
             options.sessionKey,
             orderedConnections,
@@ -2113,7 +2118,7 @@ export async function getProviderCredentials(
           ...probeStamp,
         });
       }
-      let claim = mutateExclusiveConnectionLease(
+      let claim = await mutateExclusiveConnectionLease(
         connection,
         leasePolicy.activeLease,
         options.lease
@@ -2260,8 +2265,10 @@ export async function getProviderCredentialsWithQuotaPreflight(
     }
     const commitLease = async () => {
       if (!options.lease) return credentials;
-      const activeLease = getActiveExclusiveConnectionLease(options.lease.context.leaseOwnerId);
-      const claim = mutateExclusiveConnectionLease(
+      const activeLease = await getActiveExclusiveConnectionLeaseAsync(
+        options.lease.context.leaseOwnerId
+      );
+      const claim = await mutateExclusiveConnectionLease(
         selectedCredentials as unknown as ProviderConnectionView,
         activeLease,
         options.lease
@@ -2504,7 +2511,7 @@ async function applyEgressIpLockout(
 ): Promise<void> {
   try {
     const since = new Date(Date.now() - EGRESS_IP_LOOKUP_WINDOW_MS).toISOString();
-    const recent = getRecentEgressIpForConnection(connectionId, since);
+    const recent = await getRecentEgressIpForConnection(connectionId, since);
     if (!recent) {
       log.info(
         "AUTH",
@@ -2512,7 +2519,6 @@ async function applyEgressIpLockout(
       );
       return;
     }
-    const db = getDbInstance();
     // Siblings are scoped to the allowlisted provider family: the egress IP
     // budget is per provider (the opencode free tier is IP-bucketed, not
     // account-bucketed — see #9611), so a 429 from one provider must never
@@ -2525,15 +2531,12 @@ async function applyEgressIpLockout(
     // widening of the allowlist, leaving the opt-in half applied (the gate
     // would fire for the new provider while its siblings stayed invisible).
     const family = egressBucketedLockProviders();
-    const familyPlaceholders = family.map(() => "?").join(",");
-    const siblingIds = db
-      .prepare(
-        `SELECT DISTINCT connection_id FROM proxy_logs
-         WHERE egress_ip = ? AND timestamp >= ? AND connection_id != ?
-         AND provider IN (${familyPlaceholders})`
-      )
-      .all(recent.egressIp, since, connectionId, ...family)
-      .map((row: { connection_id: string }) => row.connection_id);
+    const siblingIds = await getEgressSiblingConnectionIdsAsync(
+      recent.egressIp,
+      since,
+      connectionId,
+      family
+    );
     const now = Date.now();
     let cooledCount = 0;
     for (const id of siblingIds) {

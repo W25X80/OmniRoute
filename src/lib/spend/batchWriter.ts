@@ -1,12 +1,19 @@
-import { batchSaveCostEntries } from "@/lib/db/domainState";
+import { randomUUID } from "node:crypto";
+import { captureSpendEntries, isPostgresSpendReceiptError } from "@/lib/db/postgres/spendReceipts";
+import { batchSaveCostEntriesAsync } from "@/lib/db/domainStateAsync";
+import { getSelectedPersistenceIdentity } from "@/lib/db/controlPlaneContext";
+import { runPersistenceBackgroundWork } from "@/lib/db/persistenceRuntime";
+import { isPostgresErrorKind } from "@/lib/db/postgres/database";
 
 export interface BufferedCostEntry {
+  readonly receiptId?: string;
   apiKeyId: string;
   cost: number;
   timestamp: number;
 }
 
 interface SpendBatchWriterOptions {
+  createReceiptId?: () => string;
   flushIntervalMs?: number;
   maxBufferSize?: number;
   persistEntries?: (entries: BufferedCostEntry[]) => Promise<void> | void;
@@ -44,17 +51,22 @@ function normalizeEntry(entry: BufferedCostEntry): BufferedCostEntry | null {
 export class SpendBatchWriter {
   private buffer: BufferedCostEntry[] = [];
   private inFlightEntries: BufferedCostEntry[] = [];
+  private uncertainEntries: BufferedCostEntry[] = [];
   private discardedApiKeyIds = new Set<string>();
   private timer: NodeJS.Timeout | null = null;
   private started = false;
   private flushPromise: Promise<FlushResult> | null = null;
   private persistEntries: (entries: BufferedCostEntry[]) => Promise<void> | void;
   private logger: Pick<Console, "log" | "error">;
+  private createReceiptId?: () => string;
   private flushIntervalMs: number;
   private maxBufferSize: number;
 
   constructor(options: SpendBatchWriterOptions = {}) {
-    this.persistEntries = options.persistEntries || batchSaveCostEntries;
+    this.createReceiptId = options.createReceiptId;
+    this.persistEntries =
+      options.persistEntries ||
+      ((entries) => runPersistenceBackgroundWork(() => batchSaveCostEntriesAsync(entries)));
     this.logger = options.logger || console;
     this.flushIntervalMs = options.flushIntervalMs ?? getFlushIntervalMs();
     this.maxBufferSize = options.maxBufferSize ?? getMaxBufferSize();
@@ -75,7 +87,10 @@ export class SpendBatchWriter {
 
     this.start();
     this.discardedApiKeyIds.delete(entry.apiKeyId);
-    this.buffer.push(entry);
+    const accepted = this.createReceiptId
+      ? captureSpendEntries([{ ...entry, receiptId: this.createReceiptId() }])[0]
+      : entry;
+    this.buffer.push(accepted);
 
     if (this.buffer.length >= this.maxBufferSize) {
       void this.flush();
@@ -92,7 +107,9 @@ export class SpendBatchWriter {
       entry.timestamp >= sinceTimestamp &&
       entry.timestamp < untilTimestamp;
 
-    return [...this.inFlightEntries, ...this.buffer].filter(matchesWindow);
+    return [...this.uncertainEntries, ...this.inFlightEntries, ...this.buffer].filter(
+      matchesWindow
+    );
   }
 
   getPendingCostTotal(
@@ -109,6 +126,7 @@ export class SpendBatchWriter {
   discardEntries(apiKeyId: string) {
     this.discardedApiKeyIds.add(apiKeyId);
     this.buffer = this.buffer.filter((entry) => entry.apiKeyId !== apiKeyId);
+    this.uncertainEntries = this.uncertainEntries.filter((entry) => entry.apiKeyId !== apiKeyId);
     this.inFlightEntries = this.inFlightEntries.filter((entry) => entry.apiKeyId !== apiKeyId);
   }
 
@@ -146,6 +164,15 @@ export class SpendBatchWriter {
           requeued: false,
         };
       } catch (error) {
+        if (isPostgresErrorKind(error, "commit_unknown") || isPostgresSpendReceiptError(error)) {
+          // Replaying an unacknowledged financial COMMIT can charge twice. Keep
+          // uncertainty visible to diagnostics and conservatively to budget reads.
+          this.uncertainEntries.push(...entriesToPersist);
+          this.logger.error(
+            `[SpendWriter] Quarantined ${entriesToPersist.length} entries after uncertain or conflicting persistence outcome; reconciliation required`
+          );
+          return { flushedEntries: 0, uniqueKeys, requeued: false };
+        }
         this.buffer = [...entriesToPersist, ...this.buffer];
         const message = error instanceof Error ? error.message : String(error);
         this.logger.error(`[SpendWriter] Flush error: ${message}`);
@@ -172,6 +199,20 @@ export class SpendBatchWriter {
     return this.flush();
   }
 
+  getUncertainEntries(): readonly BufferedCostEntry[] {
+    return this.uncertainEntries.map((entry) => ({ ...entry }));
+  }
+
+  /** Remove only quarantined events whose canonical receipt was read after commit. */
+  resolveCommittedReceipts(receiptIds: readonly string[]): number {
+    const committed = new Set(receiptIds);
+    const before = this.uncertainEntries.length;
+    this.uncertainEntries = this.uncertainEntries.filter(
+      (entry) => !entry.receiptId || !committed.has(entry.receiptId)
+    );
+    return before - this.uncertainEntries.length;
+  }
+
   resetForTests() {
     if (this.timer) {
       clearInterval(this.timer);
@@ -180,12 +221,56 @@ export class SpendBatchWriter {
     this.started = false;
     this.buffer = [];
     this.inFlightEntries = [];
+    this.uncertainEntries = [];
     this.discardedApiKeyIds.clear();
     this.flushPromise = null;
   }
 }
 
-export const spendBatchWriter = new SpendBatchWriter();
+const SPEND_WRITER_STATE = Symbol.for("omniroute.spendBatchWriters");
+interface SpendWriterState {
+  sqlite: SpendBatchWriter;
+  postgres: WeakMap<object, SpendBatchWriter>;
+}
+const sharedWriters = globalThis as typeof globalThis & { [SPEND_WRITER_STATE]?: SpendWriterState };
+const writerState = (sharedWriters[SPEND_WRITER_STATE] ??= {
+  sqlite: new SpendBatchWriter(),
+  postgres: new WeakMap(),
+});
+
+function selectedSpendWriter(): SpendBatchWriter {
+  const identity = getSelectedPersistenceIdentity();
+  if (!identity) return writerState.sqlite;
+  let writer = writerState.postgres.get(identity);
+  if (!writer) {
+    writer = new SpendBatchWriter({
+      createReceiptId: randomUUID,
+      persistEntries: (entries) =>
+        runPersistenceBackgroundWork(async () => {
+          if (getSelectedPersistenceIdentity() !== identity)
+            throw new Error("Spend persistence changed during background work");
+          await batchSaveCostEntriesAsync(entries);
+        }),
+    });
+    writerState.postgres.set(identity, writer);
+  }
+  return writer;
+}
+
+/** Share pending spend across Next bundles, while keeping SQLite and each native database separate. */
+export const spendBatchWriter = new Proxy(writerState.sqlite, {
+  get(_target, property) {
+    const writer = selectedSpendWriter();
+    const value = Reflect.get(writer, property);
+    return typeof value === "function"
+      ? (...args: unknown[]) => {
+          if (selectedSpendWriter() !== writer)
+            throw new Error("Spend writer belongs to another persistence scope");
+          return Reflect.apply(value, writer, args);
+        }
+      : value;
+  },
+});
 
 export function startSpendBatchWriter() {
   spendBatchWriter.start();

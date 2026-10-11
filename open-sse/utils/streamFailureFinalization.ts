@@ -145,6 +145,7 @@ export function finalizeStreamRequestLog({
   error,
   errorCode,
   onWarn,
+  completedAt,
 }: {
   pendingRequestId: string;
   model: string;
@@ -156,23 +157,34 @@ export function finalizeStreamRequestLog({
   error?: string | null;
   errorCode?: string | null;
   onWarn?: (error: unknown) => void;
+  completedAt?: number;
 }) {
   try {
-    const completedById = finalizePendingRequestById(pendingRequestId, {
-      providerResponse,
-      clientResponse,
-      status,
-      error: error || null,
-      errorCode: errorCode || null,
-    });
-    if (!completedById) {
-      finalizeMostRecentPendingRequest(model, provider, connectionId, {
+    const completedById = finalizePendingRequestById(
+      pendingRequestId,
+      {
         providerResponse,
         clientResponse,
         status,
         error: error || null,
         errorCode: errorCode || null,
-      });
+      },
+      completedAt
+    );
+    if (!completedById) {
+      finalizeMostRecentPendingRequest(
+        model,
+        provider,
+        connectionId,
+        {
+          providerResponse,
+          clientResponse,
+          status,
+          error: error || null,
+          errorCode: errorCode || null,
+        },
+        completedAt
+      );
     }
   } catch (error) {
     try {
@@ -188,6 +200,16 @@ export function finalizeStreamRequestLog({
   }
 }
 
+function observeStreamCallback(work: void | Promise<void>, label: string): void {
+  if (!work) return;
+  void work.catch((error: unknown) => {
+    console.warn(
+      `[STREAM] ${label} callback failed:`,
+      error instanceof Error ? error.name : "Error"
+    );
+  });
+}
+
 export function createStreamFailureFinalizers({
   isFailureCompletionRecorded,
   isStreamCompletionRecorded = () => false,
@@ -198,9 +220,9 @@ export function createStreamFailureFinalizers({
 }: {
   isFailureCompletionRecorded: () => boolean;
   isStreamCompletionRecorded?: () => boolean;
-  onStreamComplete: (payload: StreamCompletionPayload) => void;
-  persistFailureUsage: (status: number, errorCode?: string) => void;
-  onStreamFailure?: ((failure: StreamFailurePayload) => void) | null;
+  onStreamComplete: (payload: StreamCompletionPayload) => void | Promise<void>;
+  persistFailureUsage: (status: number, errorCode?: string) => void | Promise<void>;
+  onStreamFailure?: ((failure: StreamFailurePayload) => void | Promise<void>) | null;
   hasEmittedOutput?: () => boolean;
 }) {
   const handleStreamFailure = (failure: StreamFailurePayload) => {
@@ -216,7 +238,7 @@ export function createStreamFailureFinalizers({
     const projectedCode = errorBody.error.code || String(status);
 
     if (!isFailureCompletionRecorded()) {
-      onStreamComplete({
+      const completion = onStreamComplete({
         status,
         usage: null,
         responseBody: errorBody,
@@ -226,11 +248,15 @@ export function createStreamFailureFinalizers({
         errorCode: projectedCode,
         ttft: 0,
       });
+      observeStreamCallback(completion, "Completion");
     }
 
-    persistFailureUsage(status, projectedCode);
+    observeStreamCallback(persistFailureUsage(status, projectedCode), "Failure usage");
     try {
-      onStreamFailure?.({ ...failure, outputEmitted: hasEmittedOutput() });
+      observeStreamCallback(
+        onStreamFailure?.({ ...failure, outputEmitted: hasEmittedOutput() }),
+        "Provider failure"
+      );
     } catch {
       // Best-effort fallback state update only.
     }

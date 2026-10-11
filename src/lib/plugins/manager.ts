@@ -13,16 +13,24 @@ import { randomUUID } from "crypto";
 import { logger } from "../../../open-sse/utils/logger.ts";
 import { getDefaultPluginDir, scanPluginDir } from "./scanner";
 import { loadPlugin, type LoadedPlugin } from "./loader";
-import { registerHook, unregisterHooks, emitHook, type HookHandler, type Plugin } from "./hooks";
 import {
-  insertPlugin,
+  registerHook,
+  unregisterHooks,
+  emitHook,
+  disposeSelectedPluginHooksRuntime,
+  type HookHandler,
+  type Plugin,
+} from "./hooks";
+import {
+  insertPluginAsync,
   getPluginByName,
+  getPluginByNameAsync,
   listPlugins as dbListPlugins,
-  updatePluginStatus,
-  updatePluginConfig,
-  updatePluginManifest,
-  deletePlugin as dbDeletePlugin,
-  pluginExists,
+  listPluginsAsync as dbListPluginsAsync,
+  updatePluginStatusAsync,
+  updatePluginManifestAsync,
+  deletePluginAsync as dbDeletePluginAsync,
+  pluginExistsAsync,
   type PluginRow,
 } from "../db/plugins";
 import type { PluginManifestWithDefaults } from "./manifest";
@@ -104,8 +112,14 @@ function assertEntryPointWithinDest(destDir: string, entryPoint: string): void {
   }
 }
 
+import {
+  getAgentRuntimeAuthority,
+  requiresDurableAgentPersistence,
+  isNativeAgentPersistenceError,
+} from "../db/agentRuntimeState";
+
 class PluginManager {
-  private static instance: PluginManager;
+  private static instances = new WeakMap<object, PluginManager>();
   private loadedPlugins: Map<string, LoadedPlugin> = new Map();
   private pluginDir: string;
 
@@ -113,11 +127,33 @@ class PluginManager {
     this.pluginDir = getDefaultPluginDir();
   }
 
+  static async shutdownSelectedRuntime(): Promise<void> {
+    const authority = getAgentRuntimeAuthority();
+    const manager = PluginManager.instances.get(authority);
+    const children = manager ? [...manager.loadedPlugins.values()] : [];
+    const results = await Promise.allSettled(
+      children.map(async (loaded) => {
+        if (loaded.cleanupAsync) await loaded.cleanupAsync();
+        else loaded.cleanup();
+      })
+    );
+    manager?.loadedPlugins.clear();
+    PluginManager.instances.delete(authority);
+    disposeSelectedPluginHooksRuntime();
+    const failures = results
+      .filter((result): result is PromiseRejectedResult => result.status === "rejected")
+      .map((result) => result.reason);
+    if (failures.length) throw new AggregateError(failures, "Plugin child cleanup failed");
+  }
+
   static getInstance(): PluginManager {
-    if (!PluginManager.instance) {
-      PluginManager.instance = new PluginManager();
+    const authority = getAgentRuntimeAuthority();
+    let instance = PluginManager.instances.get(authority);
+    if (!instance) {
+      instance = new PluginManager();
+      PluginManager.instances.set(authority, instance);
     }
-    return PluginManager.instance;
+    return instance;
   }
 
   /**
@@ -166,8 +202,8 @@ class PluginManager {
     const { name, manifest, pluginDir: srcDir } = discovered;
 
     // If already installed, auto-upgrade when source is strictly newer; reject otherwise.
-    if (pluginExists(name)) {
-      const existing = getPluginByName(name)!;
+    if (await pluginExistsAsync(name)) {
+      const existing = (await getPluginByNameAsync(name))!;
       if (compareSemver(manifest.version, existing.version) > 0) {
         // Source is newer — delegate to upgrade()
         return this.upgrade(sourceDir);
@@ -204,7 +240,7 @@ class PluginManager {
     }
 
     // Register in DB (destDir is now in place)
-    const row = insertPlugin({
+    const row = await insertPluginAsync({
       id: randomUUID(),
       name,
       version: manifest.version,
@@ -285,11 +321,11 @@ class PluginManager {
     const { name, manifest } = discovered;
 
     // Must be already installed
-    if (!pluginExists(name)) {
+    if (!(await pluginExistsAsync(name))) {
       throw new Error(`Plugin '${name}' is not installed — use install() instead`);
     }
 
-    const existing = getPluginByName(name)!;
+    const existing = (await getPluginByNameAsync(name))!;
 
     // Source must be strictly newer
     if (compareSemver(manifest.version, existing.version) <= 0) {
@@ -325,7 +361,7 @@ class PluginManager {
       } catch (err: any) {
         log.warn("manager.upgrade_dir_error", { name, error: err.message });
       }
-      dbDeletePlugin(name);
+      await dbDeletePluginAsync(name);
 
       // Atomic rename staging → final dest
       await rename(stagingDir, destDir);
@@ -335,7 +371,7 @@ class PluginManager {
       throw err;
     }
 
-    const row = insertPlugin({
+    const row = await insertPluginAsync({
       id: randomUUID(),
       name,
       version: manifest.version,
@@ -389,6 +425,7 @@ class PluginManager {
    */
   private async refreshManifestFromDisk(row: PluginRow): Promise<PluginManifestWithDefaults> {
     const stored = JSON.parse(row.manifest) as PluginManifestWithDefaults;
+    let manifestWriteStarted = false;
     try {
       const { safeValidateManifest } = await import("./manifest");
       const raw = await readFile(join(row.pluginDir, "plugin.json"), "utf-8");
@@ -403,7 +440,8 @@ class PluginManager {
 
       const freshJson = JSON.stringify(fresh);
       if (freshJson !== row.manifest) {
-        updatePluginManifest(
+        manifestWriteStarted = true;
+        await updatePluginManifestAsync(
           row.name,
           fresh as unknown as Record<string, unknown>,
           [
@@ -420,7 +458,8 @@ class PluginManager {
         log.info("manager.manifest_refreshed", { name: row.name });
       }
       return fresh;
-    } catch {
+    } catch (err) {
+      if (manifestWriteStarted && requiresDurableAgentPersistence()) throw err;
       return stored;
     }
   }
@@ -429,7 +468,7 @@ class PluginManager {
    * Activate a plugin — load into VM, register hooks, update DB.
    */
   async activate(name: string): Promise<void> {
-    const row = getPluginByName(name);
+    const row = await getPluginByNameAsync(name);
     if (!row) throw new Error(`Plugin '${name}' not found`);
     // Guard on in-memory state, not DB status. DB status survives a restart but
     // loadedPlugins/hooks do not, so a DB-only check makes activate() a no-op for
@@ -458,6 +497,7 @@ class PluginManager {
       throw new Error(`Plugin '${name}' entry point escapes plugin directory`);
     }
 
+    let statusWriteStarted = false;
     try {
       const loaded = await loadPlugin(entryPoint, manifest);
 
@@ -479,7 +519,8 @@ class PluginManager {
       }
 
       this.loadedPlugins.set(name, loaded);
-      updatePluginStatus(name, "active");
+      statusWriteStarted = true;
+      await updatePluginStatusAsync(name, "active");
 
       // Fire onActivate lifecycle hook
       if (manifest.hooks.onActivate) {
@@ -488,7 +529,18 @@ class PluginManager {
 
       log.info("manager.activated", { name });
     } catch (err: any) {
-      updatePluginStatus(name, "error", err.message);
+      if (requiresDurableAgentPersistence()) {
+        // Stop local dispatch without interpreting an unacknowledged status commit.
+        const loaded = this.loadedPlugins.get(name);
+        if (loaded) {
+          unregisterHooks(name);
+          loaded.cleanup();
+          this.loadedPlugins.delete(name);
+        }
+        if (!statusWriteStarted) await updatePluginStatusAsync(name, "error", err.message);
+      } else {
+        await updatePluginStatusAsync(name, "error", err.message);
+      }
       log.error("manager.activate_failed", { name, error: err.message });
       throw err;
     }
@@ -502,7 +554,7 @@ class PluginManager {
    * cleanup logic. See PR #3473 review finding.
    */
   async deactivate(name: string): Promise<void> {
-    const row = getPluginByName(name);
+    const row = await getPluginByNameAsync(name);
     const manifest = row ? (JSON.parse(row.manifest) as PluginManifestWithDefaults) : null;
 
     // Fire onDeactivate lifecycle hook BEFORE unregistering — plugin's handlers
@@ -518,7 +570,7 @@ class PluginManager {
       this.loadedPlugins.delete(name);
     }
 
-    updatePluginStatus(name, "inactive");
+    await updatePluginStatusAsync(name, "inactive");
 
     log.info("manager.deactivated", { name });
   }
@@ -527,7 +579,7 @@ class PluginManager {
    * Uninstall a plugin — deactivate, delete directory (containment-checked), remove from DB.
    */
   async uninstall(name: string): Promise<void> {
-    const row = getPluginByName(name);
+    const row = await getPluginByNameAsync(name);
     if (!row) throw new Error(`Plugin '${name}' not found`);
 
     const manifest = JSON.parse(row.manifest) as PluginManifestWithDefaults;
@@ -555,7 +607,7 @@ class PluginManager {
     }
 
     // Remove from DB
-    dbDeletePlugin(name);
+    await dbDeletePluginAsync(name);
     log.info("manager.uninstalled", { name });
   }
 
@@ -568,9 +620,9 @@ class PluginManager {
 
     // Register newly discovered plugins that aren't in DB
     for (const discovered of plugins) {
-      if (!pluginExists(discovered.name)) {
+      if (!(await pluginExistsAsync(discovered.name))) {
         try {
-          insertPlugin({
+          await insertPluginAsync({
             id: randomUUID(),
             name: discovered.name,
             version: discovered.manifest.version,
@@ -609,13 +661,14 @@ class PluginManager {
    * Load all active plugins on startup.
    */
   async loadAll(): Promise<void> {
-    const rows = dbListPlugins("active");
+    const rows = await dbListPluginsAsync("active");
     log.info("manager.loadAll", { count: rows.length });
 
     for (const row of rows) {
       try {
         await this.activate(row.name);
       } catch (err: any) {
+        if (isNativeAgentPersistenceError(err)) throw err;
         log.error("manager.loadAll_failed", { name: row.name, error: err.message });
       }
     }
@@ -631,6 +684,10 @@ class PluginManager {
   /**
    * List all plugins from DB.
    */
+  async listAllAsync(): Promise<PluginRow[]> {
+    return dbListPluginsAsync();
+  }
+
   listAll(): PluginRow[] {
     return dbListPlugins();
   }
@@ -638,9 +695,24 @@ class PluginManager {
   /**
    * Get plugin by name from DB.
    */
+  async getPluginAsync(name: string): Promise<PluginRow | null> {
+    return getPluginByNameAsync(name);
+  }
+
   getPlugin(name: string): PluginRow | null {
     return getPluginByName(name);
   }
 }
 
-export const pluginManager = PluginManager.getInstance();
+export const pluginManager = new Proxy({} as PluginManager, {
+  get(_target, property) {
+    const manager = PluginManager.getInstance();
+    const value = Reflect.get(manager, property, manager);
+    return typeof value === "function" ? value.bind(manager) : value;
+  },
+});
+
+/** Stop process resources after admitted work drains; durable plugin status is retained. */
+export async function shutdownPluginRuntime(): Promise<void> {
+  await PluginManager.shutdownSelectedRuntime();
+}

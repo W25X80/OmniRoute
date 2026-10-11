@@ -73,7 +73,7 @@ test("cache API accepts internal auth only through the trusted loopback verifier
   // independent way in (read scope for GET, write scope for DELETE). The internal
   // service token is still accepted ONLY through the trusted loopback verifier.
   const trustedGuard =
-    /if \(\s*!isTrustedLoopbackInternalServiceRequest\(req\) &&\s*!\(await isAuthenticated\(req\)\)(?:\s*&&\s*!\(await isCacheScopedKey\(req, CACHE_(?:READ|WRITE)_SCOPE\)\))?\s*\)/g;
+    /if \(\s*!\(await isTrustedLoopbackInternalServiceRequestAsync\(req\)\) &&\s*!\(await isAuthenticated\(req\)\)(?:\s*&&\s*!\(await isCacheScopedKey\(req, CACHE_(?:READ|WRITE)_SCOPE\)\))?\s*\)/g;
 
   assert.equal(
     [...source.matchAll(trustedGuard)].length,
@@ -82,7 +82,7 @@ test("cache API accepts internal auth only through the trusted loopback verifier
   );
   assert.doesNotMatch(
     source,
-    /isInternalServiceRequest\(req\)/,
+    /isInternalServiceRequest(?:Async)?\(req\)/,
     "the cache route must not trust the service token without the loopback guard"
   );
 });

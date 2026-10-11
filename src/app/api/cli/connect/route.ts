@@ -21,7 +21,7 @@ import {
   isHostOperatorRequest,
 } from "@/server/auth/loginPeer";
 import { getRequestPeerLocality } from "@/shared/utils/apiAuth";
-import { createAccessToken } from "@/lib/db/accessTokens";
+import { createAccessTokenAsync } from "@/lib/db/accessTokens";
 import { ACCESS_SCOPES } from "@/lib/accessTokens/scopes";
 
 /**
@@ -179,7 +179,7 @@ export async function POST(request: Request) {
         ? new Date(Date.now() + expiresInDays * 86_400_000).toISOString()
         : null;
 
-    const { record, secret } = createAccessToken({
+    const { record, secret } = await createAccessTokenAsync({
       name: tokenName,
       scope: tokenScope,
       expiresAt,

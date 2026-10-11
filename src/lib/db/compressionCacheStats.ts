@@ -1,3 +1,5 @@
+import { getSelectedPostgresDatabase } from "./controlPlaneContext";
+import { createPostgresCompressionTelemetryRepository } from "./postgres/compressionTelemetryRepository";
 import { getDbInstance } from "./core";
 
 export interface CacheStatsEntry {
@@ -46,8 +48,6 @@ export function recordCacheStats(entry: CacheStatsEntry): void {
 
 export function getCacheStatsSummary(since?: Date): CacheStatsSummary {
   const db = getDbInstance();
-  const whereClause = since ? "WHERE created_at >= ?" : "";
-  const params = since ? [since.toISOString()] : [];
 
   // Global aggregates
   const globalRow = since
@@ -56,15 +56,13 @@ export function getCacheStatsSummary(since?: Date): CacheStatsSummary {
           `SELECT COUNT(*) as totalRequests, AVG(net_savings) as avgNetSavings, SUM(estimated_cache_hit) * 1.0 / COUNT(*) as cacheHitRate FROM compression_cache_stats WHERE created_at >= ?`
         )
         .get(since.toISOString()) as
-        | { totalRequests: number; avgNetSavings: number; cacheHitRate: number }
-        | undefined)
+        { totalRequests: number; avgNetSavings: number; cacheHitRate: number } | undefined)
     : (db
         .prepare(
           `SELECT COUNT(*) as totalRequests, AVG(net_savings) as avgNetSavings, SUM(estimated_cache_hit) * 1.0 / COUNT(*) as cacheHitRate FROM compression_cache_stats`
         )
         .get() as
-        | { totalRequests: number; avgNetSavings: number; cacheHitRate: number }
-        | undefined);
+        { totalRequests: number; avgNetSavings: number; cacheHitRate: number } | undefined);
 
   if (!globalRow || globalRow.totalRequests === 0) {
     return { totalRequests: 0, avgNetSavings: 0, cacheHitRate: 0, byProvider: {} };
@@ -109,4 +107,18 @@ export function getCacheStatsSummary(since?: Date): CacheStatsSummary {
     cacheHitRate: globalRow.cacheHitRate ?? 0,
     byProvider,
   };
+}
+
+export async function recordCacheStatsAsync(entry: CacheStatsEntry): Promise<void> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresCompressionTelemetryRepository(database).insertCacheStats(entry)
+    : recordCacheStats(entry);
+}
+
+export async function getCacheStatsSummaryAsync(since?: Date): Promise<CacheStatsSummary> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresCompressionTelemetryRepository(database).cacheStats(since)
+    : getCacheStatsSummary(since);
 }

@@ -26,7 +26,7 @@
  */
 
 import { deleteProxyById, listProxies, updateProxy } from "@/lib/db/proxies";
-import { exportProxyLogsSince } from "@/lib/db/proxyLogs";
+import { exportProxyLogsSinceAsync } from "@/lib/db/proxyLogs";
 import { isProxyLogIncludeIps } from "@/lib/proxyLogger";
 import {
   getRecentEgressSharingSummary,
@@ -67,6 +67,9 @@ import {
   deleteBlockedHistory,
   pruneBlockedHistory,
   recordBlockedObservation,
+  recordBlockedObservationAsync,
+  deleteBlockedHistoryAsync,
+  pruneBlockedHistoryAsync,
 } from "./blockedHistory.ts";
 import {
   isProxyHealthBlockedResetsStreakEnabled,
@@ -79,6 +82,11 @@ import {
   resolvePassiveWindowMs,
   type PassiveLogRow,
 } from "./passiveVerdict.ts";
+
+import { createPersistencePoller, type PersistencePoller } from "@/lib/config/persistencePoller";
+import { parseDatabaseBackend } from "@/lib/db/backendSelection";
+import { getSelectedPersistenceIdentity } from "@/lib/db/controlPlaneContext";
+import { runPersistenceBackgroundWork } from "@/lib/db/persistenceRuntime";
 
 // #6246: a HEAD to the public probe target through a legit (often loaded) proxy
 // can exceed a few seconds; the old 5s ceiling produced false negatives that
@@ -180,9 +188,9 @@ interface CollectedProbe {
 }
 
 /** Phase 1 of the sweep: probe every proxy in batches, decide nothing yet. */
-async function collectProbeResults(
-  proxies: Array<{ id: string }>,
-  probe: (proxy: { id: string }) => Promise<CollectedProbe>
+async function collectProbeResults<Proxy extends { id: string }>(
+  proxies: Proxy[],
+  probe: (proxy: Proxy) => Promise<CollectedProbe>
 ): Promise<CollectedProbe[]> {
   const collected: CollectedProbe[] = [];
   for (let i = 0; i < proxies.length; i += CONCURRENCY) {
@@ -198,10 +206,10 @@ async function collectProbeResults(
   return collected;
 }
 
-async function probeBatchMember(
-  proxy: { id: string },
+async function probeBatchMember<Proxy extends { id: string }>(
+  proxy: Proxy,
   indexInBatch: number,
-  probe: (proxy: { id: string }) => Promise<CollectedProbe>
+  probe: (proxy: Proxy) => Promise<CollectedProbe>
 ): Promise<CollectedProbe> {
   // Spread the departures: without this the whole batch leaves at the same tick and a
   // shared egress IP hits the target with CONCURRENCY simultaneous requests.
@@ -297,7 +305,7 @@ export async function __decideOneResultForTesting(
 
 async function decideOneResult(
   raw: CollectedProbe,
-  final: CollectedProbe,
+  final: Pick<CollectedProbe, "outcome" | "status" | "target">,
   wasPromoted: boolean,
   ctx: {
     failureMap: Map<string, number>;
@@ -334,10 +342,13 @@ async function decideOneResult(
   const verdict = toSweepVerdict(outcome, final.status, Date.now());
   recordSweepVerdict(id, verdict);
   if (verdict.verdict === "blocked") {
-    recordBlockedObservation(id, verdict.cause, verdict.status, verdict.at);
+    if (parseDatabaseBackend() === "postgres")
+      await recordBlockedObservationAsync(id, verdict.cause, verdict.status, verdict.at);
+    else recordBlockedObservation(id, verdict.cause, verdict.status, verdict.at);
   } else if (verdict.verdict === "ok") {
     // A healthy sweep ends the refusal streak (see blockedHistory.ts lifecycle).
-    deleteBlockedHistory(id);
+    if (parseDatabaseBackend() === "postgres") await deleteBlockedHistoryAsync(id);
+    else deleteBlockedHistory(id);
   }
 
   if (decision.clearFailures) ctx.failureMap.delete(id);
@@ -356,7 +367,8 @@ async function decideOneResult(
     if (await deleteProxyById(id, { force: true }).catch(() => false)) {
       ctx.failureMap.delete(id);
       deleteSweepVerdict(id);
-      deleteBlockedHistory(id);
+      if (parseDatabaseBackend() === "postgres") await deleteBlockedHistoryAsync(id);
+      else deleteBlockedHistory(id);
       tally.removed++;
       try {
         clearDispatcherCache();
@@ -521,7 +533,11 @@ async function testOneProxy(proxy: {
       dispatcher,
       headers: { "User-Agent": "OmniRoute/1.0" },
     });
-    return { outcome: classifyProbeStatus(resp.status), status: resp.status, target };
+    return {
+      outcome: classifyProbeStatus(resp.status),
+      status: resp.status,
+      target,
+    };
   } catch (error) {
     // Our own deadline elapsed → hang when we had resolved the host but the
     // handshake never completed; otherwise inconclusive (slow, not dead).
@@ -563,9 +579,9 @@ interface EndpointVerdict {
   providers: string[];
 }
 
-function readPassiveVerdicts(
+async function readPassiveVerdicts(
   proxies: Array<{ host: string; port: number }>
-): Map<string, EndpointVerdict> {
+): Promise<Map<string, EndpointVerdict>> {
   const verdicts = new Map<string, EndpointVerdict>();
   const windowMs = resolvePassiveWindowMs();
   const now = Date.now();
@@ -574,7 +590,7 @@ function readPassiveVerdicts(
   try {
     // Bounded by the short window via idx_pl_timestamp; never let a DB
     // hiccup fail the sweep — fall back to live probes (no skip anywhere).
-    rows = exportProxyLogsSince(since);
+    rows = await exportProxyLogsSinceAsync(since);
   } catch (error) {
     console.error(`${LOG_PREFIX} Passive verdicts skipped:`, error);
     return verdicts;
@@ -599,7 +615,10 @@ function readPassiveVerdicts(
 }
 
 /** Test-only: skip lookup seam for sweep-level tests. */
-export type PassiveVerdictReader = (proxyId: string) => { skip: boolean; providers: string[] };
+export type PassiveVerdictReader = (proxyId: string) => {
+  skip: boolean;
+  providers: string[];
+};
 
 let passiveReader: PassiveVerdictReader | null = null;
 
@@ -651,7 +670,9 @@ async function sweep(): Promise<void> {
 
   const { items: proxies } = await listProxies({ includeSecrets: true });
   // Before the empty-registry return, so deleting the last proxy prunes too.
-  pruneBlockedHistory(proxies.map((proxy) => proxy.id));
+  if (parseDatabaseBackend() === "postgres")
+    await pruneBlockedHistoryAsync(proxies.map((proxy) => proxy.id));
+  else pruneBlockedHistory(proxies.map((proxy) => proxy.id));
   if (proxies.length === 0) return;
 
   // Passive verdicts from production traffic (opt-in): an endpoint already
@@ -660,7 +681,7 @@ async function sweep(): Promise<void> {
   // streak, the cross-proxy evidence, the promotion tally, or the sweep
   // verdict display.
   const passiveEnabled = isPassiveSweepSkipEnabled();
-  const passiveVerdicts = passiveEnabled ? readPassiveVerdicts(proxies) : new Map();
+  const passiveVerdicts = passiveEnabled ? await readPassiveVerdicts(proxies) : new Map();
   const failureMap = getFailureMap();
   const removeAfter = getRemoveAfter();
   const autoRemove = isAutoRemoveEnabled();
@@ -807,6 +828,86 @@ export function __recoveryLedgerSizeForTesting(): number {
   return recoveryLedger.size;
 }
 
+interface NativeProxyHealthScheduler {
+  identity: object;
+  sweep: PersistencePoller;
+  recovery: PersistencePoller;
+  pending: Set<Promise<void>>;
+  stopping?: Promise<void>;
+}
+const NATIVE_PROXY_SCHEDULERS = Symbol.for("omniroute.nativeProxyHealthSchedulers");
+const nativeProxyGlobals = globalThis as typeof globalThis & {
+  [NATIVE_PROXY_SCHEDULERS]?: WeakMap<object, NativeProxyHealthScheduler>;
+};
+const nativeProxySchedulers = (nativeProxyGlobals[NATIVE_PROXY_SCHEDULERS] ??= new WeakMap());
+
+async function runNativeProxyWork(
+  scheduler: NativeProxyHealthScheduler,
+  body: () => Promise<void>
+): Promise<void> {
+  if (scheduler.stopping) throw new Error("Proxy health scheduler is stopping");
+  const work = runPersistenceBackgroundWork(async () => {
+    if (getSelectedPersistenceIdentity() !== scheduler.identity)
+      throw new Error("Proxy health persistence authority changed");
+    await body();
+  });
+  scheduler.pending.add(work);
+  try {
+    await work;
+  } finally {
+    scheduler.pending.delete(work);
+  }
+}
+
+function selectedNativeProxyScheduler(): NativeProxyHealthScheduler {
+  const identity = getSelectedPersistenceIdentity();
+  if (!identity) throw new Error("Proxy health requires selected PostgreSQL persistence");
+  let scheduler = nativeProxySchedulers.get(identity);
+  if (!scheduler) {
+    const pending = new Set<Promise<void>>();
+    const created: NativeProxyHealthScheduler = {
+      identity,
+      pending,
+      sweep: createPersistencePoller({
+        intervalMs: getIntervalMs(),
+        initialDelayMs: INITIAL_DELAY_MS,
+        check: () => runNativeProxyWork(created, sweep),
+        onFailure: () => console.error(`${LOG_PREFIX} Sweep failed`),
+      }),
+      recovery: createPersistencePoller({
+        intervalMs: getRecoveryIntervalMs(),
+        initialDelayMs: INITIAL_DELAY_MS + getRecoveryIntervalMs(),
+        check: () =>
+          runNativeProxyWork(created, async () => {
+            await runRecoveryPass();
+          }),
+        onFailure: () => console.error(`${LOG_PREFIX} Recovery failed`),
+      }),
+    };
+    scheduler = created;
+    nativeProxySchedulers.set(identity, scheduler);
+  }
+  return scheduler;
+}
+
+function stopNativeProxyScheduler(scheduler: NativeProxyHealthScheduler): Promise<void> {
+  if (scheduler.stopping) return scheduler.stopping;
+  const sweepStopped = scheduler.sweep.stop();
+  const recoveryStopped = scheduler.recovery.stop();
+  const stopping = (async () => {
+    await Promise.all([
+      sweepStopped,
+      recoveryStopped,
+      ...[...scheduler.pending].map((work) => work.catch(() => {})),
+    ]);
+  })();
+  scheduler.stopping = stopping;
+  void stopping.finally(() => {
+    if (scheduler.stopping === stopping) scheduler.stopping = undefined;
+  });
+  return stopping;
+}
+
 function scheduleSweep(): void {
   const interval = getIntervalMs();
   globalThis.__proxyHealthInterval = setInterval(() => {
@@ -831,6 +932,14 @@ function scheduleRecoveryPass(): void {
 }
 
 export function initProxyHealthCheck(): void {
+  if (parseDatabaseBackend() === "postgres") {
+    if (!isEnabled() || isBuildProcess() || isBackgroundServicesDisabled()) return;
+    const scheduler = selectedNativeProxyScheduler();
+    if (scheduler.stopping) throw new Error("Proxy health scheduler is stopping");
+    scheduler.sweep.start();
+    scheduler.recovery.start();
+    return;
+  }
   if (!isEnabled() || isBuildProcess() || isBackgroundServicesDisabled()) return;
   if (globalThis.__proxyHealthInterval) return;
 
@@ -845,6 +954,10 @@ export function initProxyHealthCheck(): void {
 }
 
 export function stopProxyHealthCheck(): void {
+  if (parseDatabaseBackend() === "postgres") {
+    void stopNativeProxyScheduler(selectedNativeProxyScheduler());
+    return;
+  }
   if (globalThis.__proxyHealthInterval) {
     clearInterval(globalThis.__proxyHealthInterval);
     globalThis.__proxyHealthInterval = undefined;
@@ -856,8 +969,17 @@ export function stopProxyHealthCheck(): void {
 }
 
 export async function forceProxyHealthSweep(): Promise<void> {
-  await sweep();
+  if (parseDatabaseBackend() === "postgres")
+    await runNativeProxyWork(selectedNativeProxyScheduler(), sweep);
+  else await sweep();
 }
 
-// Auto-initialize on first import
-initProxyHealthCheck();
+/** Drain sweep/recovery callbacks and all accepted native manual checks. */
+export async function stopProxyHealthCheckAsync(): Promise<void> {
+  if (parseDatabaseBackend() === "postgres")
+    await stopNativeProxyScheduler(selectedNativeProxyScheduler());
+  else stopProxyHealthCheck();
+}
+
+// Native scheduling begins only at the explicit post-readiness boot boundary.
+if (parseDatabaseBackend() === "sqlite") initProxyHealthCheck();

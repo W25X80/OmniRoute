@@ -1,3 +1,5 @@
+import { getSelectedPostgresDatabase } from "./controlPlaneContext";
+import { createPostgresAgentMetadataRepository } from "./postgres/agentMetadataRepository";
 /**
  * Database module: AgentBridgeMappings
  * CRUD operations for agent_bridge_mappings table.
@@ -73,4 +75,40 @@ export function syncAgentBridgeMappingsToMitmAlias(agentId: string): void {
     mappings[row.source_model] = row.target_model;
   }
   setMitmAliasAll(agentId, mappings);
+}
+
+export async function getMappingsForAgentAsync(
+  ...args: Parameters<typeof getMappingsForAgent>
+): Promise<Awaited<ReturnType<typeof getMappingsForAgent>>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresAgentMetadataRepository(database).getMappingsForAgent(...args)
+    : getMappingsForAgent(...args);
+}
+
+export async function setMappingsAsync(
+  ...args: Parameters<typeof setMappings>
+): Promise<Awaited<ReturnType<typeof setMappings>>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresAgentMetadataRepository(database).setMappings(...args)
+    : setMappings(...args);
+}
+
+export async function deleteMappingAsync(
+  ...args: Parameters<typeof deleteMapping>
+): Promise<Awaited<ReturnType<typeof deleteMapping>>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresAgentMetadataRepository(database).deleteMapping(...args)
+    : deleteMapping(...args);
+}
+
+export async function syncAgentBridgeMappingsToMitmAliasAsync(
+  ...args: Parameters<typeof syncAgentBridgeMappingsToMitmAlias>
+): Promise<Awaited<ReturnType<typeof syncAgentBridgeMappingsToMitmAlias>>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresAgentMetadataRepository(database).syncAgentBridgeMappingsToMitmAlias(...args)
+    : syncAgentBridgeMappingsToMitmAlias(...args);
 }

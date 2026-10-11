@@ -32,7 +32,8 @@ export interface ConsumeResult {
 }
 
 export interface QuotaStore {
-  consume(apiKeyId: string, dim: DimensionKey, cost: number): Promise<number>;
+  /** Native completion owners may supply their captured instant; omitted keeps entry-time accounting. */
+  consume(apiKeyId: string, dim: DimensionKey, cost: number, eventTimeMs?: number): Promise<number>;
   peek(apiKeyId: string, dim: DimensionKey): Promise<number>;
   /**
    * Return the real pool-wide consumption for a dimension in the current

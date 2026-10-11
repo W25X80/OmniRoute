@@ -1,3 +1,5 @@
+import { parseDatabaseBackend } from "@/lib/db/backendSelection";
+import { runPersistenceBackgroundWork } from "@/lib/db/persistenceRuntime";
 /**
  * chatCore context-editing telemetry hook (Quality Gate v2 / Fase 9 — chatCore god-file
  * decomposition, #3501).
@@ -17,17 +19,18 @@ export function recordContextEditingTelemetryHook(args: {
   responseBody: unknown;
   skillRequestId: string;
   log?: LoggerLike;
-}): void {
+}): void | Promise<void> {
   const { contextEditingEnabled, provider, responseBody, skillRequestId, log } = args;
   if (!contextEditingEnabled || provider !== "claude") return;
 
-  void (async () => {
+  const work = runPersistenceBackgroundWork(async () => {
     try {
       const { extractContextEditingTelemetry } = await import("../../config/contextEditing.ts");
       const tele = extractContextEditingTelemetry(responseBody);
       if (tele) {
-        const { recordContextEditingTelemetry } = await import("@/lib/db/compressionAnalytics");
-        recordContextEditingTelemetry(skillRequestId, tele, provider);
+        const { recordContextEditingTelemetryAsync } =
+          await import("@/lib/db/compressionAnalytics");
+        await recordContextEditingTelemetryAsync(skillRequestId, tele, provider);
         log?.debug?.(
           "CONTEXT_EDITING",
           `cleared ${tele.clearedInputTokens} input tokens / ${tele.clearedToolUses} tool uses (${tele.editCount} edits)`
@@ -36,5 +39,6 @@ export function recordContextEditingTelemetryHook(args: {
     } catch {
       // Telemetry is best-effort and must never affect the response.
     }
-  })();
+  }).catch(() => {});
+  if (parseDatabaseBackend() === "postgres") return work;
 }

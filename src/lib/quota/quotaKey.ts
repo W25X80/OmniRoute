@@ -7,11 +7,14 @@
  * `exclusive` flag.
  */
 
-import { getPool, getPoolsByGroup } from "@/lib/db/quotaPools";
+import {
+  getPoolAsync as getPool,
+  getPoolsByGroupAsync as getPoolsByGroup,
+} from "@/lib/db/quotaPools";
 import { getCachedProviderConnectionById } from "@/lib/db/readCache";
 import { getApiKeyById, updateApiKeyPermissions } from "@/lib/db/apiKeys";
 import { quotaGroupSlug } from "./quotaModelNaming";
-import { getGroupName } from "@/lib/db/quotaGroups";
+import { getGroupNameAsync as getGroupName } from "@/lib/db/quotaGroups";
 
 // ---------------------------------------------------------------------------
 // Public interface
@@ -62,7 +65,7 @@ export function constrainConnectionsToQuota(
  *
  * Task B5 — Real-group access:
  * For each allowed pool, the scope expands to ALL pools in the same group:
- *   pool → pool.groupId → getPoolsByGroup(groupId) → aggregate their
+ *   pool → pool.groupId → await getPoolsByGroup(groupId) → aggregate their
  *   connections and providers.
  *
  * The returned `poolSlugs` field holds GROUP slugs (one per distinct group),
@@ -94,14 +97,14 @@ export async function resolveQuotaKeyScope(
   // Deduplicate: a key in 2 pools of the same group expands once.
   const groupIdSet = new Set<string>();
   for (const poolId of allowedQuotas) {
-    const pool = getPool(poolId);
+    const pool = await getPool(poolId);
     if (!pool) continue;
     groupIdSet.add(pool.groupId);
   }
 
   // For each distinct group, aggregate ALL pools in that group.
   for (const groupId of groupIdSet) {
-    const groupPools = getPoolsByGroup(groupId);
+    const groupPools = await getPoolsByGroup(groupId);
     // Group-level "anyValidConnection" gate: include the group slug only when
     // at least one pool in the group has a usable connection.
     let groupHasValidConnection = false;
@@ -129,7 +132,7 @@ export async function resolveQuotaKeyScope(
     // Only expose the group slug when the group has at least one usable
     // connection — a fully-orphaned group has no qtSd/<groupSlug>/... models.
     if (groupHasValidConnection) {
-      const groupName = getGroupName(groupId) ?? groupId;
+      const groupName = (await getGroupName(groupId)) ?? groupId;
       groupSlugSet.add(quotaGroupSlug(groupName));
     }
   }

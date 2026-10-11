@@ -182,7 +182,7 @@ export function runMemoryExtractionGate(input: {
   responseBody: Record<string, unknown> | null | undefined;
   extractFacts: (text: string, memoryOwnerId: string, sessionId: string) => void;
   log?: { debug?: (tag: string, message: string) => void } | null;
-}): void {
+}): void | Promise<void> {
   const {
     memoryOwnerId,
     memorySettings,
@@ -213,13 +213,27 @@ export function runMemoryExtractionGate(input: {
     return;
   }
 
+  const pending: Promise<unknown>[] = [];
   const requestMemoryText = extractMemoryTextFromRequestBody(requestBody ?? null);
   if (requestMemoryText) {
-    extractFacts(requestMemoryText, memoryOwnerId, pipelineSessionId);
+    const work: unknown = extractFacts(requestMemoryText, memoryOwnerId, pipelineSessionId);
+    if (work && typeof work === "object" && "then" in work && typeof work.then === "function") {
+      pending.push(Promise.resolve(work));
+    }
   }
 
   const responseMemoryText = extractMemoryTextFromResponse(responseBody ?? null);
   if (responseMemoryText) {
-    extractFacts(responseMemoryText, memoryOwnerId, pipelineSessionId);
+    const work: unknown = extractFacts(responseMemoryText, memoryOwnerId, pipelineSessionId);
+    if (work && typeof work === "object" && "then" in work && typeof work.then === "function") {
+      pending.push(Promise.resolve(work));
+    }
   }
+  if (pending.length)
+    return Promise.allSettled(pending).then((outcomes) => {
+      const failures = outcomes.flatMap((outcome) =>
+        outcome.status === "rejected" ? [outcome.reason] : []
+      );
+      if (failures.length) throw new AggregateError(failures, "Memory extraction failed");
+    });
 }

@@ -12,7 +12,10 @@
  * Part of: Group B — Quota Sharing Engine (plan 22, frente F6).
  */
 
-import { getPlan as getProviderPlan } from "@/lib/db/providerPlans";
+import {
+  getPlan as getProviderPlan,
+  getPlanAsync as getProviderPlanAsync,
+} from "@/lib/db/providerPlans";
 import { getKnownPlan } from "./planRegistry";
 import type { ProviderPlan } from "./dimensions";
 
@@ -57,6 +60,10 @@ export function resolvePlan(
     // DB not available (e.g. test env without migration) — fall through
   }
 
+  return catalogFallback(provider);
+}
+
+function catalogFallback(provider: string): ProviderPlan {
   // 2. Known catalog
   const catalogPlan = getKnownPlan(provider);
   if (catalogPlan) {
@@ -75,4 +82,19 @@ export function resolvePlan(
     dimensions: [],
     source: "manual",
   };
+}
+
+export async function resolvePlanAsync(
+  connectionId: string,
+  provider: string,
+  _runtimeSignals?: RuntimeSignals
+): Promise<ProviderPlan> {
+  try {
+    const plan = await getProviderPlanAsync(connectionId);
+    if (plan && plan.dimensions.length > 0)
+      return { ...plan, dimensions: plan.dimensions as ProviderPlan["dimensions"] };
+  } catch {
+    // Existing B16 plan lookup fallback, never a fallback to another durable backend.
+  }
+  return catalogFallback(provider);
 }

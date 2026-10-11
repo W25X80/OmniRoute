@@ -530,6 +530,17 @@ export class ChatGptTurnSessions {
   private readonly retirements = new Map<string, Promise<void>>();
   private readonly ownerRetirements = new Map<string, Promise<void>>();
   private readonly conversationRetirements = new Map<string, Promise<void>>();
+  private readonly nativeInitializers = new Map<
+    string,
+    {
+      key: string;
+      session?: ChatGptTurnSession;
+      traceId?: string;
+      cancelled?: Error;
+      settled: Promise<void>;
+    }
+  >();
+  private nativeStartGeneration = 0;
 
   constructor(
     private readonly ttlMs = 30 * 60_000,
@@ -568,10 +579,20 @@ export class ChatGptTurnSessions {
     ownerKey: string,
     start: () => ChatGptTurnRuntime,
     traceId?: string,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    nativeStart?: { prepareStart?: () => Promise<() => ChatGptTurnRuntime> }
   ): Promise<ChatGptTurnSession> {
+    const generation = this.nativeStartGeneration;
     for (;;) {
-      if (signal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
+      if (signal?.aborted || (nativeStart && generation !== this.nativeStartGeneration))
+        throw new DOMException("ChatGPT web turn aborted", "AbortError");
+      if (nativeStart) {
+        const initializing = this.nativeInitializers.get(ownerKey);
+        if (initializing) {
+          await awaitWithAbort(initializing.settled, signal);
+          continue;
+        }
+      }
       const existing = this.entries.get(key);
       if (existing) {
         existing.touch();
@@ -596,6 +617,72 @@ export class ChatGptTurnSessions {
         continue;
       }
       if (signal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
+      if (nativeStart) {
+        this.prune();
+        const active = [...this.entries.values()].filter((session) => session.isActive()).length;
+        const pending = [...this.nativeInitializers.values()].filter(
+          (entry) => !entry.session && !this.entries.has(entry.key)
+        ).length;
+        if (active + pending >= MAX_CHATGPT_BROWSER_TABS) {
+          throw new Error(
+            `ChatGPT Web supports at most ${MAX_CHATGPT_BROWSER_TABS} simultaneous browser turns; close or finish a browser tab before starting another`
+          );
+        }
+        if (this.entries.size + pending >= this.maxEntries)
+          throw new Error(`ChatGPT web session registry is full (${this.maxEntries} entries)`);
+        let release!: () => void;
+        const initializing: {
+          key: string;
+          session?: ChatGptTurnSession;
+          traceId?: string;
+          cancelled?: Error;
+          settled: Promise<void>;
+        } = {
+          key,
+          traceId,
+          settled: new Promise<void>((resolveSettled) => {
+            release = resolveSettled;
+          }),
+        };
+        this.nativeInitializers.set(ownerKey, initializing);
+        const work = (async () => {
+          const ready = nativeStart.prepareStart ? await nativeStart.prepareStart() : start;
+          if (signal?.aborted || generation !== this.nativeStartGeneration)
+            throw new DOMException("ChatGPT web turn aborted", "AbortError");
+          if (initializing.cancelled) throw initializing.cancelled;
+          const concurrent = this.entries.get(key);
+          if (concurrent) {
+            concurrent.touch();
+            initializing.session = concurrent;
+            return concurrent;
+          }
+          const pending = this.retirements.get(key) ?? this.ownerRetirements.get(ownerKey);
+          const activeOwner = [...this.entries].find(
+            ([ownedKey, session]) =>
+              ownedKey !== key && session.ownerKey === ownerKey && !session.isPhysicallySettled()
+          );
+          if (pending || activeOwner) return undefined;
+          // Reuse the source capacity and duplicate checks immediately before model start.
+          const session = this.getOrCreate(key, ready, traceId, ownerKey);
+          initializing.session = session;
+          return session;
+        })();
+        void work.then(
+          () => {
+            if (this.nativeInitializers.get(ownerKey) === initializing)
+              this.nativeInitializers.delete(ownerKey);
+            release();
+          },
+          () => {
+            if (this.nativeInitializers.get(ownerKey) === initializing)
+              this.nativeInitializers.delete(ownerKey);
+            release();
+          }
+        );
+        const session = await awaitWithAbort(work, signal);
+        if (session) return session;
+        continue;
+      }
       return this.getOrCreate(key, start, traceId, ownerKey);
     }
   }
@@ -674,6 +761,7 @@ export class ChatGptTurnSessions {
   }
 
   clear(): number {
+    this.nativeStartGeneration += 1;
     const cancelled = this.entries.size;
     for (const [key, session] of this.entries) this.beginRetirement(key, session);
     this.entries.clear();
@@ -682,12 +770,19 @@ export class ChatGptTurnSessions {
   }
 
   async cancelTrace(traceId: string, reason = chatGptBrowserTabClosedError()): Promise<number> {
+    const initializing = [...this.nativeInitializers.values()].filter(
+      (entry) => entry.traceId === traceId && !entry.session
+    );
+    for (const entry of initializing) entry.cancelled = reason;
     const sessions = [...this.entries.values()].filter(
       (session) => session.traceId === traceId && session.isActive()
     );
     for (const session of sessions) session.cancel(reason);
-    await Promise.all(sessions.map((session) => session.physicalSettlement));
-    return sessions.length;
+    await Promise.all([
+      ...sessions.map((session) => session.physicalSettlement),
+      ...initializing.map((entry) => entry.settled),
+    ]);
+    return sessions.length + initializing.length;
   }
 
   cancelledError(traceId: string): Error | undefined {

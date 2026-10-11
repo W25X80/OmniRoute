@@ -1,5 +1,10 @@
 import { NextResponse } from "next/server";
-import { getCombos, getCombosCount, createCombo, getComboByName } from "@/lib/db/combos";
+import {
+  getCombos,
+  getCombosCountAsync as getCombosCount,
+  createCombo,
+  getComboByName,
+} from "@/lib/db/combos";
 import { isCloudEnabled } from "@/lib/db/settings";
 import { getConsistentMachineId } from "@/shared/utils/machineId";
 import { syncToCloud } from "@/lib/cloudSync";
@@ -32,7 +37,7 @@ export async function GET(request: Request) {
     }
 
     const range = validation.data;
-    const total = getCombosCount();
+    const total = await getCombosCount();
     const rawCombos = await getCombos(range.limit, range.offset);
     const combos = rawCombos.map((combo) => ({
       ...combo,

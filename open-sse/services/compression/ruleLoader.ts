@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import fsp from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import type { CavemanIntensity, CavemanRule } from "./types.ts";
@@ -304,4 +305,160 @@ export function loadCavemanFileRules(
 
 export function listCavemanRulePacks(): RulePackMetadata[] {
   return getAvailableLanguagePacks();
+}
+
+let nativeRulesDir: Promise<string> | undefined;
+const nativeRuleReads = new Map<string, Promise<CavemanRule[]>>();
+
+async function existsAsync(filename: string): Promise<boolean> {
+  try {
+    await fsp.access(filename);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function getRulesDirAsync(): Promise<string> {
+  return (nativeRulesDir ??= (async () => {
+    if (rulesDirCache) return rulesDirCache;
+    const anchors = [process.cwd()];
+    const argv1 = process.argv[1];
+    if (typeof argv1 === "string" && argv1) anchors.push(path.dirname(argv1));
+    const rel = path.join("open-sse", "services", "compression");
+    const fallback = path.join(os.homedir(), ".omniroute");
+    let root = fallback;
+    search: for (const anchor of anchors) {
+      let directory = path.resolve(anchor);
+      for (let index = 0; index <= 8; index++) {
+        if (await existsAsync(path.join(directory, rel))) {
+          root = directory;
+          break search;
+        }
+        const parent = path.dirname(directory);
+        if (parent === directory) break;
+        directory = parent;
+      }
+    }
+    const candidates = [path.join(root, rel, "rules"), path.join(root, "app", rel, "rules")];
+    for (const candidate of candidates) if (await existsAsync(candidate)) return candidate;
+    return candidates[0];
+  })());
+}
+
+async function readPackFileAsync(filename: string, label: string): Promise<RulePack | null> {
+  if (!(await existsAsync(filename))) return null;
+  const parsed: unknown = JSON.parse(await fsp.readFile(filename, "utf8"));
+  const validation = validateRulePack(parsed);
+  if (!validation.valid)
+    throw new Error(`Invalid Caveman rule pack ${label}: ${validation.errors.join("; ")}`);
+  return parsed as RulePack;
+}
+
+async function readMergedRulesAsync(
+  root: string,
+  userRoot: string,
+  language: string,
+  category: string
+): Promise<FileRule[] | null> {
+  const bundled = await readPackFileAsync(
+    path.join(root, language, `${category}.json`),
+    `${language}/${category}`
+  );
+  let user: RulePack | null = null;
+  try {
+    user = await readPackFileAsync(
+      path.join(userRoot, language, `${category}.json`),
+      `user:${language}/${category}`
+    );
+  } catch (error) {
+    console.warn(`[compression] ignoring invalid user rule pack: ${String(error)}`);
+  }
+  if (!bundled && !user) return null;
+  if (!user) return bundled?.rules ?? null;
+  const overrides = new Map(user.rules.map((rule) => [rule.name, rule]));
+  const merged = (bundled?.rules ?? []).map((rule) => overrides.get(rule.name) ?? rule);
+  const names = new Set((bundled?.rules ?? []).map((rule) => rule.name));
+  return [...merged, ...user.rules.filter((rule) => !names.has(rule.name))];
+}
+
+async function loadRulePackAtAsync(
+  root: string,
+  userRoot: string,
+  language: string,
+  category: string,
+  options: { refresh?: boolean }
+): Promise<CavemanRule[]> {
+  const key = `${root}:${userRoot}:${language}:${category}`;
+  if (cache.has(key) && !options.refresh) return cache.get(key) ?? [];
+  const pending = nativeRuleReads.get(key);
+  if (pending && !options.refresh) return pending;
+  const reading = (async () => {
+    await pending?.catch(() => {});
+    const merged = await readMergedRulesAsync(root, userRoot, language, category);
+    const rules = (merged ?? []).map((rule) => compileRule(rule, `${language}/${category}`));
+    cache.set(key, rules);
+    return rules;
+  })();
+  nativeRuleReads.set(key, reading);
+  try {
+    return await reading;
+  } finally {
+    if (nativeRuleReads.get(key) === reading) nativeRuleReads.delete(key);
+  }
+}
+
+/** Prepare the same ordered overlay rules without blocking the serving thread on disk. */
+export async function loadAllRulesForLanguageAsync(
+  language: string,
+  options: { refresh?: boolean } = {}
+): Promise<CavemanRule[]> {
+  const userRoot = getUserRulesDir();
+  const root = await getRulesDirAsync();
+  const key = `${root}:${userRoot}:${language}:*`;
+  if (cache.has(key) && !options.refresh) return cache.get(key) ?? [];
+  const pending = nativeRuleReads.get(key);
+  if (pending && !options.refresh) return pending;
+  const reading = (async () => {
+    await pending?.catch(() => {});
+    const names = new Set<string>();
+    for (const directory of [path.join(root, language), path.join(userRoot, language)]) {
+      if (!(await existsAsync(directory))) continue;
+      for (const entry of await fsp.readdir(directory)) {
+        if (entry.endsWith(".json")) names.add(path.basename(entry, ".json"));
+      }
+    }
+    const rules: CavemanRule[] = [];
+    for (const category of [...names].sort()) {
+      rules.push(...(await loadRulePackAtAsync(root, userRoot, language, category, options)));
+    }
+    cache.set(key, rules);
+    return rules;
+  })();
+  nativeRuleReads.set(key, reading);
+  try {
+    return await reading;
+  } finally {
+    if (nativeRuleReads.get(key) === reading) nativeRuleReads.delete(key);
+  }
+}
+
+/** Native catalog keeps bundled-language/category metadata and overlay rule counts. */
+export async function listCavemanRulePacksAsync(): Promise<RulePackMetadata[]> {
+  const userRoot = getUserRulesDir();
+  const root = await getRulesDirAsync();
+  if (!(await existsAsync(root))) return [];
+  const metadata: RulePackMetadata[] = [];
+  for (const language of await fsp.readdir(root)) {
+    if (!(await fsp.stat(path.join(root, language))).isDirectory()) continue;
+    const categories = (await fsp.readdir(path.join(root, language)))
+      .filter((entry) => entry.endsWith(".json"))
+      .map((entry) => path.basename(entry, ".json"))
+      .sort();
+    let ruleCount = 0;
+    for (const category of categories)
+      ruleCount += (await loadRulePackAtAsync(root, userRoot, language, category, {})).length;
+    metadata.push({ language, categories, ruleCount });
+  }
+  return metadata.sort((a, b) => a.language.localeCompare(b.language));
 }

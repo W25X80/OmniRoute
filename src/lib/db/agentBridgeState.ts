@@ -1,3 +1,5 @@
+import { getSelectedPostgresDatabase } from "./controlPlaneContext";
+import { createPostgresAgentMetadataRepository } from "./postgres/agentMetadataRepository";
 /**
  * Database module: AgentBridgeState
  * CRUD operations for agent_bridge_state table.
@@ -38,8 +40,7 @@ export function getAllAgentBridgeStates(): AgentBridgeStateRow[] {
 export function getAgentBridgeState(agentId: string): AgentBridgeStateRow | null {
   const db = getDbInstance();
   const row = db.prepare("SELECT * FROM agent_bridge_state WHERE agent_id = ?").get(agentId) as
-    | AgentBridgeStateDbRow
-    | undefined;
+    AgentBridgeStateDbRow | undefined;
   return row ? mapRow(row) : null;
 }
 
@@ -112,4 +113,49 @@ export function setLastError(agentId: string, err: string | null): void {
      VALUES (?, ?)
      ON CONFLICT(agent_id) DO UPDATE SET last_error = excluded.last_error`
   ).run(agentId, err);
+}
+
+export async function getAllAgentBridgeStatesAsync(
+  ...args: Parameters<typeof getAllAgentBridgeStates>
+): Promise<Awaited<ReturnType<typeof getAllAgentBridgeStates>>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresAgentMetadataRepository(database).getAllAgentBridgeStates(...args)
+    : getAllAgentBridgeStates(...args);
+}
+
+export async function getAgentBridgeStateAsync(
+  ...args: Parameters<typeof getAgentBridgeState>
+): Promise<Awaited<ReturnType<typeof getAgentBridgeState>>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresAgentMetadataRepository(database).getAgentBridgeState(...args)
+    : getAgentBridgeState(...args);
+}
+
+export async function upsertAgentBridgeStateAsync(
+  ...args: Parameters<typeof upsertAgentBridgeState>
+): Promise<Awaited<ReturnType<typeof upsertAgentBridgeState>>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresAgentMetadataRepository(database).upsertAgentBridgeState(...args)
+    : upsertAgentBridgeState(...args);
+}
+
+export async function setLastStartedAsync(
+  ...args: Parameters<typeof setLastStarted>
+): Promise<Awaited<ReturnType<typeof setLastStarted>>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresAgentMetadataRepository(database).setLastStarted(...args)
+    : setLastStarted(...args);
+}
+
+export async function setLastErrorAsync(
+  ...args: Parameters<typeof setLastError>
+): Promise<Awaited<ReturnType<typeof setLastError>>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresAgentMetadataRepository(database).setLastError(...args)
+    : setLastError(...args);
 }

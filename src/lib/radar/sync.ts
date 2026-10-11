@@ -14,7 +14,7 @@
 import { RadarFeedSchema, RadarTierSchema, type RadarFeed, type RadarTier } from "./feedSchema";
 import { verifyFeedBytes } from "./verify";
 import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
-import { isFeatureFlagEnabled } from "@/shared/utils/featureFlags";
+import { isFeatureFlagEnabledAsync } from "@/shared/utils/featureFlags";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -71,7 +71,7 @@ export interface RadarSettingsSnapshot {
 export interface SyncDeps {
   fetch?: typeof globalThis.fetch;
   now?: () => Date;
-  getFlag?: (key: string) => boolean;
+  getFlag?: (key: string) => boolean | Promise<boolean>;
   getSettings?: () => RadarSettingsSnapshot;
   getCache?: () => RadarCacheEntry | null;
   setCache?: (entry: RadarCacheEntry) => void;
@@ -169,7 +169,7 @@ export async function syncRadar(deps: SyncDeps = {}): Promise<SyncStatus> {
   const {
     fetch: fetchFn = globalThis.fetch,
     now = () => new Date(),
-    getFlag = isFeatureFlagEnabled,
+    getFlag = isFeatureFlagEnabledAsync,
     getSettings: getSettingsFn,
     getCache: getCacheFn,
     setCache: setCacheFn,
@@ -177,7 +177,7 @@ export async function syncRadar(deps: SyncDeps = {}): Promise<SyncStatus> {
 
   try {
     // Step 1: Feature flag gate
-    const flagOn = getFlag("RADAR_ENABLED");
+    const flagOn = await getFlag("RADAR_ENABLED");
     if (!flagOn) {
       return { status: "disabled" };
     }
@@ -188,7 +188,7 @@ export async function syncRadar(deps: SyncDeps = {}): Promise<SyncStatus> {
       settings = getSettingsFn();
     } else {
       const mod = await import("@/lib/db/radar");
-      settings = mod.getRadarSettings();
+      settings = await mod.getRadarSettingsAsync();
     }
     if (!settings.optIn) {
       return { status: "opt_out" };
@@ -290,7 +290,7 @@ export async function syncRadar(deps: SyncDeps = {}): Promise<SyncStatus> {
       existingCache = getCacheFn();
     } else {
       const mod = await import("@/lib/db/radar");
-      existingCache = mod.getRadarCache();
+      existingCache = await mod.getRadarCacheAsync();
     }
 
     const isEntitlementDowngrade = existingCache?.tier === "live" && servedTier === "community";
@@ -326,7 +326,7 @@ export async function syncRadar(deps: SyncDeps = {}): Promise<SyncStatus> {
       setCacheFn(cacheEntry);
     } else {
       const mod = await import("@/lib/db/radar");
-      mod.setRadarCache(cacheEntry);
+      await mod.setRadarCacheAsync(cacheEntry);
     }
 
     return { status: "updated", version: feed.version, tier: servedTier };

@@ -1,7 +1,10 @@
-import { getComboForecastUsageRows, type ComboForecastUsageRow } from "@/lib/db/comboForecast";
+import {
+  getComboForecastUsageRowsAsync as getComboForecastUsageRows,
+  type ComboForecastUsageRow,
+} from "@/lib/db/comboForecast";
 import { getCombos, getComboById } from "@/lib/db/combos";
 import { getPricingForModel } from "@/lib/db/settings";
-import { getQuotaSnapshots } from "@/lib/db/quotaSnapshots";
+import { getQuotaSnapshotsAsync as getQuotaSnapshots } from "@/lib/db/quotaSnapshots";
 import { computeCostFromPricing, normalizeModelName } from "@/lib/usage/costCalculator";
 import { resolveNestedComboTargets } from "@omniroute/open-sse/services/combo.ts";
 import type {
@@ -265,7 +268,10 @@ async function buildComboForecast(
   const comboName = typeof combo.name === "string" ? combo.name : "";
   if (!comboId || !comboName) return null;
 
-  const targets = resolveNestedComboTargets(combo, allCombos) as ResolvedComboTargetView[];
+  const targets = resolveNestedComboTargets(
+    normalizeComboView(combo),
+    allCombos.map(normalizeComboView)
+  ) as ResolvedComboTargetView[];
   const rowsByTarget = groupRowsByExecutionKey(rows);
   const totalRequests = rows.reduce((sum, row) => sum + row.requests, 0);
   const totalCostUsd = rows.reduce((sum, row) => sum + row.costUsd, 0);
@@ -287,7 +293,7 @@ async function buildComboForecast(
     let quotaSnapshots: QuotaSnapshotRow[] = [];
     let scope: ComboForecastTarget["quota"]["scope"] = "none";
     if (target.connectionId) {
-      quotaSnapshots = getQuotaSnapshots({
+      quotaSnapshots = await getQuotaSnapshots({
         provider: target.provider,
         connectionId: target.connectionId,
         since,
@@ -295,7 +301,7 @@ async function buildComboForecast(
       if (quotaSnapshots.length > 0) scope = "connection";
     }
     if (quotaSnapshots.length === 0) {
-      quotaSnapshots = getQuotaSnapshots({ provider: target.provider, since });
+      quotaSnapshots = await getQuotaSnapshots({ provider: target.provider, since });
       if (quotaSnapshots.length > 0) scope = "provider";
     }
     const quota = buildQuotaForecast(quotaSnapshots, rangeDays, horizonDays);
@@ -407,7 +413,7 @@ export async function buildComboForecastResponse(opts: {
   );
   const onlyComboName = comboNames.size === 1 ? Array.from(comboNames)[0] : undefined;
   const usageRows = await attachCosts(
-    getComboForecastUsageRows({ since, comboName: onlyComboName })
+    await getComboForecastUsageRows({ since, comboName: onlyComboName })
   );
   const rowsByCombo = new Map<string, CostedUsageRow[]>();
   for (const row of usageRows) {
@@ -438,4 +444,16 @@ export async function buildComboForecastResponse(opts: {
     method: "linear_history",
     combos: forecasts.filter((entry): entry is ComboForecastMetrics => entry !== null),
   };
+}
+
+function normalizeComboView(combo: ComboRecord): Parameters<typeof resolveNestedComboTargets>[0] {
+  const config =
+    combo.config && typeof combo.config === "object" && !Array.isArray(combo.config)
+      ? (combo.config as Record<string, unknown>)
+      : null;
+  const autoConfig =
+    combo.autoConfig && typeof combo.autoConfig === "object" && !Array.isArray(combo.autoConfig)
+      ? (combo.autoConfig as Record<string, unknown>)
+      : null;
+  return { ...combo, name: combo.name ?? "", models: combo.models ?? [], config, autoConfig };
 }

@@ -1,3 +1,5 @@
+import { getSelectedPostgresDatabase } from "./controlPlaneContext";
+import { createPostgresAgenticConversationsRepository } from "./postgres/agenticConversationsRepository";
 /**
  * db/agenticConversations.ts — CRUD for the agentic conversation-tracking
  * tables: `agentic_conversations` (one row per conversation tree root) and
@@ -463,4 +465,100 @@ export function getMultiTurnConversationById(id: string): MultiTurnConversationR
   const db = getDbInstance();
   const row = db.prepare(`${MULTI_TURN_CONVERSATION_SELECT} WHERE ac.id = ?`).get(id);
   return row ? toMultiTurnConversationRow(row) : null;
+}
+
+export async function createAgenticConversationAsync(
+  ...args: Parameters<typeof createAgenticConversation>
+): Promise<Awaited<ReturnType<typeof createAgenticConversation>>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresAgenticConversationsRepository(database).createAgenticConversation(...args)
+    : createAgenticConversation(...args);
+}
+
+export async function findAgenticConversationsByFingerprintAsync(
+  ...args: Parameters<typeof findAgenticConversationsByFingerprint>
+): Promise<Awaited<ReturnType<typeof findAgenticConversationsByFingerprint>>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresAgenticConversationsRepository(database).findAgenticConversationsByFingerprint(
+        ...args
+      )
+    : findAgenticConversationsByFingerprint(...args);
+}
+
+export async function updateAgenticConversationAsync(
+  ...args: Parameters<typeof updateAgenticConversation>
+): Promise<Awaited<ReturnType<typeof updateAgenticConversation>>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresAgenticConversationsRepository(database).updateAgenticConversation(...args)
+    : updateAgenticConversation(...args);
+}
+
+export async function getConversationTurnIndexAsync(
+  ...args: Parameters<typeof getConversationTurnIndex>
+): Promise<Awaited<ReturnType<typeof getConversationTurnIndex>>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresAgenticConversationsRepository(database).getConversationTurnIndex(...args)
+    : getConversationTurnIndex(...args);
+}
+
+export async function insertConversationTurnNodesAsync(
+  ...args: Parameters<typeof insertConversationTurnNodes>
+): Promise<Awaited<ReturnType<typeof insertConversationTurnNodes>>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresAgenticConversationsRepository(database).insertConversationTurnNodes(...args)
+    : insertConversationTurnNodes(...args);
+}
+
+export async function getConversationTurnPageAsync(
+  ...args: Parameters<typeof getConversationTurnPage>
+): Promise<Awaited<ReturnType<typeof getConversationTurnPage>>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresAgenticConversationsRepository(database).getConversationTurnPage(...args)
+    : getConversationTurnPage(...args);
+}
+
+export async function resolveCallLogIdsByCorrelationIdsAsync(
+  ...args: Parameters<typeof resolveCallLogIdsByCorrelationIds>
+): Promise<Awaited<ReturnType<typeof resolveCallLogIdsByCorrelationIds>>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresAgenticConversationsRepository(database).resolveCallLogIdsByCorrelationIds(
+        ...args
+      )
+    : resolveCallLogIdsByCorrelationIds(...args);
+}
+
+export async function touchOrCreateExternalConversationAsync(
+  ...args: Parameters<typeof touchOrCreateExternalConversation>
+): Promise<Awaited<ReturnType<typeof touchOrCreateExternalConversation>>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresAgenticConversationsRepository(database).touchOrCreateExternalConversation(
+        ...args
+      )
+    : touchOrCreateExternalConversation(...args);
+}
+
+export async function listMultiTurnConversationsAsync(
+  ...args: Parameters<typeof listMultiTurnConversations>
+): Promise<Awaited<ReturnType<typeof listMultiTurnConversations>>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresAgenticConversationsRepository(database).listMultiTurnConversations(...args)
+    : listMultiTurnConversations(...args);
+}
+
+export async function getMultiTurnConversationByIdAsync(
+  ...args: Parameters<typeof getMultiTurnConversationById>
+): Promise<Awaited<ReturnType<typeof getMultiTurnConversationById>>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresAgenticConversationsRepository(database).getMultiTurnConversationById(...args)
+    : getMultiTurnConversationById(...args);
 }

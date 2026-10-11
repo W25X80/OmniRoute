@@ -8,7 +8,11 @@
 import { z } from "zod";
 import { NextResponse } from "next/server";
 import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
-import { getWebhook, updateWebhook as updateWebhookRecord, deleteWebhook } from "@/lib/db/webhooks";
+import {
+  getWebhookAsync,
+  updateWebhookAsync as updateWebhookRecord,
+  deleteWebhookAsync,
+} from "@/lib/db/webhooks";
 import { validateBody, isValidationFailure } from "@/shared/validation/helpers";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 import { encryptMetadata } from "@/lib/webhookDispatcher";
@@ -28,7 +32,7 @@ const updateWebhookSchema = z
     description: z.string().max(1000).optional(),
     enabled: z.boolean().optional(),
     kind: z.enum(WEBHOOK_KINDS).optional(),
-    metadata: z.record(z.string()).optional(),
+    metadata: z.record(z.string(), z.string()).optional(),
   })
   .strict();
 
@@ -38,7 +42,7 @@ export async function GET(_: Request, { params }: { params: Promise<{ id: string
 
   try {
     const { id } = await params;
-    const webhook = getWebhook(id);
+    const webhook = await getWebhookAsync(id);
     if (!webhook) {
       return NextResponse.json({ error: "Webhook not found" }, { status: 404 });
     }
@@ -68,7 +72,7 @@ export async function PUT(request: Request, { params }: { params: Promise<{ id: 
       metadata?: Record<string, string>;
     };
 
-    const existingWebhook = getWebhook(id);
+    const existingWebhook = await getWebhookAsync(id);
     if (!existingWebhook) {
       return NextResponse.json({ error: "Webhook not found" }, { status: 404 });
     }
@@ -96,7 +100,7 @@ export async function PUT(request: Request, { params }: { params: Promise<{ id: 
       (updateData as any).metadataEncrypted = encryptMetadata(metadata);
     }
 
-    const webhook = updateWebhookRecord(id, updateData);
+    const webhook = await updateWebhookRecord(id, updateData);
     if (!webhook) {
       return NextResponse.json({ error: "Webhook not found" }, { status: 404 });
     }
@@ -112,7 +116,7 @@ export async function DELETE(_: Request, { params }: { params: Promise<{ id: str
 
   try {
     const { id } = await params;
-    const deleted = deleteWebhook(id);
+    const deleted = await deleteWebhookAsync(id);
     if (!deleted) {
       return NextResponse.json({ error: "Webhook not found" }, { status: 404 });
     }

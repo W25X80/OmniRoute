@@ -1,4 +1,8 @@
-import { cacheReasoningFromAssistantMessage, requiresReasoningReplay } from "../../services/reasoningCache.ts";
+import {
+  cacheReasoningFromAssistantMessage,
+  cacheReasoningFromAssistantMessageAsync,
+  requiresReasoningReplay,
+} from "../../services/reasoningCache.ts";
 import { FORMATS } from "../../translator/formats.ts";
 import { needsTranslation } from "../../translator/index.ts";
 import { extractToolSchemaMap } from "../../translator/response/openai-responses/toolSchemas.ts";
@@ -19,6 +23,25 @@ interface StreamReasoningCaptureInput {
 
 /** Best-effort reasoning capture after a successful stream; never changes the client response. */
 export function captureStreamReasoningForReplay(input: StreamReasoningCaptureInput): void {
+  void captureStreamReasoning(input, cacheReasoningFromAssistantMessage);
+}
+
+/** Await optional native capture settlement while preserving the source fail-open response. */
+export async function captureStreamReasoningForReplayAsync(
+  input: StreamReasoningCaptureInput
+): Promise<void> {
+  try {
+    await captureStreamReasoning(input, cacheReasoningFromAssistantMessageAsync);
+  } catch {
+    // Cache capture is non-critical — never fail the stream.
+  }
+}
+
+function captureStreamReasoning(
+  input: StreamReasoningCaptureInput,
+  capture:
+    typeof cacheReasoningFromAssistantMessage | typeof cacheReasoningFromAssistantMessageAsync
+): number | Promise<number> | undefined {
   try {
     const streamBody = input.streamResponseBody as Record<string, unknown>;
     const cacheStreamBody = Array.isArray(streamBody.choices)
@@ -39,7 +62,7 @@ export function captureStreamReasoningForReplay(input: StreamReasoningCaptureInp
       (input.translatedBody as { messages?: unknown[] } | null | undefined)?.messages ??
       input.reasoningReplayHistory;
     if (requiresReasoningReplay({ provider: input.provider, model: input.model })) {
-      cacheReasoningFromAssistantMessage(msg, input.provider, input.model, {
+      return capture(msg, input.provider, input.model, {
         scope: input.reasoningCacheScope,
         historyMessages: Array.isArray(historyMessages) ? historyMessages : [],
         videoTranscriptSensitive: input.videoTranscriptSensitive,

@@ -2,6 +2,8 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
+import { access, mkdir, readFile, rm } from "node:fs/promises";
+import { parseDatabaseBackend } from "../../../src/lib/db/backendSelection.ts";
 import { dirname, join } from "node:path";
 import {
   chromium,
@@ -10,9 +12,10 @@ import {
   type BrowserContextOptions,
   type Page,
 } from "playwright-core";
-import { cdpConnectOptions } from "./cdp-auth";
+import { cdpConnectOptions, cdpConnectOptionsAsync } from "./cdp-auth";
 import type { AppConfig } from "./config";
-import { atomicWriteFile } from "./config";
+import { atomicWriteFile, atomicWriteFileAsync } from "./config";
+import { protectedConnectionWrite } from "./storage-state-write";
 import {
   assertAuthenticatedChatGptPage,
   assertTemporaryChatPage,
@@ -112,7 +115,10 @@ async function inspectStoredState(
     throw new Error("ChatGPT browser verification requires Chrome or a CDP endpoint");
   }
   const verifierBrowser = config.cdpEndpoint
-    ? await chromium.connectOverCDP(config.cdpEndpoint, cdpConnectOptions())
+    ? await chromium.connectOverCDP(
+        config.cdpEndpoint,
+        parseDatabaseBackend() === "postgres" ? await cdpConnectOptionsAsync() : cdpConnectOptions()
+      )
     : await chromium.launch({
         executablePath: config.chromeExecutablePath,
         headless: false,
@@ -152,14 +158,20 @@ async function inspectStoredState(
 export async function inspectBrowserLoginCapabilities(
   config: BrowserLoginConfig
 ): Promise<ChatGptWebAccountCapabilities> {
+  const native = parseDatabaseBackend() === "postgres";
   if (
-    !existsSync(config.storageStatePath) ||
-    !existsSync(loginVerificationMarkerPath(config.storageStatePath))
+    !(native
+      ? await pathExistsAsync(config.storageStatePath)
+      : existsSync(config.storageStatePath)) ||
+    !(native
+      ? await pathExistsAsync(loginVerificationMarkerPath(config.storageStatePath))
+      : existsSync(loginVerificationMarkerPath(config.storageStatePath)))
   ) {
     throw new Error("ChatGPT login state is missing");
   }
   const inspected = await inspectStoredState(config, config.storageStatePath);
-  writeVerificationMarker(config.storageStatePath, inspected);
+  if (native) await writeVerificationMarkerAsync(config.storageStatePath, inspected);
+  else writeVerificationMarker(config.storageStatePath, inspected);
   return { solAvailable: inspected.solAvailable, proAvailable: inspected.proAvailable };
 }
 
@@ -184,13 +196,19 @@ export async function loginToChatGpt(
   config: AppConfig,
   options: { timeoutMs?: number } = {}
 ): Promise<BrowserLoginResult> {
-  if (!existsSync(config.chromeExecutablePath)) {
+  const native = parseDatabaseBackend() === "postgres";
+  if (
+    !(native
+      ? await pathExistsAsync(config.chromeExecutablePath)
+      : existsSync(config.chromeExecutablePath))
+  ) {
     throw new Error(
       `Google Chrome was not found at ${config.chromeExecutablePath}. Pass --chrome with its executable path.`
     );
   }
   const profileDir = join(dirname(config.storageStatePath), "login-profile");
-  mkdirSync(profileDir, { recursive: true, mode: 0o700 });
+  if (native) await mkdir(profileDir, { recursive: true, mode: 0o700 });
+  else mkdirSync(profileDir, { recursive: true, mode: 0o700 });
   process.stdout.write(
     "A normal Chrome window is open. Sign in to ChatGPT, confirm that the composer is visible, then quit this dedicated Chrome instance completely.\n"
   );
@@ -239,8 +257,15 @@ export async function loginToChatGpt(
     const state = await context.storageState();
 
     const inspected = await inspectStoredState(config, state);
-    atomicWriteFile(config.storageStatePath, `${JSON.stringify(state)}\n`);
-    writeVerificationMarker(config.storageStatePath, inspected);
+    if (native) {
+      await protectedConnectionWrite(dirname(config.storageStatePath), async () => {
+        await atomicWriteFileAsync(config.storageStatePath, `${JSON.stringify(state)}\n`);
+        await writeVerificationMarkerFileAsync(config.storageStatePath, inspected);
+      });
+    } else {
+      atomicWriteFile(config.storageStatePath, `${JSON.stringify(state)}\n`);
+      writeVerificationMarker(config.storageStatePath, inspected);
+    }
     return {
       storageStatePath: config.storageStatePath,
       accountSurfaceUrl: page.url(),
@@ -249,7 +274,11 @@ export async function loginToChatGpt(
     };
   } finally {
     await context.close();
-    if (browserLoginStateExists(config)) rmSync(profileDir, { recursive: true, force: true });
+    if (native) {
+      if (await browserLoginStateExistsAsync(config))
+        await rm(profileDir, { recursive: true, force: true });
+    } else if (browserLoginStateExists(config))
+      rmSync(profileDir, { recursive: true, force: true });
   }
 }
 
@@ -273,7 +302,11 @@ export function browserLoginStateExists(
 }
 
 export async function checkBrowserEngine(config: AppConfig): Promise<void> {
-  if (!existsSync(config.chromeExecutablePath))
+  if (
+    !(parseDatabaseBackend() === "postgres"
+      ? await pathExistsAsync(config.chromeExecutablePath)
+      : existsSync(config.chromeExecutablePath))
+  )
     throw new Error(`Google Chrome was not found at ${config.chromeExecutablePath}`);
   const browser = await chromium.launch({
     executablePath: config.chromeExecutablePath,
@@ -287,5 +320,95 @@ export async function checkBrowserEngine(config: AppConfig): Promise<void> {
       throw new Error("Browser page did not reach complete state");
   } finally {
     await browser.close();
+  }
+}
+
+async function pathExistsAsync(path: string): Promise<boolean> {
+  try {
+    await access(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function writeVerificationMarkerAsync(
+  storageStatePath: string,
+  capabilities: ChatGptWebAccountCapabilities
+): Promise<void> {
+  return protectedConnectionWrite(dirname(storageStatePath), () =>
+    writeVerificationMarkerFileAsync(storageStatePath, capabilities)
+  );
+}
+
+async function writeVerificationMarkerFileAsync(
+  storageStatePath: string,
+  capabilities: ChatGptWebAccountCapabilities
+): Promise<void> {
+  let previous: Partial<LoginVerificationMarker> = {};
+  try {
+    previous = JSON.parse(
+      await readFile(loginVerificationMarkerPath(storageStatePath), "utf8")
+    ) as Partial<LoginVerificationMarker>;
+  } catch {
+    // No prior cookie-injection marker.
+  }
+  let storageStateFingerprint = previous.storageStateFingerprint;
+  try {
+    const state = JSON.parse(await readFile(storageStatePath, "utf8")) as Record<string, unknown>;
+    storageStateFingerprint = createHash("sha256").update(JSON.stringify(state)).digest("hex");
+  } catch {
+    // The caller that owns storage-state validation reports malformed state.
+  }
+  const marker: LoginVerificationMarker = {
+    version: 1,
+    authenticated: true,
+    verifiedAt: new Date().toISOString(),
+    ...capabilities,
+    ...(previous.cookieFingerprint ? { cookieFingerprint: previous.cookieFingerprint } : {}),
+    ...(storageStateFingerprint ? { storageStateFingerprint } : {}),
+    pendingBrowserVerification: false,
+  };
+  await atomicWriteFileAsync(
+    loginVerificationMarkerPath(storageStatePath),
+    `${JSON.stringify(marker)}\n`
+  );
+}
+
+export async function browserLoginStateExistsAsync(
+  config: Pick<BrowserLoginConfig, "storageStatePath">
+): Promise<boolean> {
+  if (!(await pathExistsAsync(config.storageStatePath))) return false;
+  const markerPath = loginVerificationMarkerPath(config.storageStatePath);
+  if (!(await pathExistsAsync(markerPath))) return false;
+  try {
+    const marker = JSON.parse(
+      await readFile(markerPath, "utf8")
+    ) as Partial<LoginVerificationMarker>;
+    return (
+      marker.version === 1 &&
+      marker.authenticated === true &&
+      marker.pendingBrowserVerification !== true &&
+      typeof marker.verifiedAt === "string"
+    );
+  } catch {
+    return false;
+  }
+}
+
+export async function storedBrowserLoginCapabilitiesAsync(
+  config: BrowserLoginConfig
+): Promise<Partial<ChatGptWebAccountCapabilities>> {
+  if (!(await browserLoginStateExistsAsync(config))) return {};
+  try {
+    const marker = JSON.parse(
+      await readFile(loginVerificationMarkerPath(config.storageStatePath), "utf8")
+    ) as Partial<LoginVerificationMarker>;
+    return {
+      ...(typeof marker.solAvailable === "boolean" ? { solAvailable: marker.solAvailable } : {}),
+      ...(typeof marker.proAvailable === "boolean" ? { proAvailable: marker.proAvailable } : {}),
+    };
+  } catch {
+    return {};
   }
 }

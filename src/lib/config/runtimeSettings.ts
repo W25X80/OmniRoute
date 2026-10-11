@@ -451,7 +451,7 @@ async function applyModelsDevSyncSection(
 ) {
   const {
     startPeriodicSync,
-    stopPeriodicSync,
+    stopPeriodicSyncAsync,
     isModelsDevSyncEnvDisabled,
     isModelsDevSyncEnvForcedOn,
   } = await import("@/lib/modelsDevSync");
@@ -460,7 +460,7 @@ async function applyModelsDevSyncSection(
     isTruthyEnvFlag(process.env.OMNIROUTE_DISABLE_BACKGROUND_SERVICES);
 
   if (skipBackgroundSyncInTests || isModelsDevSyncEnvDisabled()) {
-    stopPeriodicSync();
+    await stopPeriodicSyncAsync();
     return;
   }
 
@@ -471,13 +471,13 @@ async function applyModelsDevSyncSection(
 
   if (!isEnabled) {
     if (wasEnabled || force) {
-      stopPeriodicSync();
+      await stopPeriodicSyncAsync();
     }
     return;
   }
 
   if (force) {
-    stopPeriodicSync();
+    await stopPeriodicSyncAsync();
     startPeriodicSync(currentSnapshot.modelsDevSyncInterval || undefined);
     return;
   }
@@ -488,7 +488,7 @@ async function applyModelsDevSyncSection(
   }
 
   if (intervalChanged) {
-    stopPeriodicSync();
+    await stopPeriodicSyncAsync();
     startPeriodicSync(currentSnapshot.modelsDevSyncInterval || undefined);
   }
 }

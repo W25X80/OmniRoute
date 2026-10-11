@@ -1,8 +1,9 @@
+import { getSelectedControlPlane } from "@/lib/db/controlPlaneContext";
 import {
   generateSignature,
-  getCachedResponse,
+  getCachedResponseAsync,
   isCacheableForRead,
-  recordSemanticCacheHit,
+  recordSemanticCacheHitAsync,
   outputContractOf,
 } from "@/lib/semanticCache";
 import { calculateCost } from "@/lib/usage/costCalculator";
@@ -12,7 +13,7 @@ import { synthesizeOpenAiSseFromJson } from "../../utils/jsonToSse.ts";
 import { attachOmniRouteMetaHeaders } from "@/domain/omnirouteResponseMeta";
 import { extractUsageFromResponse } from "../usageExtractor.ts";
 import { OMNIROUTE_RESPONSE_HEADERS } from "@/shared/constants/headers";
-import { getSemanticCacheManager } from "../../services/cache/semanticCacheManager.ts";
+import { getSemanticCacheManagerAsync } from "../../services/cache/semanticCacheManager.ts";
 
 export function isSemanticCacheEnabled(
   settings: Record<string, unknown>,
@@ -57,7 +58,7 @@ export async function checkSemanticCache({
   pendingScope: PendingRequestScope;
   startTime: number;
   log: { debug?: (...args: unknown[]) => void } | null;
-  persistAttemptLogs: (args: unknown) => void;
+  persistAttemptLogs: (args: unknown) => void | Promise<void>;
   apiKeyId?: string | null;
   cacheDefaultMode?: "legacy" | "bypass" | null;
   videoTranscriptSensitive?: boolean;
@@ -66,7 +67,7 @@ export async function checkSemanticCache({
   // Per-key bypass: skip cache lookup entirely when the API key opts out.
   if (cacheDefaultMode === "bypass") return null;
   if (semanticCacheEnabled && isCacheableForRead(body, clientRawRequest?.headers)) {
-    const manager = getSemanticCacheManager();
+    const manager = await getSemanticCacheManagerAsync();
     const managerResult = await manager.lookup({
       body,
       headers: clientRawRequest?.headers,
@@ -98,7 +99,7 @@ export async function checkSemanticCache({
         apiKeyId ?? undefined,
         outputContractOf(body)
       );
-      const legacyCached = getCachedResponse(signature);
+      const legacyCached = await getCachedResponseAsync(signature);
       if (legacyCached) {
         cached = legacyCached as Record<string, unknown>;
         hitType = "exact";
@@ -116,7 +117,7 @@ export async function checkSemanticCache({
             serviceTier: effectiveServiceTier,
           })
         : 0;
-      persistAttemptLogs({
+      const attemptPersistence = persistAttemptLogs({
         status: 200,
         tokens: cached?.usage,
         responseBody: cached,
@@ -128,6 +129,7 @@ export async function checkSemanticCache({
         // to "upstream" (#14159). The hit type is surfaced via the response headers.
         cacheSource: "semantic",
       });
+      if (getSelectedControlPlane()) await attemptPersistence;
       // Finalize by exact request id (#12910): a (model, provider, connectionId)
       // tuple can match the wrong in-flight request when connectionId is null or
       // multiple requests share the same connection.
@@ -163,7 +165,7 @@ export async function checkSemanticCache({
         (hitType === "exact" ? requestSignature : managerResult.entry?.hash);
 
       if (targetSignature) {
-        recordSemanticCacheHit(targetSignature, tokensSaved);
+        await recordSemanticCacheHitAsync(targetSignature, tokensSaved);
       }
 
       const headers: Record<string, string> = {

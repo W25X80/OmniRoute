@@ -108,7 +108,11 @@ export default function SystemStorageTab() {
   const [dbSettingsSaving, setDbSettingsSaving] = useState(false);
   const [dbStatsRefreshing, setDbStatsRefreshing] = useState(false);
 
+  const sqliteMaintenanceAvailable =
+    dbSettings?.backend !== "postgresql" && storageHealth.driver !== "postgresql";
+
   const loadBackups = async () => {
+    if (!sqliteMaintenanceAvailable) return;
     setBackupsLoading(true);
     try {
       const res = await fetch("/api/db-backups");
@@ -153,7 +157,11 @@ export default function SystemStorageTab() {
       const res = await fetch("/api/settings/database", {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ logs, backup, cache, retention, aggregation, optimization }),
+        body: JSON.stringify(
+          sqliteMaintenanceAvailable
+            ? { logs, backup, cache, retention, aggregation, optimization }
+            : { logs, cache, retention, aggregation }
+        ),
       });
       if (res.ok) {
         await loadDatabaseSettings();
@@ -780,12 +788,14 @@ export default function SystemStorageTab() {
           </div>
           <div className="p-3 rounded-lg bg-black/[0.02] dark:bg-white/[0.02]">
             <p className="text-xs text-text-muted mb-1">{t("storagePageCount")}</p>
-            <p className="text-sm font-semibold">{dbSettings.stats.pageCount.toLocaleString()}</p>
+            <p className="text-sm font-semibold">
+              {dbSettings.stats.pageCount?.toLocaleString() ?? "—"}
+            </p>
           </div>
           <div className="p-3 rounded-lg bg-black/[0.02] dark:bg-white/[0.02]">
             <p className="text-xs text-text-muted mb-1">{t("storageFreelistCount")}</p>
             <p className="text-sm font-semibold">
-              {dbSettings.stats.freelistCount.toLocaleString()}
+              {dbSettings.stats.freelistCount?.toLocaleString() ?? "—"}
             </p>
           </div>
           <div className="p-3 rounded-lg bg-black/[0.02] dark:bg-white/[0.02]">
@@ -793,7 +803,9 @@ export default function SystemStorageTab() {
             <p className="text-sm font-semibold">
               {dbSettings.stats.lastVacuumAt
                 ? new Date(dbSettings.stats.lastVacuumAt).toLocaleString(locale)
-                : t("never")}
+                : sqliteMaintenanceAvailable
+                  ? t("never")
+                  : "—"}
             </p>
           </div>
           <div className="p-3 rounded-lg bg-black/[0.02] dark:bg-white/[0.02]">
@@ -801,7 +813,9 @@ export default function SystemStorageTab() {
             <p className="text-sm font-semibold">
               {dbSettings.stats.lastOptimizationAt
                 ? new Date(dbSettings.stats.lastOptimizationAt).toLocaleString(locale)
-                : t("never")}
+                : sqliteMaintenanceAvailable
+                  ? t("never")
+                  : "—"}
             </p>
           </div>
           <div className="p-3 rounded-lg bg-black/[0.02] dark:bg-white/[0.02]">
@@ -822,7 +836,7 @@ export default function SystemStorageTab() {
   };
 
   const renderBackupList = () => {
-    if (!backupsExpanded) return null;
+    if (!backupsExpanded || !sqliteMaintenanceAvailable) return null;
 
     return (
       <div className="flex flex-col gap-2 mt-3">
@@ -1013,27 +1027,29 @@ export default function SystemStorageTab() {
           </Button>
         </div>
         <div className="mt-5 border-t border-border/50 pt-4">
-          <DatabaseBackupRetentionCard
-            title={t("storageDatabaseBackups")}
-            className="mb-0"
-            storageHealth={storageHealth}
-            backupCleanupOptions={backupCleanupOptions}
-            setBackupCleanupOptions={setBackupCleanupOptions}
-            saveBackupRetentionLoading={saveBackupRetentionLoading}
-            backupRetentionStatus={backupRetentionStatus}
-            setBackupRetentionStatus={setBackupRetentionStatus}
-            cleanupBackupsLoading={cleanupBackupsLoading}
-            cleanupBackupsStatus={cleanupBackupsStatus}
-            onSaveRetention={handleSaveBackupRetention}
-            onCleanupBackups={handleCleanupBackups}
-          />
+          {sqliteMaintenanceAvailable && (
+            <DatabaseBackupRetentionCard
+              title={t("storageDatabaseBackups")}
+              className="mb-0"
+              storageHealth={storageHealth}
+              backupCleanupOptions={backupCleanupOptions}
+              setBackupCleanupOptions={setBackupCleanupOptions}
+              saveBackupRetentionLoading={saveBackupRetentionLoading}
+              backupRetentionStatus={backupRetentionStatus}
+              setBackupRetentionStatus={setBackupRetentionStatus}
+              cleanupBackupsLoading={cleanupBackupsLoading}
+              cleanupBackupsStatus={cleanupBackupsStatus}
+              onSaveRetention={handleSaveBackupRetention}
+              onCleanupBackups={handleCleanupBackups}
+            />
+          )}
         </div>
       </div>
     );
   };
 
   const renderOptimizationSettings = () => {
-    if (dbSettingsLoading || !dbSettings) return null;
+    if (dbSettingsLoading || !dbSettings || !sqliteMaintenanceAvailable) return null;
 
     return (
       <div className="mt-6 p-4 rounded-lg border border-border bg-bg">
@@ -1285,14 +1301,24 @@ export default function SystemStorageTab() {
         </div>
         <div className="flex-1">
           <h3 className="text-lg font-semibold">{t("systemStorage")}</h3>
-          <p className="text-xs text-text-muted">{t("allDataLocal")}</p>
+          <p className="text-xs text-text-muted">
+            {sqliteMaintenanceAvailable
+              ? t("allDataLocal")
+              : "Application data is stored in PostgreSQL."}
+          </p>
           <p className="text-xs text-text-muted mt-1">
-            Database backups are stored on this server in the db_backups folder under its data
-            directory.{" "}
-            <a href="/dashboard/endpoint" className="underline">
-              Cloud sync is a separate setting under Endpoints
-            </a>{" "}
-            and can upload credentials to a configured remote destination.
+            {sqliteMaintenanceAvailable ? (
+              <>
+                Database backups are stored on this server in the db_backups folder under its data
+                directory.{" "}
+                <a href="/dashboard/endpoint" className="underline">
+                  Cloud sync is a separate setting under Endpoints
+                </a>{" "}
+                and can upload credentials to a configured remote destination.
+              </>
+            ) : (
+              "Backups, restore and database maintenance are managed by the database operator. SQLite file controls are unavailable for this backend."
+            )}
           </p>
         </div>
         <Badge variant="success" size="sm">
@@ -1325,7 +1351,13 @@ export default function SystemStorageTab() {
           <p className="font-medium">{t("export")}</p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <Button variant="outline" size="sm" onClick={handleExport} loading={exportLoading}>
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={!sqliteMaintenanceAvailable}
+            onClick={handleExport}
+            loading={exportLoading}
+          >
             <span className="material-symbols-outlined text-[14px] mr-1" aria-hidden="true">
               download
             </span>
@@ -1334,6 +1366,7 @@ export default function SystemStorageTab() {
           <Button
             variant="outline"
             size="sm"
+            disabled={!sqliteMaintenanceAvailable}
             onClick={async () => {
               setExportLoading(true);
               try {
@@ -1358,7 +1391,13 @@ export default function SystemStorageTab() {
             </span>
             {t("exportAll")}
           </Button>
-          <Button variant="outline" size="sm" onClick={handleImportClick} loading={importLoading}>
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={!sqliteMaintenanceAvailable}
+            onClick={handleImportClick}
+            loading={importLoading}
+          >
             <span className="material-symbols-outlined text-[14px] mr-1" aria-hidden="true">
               upload
             </span>
@@ -1380,6 +1419,7 @@ export default function SystemStorageTab() {
           <Button
             variant="outline"
             size="sm"
+            disabled={!sqliteMaintenanceAvailable}
             onClick={handleImportJsonClick}
             loading={importLoading}
           >
@@ -1466,6 +1506,7 @@ export default function SystemStorageTab() {
             variant="outline"
             size="sm"
             loading={manualVacuumLoading}
+            disabled={!sqliteMaintenanceAvailable}
             onClick={handleManualVacuum}
           >
             <span className="material-symbols-outlined text-[14px] mr-1" aria-hidden="true">
@@ -1546,7 +1587,9 @@ export default function SystemStorageTab() {
                   " (" +
                   formatRelativeTime(storageHealth.lastBackupAt) +
                   ")"
-                : t("noBackupYet")}
+                : sqliteMaintenanceAvailable
+                  ? t("noBackupYet")
+                  : "Managed by the database operator"}
             </p>
           </div>
         </div>
@@ -1554,6 +1597,7 @@ export default function SystemStorageTab() {
           <Button
             variant="outline"
             size="sm"
+            disabled={!sqliteMaintenanceAvailable}
             onClick={handleManualBackup}
             loading={manualBackupLoading}
           >
@@ -1565,6 +1609,7 @@ export default function SystemStorageTab() {
           <Button
             variant="outline"
             size="sm"
+            disabled={!sqliteMaintenanceAvailable}
             onClick={() => {
               setBackupsExpanded(!backupsExpanded);
               if (!backupsExpanded && backups.length === 0) loadBackups();

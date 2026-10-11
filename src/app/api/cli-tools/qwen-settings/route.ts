@@ -9,7 +9,10 @@ import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
 
 import { requireCliToolsAuth } from "@/lib/api/requireCliToolsAuth";
 import { getApiKeyById } from "@/lib/db/apiKeys";
-import { deleteCliToolLastConfigured, saveCliToolLastConfigured } from "@/lib/db/cliToolState";
+import {
+  deleteCliToolLastConfiguredAsync,
+  saveCliToolLastConfiguredAsync,
+} from "@/lib/db/cliToolState";
 import { createMultiBackup } from "@/shared/services/backupService";
 import {
   hasOmniRouteQwenCodeConfig,
@@ -156,7 +159,7 @@ export async function POST(request: Request): Promise<Response> {
     await writeAtomic(configPaths.env, nextEnv, 0o600);
 
     try {
-      saveCliToolLastConfigured("qwen");
+      await saveCliToolLastConfiguredAsync("qwen");
     } catch (error) {
       logger.warn({ err: error }, "Failed to save Qwen Code configuration timestamp");
     }
@@ -203,7 +206,7 @@ export async function DELETE(request: Request): Promise<Response> {
     }
 
     try {
-      deleteCliToolLastConfigured("qwen");
+      await deleteCliToolLastConfiguredAsync("qwen");
     } catch (error) {
       logger.warn({ err: error }, "Failed to clear Qwen Code configuration timestamp");
     }

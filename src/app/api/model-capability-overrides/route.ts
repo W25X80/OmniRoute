@@ -1,3 +1,7 @@
+import { removeModelCapabilityOverrideAsync } from "@/lib/db/modelCapabilityOverrides";
+import { setModelCapabilityOverrideAsync } from "@/lib/db/modelCapabilityOverrides";
+import { removeModelContextOverrideAsync } from "@/lib/db/modelContextOverrides";
+import { setModelContextOverrideAsync } from "@/lib/db/modelContextOverrides";
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import { resolveProviderAlias } from "@omniroute/open-sse/services/model.ts";
@@ -5,15 +9,9 @@ import { parseReasoningEffortsOverride } from "@/shared/reasoning/reasoningEffor
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 import {
   listModelCapabilityOverrides,
-  removeModelCapabilityOverride,
-  setModelCapabilityOverride,
   type ModelCapabilityOverrideKey,
 } from "@/lib/db/modelCapabilityOverrides";
-import {
-  listModelContextOverrides,
-  removeModelContextOverride,
-  setModelContextOverride,
-} from "@/lib/db/modelContextOverrides";
+import { listModelContextOverrides } from "@/lib/db/modelContextOverrides";
 import { getProviderPrefixIndex, type ProviderPrefixEntry } from "@/lib/providerNodePrefixes";
 
 const overrideKeySchema = z.enum([
@@ -209,8 +207,13 @@ export async function PATCH(request: Request) {
   const targetParts = canonical.target.split(/\/(.*)/s);
   const written =
     parsed.data.key === "context_length"
-      ? setModelContextOverride(targetParts[0], targetParts[1], parsed.data.value, "manual")
-      : setModelCapabilityOverride(
+      ? await setModelContextOverrideAsync(
+          targetParts[0],
+          targetParts[1],
+          parsed.data.value,
+          "manual"
+        )
+      : await setModelCapabilityOverrideAsync(
           canonical.target,
           parsed.data.key as ModelCapabilityOverrideKey,
           parsed.data.value
@@ -251,9 +254,12 @@ export async function DELETE(request: Request) {
 
   if (parsedKey.data === "context_length") {
     const targetParts = canonical.target.split(/\/(.*)/s);
-    removeModelContextOverride(targetParts[0], targetParts[1]);
+    await removeModelContextOverrideAsync(targetParts[0], targetParts[1]);
   } else {
-    removeModelCapabilityOverride(canonical.target, parsedKey.data as ModelCapabilityOverrideKey);
+    await removeModelCapabilityOverrideAsync(
+      canonical.target,
+      parsedKey.data as ModelCapabilityOverrideKey
+    );
   }
   return NextResponse.json({
     overrides: await listPublicOverrides(nodeToPrefix, eligibleNodeIds, compatibleNodeIds),

@@ -1,3 +1,9 @@
+import {
+  getActionCountAsync,
+  getUniqueCountAsync,
+  getFirstLogDateAsync,
+  seedBadgesAsync,
+} from "../db/gamificationRuntime";
 /**
  * Badge Definitions & Evaluation Engine for OmniRoute Gamification
  *
@@ -25,7 +31,11 @@ export const BUILTIN_BADGES: Omit<BadgeDefinition, "createdAt">[] = [
     icon: "sparkles",
     category: "usage",
     rarity: "common",
-    criteria: JSON.stringify({ type: "action_count", action: "request", threshold: 1 }),
+    criteria: JSON.stringify({
+      type: "action_count",
+      action: "request",
+      threshold: 1,
+    }),
     hidden: 0,
   },
   {
@@ -35,7 +45,11 @@ export const BUILTIN_BADGES: Omit<BadgeDefinition, "createdAt">[] = [
     icon: "zap",
     category: "usage",
     rarity: "uncommon",
-    criteria: JSON.stringify({ type: "action_count", action: "request", threshold: 1000 }),
+    criteria: JSON.stringify({
+      type: "action_count",
+      action: "request",
+      threshold: 1000,
+    }),
     hidden: 0,
   },
   {
@@ -45,7 +59,11 @@ export const BUILTIN_BADGES: Omit<BadgeDefinition, "createdAt">[] = [
     icon: "cpu",
     category: "usage",
     rarity: "rare",
-    criteria: JSON.stringify({ type: "action_count", action: "request", threshold: 10000 }),
+    criteria: JSON.stringify({
+      type: "action_count",
+      action: "request",
+      threshold: 10000,
+    }),
     hidden: 0,
   },
   {
@@ -55,7 +73,11 @@ export const BUILTIN_BADGES: Omit<BadgeDefinition, "createdAt">[] = [
     icon: "whale",
     category: "usage",
     rarity: "legendary",
-    criteria: JSON.stringify({ type: "action_count", action: "request", threshold: 100000 }),
+    criteria: JSON.stringify({
+      type: "action_count",
+      action: "request",
+      threshold: 100000,
+    }),
     hidden: 0,
   },
 
@@ -67,7 +89,11 @@ export const BUILTIN_BADGES: Omit<BadgeDefinition, "createdAt">[] = [
     icon: "gift",
     category: "sharing",
     rarity: "common",
-    criteria: JSON.stringify({ type: "action_count", action: "token_share", threshold: 1000 }),
+    criteria: JSON.stringify({
+      type: "action_count",
+      action: "token_share",
+      threshold: 1000,
+    }),
     hidden: 0,
   },
   {
@@ -77,7 +103,11 @@ export const BUILTIN_BADGES: Omit<BadgeDefinition, "createdAt">[] = [
     icon: "heart",
     category: "sharing",
     rarity: "uncommon",
-    criteria: JSON.stringify({ type: "action_count", action: "token_share", threshold: 10000 }),
+    criteria: JSON.stringify({
+      type: "action_count",
+      action: "token_share",
+      threshold: 10000,
+    }),
     hidden: 0,
   },
   {
@@ -87,7 +117,11 @@ export const BUILTIN_BADGES: Omit<BadgeDefinition, "createdAt">[] = [
     icon: "santa",
     category: "sharing",
     rarity: "rare",
-    criteria: JSON.stringify({ type: "action_count", action: "token_share", threshold: 100000 }),
+    criteria: JSON.stringify({
+      type: "action_count",
+      action: "token_share",
+      threshold: 100000,
+    }),
     hidden: 0,
   },
   {
@@ -113,7 +147,11 @@ export const BUILTIN_BADGES: Omit<BadgeDefinition, "createdAt">[] = [
     icon: "compass",
     category: "contribution",
     rarity: "uncommon",
-    criteria: JSON.stringify({ type: "unique_count", action: "provider", threshold: 5 }),
+    criteria: JSON.stringify({
+      type: "unique_count",
+      action: "provider",
+      threshold: 5,
+    }),
     hidden: 0,
   },
   {
@@ -123,7 +161,11 @@ export const BUILTIN_BADGES: Omit<BadgeDefinition, "createdAt">[] = [
     icon: "languages",
     category: "contribution",
     rarity: "rare",
-    criteria: JSON.stringify({ type: "unique_count", action: "model", threshold: 10 }),
+    criteria: JSON.stringify({
+      type: "unique_count",
+      action: "model",
+      threshold: 10,
+    }),
     hidden: 0,
   },
   {
@@ -133,7 +175,11 @@ export const BUILTIN_BADGES: Omit<BadgeDefinition, "createdAt">[] = [
     icon: "blocks",
     category: "contribution",
     rarity: "uncommon",
-    criteria: JSON.stringify({ type: "action_count", action: "combo_create", threshold: 3 }),
+    criteria: JSON.stringify({
+      type: "action_count",
+      action: "combo_create",
+      threshold: 3,
+    }),
     hidden: 0,
   },
   {
@@ -158,7 +204,12 @@ export const BUILTIN_BADGES: Omit<BadgeDefinition, "createdAt">[] = [
     icon: "shield",
     category: "contribution",
     rarity: "rare",
-    criteria: JSON.stringify({ type: "threshold", metric: "uptime", threshold: 100, window: 7 }),
+    criteria: JSON.stringify({
+      type: "threshold",
+      metric: "uptime",
+      threshold: 100,
+      window: 7,
+    }),
     hidden: 0,
   },
   {
@@ -168,7 +219,11 @@ export const BUILTIN_BADGES: Omit<BadgeDefinition, "createdAt">[] = [
     icon: "radar",
     category: "contribution",
     rarity: "rare",
-    criteria: JSON.stringify({ type: "action_count", action: "radar_supporter", threshold: 1 }),
+    criteria: JSON.stringify({
+      type: "action_count",
+      action: "radar_supporter",
+      threshold: 1,
+    }),
     hidden: 0,
   },
 
@@ -232,7 +287,11 @@ export const BUILTIN_BADGES: Omit<BadgeDefinition, "createdAt">[] = [
     icon: "bug",
     category: "rare",
     rarity: "rare",
-    criteria: JSON.stringify({ type: "action_count", action: "issue_report", threshold: 5 }),
+    criteria: JSON.stringify({
+      type: "action_count",
+      action: "issue_report",
+      threshold: 5,
+    }),
     hidden: 0,
   },
   {
@@ -242,7 +301,11 @@ export const BUILTIN_BADGES: Omit<BadgeDefinition, "createdAt">[] = [
     icon: "git-merge",
     category: "rare",
     rarity: "rare",
-    criteria: JSON.stringify({ type: "action_count", action: "pr_merge", threshold: 1 }),
+    criteria: JSON.stringify({
+      type: "action_count",
+      action: "pr_merge",
+      threshold: 1,
+    }),
     hidden: 0,
   },
   {
@@ -330,16 +393,7 @@ type BadgeCriteria =
  * function now agree on the same durable source.
  */
 async function getActionCount(apiKeyId: string, action: string): Promise<number> {
-  const { getDbInstance } = await import("../db/core");
-  const db = getDbInstance();
-
-  const row = db
-    .prepare(
-      `SELECT count AS total FROM xp_action_counts WHERE api_key_id = ? AND action = ?`
-    )
-    .get(apiKeyId, action) as { total: number } | undefined;
-
-  return row?.total ?? 0;
+  return getActionCountAsync(apiKeyId, action);
 }
 
 // ─── Helper: Unique Count ────────────────────────────────────────────────────
@@ -349,18 +403,7 @@ async function getActionCount(apiKeyId: string, action: string): Promise<number>
  * from the XP audit log metadata.
  */
 async function getUniqueCount(apiKeyId: string, type: string): Promise<number> {
-  const { getDbInstance } = await import("../db/core");
-  const db = getDbInstance();
-
-  const row = db
-    .prepare(
-      `SELECT COUNT(DISTINCT json_extract(metadata, '$.' || ?)) AS total
-      FROM xp_audit_log
-      WHERE api_key_id = ? AND metadata IS NOT NULL`
-    )
-    .get(type, apiKeyId) as { total: number } | undefined;
-
-  return row?.total ?? 0;
+  return getUniqueCountAsync(apiKeyId, type);
 }
 
 // ─── Helper: Streak ──────────────────────────────────────────────────────────
@@ -395,11 +438,15 @@ export async function evaluateBadges(
   metadata?: Record<string, unknown>
 ): Promise<string[]> {
   // Import DB functions dynamically to avoid circular deps
-  const { getBadgeDefinitions, unlockBadge, getBadges, getRank } =
-    await import("../db/gamification");
+  const {
+    getBadgeDefinitionsAsync: getBadgeDefinitions,
+    unlockBadgeAsync: unlockBadge,
+    getBadgesAsync: getBadges,
+    getRankAsync: getRank,
+  } = await import("../db/gamification");
 
-  const definitions = getBadgeDefinitions();
-  const earned = getBadges(apiKeyId);
+  const definitions = await getBadgeDefinitions();
+  const earned = await getBadges(apiKeyId);
   const earnedIds = new Set(earned.map((b) => b.badgeId));
   const newlyUnlocked: string[] = [];
 
@@ -457,22 +504,16 @@ export async function evaluateBadges(
 
       case "rank": {
         // getRank returns 0 for a key with no leaderboard entry — that is unranked, not rank 0.
-        const rank = getRank(apiKeyId, "global");
+        const rank = await getRank(apiKeyId, "global");
         unlocked = rank > 0 && rank <= criteria.threshold;
         break;
       }
 
       case "first": {
         // Time-limited badge: check if user joined within window
-        const { getDbInstance } = await import("../db/core");
-        const db = getDbInstance();
-
-        const firstLog = db
-          .prepare(`SELECT MIN(created_at) AS first_at FROM xp_audit_log WHERE api_key_id = ?`)
-          .get(apiKeyId) as { first_at: string | null } | undefined;
-
-        if (firstLog?.first_at) {
-          const joinDate = new Date(firstLog.first_at);
+        const firstAt = await getFirstLogDateAsync(apiKeyId);
+        if (firstAt) {
+          const joinDate = new Date(firstAt);
           const windowEnd = new Date(joinDate);
           windowEnd.setDate(windowEnd.getDate() + (criteria as FirstCriteria).window_days);
           unlocked = new Date() <= windowEnd;
@@ -483,7 +524,11 @@ export async function evaluateBadges(
       case "hidden": {
         // Secret badge: unlocked by having earned all other badges
         const allOtherDefs = definitions.filter(
-          (d) => d.id !== def.id && !JSON.parse(d.criteria).type?.toString().includes("hidden")
+          (d) =>
+            d.id !== def.id &&
+            !JSON.parse(d.criteria as string)
+              .type?.toString()
+              .includes("hidden")
         );
         const allOtherEarned = allOtherDefs.every((d) => earnedIds.has(d.id));
         unlocked = allOtherEarned;
@@ -492,8 +537,7 @@ export async function evaluateBadges(
     }
 
     if (unlocked) {
-      unlockBadge(apiKeyId, def.id);
-      newlyUnlocked.push(def.id);
+      if (await unlockBadge(apiKeyId, def.id)) newlyUnlocked.push(def.id);
     }
   }
 
@@ -505,28 +549,5 @@ export async function evaluateBadges(
  * Idempotent — uses INSERT OR IGNORE so existing badges are not overwritten.
  */
 export async function seedBuiltinBadges(): Promise<void> {
-  const { getDbInstance } = await import("../db/core");
-  const db = getDbInstance();
-
-  const insert = db.prepare(
-    `INSERT OR IGNORE INTO badge_definitions (id, name, description, icon, category, rarity, criteria, hidden)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-  );
-
-  const insertMany = db.transaction((badges: typeof BUILTIN_BADGES) => {
-    for (const badge of badges) {
-      insert.run(
-        badge.id,
-        badge.name,
-        badge.description,
-        badge.icon,
-        badge.category,
-        badge.rarity,
-        badge.criteria,
-        badge.hidden
-      );
-    }
-  });
-
-  insertMany(BUILTIN_BADGES);
+  await seedBadgesAsync(BUILTIN_BADGES);
 }

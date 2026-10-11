@@ -1,5 +1,5 @@
 import { applyLiteCompression, isUsableLiteMaxToolLength } from "../lite.ts";
-import { cavemanCompress } from "../caveman.ts";
+import { cavemanCompress, cavemanCompressAsync } from "../caveman.ts";
 import { compressAggressive } from "../aggressive.ts";
 import { ultraCompressHeuristic } from "../ultra.ts";
 import { createCompressionStats } from "../stats.ts";
@@ -9,7 +9,12 @@ import {
   DEFAULT_ULTRA_CONFIG,
   type CavemanIntensity,
 } from "../types.ts";
-import type { CompressionEngine, EngineConfigField, EngineValidationResult } from "./types.ts";
+import type {
+  CompressionEngine,
+  CompressionEngineApplyOptions,
+  EngineConfigField,
+  EngineValidationResult,
+} from "./types.ts";
 
 const CAVEMAN_INTENSITIES: CavemanIntensity[] = ["lite", "full", "ultra"];
 
@@ -286,6 +291,40 @@ export const liteEngine: CompressionEngine = {
   },
 };
 
+function resolveCavemanStepConfig(options?: CompressionEngineApplyOptions) {
+  // Mirror rtkAdapter's default-enabled behavior (see rtk/index.ts:530-535). When this engine
+  // is invoked as a stacked step without explicit `enabled` on either the cavemanConfig or the
+  // stepConfig, default `enabled: true` so the rules actually run. Without this,
+  // DEFAULT_CAVEMAN_CONFIG.enabled=false made cavemanCompress() a silent no-op, and the
+  // preview route's default [rtk, caveman] pipeline reported 0% savings even on trigger prose.
+  // (Issue #6425.)
+  const explicitCavemanConfig = options?.config?.cavemanConfig;
+  const explicitStepConfig = options?.stepConfig;
+  const explicitEnabled =
+    (explicitCavemanConfig && "enabled" in explicitCavemanConfig) ||
+    (explicitStepConfig && "enabled" in explicitStepConfig);
+  const enabledDefault = explicitEnabled ? {} : { enabled: true };
+  return {
+    ...enabledDefault,
+    ...(explicitCavemanConfig ?? {}),
+    ...(explicitStepConfig ?? {}),
+    ...(options?.config?.languageConfig?.enabled
+      ? {
+          language: options.config.languageConfig.defaultLanguage,
+          autoDetectLanguage: options.config.languageConfig.autoDetect,
+          enabledLanguagePacks: options.config.languageConfig.enabledPacks,
+        }
+      : {}),
+    ...(options?.config?.preserveSystemPrompt !== false
+      ? {
+          compressRoles: (options?.config?.cavemanConfig?.compressRoles ?? ["user"]).filter(
+            (role) => role !== "system"
+          ),
+        }
+      : {}),
+  };
+}
+
 export const cavemanEngine: CompressionEngine = {
   id: "caveman",
   name: "Caveman",
@@ -305,40 +344,18 @@ export const cavemanEngine: CompressionEngine = {
   },
   apply(body, options) {
     const adapter = adaptBodyForCompression(body);
-    // Mirror rtkAdapter's default-enabled behavior (see rtk/index.ts:530-535). When this engine
-    // is invoked as a stacked step without explicit `enabled` on either the cavemanConfig or the
-    // stepConfig, default `enabled: true` so the rules actually run. Without this,
-    // DEFAULT_CAVEMAN_CONFIG.enabled=false made cavemanCompress() a silent no-op, and the
-    // preview route's default [rtk, caveman] pipeline reported 0% savings even on trigger prose.
-    // (Issue #6425.)
-    const explicitCavemanConfig = options?.config?.cavemanConfig;
-    const explicitStepConfig = options?.stepConfig;
-    const explicitEnabled =
-      (explicitCavemanConfig && "enabled" in explicitCavemanConfig) ||
-      (explicitStepConfig && "enabled" in explicitStepConfig);
-    const enabledDefault = explicitEnabled ? {} : { enabled: true };
-    const cavemanConfig = {
-      ...enabledDefault,
-      ...(explicitCavemanConfig ?? {}),
-      ...(explicitStepConfig ?? {}),
-      ...(options?.config?.languageConfig?.enabled
-        ? {
-            language: options.config.languageConfig.defaultLanguage,
-            autoDetectLanguage: options.config.languageConfig.autoDetect,
-            enabledLanguagePacks: options.config.languageConfig.enabledPacks,
-          }
-        : {}),
-      ...(options?.config?.preserveSystemPrompt !== false
-        ? {
-            compressRoles: (options?.config?.cavemanConfig?.compressRoles ?? ["user"]).filter(
-              (role) => role !== "system"
-            ),
-          }
-        : {}),
-    };
+    const cavemanConfig = resolveCavemanStepConfig(options);
     const result = cavemanCompress(
       adapter.body as Parameters<typeof cavemanCompress>[0],
       cavemanConfig
+    );
+    return adapter.adapted ? { ...result, body: adapter.restore(result.body) } : result;
+  },
+  async applyAsync(body, options) {
+    const adapter = adaptBodyForCompression(body);
+    const result = await cavemanCompressAsync(
+      adapter.body as Parameters<typeof cavemanCompress>[0],
+      resolveCavemanStepConfig(options)
     );
     return adapter.adapted ? { ...result, body: adapter.restore(result.body) } : result;
   },

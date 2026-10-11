@@ -13,7 +13,21 @@
  * - Optional human notes
  */
 
+import { randomUUID } from "node:crypto";
 import { getDbInstance } from "../lib/db/core";
+import { getSelectedPostgresDatabase } from "../lib/db/controlPlaneContext";
+import {
+  configAuditEntryParams,
+  createConfigAuditEntry,
+  rowToConfigAuditEntry as rowToEntry,
+  summarizeConfigAuditRows,
+  type ConfigAuditRow,
+  type ConfigAuditLogOptions,
+  type ConfigAuditSummary,
+} from "../lib/db/configAuditModel";
+import { createPostgresConfigAuditRepository } from "../lib/db/postgres/configAuditRepository";
+export { computeDiff } from "../lib/db/configAuditModel";
+export type { ConfigAuditLogOptions, ConfigAuditSummary } from "../lib/db/configAuditModel";
 
 /** Types of configuration entities that can be audited */
 export type AuditTarget = "provider" | "combo" | "policy" | "connection" | "settings";
@@ -89,83 +103,6 @@ function db() {
   return getDbInstance();
 }
 
-interface ConfigAuditRow {
-  id: string;
-  timestamp: string;
-  action: string;
-  target: string;
-  target_id: string;
-  target_name: string;
-  before_json: string | null;
-  after_json: string | null;
-  diff_json: string;
-  source: string;
-  note: string | null;
-}
-
-function rowToEntry(row: ConfigAuditRow): ConfigAuditEntry {
-  return {
-    id: row.id,
-    timestamp: row.timestamp,
-    action: row.action as AuditAction,
-    target: row.target as AuditTarget,
-    targetId: row.target_id,
-    targetName: row.target_name,
-    before: row.before_json === null ? null : (JSON.parse(row.before_json) as Record<string, unknown> | null),
-    after: row.after_json === null ? null : (JSON.parse(row.after_json) as Record<string, unknown> | null),
-    source: row.source as AuditSource,
-    diff: JSON.parse(row.diff_json) as ConfigDiff,
-    note: row.note,
-  };
-}
-
-/**
- * Compute a structured diff between two configuration states.
- */
-export function computeDiff(
-  before: Record<string, unknown> | null,
-  after: Record<string, unknown> | null
-): ConfigDiff {
-  const beforeKeys = new Set(before ? Object.keys(before) : []);
-  const afterKeys = new Set(after ? Object.keys(after) : []);
-
-  const added: string[] = [];
-  const removed: string[] = [];
-  const changed: Array<{ key: string; from: unknown; to: unknown }> = [];
-
-  // Keys in after but not in before → added
-  for (const key of afterKeys) {
-    if (!beforeKeys.has(key)) {
-      added.push(key);
-    }
-  }
-
-  // Keys in before but not in after → removed
-  for (const key of beforeKeys) {
-    if (!afterKeys.has(key)) {
-      removed.push(key);
-    }
-  }
-
-  // Keys in both → check for changes
-  for (const key of beforeKeys) {
-    if (afterKeys.has(key)) {
-      const beforeVal = before![key];
-      const afterVal = after![key];
-      if (JSON.stringify(beforeVal) !== JSON.stringify(afterVal)) {
-        changed.push({ key, from: beforeVal, to: afterVal });
-      }
-    }
-  }
-
-  return {
-    added,
-    removed,
-    changed,
-    isEmpty: added.length === 0 && removed.length === 0 && changed.length === 0,
-  };
-}
-
 /**
  * Record a configuration change in the audit log.
  */
@@ -179,9 +116,8 @@ export function recordChange(
   source: AuditSource,
   note?: string | null
 ): ConfigAuditEntry {
-  const entry: ConfigAuditEntry = {
-    id: generateId(),
-    timestamp: new Date().toISOString(),
+  const entry = createConfigAuditEntry(
+    generateId(),
     action,
     target,
     targetId,
@@ -189,28 +125,17 @@ export function recordChange(
     before,
     after,
     source,
-    diff: computeDiff(before, after),
-    note: note ?? null,
-  };
+    note
+  );
 
-  db().prepare(
-    `INSERT INTO config_audit_log
+  db()
+    .prepare(
+      `INSERT INTO config_audit_log
        (id, timestamp, action, target, target_id, target_name, before_json, after_json, diff_json, source, note)
      VALUES
        (@id, @timestamp, @action, @target, @targetId, @targetName, @beforeJson, @afterJson, @diffJson, @source, @note)`
-  ).run({
-    id: entry.id,
-    timestamp: entry.timestamp,
-    action: entry.action,
-    target: entry.target,
-    targetId: entry.targetId,
-    targetName: entry.targetName,
-    beforeJson: before === null ? null : JSON.stringify(before),
-    afterJson: after === null ? null : JSON.stringify(after),
-    diffJson: JSON.stringify(entry.diff),
-    source: entry.source,
-    note: entry.note,
-  });
+    )
+    .run(configAuditEntryParams(entry));
 
   return entry;
 }
@@ -218,15 +143,10 @@ export function recordChange(
 /**
  * Get audit entries, optionally filtered.
  */
-export function getAuditLog(options?: {
-  target?: AuditTarget;
-  targetId?: string;
-  action?: AuditAction;
-  source?: AuditSource;
-  since?: string; // ISO date
-  limit?: number;
-  offset?: number;
-}): { entries: ConfigAuditEntry[]; total: number } {
+export function getAuditLog(options?: ConfigAuditLogOptions): {
+  entries: ConfigAuditEntry[];
+  total: number;
+} {
   const where: string[] = [];
   const params: Record<string, unknown> = {};
 
@@ -274,9 +194,8 @@ export function getAuditLog(options?: {
  * Get a specific audit entry by ID.
  */
 export function getAuditEntry(id: string): ConfigAuditEntry | null {
-  const row = db()
-    .prepare("SELECT * FROM config_audit_log WHERE id = @id")
-    .get({ id }) as ConfigAuditRow | undefined;
+  const row = db().prepare("SELECT * FROM config_audit_log WHERE id = @id").get({ id }) as
+    ConfigAuditRow | undefined;
   return row ? rowToEntry(row) : null;
 }
 
@@ -309,36 +228,11 @@ export function createSnapshot(
 /**
  * Get summary statistics of the audit log.
  */
-export function getAuditSummary(): {
-  totalEntries: number;
-  byTarget: Record<string, number>;
-  byAction: Record<string, number>;
-  bySource: Record<string, number>;
-  oldestEntry: string | null;
-  newestEntry: string | null;
-} {
-  const byTarget: Record<string, number> = {};
-  const byAction: Record<string, number> = {};
-  const bySource: Record<string, number> = {};
-
+export function getAuditSummary(): ConfigAuditSummary {
   const rows = db()
     .prepare("SELECT * FROM config_audit_log ORDER BY datetime(timestamp) DESC, id DESC")
     .all() as ConfigAuditRow[];
-
-  for (const row of rows) {
-    byTarget[row.target] = (byTarget[row.target] || 0) + 1;
-    byAction[row.action] = (byAction[row.action] || 0) + 1;
-    bySource[row.source] = (bySource[row.source] || 0) + 1;
-  }
-
-  return {
-    totalEntries: rows.length,
-    byTarget,
-    byAction,
-    bySource,
-    oldestEntry: rows.length > 0 ? rows[rows.length - 1].timestamp : null,
-    newestEntry: rows.length > 0 ? rows[0].timestamp : null,
-  };
+  return summarizeConfigAuditRows(rows);
 }
 
 /**
@@ -347,4 +241,65 @@ export function getAuditSummary(): {
 export function resetAuditLog(): void {
   db().prepare("DELETE FROM config_audit_log").run();
   idCounter = 0;
+}
+
+/** Native asynchronous siblings; synchronous SQLite callers retain their existing contract. */
+export async function recordChangeAsync(
+  action: AuditAction,
+  target: AuditTarget,
+  targetId: string,
+  targetName: string,
+  before: Record<string, unknown> | null,
+  after: Record<string, unknown> | null,
+  source: AuditSource,
+  note?: string | null
+): Promise<ConfigAuditEntry> {
+  const database = getSelectedPostgresDatabase();
+  if (!database)
+    return recordChange(action, target, targetId, targetName, before, after, source, note);
+  const id = `audit-${Date.now().toString(36)}-${randomUUID()}`;
+  const entry = createConfigAuditEntry(
+    id,
+    action,
+    target,
+    targetId,
+    targetName,
+    before,
+    after,
+    source,
+    note
+  );
+  // Capture JSON before the first await, as the synchronous source writer does.
+  await createPostgresConfigAuditRepository(database).insert(configAuditEntryParams(entry));
+  return entry;
+}
+export async function getAuditLogAsync(
+  options?: ConfigAuditLogOptions
+): Promise<{ entries: ConfigAuditEntry[]; total: number }> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return getAuditLog(options);
+  const result = await createPostgresConfigAuditRepository(database).list(options);
+  return { entries: result.rows.map(rowToEntry), total: result.total };
+}
+export async function getAuditEntryAsync(id: string): Promise<ConfigAuditEntry | null> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return getAuditEntry(id);
+  const row = await createPostgresConfigAuditRepository(database).find(id);
+  return row ? rowToEntry(row) : null;
+}
+export async function getRollbackStateAsync(
+  entryId: string
+): Promise<Record<string, unknown> | null> {
+  const entry = await getAuditEntryAsync(entryId);
+  return entry ? entry.before : null;
+}
+export async function getAuditSummaryAsync(): Promise<ConfigAuditSummary> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return getAuditSummary();
+  return summarizeConfigAuditRows(await createPostgresConfigAuditRepository(database).all());
+}
+export async function resetAuditLogAsync(): Promise<void> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return resetAuditLog();
+  await createPostgresConfigAuditRepository(database).clear();
 }

@@ -8,7 +8,7 @@ import { buildClientRawRequest, resolveDispatchClientRawRequest } from "./chat/c
 export { buildClientRawRequest, resolveDispatchClientRawRequest };
 import { normalizeReasoningRequest } from "@/shared/reasoning/effortStandardization";
 import { isDetailedLoggingEnabled } from "@/lib/db/detailedLogs";
-import { resolvePreviousResponseState } from "@/lib/db/responsesContinuationStore";
+import { resolvePreviousResponseStateAsync } from "@/lib/db/responsesContinuationStore";
 import { normalizeResponsesPreviousResponseIdMode } from "@omniroute/open-sse/utils/responsesStatePolicy.ts";
 import { FORMATS } from "@omniroute/open-sse/translator/formats.ts";
 import { resolveRoutingModel, RoutingModelOps } from "./resolveRoutingModel";
@@ -72,14 +72,14 @@ import { rejectPeerRequest } from "@/shared/resilience/peerRouting";
 import { isRuntimeProviderRetirementError } from "@/shared/constants/providerRetirement";
 import { isCommonChatGptWebRetirementError } from "@/shared/constants/chatgptWebRetirement";
 import { isChatGptWebCodexModel } from "@/shared/constants/chatgptWebCodex";
-import { deleteHandoff, getHandoff } from "@/lib/db/contextHandoffs";
+import { deleteHandoffAsync, getHandoffAsync } from "@/lib/db/contextHandoffs";
 import { getComboByName, updateCombo } from "@/lib/db/combos";
 import { isModelAllowedForKey } from "@/lib/db/apiKeys";
 import { promoteSuccessfulComboModel } from "@/lib/combos/autoPromote";
 import {
-  deleteSessionAccountAffinity,
-  evictSessionAccountAffinityForConnection,
-  getSessionAccountAffinity,
+  deleteSessionAccountAffinityAsync,
+  evictSessionAccountAffinityForConnectionAsync,
+  getSessionAccountAffinityAsync,
 } from "@/lib/db/sessionAccountAffinity";
 import { dispatchChatWithAffinityEviction } from "./chatDispatch";
 import { getCachedSettings, getCombosCacheVersion } from "@/lib/db/readCache";
@@ -159,7 +159,7 @@ import { RequestTelemetry, recordTelemetry } from "../../shared/utils/requestTel
 import { generateRequestId } from "../../shared/utils/requestId";
 import { logAuditEvent } from "../../lib/compliance/index";
 import { enforceApiKeyPolicy } from "../../shared/utils/apiKeyPolicy";
-import { rejectIfMeteredBudgetExceeded } from "@/lib/usage/meteredBudgetPolicy";
+import { rejectIfMeteredBudgetExceededAsync as rejectIfMeteredBudgetExceeded } from "@/lib/usage/meteredBudgetPolicy";
 import { hasProviderQuotaBypassScope } from "../../shared/constants/apiKeyPolicyScopes";
 import { isMicrosoftDesignerWebProviderRetiredError } from "../../shared/constants/designerWebRetirement";
 import { cloneBoundedForLog } from "@omniroute/open-sse/utils/requestLogger.ts";
@@ -821,7 +821,7 @@ async function handleChatImplementation(
     const previousResponseId = (body as { previous_response_id: string }).previous_response_id;
     const detailedLoggingEnabled = await isDetailedLoggingEnabled();
     const stored = detailedLoggingEnabled
-      ? resolvePreviousResponseState(previousResponseId, apiKeyInfo?.id ?? null)
+      ? await resolvePreviousResponseStateAsync(previousResponseId, apiKeyInfo?.id ?? null)
       : null;
     // resume flag for the attempt store in handleChatCore (best-effort).
     if (!stored) {
@@ -1658,7 +1658,7 @@ async function handleSingleModelChat(
   const modelPolicyRejection = await resolvedModelGate([`${provider}/${model}`]);
   if (modelPolicyRejection) return modelPolicyRejection;
   const forceLiveComboTest = runtimeOptions.forceLiveComboTest === true;
-  const budgetRejection = rejectIfMeteredBudgetExceeded(apiKeyInfo?.id, provider, modelStr);
+  const budgetRejection = await rejectIfMeteredBudgetExceeded(apiKeyInfo?.id, provider, modelStr);
   if (budgetRejection) return budgetRejection;
   const bypassProviderQuotaPolicy = hasProviderQuotaBypassScope(apiKeyInfo?.scopes);
   const forcedConnectionId =
@@ -2028,7 +2028,7 @@ async function handleSingleModelChat(
         runtimeOptions.sessionId &&
         body?._omnirouteSkipContextRelay !== true
       ) {
-        const handoff = getHandoff(runtimeOptions.sessionId, comboName);
+        const handoff = await getHandoffAsync(runtimeOptions.sessionId, comboName);
         if (handoff && handoff.fromAccount !== credentials.connectionId) {
           // Inject only after a real account switch. The combo loop itself cannot
           // reliably detect this because account selection happens inside auth.
@@ -2212,7 +2212,7 @@ async function handleSingleModelChat(
           breaker._onSuccess();
         }
         if (injectedHandoff && runtimeOptions.sessionId && comboName) {
-          deleteHandoff(runtimeOptions.sessionId, comboName);
+          await deleteHandoffAsync(runtimeOptions.sessionId, comboName);
         }
         if (telemetry) telemetry.startPhase("finalize");
         if (telemetry) telemetry.endPhase();
@@ -2305,7 +2305,7 @@ async function handleSingleModelChat(
 
         if (isTerminalStreamEarlyEof && runtimeOptions.sessionAffinityKey) {
           try {
-            evictSessionAccountAffinityForConnection(
+            await evictSessionAccountAffinityForConnectionAsync(
               runtimeOptions.sessionAffinityKey,
               provider,
               credentials.connectionId
@@ -2358,12 +2358,15 @@ async function handleSingleModelChat(
           }
           if (runtimeOptions.sessionAffinityKey) {
             try {
-              const affinity = getSessionAccountAffinity(
+              const affinity = await getSessionAccountAffinityAsync(
                 runtimeOptions.sessionAffinityKey,
                 provider
               );
               if (affinity?.connectionId === credentials.connectionId) {
-                deleteSessionAccountAffinity(runtimeOptions.sessionAffinityKey, provider);
+                await deleteSessionAccountAffinityAsync(
+                  runtimeOptions.sessionAffinityKey,
+                  provider
+                );
               }
             } catch {
               // best-effort: selection also excludes this connection for the current retry.
@@ -2407,12 +2410,15 @@ async function handleSingleModelChat(
           }
           if (runtimeOptions.sessionAffinityKey) {
             try {
-              const affinity = getSessionAccountAffinity(
+              const affinity = await getSessionAccountAffinityAsync(
                 runtimeOptions.sessionAffinityKey,
                 provider
               );
               if (affinity?.connectionId === credentials.connectionId) {
-                deleteSessionAccountAffinity(runtimeOptions.sessionAffinityKey, provider);
+                await deleteSessionAccountAffinityAsync(
+                  runtimeOptions.sessionAffinityKey,
+                  provider
+                );
               }
             } catch {
               // best-effort: selection also excludes this connection for the current retry.
@@ -2664,7 +2670,7 @@ async function handleSingleModelChat(
         // account is left intact.
         if (runtimeOptions.sessionAffinityKey) {
           try {
-            evictSessionAccountAffinityForConnection(
+            await evictSessionAccountAffinityForConnectionAsync(
               runtimeOptions.sessionAffinityKey,
               provider,
               credentials.connectionId

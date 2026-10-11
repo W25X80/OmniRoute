@@ -1,3 +1,8 @@
+import {
+  getCustomEvalSuiteAsync,
+  listCustomEvalSuitesAsync,
+  type EvalSuiteRecord,
+} from "@/lib/db/evals";
 /**
  * Eval Runner — T-42
  *
@@ -80,6 +85,10 @@ export function getSuite(suiteId: string) {
  * @returns {Array<{ id: string, name: string, caseCount: number }>}
  */
 export function listSuites() {
+  return collectSuites(listCustomEvalSuites());
+}
+
+function collectSuites(customSuiteRows: EvalSuiteRecord[]) {
   const builtInSuites = Array.from(suites.values()).map((s) => ({
     id: s.id,
     name: s.name,
@@ -96,7 +105,7 @@ export function listSuites() {
     })),
   }));
 
-  const customSuites = listCustomEvalSuites().map((suite) => ({
+  const customSuites = customSuiteRows.map((suite) => ({
     id: suite.id,
     name: suite.name,
     description: suite.description || "",
@@ -235,7 +244,15 @@ export function runSuite(
   outputs: Record<string, string>,
   caseMetrics: Record<string, { durationMs?: number; error?: string }> = {}
 ) {
-  const suite = getSuite(suiteId);
+  return runResolvedSuite(suiteId, getSuite(suiteId), outputs, caseMetrics);
+}
+
+function runResolvedSuite(
+  suiteId: string,
+  suite: ReturnType<typeof getSuite>,
+  outputs: Record<string, string>,
+  caseMetrics: Record<string, { durationMs?: number; error?: string }> = {}
+) {
   if (!suite) {
     throw new Error(`Suite not found: ${suiteId}`);
   }
@@ -334,4 +351,18 @@ function registerBuiltInSuites() {
   for (const suite of builtInSuites) {
     registerSuite(suite);
   }
+}
+
+export async function getSuiteAsync(suiteId: string) {
+  return suites.get(suiteId) || (await getCustomEvalSuiteAsync(suiteId)) || null;
+}
+export async function listSuitesAsync() {
+  return collectSuites(await listCustomEvalSuitesAsync());
+}
+export async function runSuiteAsync(
+  suiteId: string,
+  outputs: Record<string, string>,
+  caseMetrics: Record<string, { durationMs?: number; error?: string }> = {}
+) {
+  return runResolvedSuite(suiteId, await getSuiteAsync(suiteId), outputs, caseMetrics);
 }

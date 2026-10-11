@@ -16,13 +16,18 @@
 import type { EnforceDecision, EnforceInput, QuotaStore, RecordConsumptionInput } from "./types";
 import type { ProviderPlan, QuotaUnit } from "./dimensions";
 import { dimensionKeyToString } from "./dimensions";
+import { validateQuotaEventTimeMs } from "./eventTime";
 import { decideFairShare } from "./fairShare";
-import { resolvePlan } from "./planResolver";
+import { resolvePlanAsync as resolvePlan } from "./planResolver";
 import { getSaturation } from "./saturationSignals";
 import { getQuotaStore } from "./QuotaStore";
-import { listAllocationsForApiKey, getPool } from "@/lib/db/quotaPools";
-import { getModelCap } from "@/lib/db/quotaModelCaps";
-import { listEnabledSchedules } from "@/lib/db/quotaSchedules";
+import {
+  listAllocationsForApiKeyAsync as listAllocationsForApiKey,
+  getPoolAsync as getPool,
+} from "@/lib/db/quotaPools";
+import { getSelectedPostgresDatabase } from "@/lib/db/controlPlaneContext";
+import { getModelCapAsync as getModelCap } from "@/lib/db/quotaModelCaps";
+import { listEnabledSchedulesAsync as listEnabledSchedules } from "@/lib/db/quotaSchedules";
 import {
   failingReserve,
   reservedWindows,
@@ -75,7 +80,7 @@ export async function enforceQuotaShare(input: EnforceInput): Promise<EnforceDec
     allocation: import("@/lib/db/quotaPools").PoolAllocation;
   }>;
   try {
-    allocations = listAllocationsForApiKey(input.apiKeyId);
+    allocations = await listAllocationsForApiKey(input.apiKeyId);
   } catch {
     // DB not available or migration not run — fail-open
     return { kind: "allow" };
@@ -92,7 +97,7 @@ export async function enforceQuotaShare(input: EnforceInput): Promise<EnforceDec
   for (const { poolId, allocation } of allocations) {
     let p: import("@/lib/db/quotaPools").QuotaPool | null = null;
     try {
-      p = getPool(poolId);
+      p = await getPool(poolId);
     } catch {
       continue;
     }
@@ -128,7 +133,7 @@ export async function enforceQuotaShare(input: EnforceInput): Promise<EnforceDec
   // A request served through a different pool member must still be checked
   // against that same plan/limit, or a non-primary connection silently falls
   // back to a different (catalog/empty) plan shape (#13876).
-  const plan = resolvePlan(pool.connectionId, input.provider);
+  const plan = await resolvePlan(pool.connectionId, input.provider);
 
   // 3a-bis. Time-aware schedule gate.
   //
@@ -156,7 +161,7 @@ export async function enforceQuotaShare(input: EnforceInput): Promise<EnforceDec
   if (input.model) {
     let modelCap: import("@/lib/db/quotaModelCaps").ModelCap | null = null;
     try {
-      modelCap = getModelCap(pool.id, input.apiKeyId, input.model);
+      modelCap = await getModelCap(pool.id, input.apiKeyId, input.model);
     } catch {
       // DB error — fail-open per B16
     }
@@ -314,13 +319,26 @@ export async function enforceQuotaShare(input: EnforceInput): Promise<EnforceDec
  * Increments the quota counter for each active dimension.
  * Errors are swallowed (B29): the LLM response has already been delivered.
  */
-export async function recordConsumption(input: RecordConsumptionInput): Promise<void> {
+export async function recordConsumption(
+  input: RecordConsumptionInput,
+  eventTimeMs?: number
+): Promise<void> {
+  let nativeEventTimeMs: number | undefined;
+  try {
+    if (getSelectedPostgresDatabase()) {
+      nativeEventTimeMs = validateQuotaEventTimeMs(
+        eventTimeMs === undefined ? Date.now() : eventTimeMs
+      );
+    }
+  } catch {
+    return; // Invalid native completion context or unavailable persistence: B29.
+  }
   let allocations: Array<{
     poolId: string;
     allocation: import("@/lib/db/quotaPools").PoolAllocation;
   }>;
   try {
-    allocations = listAllocationsForApiKey(input.apiKeyId);
+    allocations = await listAllocationsForApiKey(input.apiKeyId);
   } catch {
     return; // DB not available — silent no-op
   }
@@ -334,7 +352,7 @@ export async function recordConsumption(input: RecordConsumptionInput): Promise<
   for (const { poolId: pid } of allocations) {
     let p: import("@/lib/db/quotaPools").QuotaPool | null = null;
     try {
-      p = getPool(pid);
+      p = await getPool(pid);
     } catch {
       continue;
     }
@@ -355,8 +373,8 @@ export async function recordConsumption(input: RecordConsumptionInput): Promise<
 
   // Resolved from the pool's canonical (primary) connection so writes always
   // land under the same dimension shape the dashboard reads back via
-  // resolvePlan(pool.connectionId, ...) — see enforceQuotaShare above (#13876).
-  const plan = resolvePlan(matchedPool.connectionId, input.provider);
+  // await resolvePlan(pool.connectionId, ...) — see enforceQuotaShare above (#13876).
+  const plan = await resolvePlan(matchedPool.connectionId, input.provider);
   const store = await getQuotaStore();
 
   // Pool-level dimension consumption (existing behaviour).
@@ -364,7 +382,7 @@ export async function recordConsumption(input: RecordConsumptionInput): Promise<
     const dimKey = { poolId, unit: dim.unit, window: dim.window };
     const cost = costForUnit(input.cost, dim.unit);
     if (cost > 0) {
-      await store.consume(input.apiKeyId, dimKey, cost).catch(() => {
+      await store.consume(input.apiKeyId, dimKey, cost, nativeEventTimeMs).catch(() => {
         // Fail-open per B29 — drift expected; teto global do fetcher corrige
       });
     }
@@ -377,7 +395,7 @@ export async function recordConsumption(input: RecordConsumptionInput): Promise<
   if (input.model) {
     let modelCap: import("@/lib/db/quotaModelCaps").ModelCap | null = null;
     try {
-      modelCap = getModelCap(poolId, input.apiKeyId, input.model);
+      modelCap = await getModelCap(poolId, input.apiKeyId, input.model);
     } catch {
       // DB not available — silent no-op per B29
     }
@@ -390,7 +408,7 @@ export async function recordConsumption(input: RecordConsumptionInput): Promise<
           unit: modelCap.capUnit,
           window: "hourly" as const,
         };
-        await store.consume(input.apiKeyId, modelDimKey, cost).catch(() => {
+        await store.consume(input.apiKeyId, modelDimKey, cost, nativeEventTimeMs).catch(() => {
           // Fail-open per B29
         });
       }
@@ -402,7 +420,7 @@ export async function recordConsumption(input: RecordConsumptionInput): Promise<
   // what OmniRoute spent inside this window — never what the account spent in
   // total. Only maintained while a window with a budget is open; outside one
   // there is no bucket to keep.
-  const budgetSchedule = activeBudgetSchedule(poolId);
+  const budgetSchedule = await activeBudgetSchedule(poolId, nativeEventTimeMs);
   if (budgetSchedule?.budgetUnit) {
     const cost = costForUnit(input.cost, budgetSchedule.budgetUnit);
     if (cost > 0) {
@@ -411,7 +429,7 @@ export async function recordConsumption(input: RecordConsumptionInput): Promise<
         unit: budgetSchedule.budgetUnit,
         window: budgetSchedule.budgetWindow,
       };
-      await store.consume(input.apiKeyId, scheduleDimKey, cost).catch(() => {
+      await store.consume(input.apiKeyId, scheduleDimKey, cost, nativeEventTimeMs).catch(() => {
         // Fail-open per B29
       });
     }
@@ -446,7 +464,7 @@ async function checkSchedules(
   input: EnforceInput,
   store: QuotaStore
 ): Promise<EnforceDecision | null> {
-  const schedules = listEnabledSchedules(poolId);
+  const schedules = await listEnabledSchedules(poolId);
   if (schedules.length === 0) return null;
 
   const verdict = resolveActiveSchedule(schedules, Date.now());
@@ -568,10 +586,13 @@ async function notifyQuotaExceeded(
  * from `checkSchedules` because the POST path must never block or signal — it
  * only needs to know which counter to bump.
  */
-function activeBudgetSchedule(poolId: string): QuotaSchedule | null {
-  const schedules = listEnabledSchedules(poolId);
+async function activeBudgetSchedule(
+  poolId: string,
+  eventTimeMs?: number
+): Promise<QuotaSchedule | null> {
+  const schedules = await listEnabledSchedules(poolId);
   if (schedules.length === 0) return null;
-  const verdict = resolveActiveSchedule(schedules, Date.now());
+  const verdict = resolveActiveSchedule(schedules, eventTimeMs ?? Date.now());
   if (verdict.kind !== "active") return null;
   const { schedule } = verdict;
   return schedule.budgetValue !== undefined && schedule.budgetUnit !== undefined ? schedule : null;

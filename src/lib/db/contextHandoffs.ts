@@ -1,3 +1,5 @@
+import { getSelectedPostgresDatabase } from "./controlPlaneContext";
+import { createPostgresSessionRepository } from "./postgres/sessionRepository";
 import { getDbInstance, rowToCamel } from "./core";
 
 export interface HandoffPayload {
@@ -253,4 +255,85 @@ export function deleteSessionModelHistory(sessionId: string, comboName: string):
     .prepare("DELETE FROM session_model_history WHERE session_id = ? AND combo_name = ?")
     .run(sessionId, comboName);
   return result.changes ?? 0;
+}
+
+export async function upsertHandoffAsync(
+  ...args: Parameters<typeof upsertHandoff>
+): Promise<ReturnType<typeof upsertHandoff>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresSessionRepository(database).upsertHandoff(...args)
+    : upsertHandoff(...args);
+}
+
+export async function getHandoffAsync(
+  ...args: Parameters<typeof getHandoff>
+): Promise<ReturnType<typeof getHandoff>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresSessionRepository(database).getHandoff(...args)
+    : getHandoff(...args);
+}
+
+export async function deleteHandoffAsync(
+  ...args: Parameters<typeof deleteHandoff>
+): Promise<ReturnType<typeof deleteHandoff>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresSessionRepository(database).deleteHandoff(...args)
+    : deleteHandoff(...args);
+}
+
+export async function cleanupExpiredHandoffsAsync(
+  ...args: Parameters<typeof cleanupExpiredHandoffs>
+): Promise<ReturnType<typeof cleanupExpiredHandoffs>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresSessionRepository(database).cleanupExpiredHandoffs(...args)
+    : cleanupExpiredHandoffs(...args);
+}
+
+export async function hasActiveHandoffAsync(
+  ...args: Parameters<typeof hasActiveHandoff>
+): Promise<ReturnType<typeof hasActiveHandoff>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresSessionRepository(database).hasActiveHandoff(...args)
+    : hasActiveHandoff(...args);
+}
+
+export async function recordSessionModelUsageAsync(
+  ...args: Parameters<typeof recordSessionModelUsage>
+): Promise<ReturnType<typeof recordSessionModelUsage>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresSessionRepository(database).recordSessionModelUsage(...args)
+    : recordSessionModelUsage(...args);
+}
+
+export async function getLastSessionModelAsync(
+  ...args: Parameters<typeof getLastSessionModel>
+): Promise<ReturnType<typeof getLastSessionModel>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresSessionRepository(database).getLastSessionModel(...args)
+    : getLastSessionModel(...args);
+}
+
+export async function clearSessionModelHistoryForComboAsync(
+  ...args: Parameters<typeof clearSessionModelHistoryForCombo>
+): Promise<ReturnType<typeof clearSessionModelHistoryForCombo>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresSessionRepository(database).clearSessionModelHistoryForCombo(...args)
+    : clearSessionModelHistoryForCombo(...args);
+}
+
+export async function deleteSessionModelHistoryAsync(
+  ...args: Parameters<typeof deleteSessionModelHistory>
+): Promise<ReturnType<typeof deleteSessionModelHistory>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresSessionRepository(database).deleteSessionModelHistory(...args)
+    : deleteSessionModelHistory(...args);
 }

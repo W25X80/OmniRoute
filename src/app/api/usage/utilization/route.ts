@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { getAggregatedSnapshots } from "@/lib/db/quotaSnapshots";
+import { getAggregatedSnapshotsAsync } from "@/lib/db/quotaSnapshots";
 import { getProviderConnectionById } from "@/lib/db/providers";
 import type {
   ProviderUtilizationResponse,
@@ -55,7 +55,7 @@ export async function GET(request: Request) {
     const aggregateByParam = searchParams.get("aggregateBy");
     const aggregateBy = aggregateByParam === "connection" ? "connection" : "provider";
 
-    const data = getAggregatedSnapshots({
+    const data = await getAggregatedSnapshotsAsync({
       provider: providerParam || undefined,
       since,
       bucketMinutes,

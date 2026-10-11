@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
-import { getSuite } from "@/lib/evals/evalRunner";
+import { getSuiteAsync } from "@/lib/evals/evalRunner";
 import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
 
 export async function GET(request: Request, { params }: { params: Promise<{ suiteId: string }> }) {
@@ -9,7 +9,7 @@ export async function GET(request: Request, { params }: { params: Promise<{ suit
 
   try {
     const { suiteId } = await params;
-    const suite = getSuite(suiteId);
+    const suite = await getSuiteAsync(suiteId);
     if (!suite) {
       return NextResponse.json({ error: `Suite not found: ${suiteId}` }, { status: 404 });
     }

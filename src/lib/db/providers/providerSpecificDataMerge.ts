@@ -1,3 +1,4 @@
+import { getSelectedControlPlane } from "../controlPlaneContext";
 import { getDbInstance } from "../core";
 import { invalidateDbCache } from "../readCache";
 import { parseProviderSpecificData } from "../webSessionDedup";
@@ -24,6 +25,8 @@ export async function mergeConnectionProviderSpecificData(
   id: string,
   patch: Record<string, unknown>
 ): Promise<void> {
+  const selected = getSelectedControlPlane();
+  if (selected) return selected.providers.mergeProviderSpecificData(id, patch);
   const db = getDbInstance() as unknown as DbLike;
   // Transaction so a concurrent merge cannot lose a key: the SELECT and
   // UPDATE must observe the same row version (codex account-state precedent).

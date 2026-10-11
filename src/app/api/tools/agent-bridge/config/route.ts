@@ -12,13 +12,13 @@ import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
 import { createErrorResponse } from "@/lib/api/errorResponse";
 import {
   AgentBridgeConfigSchema,
-  exportConfig,
-  importConfig,
+  exportConfigAsync,
+  importConfigAsync,
 } from "@/lib/inspector/configPortability";
 
 export async function GET(): Promise<Response> {
   try {
-    return Response.json(exportConfig());
+    return Response.json(await exportConfigAsync());
   } catch (err) {
     const msg = sanitizeErrorMessage(err instanceof Error ? err.message : String(err));
     return createErrorResponse({ status: 500, message: msg });
@@ -35,7 +35,7 @@ export async function POST(request: Request): Promise<Response> {
     });
   }
   try {
-    const result = importConfig(parsed.data);
+    const result = await importConfigAsync(parsed.data);
     return Response.json({ ok: true, ...result });
   } catch (err) {
     const msg = sanitizeErrorMessage(err instanceof Error ? err.message : String(err));

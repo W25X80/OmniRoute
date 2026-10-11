@@ -14,8 +14,18 @@
 
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
+import { readFile } from "node:fs/promises";
+import { parseDatabaseBackend } from "@/lib/db/backendSelection";
+import { getSelectedPersistenceIdentity } from "@/lib/db/controlPlaneContext";
+import { runPersistenceBackgroundWork } from "@/lib/db/persistenceRuntime";
+import { withNativeThreadCacheFile } from "../utils/nativeThreadCacheFile.ts";
 import { join } from "node:path";
-import { ensureSecureDir, writeSecureFile } from "../utils/secureFileWrite.ts";
+import {
+  ensureSecureDir,
+  ensureSecureDirAsync,
+  writeSecureFile,
+  writeSecureFileAsync,
+} from "../utils/secureFileWrite.ts";
 import {
   AdobeFireflyError,
   buildAdobeArpSessionId,
@@ -212,14 +222,20 @@ export function getAdobeForterAgeMs(cookieOrBlob: string): number {
   return Math.max(0, Date.now() - ts);
 }
 
-/** Remember an ARP that just got generate-async 2xx — batch jobs must stick to it. */
-export function markAdobeFireflyArpSuccess(fingerprint: string, arpSessionId: string): void {
+function rememberAdobeWorkingArp(fingerprint: string, arpSessionId: string) {
   const fp = String(fingerprint || "").trim();
   const arp = String(arpSessionId || "").trim();
-  if (!fp || !arp) return;
+  if (!fp || !arp) return null;
   lastWorkingArpByFingerprint.set(fp, { arp, at: Date.now() });
   consecutiveAdobeSubmitSuccesses += 1;
-  const cached = sessionCache.get(fp);
+  return { fp, arp, cached: sessionCache.get(fp) };
+}
+
+/** Remember an ARP that just got generate-async 2xx — batch jobs must stick to it. */
+export function markAdobeFireflyArpSuccess(fingerprint: string, arpSessionId: string): void {
+  const update = rememberAdobeWorkingArp(fingerprint, arpSessionId);
+  if (!update) return;
+  const { fp, arp, cached } = update;
   if (cached) {
     cached.arpSessionId = arp;
     cached.updatedAt = Date.now();
@@ -238,6 +254,36 @@ export function markAdobeFireflyArpSuccess(fingerprint: string, arpSessionId: st
       }
     } catch {
       /* best-effort */
+    }
+  }
+}
+
+export async function markAdobeFireflyArpSuccessAsync(
+  fingerprint: string,
+  arpSessionId: string
+): Promise<void> {
+  if (parseDatabaseBackend() === "sqlite")
+    return markAdobeFireflyArpSuccess(fingerprint, arpSessionId);
+  const update = rememberAdobeWorkingArp(fingerprint, arpSessionId);
+  if (!update) return;
+  const { fp, arp, cached } = update;
+  if (cached) {
+    cached.arpSessionId = arp;
+    cached.updatedAt = Date.now();
+    sessionCache.set(fp, cached);
+    await saveDiskSessionAsync(cached);
+  } else {
+    // The source fingerprint-only branch deliberately does not apply the normal disk opt-out.
+    try {
+      await runNativeSessionFile(fp, async (path) => {
+        const obj = JSON.parse(await readFile(path, "utf8")) as AdobeFireflySession;
+        obj.arpSessionId = arp;
+        obj.updatedAt = Date.now();
+        await writeSecureFileAsync(path, JSON.stringify(obj, null, 2));
+        sessionCache.set(fp, { ...obj, fingerprint: fp });
+      });
+    } catch {
+      // Sticky disk state remains best effort, as in the synchronous source.
     }
   }
 }
@@ -475,6 +521,47 @@ function saveDiskSession(session: AdobeFireflySession): void {
   }
 }
 
+function runNativeSessionFile<T>(
+  fingerprint: string,
+  body: (path: string) => Promise<T>
+): Promise<T> {
+  const dir = join(dataDir(), SESSION_DIR_NAME);
+  const path = join(dir, `${fingerprint}.json`);
+  return withNativeThreadCacheFile(path, async () => {
+    try {
+      await ensureSecureDirAsync(dir);
+    } catch {
+      /* source best effort */
+    }
+    return body(path);
+  });
+}
+
+async function loadDiskSessionAsync(fingerprint: string): Promise<AdobeFireflySession | null> {
+  if (parseDatabaseBackend() === "sqlite") return loadDiskSession(fingerprint);
+  if (!diskSessionsEnabled()) return null;
+  try {
+    return await runNativeSessionFile(fingerprint, async (path) => {
+      const obj = JSON.parse(await readFile(path, "utf8")) as AdobeFireflySession;
+      if (!obj?.accessToken || !isAdobeUserAccessToken(obj.accessToken)) return null;
+      return { ...obj, fingerprint, source: "cache" };
+    });
+  } catch {
+    return null;
+  }
+}
+
+async function saveDiskSessionAsync(session: AdobeFireflySession): Promise<void> {
+  if (parseDatabaseBackend() === "sqlite") return saveDiskSession(session);
+  if (!diskSessionsEnabled()) return;
+  try {
+    const contents = JSON.stringify(session, null, 2);
+    await runNativeSessionFile(session.fingerprint, (path) => writeSecureFileAsync(path, contents));
+  } catch {
+    // Preserve optional disk persistence failure behavior.
+  }
+}
+
 function collectCredentialBlobs(
   credentials: AdobeFireflySessionResolveOpts["credentials"]
 ): string[] {
@@ -532,6 +619,28 @@ async function writeBackAdobeFireflyCredentials(
       "ADOBE-FIREFLY",
       `credential write-back skipped: ${err instanceof Error ? err.message : String(err)}`
     );
+  }
+}
+
+function scheduleAdobeCredentialWriteBack(
+  session: AdobeFireflySession,
+  log?: AdobeFireflySessionResolveOpts["log"]
+): void {
+  if (parseDatabaseBackend() === "sqlite") {
+    void writeBackAdobeFireflyCredentials(session, log);
+    return;
+  }
+  const refused = () => log?.warn?.("ADOBE-FIREFLY", "credential write-back was not completed");
+  try {
+    const identity = getSelectedPersistenceIdentity();
+    if (!identity) throw new Error("Native credential write-back has no persistence owner");
+    void runPersistenceBackgroundWork(async () => {
+      if (getSelectedPersistenceIdentity() !== identity)
+        throw new Error("Native credential write-back persistence owner changed");
+      await writeBackAdobeFireflyCredentials(session, log);
+    }).catch(refused);
+  } catch {
+    refused();
   }
 }
 
@@ -618,9 +727,9 @@ export async function refreshAdobeSessionViaBrowser(
       source: "browser",
     };
     sessionCache.set(session.fingerprint, next);
-    saveDiskSession(next);
+    await saveDiskSessionAsync(next);
     clearAdobeFireflyWorkingArp(session.fingerprint);
-    void writeBackAdobeFireflyCredentials(next, log);
+    scheduleAdobeCredentialWriteBack(next, log);
     log?.info?.(
       "ADOBE-FIREFLY",
       `durable CDP warm refreshed session (arpLen=${next.arpSessionId.length}, force=${force}, forterTs=${warmFtr || 0}, forterDeltaMs=${warmFtr && baseFtr ? warmFtr - baseFtr : 0})`
@@ -675,8 +784,8 @@ export async function ensureAdobeFireflySession(
   const legacyFingerprint = fingerprintAdobeCredential(joined);
   const cached =
     sessionCache.get(fingerprint) ||
-    loadDiskSession(fingerprint) ||
-    (legacyFingerprint !== fingerprint ? loadDiskSession(legacyFingerprint) : null);
+    (await loadDiskSessionAsync(fingerprint)) ||
+    (legacyFingerprint !== fingerprint ? await loadDiskSessionAsync(legacyFingerprint) : null);
   if (cached && !opts.forceRefresh) {
     // Re-key legacy disk session under the stable connection fingerprint.
     const normalized = {
@@ -903,10 +1012,10 @@ export async function ensureAdobeFireflySession(
   session.fingerprint = fingerprint;
   session.browserSessionKey = session.browserSessionKey || browserSessionKey;
   sessionCache.set(fingerprint, session);
-  saveDiskSession(session);
+  await saveDiskSessionAsync(session);
   // Keep SQLite in sync when we have a real connection + user JWT (best-effort).
   if (session.source === "browser" || session.source === "rebuild") {
-    void writeBackAdobeFireflyCredentials(session, opts.log);
+    scheduleAdobeCredentialWriteBack(session, opts.log);
   }
   return session;
 }
@@ -953,7 +1062,7 @@ export async function rotateAdobeFireflySessionOnError(
       source: "cache",
     };
     sessionCache.set(session.fingerprint, same);
-    saveDiskSession(same);
+    await saveDiskSessionAsync(same);
     opts?.log?.info?.(
       "ADOBE-FIREFLY",
       `408 recovery: reusing ARP (quiet period, attempt ${attempt}, forterAgeMs=${forterAgeMs ?? "unknown"})`
@@ -980,7 +1089,7 @@ export async function rotateAdobeFireflySessionOnError(
     if (warmed?.arpSessionId) {
       const next = { ...warmed, fingerprint: session.fingerprint };
       sessionCache.set(session.fingerprint, next);
-      saveDiskSession(next);
+      await saveDiskSessionAsync(next);
       opts?.log?.info?.(
         "ADOBE-FIREFLY",
         `${opts?.authFailure ? "auth" : "408"} recovery: CDP warm done (arp changed=${warmed.arpSessionId !== prevArp}, forterTs=${extractAdobeForterTimestampMs(warmed.cookie)})`
@@ -999,7 +1108,7 @@ export async function rotateAdobeFireflySessionOnError(
     source: "rebuild",
   };
   sessionCache.set(session.fingerprint, next);
-  saveDiskSession(next);
+  await saveDiskSessionAsync(next);
   return next;
 }
 

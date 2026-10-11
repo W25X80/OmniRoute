@@ -1,3 +1,5 @@
+import { getSelectedPostgresDatabase } from "./controlPlaneContext";
+import { createPostgresMiddlewareRepository } from "./postgres/middlewareRepository";
 /**
  * Middleware Hooks DB — CRUD operations for middleware_hooks table
  *
@@ -175,4 +177,55 @@ export function getHookLogs(hookName?: string, limit = 50): HookLogEntry[] {
     error: r.error,
     timestamp: r.timestamp,
   }));
+}
+
+export async function getAllMiddlewareHooksAsync(): Promise<HookConfig[]> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return getAllMiddlewareHooks();
+  return createPostgresMiddlewareRepository(database).list();
+}
+
+export async function getEnabledMiddlewareHooksAsync(): Promise<HookConfig[]> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return getEnabledMiddlewareHooks();
+  return createPostgresMiddlewareRepository(database).list(true);
+}
+
+export async function getMiddlewareHookAsync(name: string): Promise<HookConfig | undefined> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return getMiddlewareHook(name);
+  return createPostgresMiddlewareRepository(database).get(name);
+}
+
+export async function createMiddlewareHookAsync(config: HookConfig): Promise<HookConfig> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return createMiddlewareHook(config);
+  return createPostgresMiddlewareRepository(database).create(config);
+}
+
+export async function updateMiddlewareHookAsync(
+  name: string,
+  updates: Partial<HookConfig>
+): Promise<HookConfig | undefined> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return updateMiddlewareHook(name, updates);
+  return createPostgresMiddlewareRepository(database).update(name, updates);
+}
+
+export async function deleteMiddlewareHookAsync(name: string): Promise<boolean> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return deleteMiddlewareHook(name);
+  return createPostgresMiddlewareRepository(database).delete(name);
+}
+
+export async function recordHookExecutionAsync(name: string, error?: string): Promise<void> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return recordHookExecution(name, error);
+  return createPostgresMiddlewareRepository(database).recordExecution(name, error);
+}
+
+export async function getHookLogsAsync(hookName?: string, limit = 50): Promise<HookLogEntry[]> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return getHookLogs(hookName, limit);
+  return createPostgresMiddlewareRepository(database).logs(hookName, limit);
 }

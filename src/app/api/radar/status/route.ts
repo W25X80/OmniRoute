@@ -5,11 +5,11 @@ import { NextResponse } from "next/server";
 import { buildErrorBody, sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
 
 import {
-  getRadarCache,
-  getRadarIntelCache,
-  getRadarOffersCache,
-  getRadarReferralsCache,
-  getRadarSettings,
+  getRadarCacheAsync,
+  getRadarIntelCacheAsync,
+  getRadarOffersCacheAsync,
+  getRadarReferralsCacheAsync,
+  getRadarSettingsAsync,
 } from "@/lib/db/radar";
 import { isAuthenticated } from "@/shared/utils/apiAuth";
 import { CORS_HEADERS, handleCorsOptions } from "@/shared/utils/cors";
@@ -54,15 +54,15 @@ export async function GET(request: Request) {
     });
   }
   try {
-    const settings = getRadarSettings();
+    const settings = await getRadarSettingsAsync();
     return NextResponse.json(
       {
         settings: { optIn: settings.optIn, hasSupporterKey: settings.supporterKey !== null },
         feeds: {
-          catalog: cacheStatus(getRadarCache()),
-          referrals: cacheStatus(getRadarReferralsCache()),
-          offers: cacheStatus(getRadarOffersCache()),
-          intel: cacheStatus(getRadarIntelCache()),
+          catalog: cacheStatus(await getRadarCacheAsync()),
+          referrals: cacheStatus(await getRadarReferralsCacheAsync()),
+          offers: cacheStatus(await getRadarOffersCacheAsync()),
+          intel: cacheStatus(await getRadarIntelCacheAsync()),
         },
       },
       { headers: { ...CORS_HEADERS, "Cache-Control": "no-store" } }

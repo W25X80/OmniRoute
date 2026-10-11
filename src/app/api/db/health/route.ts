@@ -1,5 +1,6 @@
+import { persistenceCapabilityResponse } from "@/lib/db/persistenceCapabilities";
 import { NextResponse } from "next/server";
-import { runManagedDbHealthCheck } from "@/lib/db/core";
+import { runManagedDatabaseHealthCheck } from "@/lib/db/healthCheck";
 import { isAuthenticated } from "@/shared/utils/apiAuth";
 import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
 
@@ -10,9 +11,11 @@ export async function GET(request: Request) {
 
   try {
     return NextResponse.json(
-      await runManagedDbHealthCheck({ autoRepair: false, skipIntegrityCheck: true })
+      await runManagedDatabaseHealthCheck({ autoRepair: false, skipIntegrityCheck: true })
     );
   } catch (error) {
+    const unavailable = persistenceCapabilityResponse(error);
+    if (unavailable) return NextResponse.json(unavailable, { status: 501 });
     const message = error instanceof Error ? error.message : String(error);
     console.error("[API] DB health diagnosis failed:", message);
     return NextResponse.json(
@@ -28,8 +31,10 @@ export async function POST(request: Request) {
   }
 
   try {
-    return NextResponse.json(await runManagedDbHealthCheck({ autoRepair: true }));
+    return NextResponse.json(await runManagedDatabaseHealthCheck({ autoRepair: true }));
   } catch (error) {
+    const unavailable = persistenceCapabilityResponse(error);
+    if (unavailable) return NextResponse.json(unavailable, { status: 501 });
     const message = error instanceof Error ? error.message : String(error);
     console.error("[API] DB health repair failed:", message);
     return NextResponse.json(

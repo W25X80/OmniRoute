@@ -11,6 +11,7 @@ import {
   readFileSync,
   existsSync,
 } from "node:fs";
+import { chmod, mkdir, open, rename, rm } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join, resolve, sep, win32 } from "node:path";
 import { tmpdir } from "node:os";
@@ -529,7 +530,9 @@ export function providerConfig(config: AppConfig): CodexProviderConfig {
     contextWindow: config.contextWindow,
     modelInputModalities: Object.fromEntries(models.map((model) => [model, ["text", "image"]])),
     modelReasoningEfforts: { [model]: efforts },
-    modelDefaultReasoningEfforts: { [model]: config.solAvailable ? "high" : "low" },
+    modelDefaultReasoningEfforts: {
+      [model]: config.solAvailable ? "high" : "low",
+    },
     noReasoningModels: [],
     chatgptWeb: {
       appName: config.appName,
@@ -549,4 +552,46 @@ export function providerConfig(config: AppConfig): CodexProviderConfig {
       autoApproveToolCalls: config.autoApproveToolCalls,
     },
   };
+}
+
+/** Same local atomic replacement contract as the sync CLI helper, with asynchronous I/O. */
+export async function atomicWriteFileAsync(path: string, data: string | Uint8Array): Promise<void> {
+  const directory = dirname(path);
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  try {
+    await chmod(directory, 0o700);
+  } catch {
+    /* Windows ACLs are managed by the installer. */
+  }
+  const temp = `${path}.tmp-${process.pid}-${crypto.randomUUID()}`;
+  const fd = await open(temp, "wx", 0o600);
+  try {
+    await fd.writeFile(data);
+    await fd.close();
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        await rename(temp, path);
+        break;
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        const transientWindowsError =
+          process.platform === "win32" &&
+          (code === "EBUSY" || code === "EPERM" || code === "EACCES");
+        const delay = WINDOWS_RENAME_RETRY_DELAYS_MS[attempt];
+        if (!transientWindowsError || delay === undefined) throw error;
+        await new Promise((resolveDelay) => setTimeout(resolveDelay, delay));
+      }
+    }
+  } catch (error) {
+    try {
+      await fd.close();
+    } catch {}
+    await rm(temp, { force: true });
+    throw error;
+  }
+  try {
+    await chmod(path, 0o600);
+  } catch {
+    /* Windows ACLs are managed by the installer. */
+  }
 }

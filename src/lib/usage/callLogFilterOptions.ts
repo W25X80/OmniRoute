@@ -1,3 +1,4 @@
+import { getSelectedCallLogRepository } from "../db/postgres/callLogRepository";
 import { getDbInstance } from "../db/core";
 import { RESOLVED_ACCOUNT_SQL } from "./callLogs";
 
@@ -23,6 +24,16 @@ function distinctStrings(rows: { value: unknown }[]): string[] {
  * match the `LIKE` filters in getCallLogs(); accounts use the same resolution as rows.
  */
 export async function getCallLogFilterOptions(): Promise<CallLogFilterOptions> {
+  const postgres = getSelectedCallLogRepository();
+  if (postgres) {
+    const rows = await postgres.filterOptions();
+    return {
+      providers: distinctStrings(rows.providers),
+      models: distinctStrings(rows.models),
+      accounts: distinctStrings(rows.accounts),
+      apiKeys: rows.apiKeys,
+    };
+  }
   const db = getDbInstance();
   const providers = db.prepare("SELECT DISTINCT provider AS value FROM call_logs").all() as {
     value: unknown;

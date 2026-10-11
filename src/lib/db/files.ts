@@ -1,3 +1,4 @@
+import { getSelectedPostgresDatabase } from "./controlPlaneContext";
 import { getDbInstance, rowToCamel, objToSnake } from "./core";
 import { v4 as uuidv4 } from "uuid";
 import { DEFAULT_BATCH_EXPIRATION_SECONDS } from "@/shared/constants/batch";
@@ -213,4 +214,92 @@ export function pruneExpiredFiles(now: number): number {
     )
     .run(now, now);
   return result.changes ?? 0;
+}
+
+export async function createFileAsync(
+  ...args: Parameters<typeof createFile>
+): Promise<ReturnType<typeof createFile>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceFiles");
+    return postgres.transaction((transaction) => native.createFile(transaction, ...args));
+  }
+  return createFile(...args);
+}
+
+export async function getFileAsync(
+  ...args: Parameters<typeof getFile>
+): Promise<ReturnType<typeof getFile>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceFiles");
+    return postgres.transaction((transaction) => native.getFile(transaction, ...args));
+  }
+  return getFile(...args);
+}
+
+export async function getFileContentAsync(
+  ...args: Parameters<typeof getFileContent>
+): Promise<ReturnType<typeof getFileContent>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceFiles");
+    return postgres.transaction((transaction) => native.getFileContent(transaction, ...args));
+  }
+  return getFileContent(...args);
+}
+
+export async function listFilesAsync(
+  ...args: Parameters<typeof listFiles>
+): Promise<ReturnType<typeof listFiles>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceFiles");
+    return postgres.transaction((transaction) => native.listFiles(transaction, ...args));
+  }
+  return listFiles(...args);
+}
+
+export async function countFilesAsync(
+  ...args: Parameters<typeof countFiles>
+): Promise<ReturnType<typeof countFiles>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceFiles");
+    return postgres.transaction((transaction) => native.countFiles(transaction, ...args));
+  }
+  return countFiles(...args);
+}
+
+export async function deleteFileAsync(
+  ...args: Parameters<typeof deleteFile>
+): Promise<ReturnType<typeof deleteFile>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceFiles");
+    return postgres.transaction((transaction) => native.deleteFile(transaction, ...args));
+  }
+  return deleteFile(...args);
+}
+
+export async function deleteFileOwnedByAsync(
+  ...args: Parameters<typeof deleteFileOwnedBy>
+): Promise<ReturnType<typeof deleteFileOwnedBy>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceFiles");
+    return postgres.transaction((transaction) => native.deleteFileOwnedBy(transaction, ...args));
+  }
+  return deleteFileOwnedBy(...args);
+}
+
+export async function pruneExpiredFilesAsync(
+  ...args: Parameters<typeof pruneExpiredFiles>
+): Promise<ReturnType<typeof pruneExpiredFiles>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceFiles");
+    return postgres.transaction((transaction) => native.pruneExpiredFiles(transaction, ...args));
+  }
+  return pruneExpiredFiles(...args);
 }

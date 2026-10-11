@@ -2,6 +2,13 @@ import { createHash, randomUUID } from "crypto";
 
 import { getDbInstance, rowToCamel } from "./core";
 import { decrypt, encrypt } from "./encryption";
+import { getSelectedPostgresDatabase } from "./controlPlaneContext";
+import {
+  createPostgresCommandAuth,
+  receivePostgresCommandAuth,
+  getPostgresCommandAuth,
+  consumePostgresCommandAuth,
+} from "./postgres/authSessionRepository";
 
 export type CommandCodeAuthStatus = "pending" | "received" | "applied" | "expired";
 
@@ -206,4 +213,43 @@ export function consumeCommandCodeAuthSecret(
       apiKey,
     };
   })() as ConsumedCommandCodeAuthSecret | null;
+}
+
+export async function createPendingCommandCodeAuthSessionAsync(input: {
+  stateHash: string;
+  expiresAt: string;
+}): Promise<CommandCodeAuthSafeStatus> {
+  const postgres = getSelectedPostgresDatabase();
+  return postgres
+    ? createPostgresCommandAuth(postgres, input)
+    : createPendingCommandCodeAuthSession(input);
+}
+
+export async function markCommandCodeAuthSessionReceivedAsync(input: {
+  stateHash: string;
+  apiKey: string;
+  metadata?: CommandCodeAuthMetadata;
+}): Promise<CommandCodeAuthSafeStatus | null> {
+  const postgres = getSelectedPostgresDatabase();
+  return postgres
+    ? receivePostgresCommandAuth(postgres, input)
+    : markCommandCodeAuthSessionReceived(input);
+}
+
+export async function getCommandCodeAuthSessionSafeStatusAsync(
+  stateHash: string
+): Promise<CommandCodeAuthSafeStatus | null> {
+  const postgres = getSelectedPostgresDatabase();
+  return postgres
+    ? getPostgresCommandAuth(postgres, stateHash)
+    : getCommandCodeAuthSessionSafeStatus(stateHash);
+}
+
+export async function consumeCommandCodeAuthSecretAsync(
+  stateHash: string
+): Promise<ConsumedCommandCodeAuthSecret | null> {
+  const postgres = getSelectedPostgresDatabase();
+  return postgres
+    ? consumePostgresCommandAuth(postgres, stateHash)
+    : consumeCommandCodeAuthSecret(stateHash);
 }

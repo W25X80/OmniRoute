@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { listFiles } from "@/lib/db/files";
+import { listFilesAsync } from "@/lib/db/files";
 import { getApiKeyRequestScope, resolveListScope } from "@/app/api/v1/_helpers/apiKeyScope";
 
 export async function GET(request: Request) {
@@ -18,8 +18,8 @@ export async function GET(request: Request) {
     const limit = Number.parseInt(url.searchParams.get("limit") || "100", 10);
     const files =
       listScope.mode === "api_key"
-        ? listFiles({ limit, apiKeyId: listScope.apiKeyId })
-        : listFiles({ limit });
+        ? await listFilesAsync({ limit, apiKeyId: listScope.apiKeyId })
+        : await listFilesAsync({ limit });
     return NextResponse.json({ files });
   } catch (error) {
     console.log("Error fetching files:", error);

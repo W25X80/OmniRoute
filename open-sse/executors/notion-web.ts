@@ -28,6 +28,7 @@
  * and Chrome work with the same cookie + body. See services/notionTlsClient.ts.
  */
 import { randomUUID } from "node:crypto";
+import { parseDatabaseBackend } from "@/lib/db/backendSelection";
 import { BaseExecutor, type ExecuteInput } from "./base.ts";
 import {
   makeExecutorErrorResult as makeErrorResult,
@@ -45,12 +46,16 @@ import {
   extractNotionMessageText,
   hashNotionConversation,
   notionThreadMarkConfirmed,
+  notionThreadMarkConfirmedAsync,
   notionThreadMarkCreateAttempted,
+  notionThreadMarkCreateAttemptedAsync,
   notionThreadSessionLookup,
   notionThreadSessionStore,
+  notionThreadSessionStoreAsync,
   readClientThreadId,
   hashNotionCallerCookie,
   resolveNotionThreadBinding,
+  resolveNotionThreadBindingAsync,
   type NotionMessage,
 } from "../services/notionThreadSessions.ts";
 import {
@@ -620,7 +625,10 @@ export class NotionWebExecutor extends BaseExecutor {
     const threadSpaceKey = agent.workflowId
       ? `caller:${callerScope}|${spaceId}|wf:${agent.workflowId}`
       : `caller:${callerScope}|${spaceId}`;
-    const binding = resolveNotionThreadBinding(threadSpaceKey, messages, clientThreadId);
+    const nativeFiles = parseDatabaseBackend() === "postgres";
+    const binding = nativeFiles
+      ? await resolveNotionThreadBindingAsync(threadSpaceKey, messages, clientThreadId)
+      : resolveNotionThreadBinding(threadSpaceKey, messages, clientThreadId);
     let { threadId, createThread, rootKey } = binding;
 
     const reqHeaders = buildNotionExecuteHeaders({ cookie, spaceId, userId, agent });
@@ -662,7 +670,8 @@ export class NotionWebExecutor extends BaseExecutor {
       });
 
       if (opts.createThread) {
-        notionThreadMarkCreateAttempted(rootKey, opts.threadId);
+        if (nativeFiles) await notionThreadMarkCreateAttemptedAsync(rootKey, opts.threadId);
+        else notionThreadMarkCreateAttempted(rootKey, opts.threadId);
       }
 
       const { rawText, errorResult } = await sendNotionInferenceRequest({
@@ -727,8 +736,13 @@ export class NotionWebExecutor extends BaseExecutor {
     }
 
     // Confirm sticky binding + prefix keys for multi-turn continuity
-    notionThreadMarkConfirmed(rootKey, threadId);
-    notionThreadSessionStore(threadSpaceKey, messages, attempt.finalText, threadId);
+    if (nativeFiles) {
+      await notionThreadMarkConfirmedAsync(rootKey, threadId);
+      await notionThreadSessionStoreAsync(threadSpaceKey, messages, attempt.finalText, threadId);
+    } else {
+      notionThreadMarkConfirmed(rootKey, threadId);
+      notionThreadSessionStore(threadSpaceKey, messages, attempt.finalText, threadId);
+    }
 
     const response = wantStream
       ? pseudoStreamResponse(attempt.finalText, modelId, threadId)

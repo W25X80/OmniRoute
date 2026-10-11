@@ -1,3 +1,5 @@
+import * as postgres from "./postgres/callLogStatsRepository";
+import { getPostgresUsageDatabase } from "./postgres/usageQueries";
 import { getDbInstance } from "./core";
 import { ERROR_TYPE_CONTRACT } from "@omniroute/open-sse/services/errorClassifier.ts";
 import {
@@ -426,4 +428,58 @@ export function getErrorTypeBreakdown(
     )
     .all(params) as Array<{ errorType: string; count: number }>;
   return rows.map((row) => ({ errorType: String(row.errorType), count: Number(row.count) }));
+}
+
+export async function getProviderMetricsAsync(): Promise<ProviderMetricRow[]> {
+  const database = getPostgresUsageDatabase();
+  return database ? postgres.getProviderMetrics(database) : getProviderMetrics();
+}
+
+export async function getProviderUsageSinceAsync(since: string): Promise<ProviderUsageRow[]> {
+  const database = getPostgresUsageDatabase();
+  return database ? postgres.getProviderUsageSince(database, since) : getProviderUsageSince(since);
+}
+
+export async function getSearchProviderStatsAsync(): Promise<SearchProviderStatRow[]> {
+  const database = getPostgresUsageDatabase();
+  return database ? postgres.getSearchProviderStats(database) : getSearchProviderStats();
+}
+
+export async function getRecentSearchLogsAsync(): Promise<SearchRecentRow[]> {
+  const database = getPostgresUsageDatabase();
+  return database ? postgres.getRecentSearchLogs(database) : getRecentSearchLogs();
+}
+
+export async function getSearchAggregateStatsAsync(
+  todayIso: string
+): Promise<SearchAggregateStats> {
+  const database = getPostgresUsageDatabase();
+  return database
+    ? postgres.getSearchAggregateStats(database, todayIso)
+    : getSearchAggregateStats(todayIso);
+}
+
+export async function getSearchProviderCountsAsync(): Promise<SearchProviderCountRow[]> {
+  const database = getPostgresUsageDatabase();
+  return database ? postgres.getSearchProviderCounts(database) : getSearchProviderCounts();
+}
+
+export async function getFallbackStatsAsync(
+  whereClause: string,
+  params: Record<string, string>
+): Promise<FallbackStatsRow> {
+  const database = getPostgresUsageDatabase();
+  return database
+    ? postgres.getFallbackStats(database, whereClause, params)
+    : getFallbackStats(whereClause, params);
+}
+
+export async function getErrorTypeBreakdownAsync(
+  whereClause: string,
+  params: Record<string, string>
+): Promise<Array<{ errorType: string; count: number }>> {
+  const database = getPostgresUsageDatabase();
+  return database
+    ? postgres.getErrorTypeBreakdown(database, whereClause, params)
+    : getErrorTypeBreakdown(whereClause, params);
 }

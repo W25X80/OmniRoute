@@ -1,3 +1,18 @@
+import { parseDatabaseBackend } from "@/lib/db/backendSelection";
+import { getSelectedPersistenceIdentity } from "@/lib/db/controlPlaneContext";
+import { runPersistenceBackgroundWork } from "@/lib/db/persistenceRuntime";
+import { createPersistencePoller, type PersistencePoller } from "@/lib/config/persistencePoller";
+import { assertSqliteBackendAllowed } from "./db/controlPlaneContext";
+import { getSelectedPostgresDatabase } from "./db/controlPlaneContext";
+import {
+  catalogNamespaceRows,
+  catalogValue,
+  requirePostgresCatalogSnapshot,
+  mutatePostgresCatalog,
+  writePostgresCatalog,
+  putCatalogValue,
+  afterPostgresCatalogCommit,
+} from "./db/postgres/catalogSnapshot";
 /**
  * pricingSync.ts — External pricing sync engine.
  *
@@ -263,6 +278,19 @@ let pricingMemoVersion = -1; // -1: never equals a real cacheVersion (starts at 
  * Read synced pricing from `pricing_synced` namespace.
  */
 export function getSyncedPricing(): PricingByProvider {
+  if (getSelectedPostgresDatabase()) {
+    requirePostgresCatalogSnapshot();
+    const synced: PricingByProvider = {};
+    for (const row of catalogNamespaceRows("pricing_synced")) {
+      try {
+        synced[row.key] = JSON.parse(row.value) as PricingModels;
+      } catch {
+        console.warn(`[PRICING_SYNC] Corrupted data for provider "${row.key}", skipping`);
+      }
+    }
+    return synced;
+  }
+
   const currentVersion = getModelCatalogCacheVersion();
   if (pricingMemo !== null && pricingMemoVersion === currentVersion) {
     return pricingMemo;
@@ -292,7 +320,25 @@ export function getSyncedPricing(): PricingByProvider {
 /**
  * Save synced pricing to `pricing_synced` namespace (full replace).
  */
-export function saveSyncedPricing(data: PricingByProvider): void {
+export async function saveSyncedPricingAsync(data: PricingByProvider): Promise<void> {
+  const catalogDatabase = getSelectedPostgresDatabase();
+  if (catalogDatabase)
+    return mutatePostgresCatalog(catalogDatabase, async () => {
+      await writePostgresCatalog("DELETE FROM omniroute.key_value WHERE namespace=$1", [
+        "pricing_synced",
+      ]);
+      const rows = Object.entries(data).map(([key, models]) => ({
+        key,
+        value: JSON.stringify(models),
+      }));
+      if (rows.length)
+        await writePostgresCatalog(
+          "INSERT INTO omniroute.key_value(namespace,key,value) SELECT $1, key,value FROM json_to_recordset($2::json) AS data(key text,value text)",
+          ["pricing_synced", JSON.stringify(rows)]
+        );
+      afterPostgresCatalogCommit(() => invalidateDbCache("pricing"));
+    });
+
   const db = getDbInstance();
   const del = db.prepare("DELETE FROM key_value WHERE namespace = 'pricing_synced'");
   const insert = db.prepare(
@@ -312,7 +358,16 @@ export function saveSyncedPricing(data: PricingByProvider): void {
 /**
  * Clear all synced pricing data.
  */
-export function clearSyncedPricing(): void {
+export async function clearSyncedPricingAsync(): Promise<void> {
+  const catalogDatabase = getSelectedPostgresDatabase();
+  if (catalogDatabase)
+    return mutatePostgresCatalog(catalogDatabase, async () => {
+      await writePostgresCatalog("DELETE FROM omniroute.key_value WHERE namespace=$1", [
+        "pricing_synced",
+      ]);
+      afterPostgresCatalogCommit(() => invalidateDbCache("pricing"));
+    });
+
   const db = getDbInstance();
   db.prepare("DELETE FROM key_value WHERE namespace = 'pricing_synced'").run();
   backupDbFile("pre-write");
@@ -332,6 +387,22 @@ const SYNC_STATUS_NAMESPACE = "pricing_sync_status";
 const SYNC_STATUS_KEY = "last_sync";
 
 function readPersistedSyncStatus(): { lastSyncTime: string; lastSyncModelCount: number } | null {
+  if (getSelectedPostgresDatabase()) {
+    requirePostgresCatalogSnapshot();
+    const row = catalogValue(SYNC_STATUS_NAMESPACE, SYNC_STATUS_KEY);
+    try {
+      const parsed = row ? JSON.parse(row.value) : null;
+      if (typeof parsed?.lastSyncTime !== "string") return null;
+      return {
+        lastSyncTime: parsed.lastSyncTime,
+        lastSyncModelCount:
+          typeof parsed.lastSyncModelCount === "number" ? parsed.lastSyncModelCount : 0,
+      };
+    } catch {
+      return null;
+    }
+  }
+
   const db = getDbInstance();
   const row = db
     .prepare("SELECT value FROM key_value WHERE namespace = ? AND key = ?")
@@ -352,7 +423,17 @@ function readPersistedSyncStatus(): { lastSyncTime: string; lastSyncModelCount: 
   }
 }
 
-function writePersistedSyncStatus(lastSync: string, modelCount: number): void {
+async function writePersistedSyncStatusAsync(lastSync: string, modelCount: number): Promise<void> {
+  const catalogDatabase = getSelectedPostgresDatabase();
+  if (catalogDatabase)
+    return mutatePostgresCatalog(catalogDatabase, async () => {
+      await putCatalogValue(
+        SYNC_STATUS_NAMESPACE,
+        SYNC_STATUS_KEY,
+        JSON.stringify({ lastSyncTime: lastSync, lastSyncModelCount: modelCount })
+      );
+    });
+
   const db = getDbInstance();
   db.prepare(
     "INSERT INTO key_value (namespace, key, value) VALUES (?, ?, ?) " +
@@ -417,10 +498,10 @@ export async function syncPricingFromSources(opts?: {
     const providerCount = Object.keys(aggregated).length;
 
     if (!dryRun) {
-      saveSyncedPricing(aggregated);
+      await saveSyncedPricingAsync(aggregated);
       lastSyncTime = new Date().toISOString();
       lastSyncModelCount = modelCount;
-      writePersistedSyncStatus(lastSyncTime, modelCount);
+      await writePersistedSyncStatusAsync(lastSyncTime, modelCount);
     }
 
     return {
@@ -453,7 +534,60 @@ export async function syncPricingFromSources(opts?: {
 /**
  * Start periodic pricing sync (non-blocking).
  */
+interface NativeSchedulerOwner {
+  readonly identity: object;
+  readonly poller: PersistencePoller;
+  stopping?: Promise<void>;
+}
+const NATIVE_SCHEDULER = Symbol.for("omniroute.pricingSync.postgresScheduler");
+const nativeGlobals = globalThis as typeof globalThis & {
+  [NATIVE_SCHEDULER]?: NativeSchedulerOwner;
+};
+
+function stopNativePoller(): Promise<void> {
+  const owner = nativeGlobals[NATIVE_SCHEDULER];
+  if (!owner) return Promise.resolve();
+
+  owner.stopping ??= owner.poller.stop().finally(() => {
+    if (nativeGlobals[NATIVE_SCHEDULER] === owner) nativeGlobals[NATIVE_SCHEDULER] = undefined;
+  });
+  return owner.stopping;
+}
+
 export function startPeriodicSync(intervalMs?: number): void {
+  if (parseDatabaseBackend() === "postgres") {
+    const identity = getSelectedPersistenceIdentity();
+    if (!identity) throw new Error("Native scheduler requires selected PostgreSQL persistence");
+    const existing = nativeGlobals[NATIVE_SCHEDULER];
+    if (existing) {
+      if (existing.identity !== identity || existing.stopping)
+        throw new Error("Native scheduler authority changed or is draining");
+      return;
+    }
+    const interval = intervalMs ?? SYNC_INTERVAL_MS;
+    activeSyncIntervalMs = interval;
+    const poller = createPersistencePoller({
+      intervalMs: interval,
+      initialDelayMs: 0,
+      check: async (phase) => {
+        await runPersistenceBackgroundWork(async () => {
+          if (getSelectedPersistenceIdentity() !== identity)
+            throw new Error("Native scheduler persistence identity changed");
+          const result = await syncPricingFromSources();
+          if (result.success)
+            console.log(
+              `[PRICING_SYNC] ${phase === "start" ? "Initial" : "Periodic"} sync complete: ${result.modelCount} models`
+            );
+        });
+      },
+      onFailure: () => {
+        console.warn("[PRICING_SYNC] Native periodic sync failed");
+      },
+    });
+    nativeGlobals[NATIVE_SCHEDULER] = { identity, poller };
+    poller.start();
+    return;
+  }
   if (syncTimer) return; // Already running
 
   const interval = intervalMs ?? SYNC_INTERVAL_MS;
@@ -473,8 +607,8 @@ export function startPeriodicSync(intervalMs?: number): void {
       console.warn("[PRICING_SYNC] Initial sync error:", err instanceof Error ? err.message : err);
     });
 
-  syncTimer = setInterval(() => {
-    syncPricingFromSources()
+  syncTimer = setInterval(async () => {
+    await syncPricingFromSources()
       .then((result) => {
         if (result.success) {
           console.log(`[PRICING_SYNC] Periodic sync complete: ${result.modelCount} models`);
@@ -497,6 +631,10 @@ export function startPeriodicSync(intervalMs?: number): void {
  * Stop periodic sync and cleanup timer.
  */
 export function stopPeriodicSync(): void {
+  if (parseDatabaseBackend() === "postgres") {
+    void stopNativePoller().catch(() => {});
+    return;
+  }
   if (syncTimer) {
     clearInterval(syncTimer);
     syncTimer = null;
@@ -511,7 +649,7 @@ export function getSyncStatus(): SyncStatus {
   const enabled = process.env.PRICING_SYNC_ENABLED === "true";
   // `lastSyncTime`/`lastSyncModelCount` are only reliably populated on the
   // module instance that performed the sync (see note above
-  // writePersistedSyncStatus) — fall back to the persisted DB record so
+  // writePersistedSyncStatusAsync) — fall back to the persisted DB record so
   // status reads from a different module instance still see it.
   const persisted = lastSyncTime === null ? readPersistedSyncStatus() : null;
   const effectiveLastSync = lastSyncTime ?? persisted?.lastSyncTime ?? null;
@@ -540,5 +678,37 @@ export async function initPricingSync(): Promise<void> {
     console.log("[PRICING_SYNC] Disabled (set PRICING_SYNC_ENABLED=true to enable)");
     return;
   }
-  startPeriodicSync();
+  await startPeriodicSync();
+}
+
+export function saveSyncedPricing(data: PricingByProvider): void {
+  assertSqliteBackendAllowed();
+  const db = getDbInstance();
+  const del = db.prepare("DELETE FROM key_value WHERE namespace = 'pricing_synced'");
+  const insert = db.prepare(
+    "INSERT INTO key_value (namespace, key, value) VALUES ('pricing_synced', ?, ?)"
+  );
+  const tx = db.transaction(() => {
+    del.run();
+    for (const [provider, models] of Object.entries(data)) {
+      insert.run(provider, JSON.stringify(models));
+    }
+  });
+  tx();
+  backupDbFile("pre-write");
+  invalidateDbCache("pricing");
+}
+
+export function clearSyncedPricing(): void {
+  assertSqliteBackendAllowed();
+  const db = getDbInstance();
+  db.prepare("DELETE FROM key_value WHERE namespace = 'pricing_synced'").run();
+  backupDbFile("pre-write");
+  invalidateDbCache("pricing");
+}
+
+/** Stop admission and wait for every accepted native tick. */
+export async function stopPeriodicSyncAsync(): Promise<void> {
+  if (parseDatabaseBackend() !== "postgres") return stopPeriodicSync();
+  await stopNativePoller();
 }

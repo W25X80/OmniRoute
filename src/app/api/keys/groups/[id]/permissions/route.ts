@@ -1,10 +1,10 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import {
-  addGroupPermission,
-  removeGroupPermission,
-  getGroupPermissions,
-  getKeyGroup,
+  addGroupPermissionAsync,
+  removeGroupPermissionAsync,
+  getGroupPermissionsAsync,
+  getKeyGroupAsync,
 } from "@/lib/db/apiKeyGroups";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
 
@@ -22,10 +22,10 @@ const addGroupPermissionSchema = z.object({
 export async function GET(request: Request, { params }: RouteParams) {
   try {
     const { id } = await params;
-    const group = getKeyGroup(id);
+    const group = await getKeyGroupAsync(id);
     if (!group) return NextResponse.json({ error: "Group not found" }, { status: 404 });
 
-    const permissions = getGroupPermissions(id);
+    const permissions = await getGroupPermissionsAsync(id);
     return NextResponse.json({ permissions });
   } catch (error) {
     return NextResponse.json({ error: "Failed to list permissions" }, { status: 500 });
@@ -39,7 +39,7 @@ export async function GET(request: Request, { params }: RouteParams) {
 export async function POST(request: Request, { params }: RouteParams) {
   try {
     const { id } = await params;
-    const group = getKeyGroup(id);
+    const group = await getKeyGroupAsync(id);
     if (!group) return NextResponse.json({ error: "Group not found" }, { status: 404 });
 
     const rawBody = await request.json();
@@ -48,7 +48,7 @@ export async function POST(request: Request, { params }: RouteParams) {
       return NextResponse.json({ error: validation.error }, { status: 400 });
     }
 
-    const permission = addGroupPermission(
+    const permission = await addGroupPermissionAsync(
       id,
       validation.data.modelPattern,
       validation.data.accessType,
@@ -71,7 +71,7 @@ export async function DELETE(request: Request, { params }: RouteParams) {
     if (!permissionId) {
       return NextResponse.json({ error: "permissionId query param required" }, { status: 400 });
     }
-    const removed = removeGroupPermission(permissionId);
+    const removed = await removeGroupPermissionAsync(permissionId);
     if (!removed) {
       return NextResponse.json({ error: "Permission not found" }, { status: 404 });
     }

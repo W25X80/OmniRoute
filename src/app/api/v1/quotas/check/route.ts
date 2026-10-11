@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { isAuthenticated } from "@/shared/utils/apiAuth";
-import { checkQuota } from "@/lib/db/registeredKeys";
+import { checkQuotaAsync } from "@/lib/db/registeredKeys";
 
 /**
  * GET /api/v1/quotas/check?provider=&accountId=
@@ -18,7 +18,7 @@ export async function GET(request: Request) {
   const accountId = searchParams.get("accountId") ?? "";
 
   try {
-    const result = checkQuota(provider, accountId);
+    const result = await checkQuotaAsync(provider, accountId);
     return NextResponse.json({
       allowed: result.allowed,
       ...(result.errorCode ? { errorCode: result.errorCode, reason: result.errorMessage } : {}),

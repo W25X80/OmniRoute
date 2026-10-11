@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 import { extractBearer, ACCESS_TOKEN_PREFIX } from "@/server/authz/accessTokenAuth";
-import { verifyAccessToken, getAccessToken } from "@/lib/db/accessTokens";
+import { verifyAccessTokenAsync, getAccessTokenAsync } from "@/lib/db/accessTokens";
 
 /**
  * GET /api/cli/whoami — report the current credential to the CLI.
@@ -18,9 +18,9 @@ export async function GET(request: Request) {
 
   const bearer = extractBearer(request);
   if (bearer && bearer.startsWith(ACCESS_TOKEN_PREFIX)) {
-    const verified = verifyAccessToken(bearer);
+    const verified = await verifyAccessTokenAsync(bearer);
     if (verified) {
-      const record = getAccessToken(verified.id);
+      const record = await getAccessTokenAsync(verified.id);
       return NextResponse.json({
         authenticated: true,
         viaAccessToken: true,

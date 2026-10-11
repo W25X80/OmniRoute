@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 
 import { authorizeA2ATaskRoute } from "@/app/api/a2a/_auth";
-import { listA2ATaskHistory } from "@/lib/db/a2aTasks";
+import { listA2ATaskHistoryAsync } from "@/lib/db/a2aTasks";
 import { buildErrorBody } from "@omniroute/open-sse/utils/error";
 
 /**
@@ -70,7 +70,7 @@ export async function GET(request: Request) {
     }
 
     const { from, to, skill, state, limit, offset } = parsed.data;
-    const { rows, total } = listA2ATaskHistory({
+    const { rows, total } = await listA2ATaskHistoryAsync({
       from,
       to,
       skill,

@@ -10,6 +10,9 @@
  */
 
 import { getDbInstance } from "./core";
+import { getSelectedPostgresDatabase } from "./controlPlaneContext";
+import { PostgresQuotaRepository } from "./postgres/quotaRepository";
+import { rowToQuotaPlan as rowToPlan, type QuotaPlanRow as PlanRow } from "./quotaSemantics";
 
 // ---------------------------------------------------------------------------
 // Local type shapes (aligned with src/lib/quota/dimensions.ts — merged by F7)
@@ -47,30 +50,6 @@ interface DbLike {
 
 function getDb(): DbLike {
   return getDbInstance() as unknown as DbLike;
-}
-
-interface PlanRow {
-  connection_id: string;
-  provider: string;
-  dimensions_json: string;
-  source: string;
-  updated_at: string;
-}
-
-function rowToPlan(row: PlanRow): ProviderPlan {
-  let dimensions: QuotaDimension[] = [];
-  try {
-    dimensions = JSON.parse(row.dimensions_json) as QuotaDimension[];
-  } catch {
-    // Malformed JSON — return empty dimensions rather than throwing
-    dimensions = [];
-  }
-  return {
-    connectionId: row.connection_id,
-    provider: row.provider,
-    dimensions,
-    source: row.source as "auto" | "manual",
-  };
 }
 
 // ---------------------------------------------------------------------------
@@ -146,4 +125,35 @@ export function deletePlan(connectionId: string): boolean {
     .prepare("DELETE FROM provider_plans WHERE connection_id = ?")
     .run(connectionId);
   return result.changes > 0;
+}
+
+function selectedQuotaRepository(): PostgresQuotaRepository | undefined {
+  const database = getSelectedPostgresDatabase();
+  return database ? new PostgresQuotaRepository(database) : undefined;
+}
+
+export async function getPlanAsync(connectionId: string): Promise<ProviderPlan | null> {
+  const repository = selectedQuotaRepository();
+  return repository ? repository.getPlan(connectionId) : getPlan(connectionId);
+}
+
+export async function listPlansAsync(): Promise<ProviderPlan[]> {
+  const repository = selectedQuotaRepository();
+  return repository ? repository.listPlans() : listPlans();
+}
+
+export async function upsertPlanAsync(
+  connectionId: string,
+  provider: string,
+  dimensions: QuotaDimension[],
+  source: "auto" | "manual"
+): Promise<void> {
+  const repository = selectedQuotaRepository();
+  if (repository) await repository.upsertPlan(connectionId, provider, dimensions, source);
+  else upsertPlan(connectionId, provider, dimensions, source);
+}
+
+export async function deletePlanAsync(connectionId: string): Promise<boolean> {
+  const repository = selectedQuotaRepository();
+  return repository ? repository.deletePlan(connectionId) : deletePlan(connectionId);
 }

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { existsSync, lstatSync, mkdirSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { assembleStandalone } from "./assembleStandalone.mjs";
@@ -191,6 +191,29 @@ runBuildTool(
   ],
   { stdio: "inherit" }
 );
+
+for (const relative of [
+  "open-sse/vendor/codex-chatgpt-web/responses/stateWorker",
+  "open-sse/executors/chatgpt-web-codex/tunnelZipWorker",
+]) {
+  const destination = join(ELECTRON_STANDALONE_DIR, `${relative}.js`);
+  mkdirSync(dirname(destination), { recursive: true });
+  runBuildTool(
+    "esbuild",
+    "esbuild",
+    [
+      join(ROOT, `${relative}.ts`),
+      "--bundle",
+      "--platform=node",
+      "--packages=external",
+      "--format=esm",
+      `--outfile=${destination}`,
+    ],
+    { stdio: "inherit" }
+  );
+  const scope = join(dirname(destination), "package.json");
+  if (!existsSync(scope)) writeFileSync(scope, JSON.stringify({ type: "module" }) + "\n");
+}
 
 const docsPrune = pruneElectronRuntimeDocs(ELECTRON_STANDALONE_DIR);
 if (docsPrune.removedFiles > 0) {

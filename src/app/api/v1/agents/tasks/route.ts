@@ -2,12 +2,12 @@ import { NextRequest, NextResponse } from "next/server";
 import { getAgent } from "@/lib/cloudAgent/registry";
 import type { CloudAgentTaskRow } from "@/lib/cloudAgent/db";
 import {
-  createCloudAgentTaskTable,
-  insertCloudAgentTask,
-  getAllCloudAgentTasks,
-  getCloudAgentTasksByProvider,
-  getCloudAgentTasksByStatus,
-  deleteCloudAgentTask,
+  createCloudAgentTaskTableAsync,
+  insertCloudAgentTaskAsync,
+  getAllCloudAgentTasksAsync,
+  getCloudAgentTasksByProviderAsync,
+  getCloudAgentTasksByStatusAsync,
+  deleteCloudAgentTaskAsync,
 } from "@/lib/cloudAgent/db";
 import {
   getCloudAgentCorsHeaders,
@@ -36,7 +36,7 @@ export async function GET(request: NextRequest) {
     const authError = await requireCloudAgentManagementAuth(request);
     if (authError) return authError;
 
-    createCloudAgentTaskTable();
+    await createCloudAgentTaskTableAsync();
 
     const { searchParams } = new URL(request.url);
     const providerId = searchParams.get("provider");
@@ -45,11 +45,11 @@ export async function GET(request: NextRequest) {
 
     let tasks: CloudAgentTaskRow[];
     if (providerId) {
-      tasks = getCloudAgentTasksByProvider(providerId, limit);
+      tasks = await getCloudAgentTasksByProviderAsync(providerId, limit);
     } else if (status) {
-      tasks = getCloudAgentTasksByStatus(status, limit);
+      tasks = await getCloudAgentTasksByStatusAsync(status, limit);
     } else {
-      tasks = getAllCloudAgentTasks(limit);
+      tasks = await getAllCloudAgentTasksAsync(limit);
     }
 
     return NextResponse.json(
@@ -113,8 +113,8 @@ export async function POST(request: NextRequest) {
       credentials
     );
 
-    createCloudAgentTaskTable();
-    insertCloudAgentTask({
+    await createCloudAgentTaskTableAsync();
+    await insertCloudAgentTaskAsync({
       id: task.id,
       provider_id: task.providerId,
       external_id: task.externalId || null,
@@ -163,7 +163,7 @@ export async function DELETE(request: NextRequest) {
     const authError = await requireCloudAgentManagementAuth(request);
     if (authError) return authError;
 
-    createCloudAgentTaskTable();
+    await createCloudAgentTaskTableAsync();
 
     const { searchParams } = new URL(request.url);
     const taskId = searchParams.get("id");
@@ -175,7 +175,7 @@ export async function DELETE(request: NextRequest) {
       );
     }
 
-    deleteCloudAgentTask(taskId);
+    await deleteCloudAgentTaskAsync(taskId);
 
     return NextResponse.json({ success: true }, { headers: getCloudAgentCorsHeaders(request) });
   } catch (error) {

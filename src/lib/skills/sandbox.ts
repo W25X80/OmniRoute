@@ -68,21 +68,29 @@ class SandboxRunner {
     image: string,
     command: string[],
     env: Record<string, string> = {},
-    configOverride: Partial<SandboxConfig> = {}
+    configOverride: Partial<SandboxConfig> = {},
+    abortSignal?: AbortSignal
   ): Promise<SandboxResult> {
     const sandboxId = randomUUID();
     const startTime = Date.now();
     const config = { ...this.config, ...configOverride };
+    if (abortSignal?.aborted) throw new Error("Skill execution timed out");
     const provider = await this.getProvider();
+    if (abortSignal?.aborted) throw new Error("Skill execution timed out");
     const resolved = provider.buildRun(image, command, sandboxId, config);
 
     return new Promise((resolve) => {
+      if (abortSignal?.aborted) throw new Error("Skill execution timed out");
       const proc = childProcess.spawn(resolved.command, resolved.args, {
         env: { ...process.env, ...env },
         stdio: ["ignore", "pipe", "pipe"],
       });
 
       this.runningContainers.set(sandboxId, proc);
+      const onAbort = () => {
+        this.kill(sandboxId);
+      };
+      abortSignal?.addEventListener("abort", onAbort, { once: true });
 
       let stdout = "";
       let stderr = "";
@@ -101,6 +109,7 @@ class SandboxRunner {
 
       proc.on("close", (code) => {
         clearTimeout(timeoutId);
+        abortSignal?.removeEventListener("abort", onAbort);
         this.runningContainers.delete(sandboxId);
 
         resolve({
@@ -116,6 +125,7 @@ class SandboxRunner {
 
       proc.on("error", (err) => {
         clearTimeout(timeoutId);
+        abortSignal?.removeEventListener("abort", onAbort);
         this.runningContainers.delete(sandboxId);
 
         resolve({

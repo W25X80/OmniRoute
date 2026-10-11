@@ -2,7 +2,10 @@ import { NextResponse } from "next/server";
 import { getCacheStats } from "@omniroute/open-sse/services/searchCache.ts";
 import { SEARCH_PROVIDERS } from "@omniroute/open-sse/config/searchRegistry.ts";
 import { isAuthenticated } from "@/shared/utils/apiAuth";
-import { getSearchProviderStats, getRecentSearchLogs } from "@/lib/db/callLogStats";
+import {
+  getSearchProviderStatsAsync as getSearchProviderStats,
+  getRecentSearchLogsAsync as getRecentSearchLogs,
+} from "@/lib/db/callLogStats";
 
 export async function GET(request: Request) {
   if (!(await isAuthenticated(request))) {
@@ -12,7 +15,7 @@ export async function GET(request: Request) {
     const cache = getCacheStats();
 
     // Provider aggregate stats — cost is per-query from registry
-    const providerStats = getSearchProviderStats();
+    const providerStats = await getSearchProviderStats();
 
     const providers: Record<
       string,
@@ -28,7 +31,7 @@ export async function GET(request: Request) {
     }
 
     // Recent searches
-    const recentRows = getRecentSearchLogs();
+    const recentRows = await getRecentSearchLogs();
 
     const recent_searches = recentRows.map((row) => {
       let query = "";

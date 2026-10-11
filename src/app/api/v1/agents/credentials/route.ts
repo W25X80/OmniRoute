@@ -1,8 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import {
-  listCloudAgentCredentials,
-  saveCloudAgentCredential,
+  listCloudAgentCredentialsAsync,
+  saveCloudAgentCredentialAsync,
   maskApiKey,
 } from "@/lib/cloudAgent/credentials";
 import { getCloudAgentCorsHeaders, requireCloudAgentManagementAuth } from "@/lib/cloudAgent/api";
@@ -26,7 +26,7 @@ export async function GET(request: NextRequest) {
     const authError = await requireCloudAgentManagementAuth(request);
     if (authError) return authError;
 
-    const data = listCloudAgentCredentials();
+    const data = await listCloudAgentCredentialsAsync();
 
     return NextResponse.json({ data }, { headers: getCloudAgentCorsHeaders(request) });
   } catch (error) {
@@ -58,7 +58,7 @@ export async function POST(request: NextRequest) {
 
     const { providerId, apiKey, baseUrl } = validation.data;
 
-    saveCloudAgentCredential(providerId, apiKey, baseUrl);
+    await saveCloudAgentCredentialAsync(providerId, apiKey, baseUrl);
 
     return NextResponse.json(
       {

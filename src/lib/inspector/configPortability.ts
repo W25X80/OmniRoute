@@ -12,6 +12,12 @@ import { z } from "zod";
 import { getUserBypassPatterns, replaceUserBypassPatterns } from "@/lib/db/agentBridgeBypass";
 import { listCustomHosts, addCustomHost } from "@/lib/db/inspectorCustomHosts";
 import { getMappingsForAgent, setMappings } from "@/lib/db/agentBridgeMappings";
+import { listCustomHostsAsync, addCustomHostAsync } from "@/lib/db/inspectorCustomHosts";
+import { getMappingsForAgentAsync, setMappingsAsync } from "@/lib/db/agentBridgeMappings";
+import {
+  getUserBypassPatternsAsync,
+  replaceUserBypassPatternsAsync,
+} from "@/lib/db/agentBridgeBypass";
 import { ALL_TARGETS } from "@/mitm/targets/index";
 
 export const AgentBridgeConfigSchema = z.object({
@@ -78,6 +84,41 @@ export function importConfig(config: AgentBridgeConfig): ImportResult {
     setMappings(agentId, mappings);
   }
 
+  return {
+    bypassPatterns: config.bypassPatterns.length,
+    customHosts: config.customHosts.length,
+    agents: Object.keys(config.agentMappings).length,
+  };
+}
+
+export async function exportConfigAsync(): Promise<AgentBridgeConfig> {
+  const customHosts = (await listCustomHostsAsync()).map((h) => ({
+    host: h.host,
+    kind: (h.kind as "llm" | "app" | "custom") ?? "custom",
+    label: h.label ?? null,
+  }));
+  const agentMappings: AgentBridgeConfig["agentMappings"] = {};
+  for (const target of ALL_TARGETS) {
+    const rows = await getMappingsForAgentAsync(target.id);
+    if (rows.length)
+      agentMappings[target.id] = rows.map((r) => ({
+        source: r.source_model,
+        target: r.target_model,
+      }));
+  }
+  return {
+    version: 1,
+    bypassPatterns: await getUserBypassPatternsAsync(),
+    customHosts,
+    agentMappings,
+  };
+}
+export async function importConfigAsync(config: AgentBridgeConfig): Promise<ImportResult> {
+  await replaceUserBypassPatternsAsync(config.bypassPatterns);
+  for (const host of config.customHosts)
+    await addCustomHostAsync(host.host, host.kind, host.label ?? undefined);
+  for (const [id, mappings] of Object.entries(config.agentMappings))
+    await setMappingsAsync(id, mappings);
   return {
     bypassPatterns: config.bypassPatterns.length,
     customHosts: config.customHosts.length,

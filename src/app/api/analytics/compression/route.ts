@@ -7,7 +7,7 @@
 
 import { NextResponse } from "next/server";
 export const dynamic = "force-dynamic";
-import { getCompressionAnalyticsSummary } from "@/lib/db/compressionAnalytics";
+import { getCompressionAnalyticsSummaryAsync } from "@/lib/db/compressionAnalytics";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 
 export async function GET(req: Request) {
@@ -19,7 +19,9 @@ export async function GET(req: Request) {
     const sinceParam = url.searchParams.get("since") ?? "24h";
     const validSince = ["24h", "7d", "30d", "all"].includes(sinceParam) ? sinceParam : "24h";
 
-    const summary = getCompressionAnalyticsSummary(validSince === "all" ? undefined : validSince);
+    const summary = await getCompressionAnalyticsSummaryAsync(
+      validSince === "all" ? undefined : validSince
+    );
 
     return NextResponse.json(summary);
   } catch (err: unknown) {

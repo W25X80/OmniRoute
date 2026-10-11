@@ -2,9 +2,9 @@ import { NextRequest, NextResponse } from "next/server";
 export const dynamic = "force-dynamic";
 import { isAuthenticated } from "@/shared/utils/apiAuth";
 import {
-  listSemanticCacheEntries,
-  deleteSemanticCacheBySignature,
-  deleteSemanticCacheByModel,
+  listSemanticCacheEntriesAsync,
+  deleteSemanticCacheBySignatureAsync,
+  deleteSemanticCacheByModelAsync,
 } from "@/lib/db/semanticCache";
 import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
 
@@ -22,7 +22,14 @@ export async function GET(req: NextRequest) {
     const sortBy = searchParams.get("sortBy") || "created_at";
     const sortOrder = searchParams.get("sortOrder") || "desc";
 
-    const { entries, total } = listSemanticCacheEntries({ page, limit, search, model, sortBy, sortOrder });
+    const { entries, total } = await listSemanticCacheEntriesAsync({
+      page,
+      limit,
+      search,
+      model,
+      sortBy,
+      sortOrder,
+    });
 
     return NextResponse.json({
       entries,
@@ -49,12 +56,12 @@ export async function DELETE(req: NextRequest) {
     const model = searchParams.get("model");
 
     if (signature) {
-      const { deleted } = deleteSemanticCacheBySignature(signature);
+      const { deleted } = await deleteSemanticCacheBySignatureAsync(signature);
       return NextResponse.json({ ok: true, deleted });
     }
 
     if (model) {
-      const { deleted } = deleteSemanticCacheByModel(model);
+      const { deleted } = await deleteSemanticCacheByModelAsync(model);
       return NextResponse.json({ ok: true, deleted });
     }
 

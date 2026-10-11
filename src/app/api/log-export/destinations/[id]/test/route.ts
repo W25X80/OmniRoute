@@ -6,7 +6,7 @@
 import { NextResponse } from "next/server";
 import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
-import { getLogExportDestination } from "@/lib/db/logExportDestinations";
+import { getLogExportDestinationAsync } from "@/lib/db/logExportDestinations";
 import { createClientForDestination } from "@/lib/logExport/runner";
 
 export async function POST(request: Request, { params }: { params: Promise<{ id: string }> }) {
@@ -15,7 +15,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
 
   try {
     const { id } = await params;
-    const destination = getLogExportDestination(id);
+    const destination = await getLogExportDestinationAsync(id);
     if (!destination) {
       return NextResponse.json({ error: "Log export destination not found" }, { status: 404 });
     }

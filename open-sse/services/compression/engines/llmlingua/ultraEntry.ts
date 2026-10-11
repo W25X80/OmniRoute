@@ -16,7 +16,8 @@
  * entry only sees prose.
  */
 
-import { workerBackend, depsAvailable } from "./worker.ts";
+import { workerBackend, depsAvailable, depsAvailableAsync } from "./worker.ts";
+import { parseDatabaseBackend } from "../../../../../src/lib/db/backendSelection";
 import { DEFAULT_LLMLINGUA_MODEL } from "./constants.ts";
 
 /** Cached probe result. null = not probed yet. */
@@ -44,6 +45,12 @@ export function slmAvailable(): boolean {
   if (_slmAvailable !== null) return _slmAvailable;
   _slmAvailable = depsAvailable();
   return _slmAvailable;
+}
+
+export async function slmAvailableAsync(): Promise<boolean> {
+  if (parseDatabaseBackend() !== "postgres") return slmAvailable();
+  if (_testHooks && typeof _testHooks.available === "boolean") return _testHooks.available;
+  return depsAvailableAsync();
 }
 
 /** Options the ultra SLM tier threads to the worker backend. */
@@ -87,7 +94,7 @@ export async function runLlmlinguaUltra(text: string, opts?: UltraSlmOptions): P
  * applies on the next real request). Returns true if a warm call was attempted.
  */
 export async function prewarmLlmlinguaUltra(opts?: UltraSlmOptions): Promise<boolean> {
-  if (!slmAvailable()) return false;
+  if (!(await slmAvailableAsync())) return false;
   try {
     // A small but non-trivial sample so the worker triggers a real model load.
     // Route through `runLlmlinguaUltra` so the same backend seam (and test hook)

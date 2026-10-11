@@ -10,6 +10,7 @@
 import { generatePKCE, generateState } from "./utils/pkce";
 import { PROVIDERS } from "./providers/index";
 import { resolvePublicCred } from "@omniroute/open-sse/utils/publicCreds.ts";
+import { parseDatabaseBackend } from "@/lib/db/backendSelection";
 
 const GOOGLE_BROWSER_PROVIDERS = new Set(["antigravity", "agy"]);
 
@@ -208,6 +209,17 @@ export function generateAuthData(providerName, redirectUri) {
   };
 }
 
+async function mapProviderTokens(
+  provider: ReturnType<typeof getProvider>,
+  tokens: unknown,
+  extra: unknown
+) {
+  if (parseDatabaseBackend() === "postgres" && typeof provider.mapTokensAsync === "function") {
+    return provider.mapTokensAsync(tokens, extra);
+  }
+  return provider.mapTokens(tokens, extra);
+}
+
 /**
  * Exchange code for tokens
  */
@@ -227,7 +239,7 @@ export async function exchangeTokens(providerName, code, redirectUri, codeVerifi
     extra = await provider.postExchange(tokens);
   }
 
-  return provider.mapTokens(tokens, extra);
+  return mapProviderTokens(provider, tokens, extra);
 }
 
 /**
@@ -244,7 +256,7 @@ export async function finalizeTokens(providerName, tokens) {
     extra = await provider.postExchange(tokens);
   }
 
-  return provider.mapTokens(tokens, extra);
+  return mapProviderTokens(provider, tokens, extra);
 }
 
 /**
@@ -279,7 +291,7 @@ export async function pollForToken(providerName, deviceCode, codeVerifier, extra
       if (provider.postExchange) {
         extra = await provider.postExchange(result.data, extraData || undefined);
       }
-      return { success: true, tokens: provider.mapTokens(result.data, extra) };
+      return { success: true, tokens: await mapProviderTokens(provider, result.data, extra) };
     } else {
       if (result.data.error === "authorization_pending" || result.data.error === "slow_down") {
         return {

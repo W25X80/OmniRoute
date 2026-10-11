@@ -1,3 +1,12 @@
+import { runPersistenceBackgroundWork } from "@/lib/db/persistenceRuntime";
+import { isFeatureFlagEnabledAsync } from "@/shared/utils/featureFlags";
+import {
+  getRadarCacheAsync,
+  getRadarSettingsAsync,
+  getRadarReferralsCacheAsync,
+  getRadarOffersCacheAsync,
+  getRadarIntelCacheAsync,
+} from "@/lib/db/radar";
 /**
  * scheduler.ts — daily background sync for the Radar feed (spec: "GET 1×/dia,
  * só quando opt-in").
@@ -24,13 +33,7 @@
  */
 
 import { isFeatureFlagEnabled } from "@/shared/utils/featureFlags";
-import {
-  getRadarCache,
-  getRadarIntelCache,
-  getRadarOffersCache,
-  getRadarSettings,
-  getRadarReferralsCache,
-} from "@/lib/db/radar";
+import { getRadarSettings } from "@/lib/db/radar";
 import { shouldSyncRadarIntel, syncRadarIntel, type IntelSyncStatus } from "./intelSync";
 import { syncRadarOffers, type OffersSyncStatus } from "./offersSync";
 import { nextSyncTime, syncRadar, type SyncStatus } from "./sync";
@@ -66,7 +69,22 @@ export interface RadarSchedulerDeps {
   clearIntervalFn?: typeof clearInterval;
 }
 
-let timer: ReturnType<typeof setInterval> | null = null;
+interface RadarSchedulerRuntime {
+  timer: ReturnType<typeof setInterval> | null;
+  generation: number;
+  closing: boolean;
+  pending: Set<Promise<unknown>>;
+  close?: Promise<void>;
+}
+declare global {
+  var __omnirouteRadarSchedulerRuntime: RadarSchedulerRuntime | undefined;
+}
+const scheduler = (globalThis.__omnirouteRadarSchedulerRuntime ??= {
+  timer: null,
+  generation: 0,
+  closing: false,
+  pending: new Set<Promise<unknown>>(),
+});
 
 /**
  * Best-effort referrals sync, gated on its own (shorter) staleness window.
@@ -76,7 +94,7 @@ let timer: ReturnType<typeof setInterval> | null = null;
  */
 async function maybeSyncReferrals(deps: RadarSchedulerDeps, nowMs: number): Promise<void> {
   try {
-    const referralsCache = (deps.getReferralsCache ?? getRadarReferralsCache)();
+    const referralsCache = await (deps.getReferralsCache ?? getRadarReferralsCacheAsync)();
     if (!shouldSyncReferralsOnRead(referralsCache?.fetchedAt ?? null, nowMs)) return;
     await (deps.syncReferrals ?? syncRadarReferrals)();
   } catch (err) {
@@ -87,7 +105,7 @@ async function maybeSyncReferrals(deps: RadarSchedulerDeps, nowMs: number): Prom
 
 async function maybeSyncSupporterFeeds(deps: RadarSchedulerDeps, nowMs: number): Promise<void> {
   try {
-    const offersCache = (deps.getOffersCache ?? getRadarOffersCache)();
+    const offersCache = await (deps.getOffersCache ?? getRadarOffersCacheAsync)();
     if (nowMs >= nextSyncTime(offersCache?.fetchedAt ?? null).getTime()) {
       await (deps.syncOffers ?? syncRadarOffers)();
     }
@@ -97,7 +115,7 @@ async function maybeSyncSupporterFeeds(deps: RadarSchedulerDeps, nowMs: number):
   }
 
   try {
-    const intelCache = (deps.getIntelCache ?? getRadarIntelCache)();
+    const intelCache = await (deps.getIntelCache ?? getRadarIntelCacheAsync)();
     if (shouldSyncRadarIntel(intelCache?.fetchedAt ?? null, nowMs)) {
       await (deps.syncIntel ?? syncRadarIntel)();
     }
@@ -112,13 +130,13 @@ async function maybeSyncSupporterFeeds(deps: RadarSchedulerDeps, nowMs: number):
  * post-start tick.
  */
 export async function radarSchedulerTick(deps: RadarSchedulerDeps = {}): Promise<RadarTickResult> {
-  const getFlag = deps.getFlag ?? isFeatureFlagEnabled;
-  if (!getFlag("RADAR_ENABLED")) {
+  const getFlag = deps.getFlag ?? isFeatureFlagEnabledAsync;
+  if (!(await getFlag("RADAR_ENABLED"))) {
     stopRadarSyncScheduler(deps);
     return { action: "stopped", reason: "flag_off" };
   }
 
-  const settings = (deps.getSettings ?? getRadarSettings)();
+  const settings = await (deps.getSettings ?? getRadarSettingsAsync)();
   if (!settings.optIn) return { action: "skipped", reason: "opt_out" };
 
   const nowMs = (deps.now ?? Date.now)();
@@ -128,7 +146,7 @@ export async function radarSchedulerTick(deps: RadarSchedulerDeps = {}): Promise
   await maybeSyncReferrals(deps, nowMs);
   await maybeSyncSupporterFeeds(deps, nowMs);
 
-  const cache = (deps.getCache ?? getRadarCache)();
+  const cache = await (deps.getCache ?? getRadarCacheAsync)();
   if (nowMs < nextSyncTime(cache?.fetchedAt ?? null).getTime()) {
     return { action: "skipped", reason: "not_due" };
   }
@@ -143,30 +161,47 @@ export async function radarSchedulerTick(deps: RadarSchedulerDeps = {}): Promise
  * full tick interval. Returns whether a new timer was created.
  */
 export function ensureRadarSyncScheduler(deps: RadarSchedulerDeps = {}): boolean {
-  if (timer) return false;
-
+  if (scheduler.closing || scheduler.timer) return false;
+  const generation = scheduler.generation;
   const tick = () => {
-    radarSchedulerTick(deps).catch((err: unknown) => {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.warn("[RADAR_SYNC] Scheduled sync tick failed (non-fatal):", msg);
-    });
+    if (scheduler.closing || generation !== scheduler.generation || scheduler.pending.size) return;
+    const work = runPersistenceBackgroundWork(() => radarSchedulerTick(deps));
+    scheduler.pending.add(work);
+    void work.then(
+      () => scheduler.pending.delete(work),
+      (error: unknown) => {
+        scheduler.pending.delete(work);
+        const message = error instanceof Error ? error.message : String(error);
+        console.warn("[RADAR_SYNC] Scheduled sync tick failed (non-fatal):", message);
+      }
+    );
   };
-
-  timer = (deps.setIntervalFn ?? setInterval)(tick, RADAR_SCHEDULER_TICK_MS);
-  // Never keep the process alive just for this timer.
-  if (timer && typeof timer === "object" && "unref" in timer) {
-    (timer as { unref?: () => void }).unref?.();
+  scheduler.timer = (deps.setIntervalFn ?? setInterval)(tick, RADAR_SCHEDULER_TICK_MS);
+  if (scheduler.timer && typeof scheduler.timer === "object" && "unref" in scheduler.timer) {
+    (scheduler.timer as { unref?: () => void }).unref?.();
   }
   tick();
   return true;
 }
 
-/** Stop the timer (used by the flag-off self-heal and by tests). */
+/** Stop future ticks while preserving the legacy synchronous API. */
 export function stopRadarSyncScheduler(deps: RadarSchedulerDeps = {}): void {
-  if (timer) {
-    (deps.clearIntervalFn ?? clearInterval)(timer);
-    timer = null;
+  scheduler.generation++;
+  if (scheduler.timer) {
+    (deps.clearIntervalFn ?? clearInterval)(scheduler.timer);
+    scheduler.timer = null;
   }
+}
+
+/** Shutdown closes admission before waiting for every accepted tick. */
+export function stopRadarSyncSchedulerAsync(deps: RadarSchedulerDeps = {}): Promise<void> {
+  if (scheduler.close) return scheduler.close;
+  scheduler.closing = true;
+  stopRadarSyncScheduler(deps);
+  scheduler.close = (async () => {
+    while (scheduler.pending.size) await Promise.allSettled([...scheduler.pending]);
+  })();
+  return scheduler.close;
 }
 
 /**
@@ -186,4 +221,14 @@ export function initRadarSyncScheduler(deps: RadarSchedulerDeps = {}): boolean {
     console.warn("[RADAR_SYNC] Scheduler init failed (non-fatal):", msg);
     return false;
   }
+}
+
+export async function initRadarSyncSchedulerAsync(deps: RadarSchedulerDeps = {}): Promise<boolean> {
+  const enabled = deps.getFlag
+    ? deps.getFlag("RADAR_ENABLED")
+    : await isFeatureFlagEnabledAsync("RADAR_ENABLED");
+  if (!enabled) return false;
+  const settings = deps.getSettings ? deps.getSettings() : await getRadarSettingsAsync();
+  if (!settings.optIn) return false;
+  return ensureRadarSyncScheduler(deps);
 }

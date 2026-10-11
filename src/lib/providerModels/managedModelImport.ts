@@ -2,7 +2,7 @@ import {
   getCustomModels,
   getModelIsHidden,
   getSyncedAvailableModelsForConnection,
-  mergeModelCompatOverride,
+  mergeModelCompatOverrideAsync as mergeModelCompatOverride,
   replaceCustomModels,
   replaceSyncedAvailableModelsForConnection,
   pruneStaleSyncedAvailableModelsForProvider,
@@ -240,13 +240,16 @@ function getCompatPatchFromCustomModel(model: JsonRecord): ModelCompatPatch | nu
   return Object.keys(patch).length > 0 ? patch : null;
 }
 
-function preserveRemovedCustomModelCompat(providerId: string, removedModels: JsonRecord[]) {
+async function preserveRemovedCustomModelCompatAsync(
+  providerId: string,
+  removedModels: JsonRecord[]
+) {
   for (const model of removedModels) {
     const modelId = getModelId(model);
     if (!modelId) continue;
     const patch = getCompatPatchFromCustomModel(model);
     if (!patch) continue;
-    mergeModelCompatOverride(providerId, modelId, patch);
+    await mergeModelCompatOverride(providerId, modelId, patch);
   }
 }
 
@@ -338,7 +341,7 @@ export async function importManagedModels({
     }>,
     { allowEmpty: true }
   )) as JsonRecord[];
-  preserveRemovedCustomModelCompat(providerId, removedCustomModels);
+  await preserveRemovedCustomModelCompatAsync(providerId, removedCustomModels);
 
   let syncedAvailableModels: SyncedAvailableModel[] = previousSyncedAvailableModels;
   if (discoveredModels.length > 0) {

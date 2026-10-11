@@ -1,6 +1,10 @@
+import {
+  readPostgresCatalogNamespace,
+  refreshSelectedPostgresCatalogAfterCommit,
+} from "./postgres/catalogSnapshot";
 import fs from "node:fs";
 
-import { DEFAULT_DATABASE_SETTINGS, type DatabaseSettings } from "@/types/databaseSettings";
+import { type DatabaseSettings } from "@/types/databaseSettings";
 
 import { backupDbFile, setDbBackupMaxFiles } from "./backup";
 import { DATA_DIR, SQLITE_FILE, applyDatabaseOptimizationSettings, getDbInstance } from "./core";
@@ -16,190 +20,38 @@ import {
 import { getDatabaseStats } from "./stats";
 import { getState as getVacuumSchedulerState, refreshVacuumScheduler } from "./vacuumScheduler";
 
-const DATABASE_SETTINGS_NAMESPACE = "databaseSettings";
-
-export type UserDatabaseSettings = Omit<DatabaseSettings, "location" | "stats">;
-type DatabaseSettingsSection = keyof UserDatabaseSettings;
-
-const DATABASE_SETTINGS_SECTIONS = Object.keys(
-  DEFAULT_DATABASE_SETTINGS
-) as DatabaseSettingsSection[];
-
-const LEGACY_FLAT_KEYS: {
-  [TSection in DatabaseSettingsSection]: Partial<
-    Record<keyof UserDatabaseSettings[TSection] & string, string[]>
-  >;
-} = {
-  logs: {
-    detailedLogsEnabled: ["detailedLogsEnabled"],
-    callLogPipelineEnabled: ["callLogPipelineEnabled"],
-    maxDetailSizeKb: ["maxDetailSizeKb"],
-    ringBufferSize: ["ringBufferSize"],
-  },
-  backup: {
-    autoBackupEnabled: ["autoBackupEnabled"],
-    autoBackupFrequency: ["autoBackupFrequency"],
-    keepLastNBackups: ["keepLastNBackups"],
-  },
-  cache: {
-    semanticCacheEnabled: ["semanticCacheEnabled"],
-    semanticCacheMaxSize: ["semanticCacheMaxSize"],
-    semanticCacheTTL: ["semanticCacheTTL"],
-    semanticCacheVectorEnabled: ["semanticCacheVectorEnabled"],
-    semanticCacheBackend: ["semanticCacheBackend"],
-    semanticCacheThreshold: ["semanticCacheThreshold"],
-    semanticCacheEmbeddingProvider: ["semanticCacheEmbeddingProvider"],
-    semanticCacheEmbeddingModel: ["semanticCacheEmbeddingModel"],
-    semanticCacheEmbeddingDimension: ["semanticCacheEmbeddingDimension"],
-    semanticCacheEmbeddingBaseUrl: ["semanticCacheEmbeddingBaseUrl"],
-    semanticCacheEmbeddingApiKey: ["semanticCacheEmbeddingApiKey"],
-    semanticCacheRedisUrl: ["semanticCacheRedisUrl"],
-    semanticCacheRedisPrefix: ["semanticCacheRedisPrefix"],
-    semanticCacheRequireZeroTemp: ["semanticCacheRequireZeroTemp"],
-    promptCacheEnabled: ["promptCacheEnabled"],
-    promptCacheStrategy: ["promptCacheStrategy"],
-    alwaysPreserveClientCache: ["alwaysPreserveClientCache"],
-    modelCatalogCacheTtlMs: ["modelCatalogCacheTtlMs"],
-  },
-  retention: {
-    quotaSnapshots: ["quotaSnapshots"],
-    compressionAnalytics: ["compressionAnalytics"],
-    mcpAudit: ["mcpAudit"],
-    configAudit: ["configAudit"],
-    a2aEvents: ["a2aEvents"],
-    callLogs: ["callLogs"],
-    conversationTurnNodes: ["conversationTurnNodes"],
-    usageHistory: ["usageHistory"],
-    memoryEntries: ["memoryEntries"],
-    domainCostHistory: ["domainCostHistory"],
-    compressionCacheStats: ["compressionCacheStats"],
-    xpAuditLog: ["xpAuditLog"],
-    compressionRunTelemetry: ["compressionRunTelemetry"],
-    autoCleanupEnabled: ["autoCleanupEnabled"],
-  },
-  aggregation: {
-    enabled: ["aggregationEnabled", "enabled"],
-    rawDataRetentionDays: ["rawDataRetentionDays"],
-    granularity: ["granularity"],
-  },
-  optimization: {
-    autoVacuumMode: ["autoVacuumMode"],
-    scheduledVacuum: ["scheduledVacuum"],
-    vacuumHour: ["vacuumHour"],
-    pageSize: ["pageSize"],
-    cacheSize: ["cacheSize"],
-    optimizeOnStartup: ["optimizeOnStartup"],
-  },
-};
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-
-function cloneDefaultSettings(): UserDatabaseSettings {
-  return structuredClone(DEFAULT_DATABASE_SETTINGS) as UserDatabaseSettings;
-}
-
-function parseStoredValue(rawValue: unknown): unknown {
-  if (typeof rawValue !== "string") return rawValue;
-
-  try {
-    return JSON.parse(rawValue);
-  } catch {
-    return rawValue;
-  }
-}
-
-function toBooleanSetting(value: unknown): boolean | null {
-  if (typeof value === "boolean") return value;
-  if (typeof value === "number") return !Number.isNaN(value) && value !== 0;
-  if (typeof value !== "string") return null;
-
-  const normalized = value.trim().toLowerCase();
-  if (["1", "true", "yes", "on"].includes(normalized)) return true;
-  if (["0", "false", "no", "off"].includes(normalized)) return false;
-  return null;
-}
-
-function normalizeOptimizationSettings(settings: UserDatabaseSettings) {
-  const fallback = DEFAULT_DATABASE_SETTINGS.optimization.cacheSize;
-  const numericCacheSize = Number(settings.optimization.cacheSize);
-  settings.optimization.cacheSize =
-    Number.isFinite(numericCacheSize) && numericCacheSize > 0
-      ? Math.min(1000000, Math.floor(numericCacheSize))
-      : fallback;
-}
+import {
+  DATABASE_SETTINGS_NAMESPACE,
+  DATABASE_SETTINGS_SECTIONS,
+  cloneDefaultSettings,
+  isRecord,
+  mergeTopLevelSections,
+  mergeDatabaseSettingsNamespace,
+  mergeRuntimeLogSettings,
+  normalizeOptimizationSettings,
+  mergeSectionObject,
+  parseStoredValue,
+  type UserDatabaseSettings,
+  type DatabaseSettingsPatch,
+} from "./databaseSettingsSemantics";
+import { getSelectedPostgresDatabase } from "./controlPlaneContext";
+import { createPostgresOperationsRepository } from "./postgres/operationsRepository";
+export type { UserDatabaseSettings, DatabaseSettingsPatch } from "./databaseSettingsSemantics";
 
 function readNamespace(namespace: string): Record<string, unknown> {
-  const db = getDbInstance();
-  const rows = db
-    .prepare("SELECT key, value FROM key_value WHERE namespace = ?")
-    .all(namespace) as Array<{ key: string; value: string }>;
+  const catalogRows = readPostgresCatalogNamespace(namespace);
+  const rows =
+    catalogRows !== undefined
+      ? catalogRows
+      : (getDbInstance()
+          .prepare("SELECT key, value FROM key_value WHERE namespace = ?")
+          .all(namespace) as Array<{ key: string; value: string }>);
 
   const values: Record<string, unknown> = {};
   for (const row of rows) {
     values[row.key] = parseStoredValue(row.value);
   }
   return values;
-}
-
-function mergeSectionObject(
-  target: UserDatabaseSettings,
-  section: DatabaseSettingsSection,
-  value: unknown
-) {
-  if (!isRecord(value)) return;
-
-  const sectionTarget = target[section] as Record<string, unknown>;
-  const defaultSection = DEFAULT_DATABASE_SETTINGS[section] as Record<string, unknown>;
-
-  for (const key of Object.keys(defaultSection)) {
-    if (value[key] !== undefined) {
-      sectionTarget[key] = value[key];
-    }
-  }
-}
-
-function mergeTopLevelSections(target: UserDatabaseSettings, values: Record<string, unknown>) {
-  for (const section of DATABASE_SETTINGS_SECTIONS) {
-    mergeSectionObject(target, section, values[section]);
-  }
-}
-
-function mergeRuntimeLogSettings(target: UserDatabaseSettings, values: Record<string, unknown>) {
-  const pipelineEnabled = toBooleanSetting(values.call_log_pipeline_enabled);
-  if (pipelineEnabled !== null) {
-    target.logs.callLogPipelineEnabled = pipelineEnabled;
-  }
-
-  const legacyDetailedEnabled = toBooleanSetting(values.detailed_logs_enabled);
-  if (legacyDetailedEnabled !== null) {
-    target.logs.detailedLogsEnabled = legacyDetailedEnabled;
-  }
-}
-
-function mergeDatabaseSettingsNamespace(
-  target: UserDatabaseSettings,
-  values: Record<string, unknown>
-) {
-  for (const section of DATABASE_SETTINGS_SECTIONS) {
-    const defaultSection = DEFAULT_DATABASE_SETTINGS[section] as Record<string, unknown>;
-    const sectionTarget = target[section] as Record<string, unknown>;
-    const flatAliases = LEGACY_FLAT_KEYS[section] as Partial<Record<string, string[]>>;
-
-    for (const key of Object.keys(defaultSection)) {
-      for (const alias of flatAliases[key] ?? []) {
-        if (values[alias] !== undefined) {
-          sectionTarget[key] = values[alias];
-        }
-      }
-
-      const nestedKey = `${section}.${key}`;
-      if (values[nestedKey] !== undefined) {
-        sectionTarget[key] = values[nestedKey];
-      }
-    }
-  }
 }
 
 function getWalSizeBytes(): number {
@@ -296,7 +148,7 @@ export function updateDatabaseSettings(
 
   for (const section of DATABASE_SETTINGS_SECTIONS) {
     if (updates[section] !== undefined) {
-      const sectionUpdate = { ...updates[section] };
+      const sectionUpdate = { ...updates[section] } as Record<string, unknown>;
       if (section === "cache") {
         for (const key of Object.keys(sectionUpdate)) {
           if (isCacheSecret(key) && sectionUpdate[key] === CACHE_SECRET_MASK)
@@ -354,4 +206,29 @@ export function updateDatabaseSettings(
   }
 
   return nextSettings;
+}
+
+/** Await persistence without changing the legacy synchronous SQLite API. */
+export async function getUserDatabaseSettingsAsync(): Promise<UserDatabaseSettings> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return getUserDatabaseSettings();
+  return createPostgresOperationsRepository(database).getUserDatabaseSettings();
+}
+
+export async function getDatabaseSettingsAsync(): Promise<DatabaseSettings> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return getDatabaseSettings();
+  return createPostgresOperationsRepository(database).getDatabaseSettings();
+}
+
+export async function updateDatabaseSettingsAsync(
+  updates: DatabaseSettingsPatch
+): Promise<UserDatabaseSettings> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return updateDatabaseSettings(updates as Partial<UserDatabaseSettings>);
+  const settings =
+    await createPostgresOperationsRepository(database).updateDatabaseSettings(updates);
+  invalidateDbCache("settings");
+  await refreshSelectedPostgresCatalogAfterCommit();
+  return settings;
 }

@@ -1,3 +1,5 @@
+import { getSelectedPostgresDatabase, getSelectedPersistenceIdentity } from "./controlPlaneContext";
+import { createPostgresSemanticCacheRepository } from "./postgres/cacheRepository";
 /**
  * db/semanticCache.ts — CRUD queries over the `semantic_cache` table.
  * Extracted from the /api/cache/entries route handler.
@@ -114,4 +116,32 @@ export function deleteSemanticCacheByModel(model: string): DeleteSemanticCacheBy
   const db = getDbInstance();
   const result = db.prepare("DELETE FROM semantic_cache WHERE model = ?").run(model);
   return { deleted: result.changes };
+}
+
+export function getSelectedSemanticCacheRepository() {
+  const database = getSelectedPostgresDatabase();
+  return database ? createPostgresSemanticCacheRepository(database) : undefined;
+}
+
+export async function listSemanticCacheEntriesAsync(options: SemanticCacheListOptions) {
+  const selected = getSelectedSemanticCacheRepository();
+  return selected ? selected.list(options) : listSemanticCacheEntries(options);
+}
+
+export async function deleteSemanticCacheBySignatureAsync(signature: string) {
+  const selected = getSelectedSemanticCacheRepository();
+  if (!selected) return deleteSemanticCacheBySignature(signature);
+  await selected.deleteBySignature(signature);
+  return { deleted: 1 };
+}
+
+export async function deleteSemanticCacheByModelAsync(model: string) {
+  const selected = getSelectedSemanticCacheRepository();
+  return selected
+    ? { deleted: await selected.deleteByModel(model) }
+    : deleteSemanticCacheByModel(model);
+}
+
+export function getSelectedSemanticCacheAuthority(): object | undefined {
+  return getSelectedPersistenceIdentity();
 }

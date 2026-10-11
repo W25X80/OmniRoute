@@ -57,3 +57,19 @@ export function registerLogExportJob(registry: JobRegistry): void {
     cronGetter: getCron,
   });
 }
+
+export async function registerLogExportJobAsync(registry: JobRegistry): Promise<void> {
+  await registry.registerAsync({
+    id: LOG_EXPORT_JOB_ID,
+    type: "cron",
+    cron: getCron(),
+    intervalMs: null,
+    enabled: true,
+    envFlag: null,
+    config: { timezone: "UTC" },
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    handler: run,
+    cronGetter: getCron,
+  });
+}

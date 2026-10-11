@@ -1,3 +1,7 @@
+import { getSelectedUsageHistoryRepository } from "@/lib/db/postgres/usageHistoryRepository";
+import { saveRequestUsageWithReceipt, type UsageEntry } from "@/lib/usage/usageHistory";
+import { recordKeyQuotaUsageAsync } from "@/domain/keyQuota";
+import { recordTokenUsageAsync } from "../../services/tokenLimitCounter.ts";
 /**
  * chatCore non-streaming usage-stats persistence (Quality Gate v2 / Fase 9 — chatCore god-file
  * decomposition, #3501 — response-handling slice of executeProviderRequest).
@@ -94,4 +98,48 @@ export function recordNonStreamingUsageStats(
   if (ctx.traceEnabled) logUsageTrace(usage, ctx.provider, ctx.connectionId);
   persistUsageRow(usage, ctx);
   recordBillableTokens(usage, ctx.apiKeyInfo, ctx.provider, ctx.model);
+}
+
+export async function recordNonStreamingUsageStatsAsync(
+  usage: unknown,
+  ctx: RecordNonStreamingUsageStatsContext
+): Promise<void> {
+  if (!getSelectedUsageHistoryRepository()) {
+    recordNonStreamingUsageStats(usage, ctx);
+    return;
+  }
+  if (!usage || typeof usage !== "object") return;
+  const { provider, connectionId, model, startTime, apiKeyInfo, effectiveServiceTier } = ctx;
+  if (ctx.traceEnabled) logUsageTrace(usage, ctx.provider, ctx.connectionId);
+  const entry: UsageEntry = {
+    provider: provider || "unknown",
+    model: model || "unknown",
+    tokens: usage,
+    status: "200",
+    success: true,
+    latencyMs: Date.now() - startTime,
+    timeToFirstTokenMs: Date.now() - startTime,
+    errorCode: null,
+    timestamp: new Date().toISOString(),
+    connectionId: connectionId || undefined,
+    apiKeyId: apiKeyInfo?.id || undefined,
+    apiKeyName: apiKeyInfo?.name || undefined,
+    serviceTier: effectiveServiceTier,
+    comboStrategy: ctx.isCombo ? ctx.comboStrategy || undefined : undefined,
+    endpoint: ctx.endpoint || undefined,
+    cpaAuthIndex: ctx.cpaAuthIndex || undefined,
+  };
+  const receipt = await saveRequestUsageWithReceipt(entry);
+  if (ctx.apiKeyInfo?.id) {
+    const billable = computeBillableTokens(usage);
+    if (receipt?.inserted) await recordKeyQuotaUsageAsync(ctx.apiKeyInfo.id, billable);
+    if (billable > 0)
+      await recordTokenUsageAsync(
+        ctx.apiKeyInfo.id,
+        ctx.provider || "unknown",
+        ctx.model || "unknown",
+        billable,
+        receipt?.id
+      );
+  }
 }

@@ -1,3 +1,4 @@
+import { getSelectedUsageReadRepository } from "../db/postgres/usageReadRepository";
 /**
  * @file providerWindowCosts.ts
  * @description Provider weekly USD cost breakdown for the dashboard modal.
@@ -7,11 +8,14 @@
  */
 
 import { setImmediate as yieldToEventLoop } from "node:timers/promises";
-import { getCostSummary } from "@/domain/costRules";
+import { getCostSummaryAsync } from "@/domain/costRules";
 import { getApiKeys } from "@/lib/db/apiKeys";
 import { getDbInstance } from "@/lib/db/core";
-import { getAllProviderLimitsCache, getProviderLimitsCache } from "@/lib/db/providerLimits";
-import { getProviderQuotaWindowStart } from "@/lib/db/quotaResetEvents";
+import {
+  getAllProviderLimitsCacheAsync,
+  getProviderLimitsCacheAsync,
+} from "@/lib/db/providerLimits";
+import { getProviderQuotaWindowStartAsync } from "@/lib/db/quotaResetEvents";
 import { calculateCost } from "@/lib/usage/costCalculator";
 import {
   COST_MATCH_BATCH_SIZE,
@@ -148,14 +152,14 @@ function parseResetAt(value: unknown, nowMs: number): number | null {
   return parsed;
 }
 
-function getProviderWindowStart(
+async function getProviderWindowStart(
   connectionId: string | null,
   resetMs: number,
   nowMs: number
-): { startMs: number; source: ProviderWindowCostBreakdown["windowStartSource"] } | null {
+): Promise<{ startMs: number; source: ProviderWindowCostBreakdown["windowStartSource"] } | null> {
   if (!connectionId) return null;
   const resetIso = new Date(resetMs).toISOString();
-  const start = getProviderQuotaWindowStart(connectionId, resetIso, nowMs);
+  const start = await getProviderQuotaWindowStartAsync(connectionId, resetIso, nowMs);
   if (!start) return null;
   const startMs = Date.parse(start.windowStartIso);
   if (!Number.isFinite(startMs)) return null;
@@ -194,11 +198,11 @@ function scoreWeeklyQuota(name: string): number {
   return score;
 }
 
-function selectWeeklyWindow(
+async function selectWeeklyWindow(
   provider: string,
   connectionId: string | null,
   nowMs: number
-): {
+): Promise<{
   startMs: number;
   resetMs: number | null;
   source: ProviderWindowCostBreakdown["windowSource"];
@@ -206,10 +210,10 @@ function selectWeeklyWindow(
   quotaUsedPercent: number | null;
   quotaRemainingPercent: number | null;
   windowStartSource: ProviderWindowCostBreakdown["windowStartSource"];
-} {
+}> {
   const cacheEntries = connectionId
-    ? [[connectionId, getProviderLimitsCache(connectionId)] as const]
-    : Object.entries(getAllProviderLimitsCache());
+    ? [[connectionId, await getProviderLimitsCacheAsync(connectionId)] as const]
+    : Object.entries(await getAllProviderLimitsCacheAsync());
 
   let selected: {
     score: number;
@@ -249,7 +253,7 @@ function selectWeeklyWindow(
   }
 
   if (selected) {
-    const providerWindowStart = getProviderWindowStart(
+    const providerWindowStart = await getProviderWindowStart(
       selected.connectionId,
       selected.resetMs,
       nowMs
@@ -336,9 +340,17 @@ function buildUsageHistoryFilter(
   return { whereSql: where.join(" AND "), params };
 }
 
-function fetchAggregatedUsageRows(filter: UsageHistoryFilter): AggregatedUsageCostRow[] {
+async function fetchAggregatedUsageRows(
+  filter: UsageHistoryFilter
+): Promise<AggregatedUsageCostRow[]> {
+  const postgres = getSelectedUsageReadRepository();
+  if (postgres)
+    return (await postgres.windowAggregates(
+      filter.whereSql,
+      filter.params
+    )) as unknown as AggregatedUsageCostRow[];
   return getDbInstance()
-    .prepare<AggregatedUsageCostRow>(
+    .prepare(
       `
       SELECT
         NULLIF(api_key_id, '') as apiKeyId,
@@ -365,13 +377,21 @@ function fetchAggregatedUsageRows(filter: UsageHistoryFilter): AggregatedUsageCo
       ORDER BY totalTokens DESC
       `
     )
-    .all(filter.params);
+    .all(filter.params) as AggregatedUsageCostRow[];
 }
 
-function fetchUsageRequestCountByApiKey(filter: UsageHistoryFilter): Map<string, number> {
-  const rows = getDbInstance()
-    .prepare<{ apiKeyId: string; requestCount: number }>(
-      `
+async function fetchUsageRequestCountByApiKey(
+  filter: UsageHistoryFilter
+): Promise<Map<string, number>> {
+  const postgres = getSelectedUsageReadRepository();
+  const rows = postgres
+    ? ((await postgres.windowCounts(filter.whereSql, filter.params)) as Array<{
+        apiKeyId: string;
+        requestCount: number;
+      }>)
+    : (getDbInstance()
+        .prepare(
+          `
       SELECT
         COALESCE(NULLIF(api_key_id, ''), '') as apiKeyId,
         COUNT(*) as requestCount
@@ -379,8 +399,8 @@ function fetchUsageRequestCountByApiKey(filter: UsageHistoryFilter): Map<string,
       WHERE ${filter.whereSql}
       GROUP BY COALESCE(NULLIF(api_key_id, ''), '')
       `
-    )
-    .all(filter.params);
+        )
+        .all(filter.params) as Array<{ apiKeyId: string; requestCount: number }>);
 
   const counts = new Map<string, number>();
   for (const row of rows) {
@@ -390,12 +410,19 @@ function fetchUsageRequestCountByApiKey(filter: UsageHistoryFilter): Map<string,
   return counts;
 }
 
-function fetchDetailedUsageRowsForApiKey(
+async function fetchDetailedUsageRowsForApiKey(
   filter: UsageHistoryFilter,
   apiKeyId: string
-): UsageCostRow[] {
+): Promise<UsageCostRow[]> {
+  const postgres = getSelectedUsageReadRepository();
+  if (postgres)
+    return (await postgres.windowDetails(
+      filter.whereSql,
+      filter.params,
+      apiKeyId
+    )) as unknown as UsageCostRow[];
   return getDbInstance()
-    .prepare<UsageCostRow>(
+    .prepare(
       `
       SELECT
         id,
@@ -417,25 +444,32 @@ function fetchDetailedUsageRowsForApiKey(
       ORDER BY timestamp ASC, id ASC
       `
     )
-    .all({ ...filter.params, apiKeyId });
+    .all({ ...filter.params, apiKeyId }) as UsageCostRow[];
 }
 
-function getRecordedCostSummariesByApiKey(
+async function getRecordedCostSummariesByApiKey(
   apiKeyIds: string[],
   sinceMs: number,
   untilMs: number
-): Map<string, RecordedCostSummary> {
+): Promise<Map<string, RecordedCostSummary>> {
   if (apiKeyIds.length === 0) return new Map();
 
+  const postgres = getSelectedUsageReadRepository();
   try {
     const params: Record<string, unknown> = {
       sinceMs: Math.max(0, sinceMs - RECORDED_COST_MATCH_TOLERANCE_MS),
       untilMs: untilMs + RECORDED_COST_MATCH_TOLERANCE_MS,
     };
     const placeholders = appendNamedPlaceholders(params, "apiKey", apiKeyIds);
-    const rows = getDbInstance()
-      .prepare<{ apiKeyId: string; totalCost: number; entryCount: number }>(
-        `
+    const rows = postgres
+      ? ((await postgres.recordedSummaries(
+          apiKeyIds,
+          Number(params.sinceMs),
+          Number(params.untilMs)
+        )) as Array<{ apiKeyId: string; totalCost: number; entryCount: number }>)
+      : (getDbInstance()
+          .prepare(
+            `
         SELECT
           api_key_id as apiKeyId,
           COALESCE(SUM(cost), 0) as totalCost,
@@ -446,8 +480,8 @@ function getRecordedCostSummariesByApiKey(
           AND timestamp <= @untilMs
         GROUP BY api_key_id
       `
-      )
-      .all(params);
+          )
+          .all(params) as Array<{ apiKeyId: string; totalCost: number; entryCount: number }>);
 
     const summaries = new Map<string, RecordedCostSummary>();
     for (const row of rows) {
@@ -458,7 +492,8 @@ function getRecordedCostSummariesByApiKey(
       });
     }
     return summaries;
-  } catch {
+  } catch (error) {
+    if (postgres) throw error;
     return new Map();
   }
 }
@@ -484,15 +519,22 @@ async function getRecordedCostsByApiKey(
 ): Promise<Map<string, RecordedCostRow[]>> {
   if (apiKeyIds.length === 0) return new Map();
 
+  const postgres = getSelectedUsageReadRepository();
   try {
     const params: Record<string, unknown> = {
       sinceMs: Math.max(0, sinceMs - RECORDED_COST_MATCH_TOLERANCE_MS),
       untilMs: untilMs + RECORDED_COST_MATCH_TOLERANCE_MS,
     };
     const placeholders = appendNamedPlaceholders(params, "apiKey", apiKeyIds);
-    const rows = getDbInstance()
-      .prepare<RecordedCostRow>(
-        `
+    const rows = postgres
+      ? ((await postgres.recordedCosts(
+          apiKeyIds,
+          Number(params.sinceMs),
+          Number(params.untilMs)
+        )) as unknown as RecordedCostRow[])
+      : (getDbInstance()
+          .prepare(
+            `
         SELECT
           id as rowId,
           api_key_id as apiKeyId,
@@ -504,8 +546,8 @@ async function getRecordedCostsByApiKey(
           AND timestamp <= @untilMs
         ORDER BY api_key_id ASC, timestamp ASC, rowid ASC
       `
-      )
-      .all(params);
+          )
+          .all(params) as RecordedCostRow[]);
 
     const byApiKey = new Map<string, RecordedCostRow[]>();
     let processed = 0;
@@ -519,7 +561,8 @@ async function getRecordedCostsByApiKey(
       byApiKey.set(row.apiKeyId, list);
     }
     return byApiKey;
-  } catch {
+  } catch (error) {
+    if (postgres) throw error;
     return new Map();
   }
 }
@@ -607,7 +650,7 @@ async function buildApiKeyCostAllocations(args: {
   if (!apiKeyId) return calculatedCosts;
 
   const matcher = await args.getMatcher(apiKeyId);
-  const detailedRows = fetchDetailedUsageRowsForApiKey(args.filter, apiKeyId);
+  const detailedRows = await fetchDetailedUsageRowsForApiKey(args.filter, apiKeyId);
   let total = 0;
   for (let i = 0; i < detailedRows.length; i++) {
     total += await getUsageRowCostUsd(detailedRows[i], matcher);
@@ -630,7 +673,7 @@ export async function getProviderWindowCostBreakdown({
 }): Promise<ProviderWindowCostBreakdown> {
   const providerKey = provider.trim().toLowerCase();
   const nowMs = Number.isFinite(now) ? now : Date.now();
-  const window = selectWeeklyWindow(providerKey, connectionId, nowMs);
+  const window = await selectWeeklyWindow(providerKey, connectionId, nowMs);
   const windowStartAt = new Date(window.startMs).toISOString();
   const windowResetAt = window.resetMs ? new Date(window.resetMs).toISOString() : null;
   const nowIso = new Date(nowMs).toISOString();
@@ -642,11 +685,15 @@ export async function getProviderWindowCostBreakdown({
     connectionId
   );
 
-  const aggregatedRows = fetchAggregatedUsageRows(filter);
-  const usageRequestCounts = fetchUsageRequestCountByApiKey(filter);
+  const aggregatedRows = await fetchAggregatedUsageRows(filter);
+  const usageRequestCounts = await fetchUsageRequestCountByApiKey(filter);
   const currentApiKeyNames = await getCurrentApiKeyNames();
   const apiKeyIds = uniqueApiKeyIds(aggregatedRows);
-  const recordedSummaries = getRecordedCostSummariesByApiKey(apiKeyIds, window.startMs, nowMs);
+  const recordedSummaries = await getRecordedCostSummariesByApiKey(
+    apiKeyIds,
+    window.startMs,
+    nowMs
+  );
   // Aggregate-only keys never need detailed records. Matchers are request-local:
   // repeated groups for a key share consumption, concurrent requests do not.
   const matchers = new Map<string, RecordedCostMatcher>();
@@ -692,7 +739,7 @@ export async function getProviderWindowCostBreakdown({
     let limitPeriod: string | null = null;
     let budgetResetAt: string | null = null;
     if (apiKeyId) {
-      const summary = getCostSummary(apiKeyId);
+      const summary = await getCostSummaryAsync(apiKeyId);
       if (summary.activeLimitUsd > 0) {
         limitUsd = summary.activeLimitUsd;
         limitPeriod = summary.resetInterval;

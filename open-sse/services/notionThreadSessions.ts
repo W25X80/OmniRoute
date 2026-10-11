@@ -17,6 +17,11 @@
 import { randomUUID, createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import {
+  withNativeThreadCacheFile,
+  readNativeThreadCacheFile,
+  writeNativeThreadCacheFile,
+} from "../utils/nativeThreadCacheFile.ts";
 
 export interface NotionMessage {
   role: string;
@@ -71,6 +76,31 @@ const threadSessionCache = new Map<string, ThreadSessionEntry>();
 let threadStoreLoaded = false;
 let threadStoreDirty = false;
 let threadStoreTimer: ReturnType<typeof setTimeout> | null = null;
+
+interface ThreadCacheContext {
+  cache: Map<string, ThreadSessionEntry>;
+  scheduleFlush: () => void;
+}
+const sqliteThreadContext: ThreadCacheContext = {
+  cache: threadSessionCache,
+  scheduleFlush: scheduleThreadStoreFlush,
+};
+
+interface NativeThreadState {
+  path: string | null;
+  context: ThreadCacheContext;
+  loaded: boolean;
+  dirty: boolean;
+  revision: number;
+  closing: boolean;
+  timer?: ReturnType<typeof setTimeout>;
+  loading?: Promise<void>;
+  flushing?: Promise<void>;
+}
+const NATIVE_THREAD_STATES = Symbol.for("omniroute.nativeNotionThreadSessions");
+const nativeGlobals = globalThis as typeof globalThis & {
+  [NATIVE_THREAD_STATES]?: Map<string, NativeThreadState>;
+};
 
 function getThreadStorePath(): string | null {
   try {
@@ -192,7 +222,9 @@ export function normalizeNotionContentForHash(content: unknown): string {
 export function hashNotionConversation(spaceId: string, msgs: NotionMessage[]): string {
   const parts = [
     `space:${spaceId}`,
-    ...msgs.map((h) => `${(h.role || "").toLowerCase()}:${normalizeNotionContentForHash(h.content)}`),
+    ...msgs.map(
+      (h) => `${(h.role || "").toLowerCase()}:${normalizeNotionContentForHash(h.content)}`
+    ),
   ];
   const raw = parts.join("\n");
   let hash = 0x811c9dc5;
@@ -218,48 +250,50 @@ export function conversationPrefixBeforeLastUser(messages: NotionMessage[]): Not
   return messages.slice(0, lastUser);
 }
 
-function readThreadSessionEntry(key: string): ThreadSessionEntry | null {
-  loadThreadStoreFromDisk();
-  const entry = threadSessionCache.get(key);
+function readThreadSessionEntry(
+  key: string,
+  context = sqliteThreadContext
+): ThreadSessionEntry | null {
+  const entry = context.cache.get(key);
   if (!entry) return null;
   if (Date.now() - entry.ts > THREAD_SESSION_MAX_AGE_MS) {
-    threadSessionCache.delete(key);
-    scheduleThreadStoreFlush();
+    context.cache.delete(key);
+    context.scheduleFlush();
     return null;
   }
   return entry;
 }
 
-function readThreadSession(key: string): string | null {
-  return readThreadSessionEntry(key)?.threadId ?? null;
+function readThreadSession(key: string, context = sqliteThreadContext): string | null {
+  return readThreadSessionEntry(key, context)?.threadId ?? null;
 }
 
 function putThreadSession(
   key: string,
   threadId: string,
-  flags: { confirmed?: boolean; createAttempted?: boolean } = {}
+  flags: { confirmed?: boolean; createAttempted?: boolean } = {},
+  context = sqliteThreadContext
 ): void {
-  loadThreadStoreFromDisk();
-  const prev = threadSessionCache.get(key);
-  threadSessionCache.set(key, {
+  const prev = context.cache.get(key);
+  context.cache.set(key, {
     threadId,
     ts: Date.now(),
     confirmed: flags.confirmed ?? prev?.confirmed ?? false,
     createAttempted: flags.createAttempted ?? prev?.createAttempted ?? false,
   });
   // Evict oldest if over cap
-  if (threadSessionCache.size > THREAD_SESSION_MAX_ENTRIES) {
+  if (context.cache.size > THREAD_SESSION_MAX_ENTRIES) {
     let oldestKey: string | null = null;
     let oldestTs = Infinity;
-    for (const [k, v] of threadSessionCache) {
+    for (const [k, v] of context.cache) {
       if (v.ts < oldestTs) {
         oldestTs = v.ts;
         oldestKey = k;
       }
     }
-    if (oldestKey) threadSessionCache.delete(oldestKey);
+    if (oldestKey) context.cache.delete(oldestKey);
   }
-  scheduleThreadStoreFlush();
+  context.scheduleFlush();
 }
 
 /** Root sticky key for web-provider continuity.
@@ -299,12 +333,26 @@ export function resolveNotionThreadBinding(
   clientThreadId?: string
 ): { threadId: string; createThread: boolean; rootKey: string | null } {
   loadThreadStoreFromDisk();
+  return resolveNotionThreadBindingFromCache(
+    spaceKey,
+    messages,
+    clientThreadId,
+    sqliteThreadContext
+  );
+}
+
+function resolveNotionThreadBindingFromCache(
+  spaceKey: string,
+  messages: NotionMessage[],
+  clientThreadId: string | undefined,
+  context: ThreadCacheContext
+): { threadId: string; createThread: boolean; rootKey: string | null } {
   const rootKey = notionThreadRootKey(spaceKey, messages);
   const hasHistory = conversationHasAssistant(messages);
 
   if (clientThreadId && clientThreadId.trim()) {
     const id = clientThreadId.trim();
-    if (rootKey) putThreadSession(rootKey, id, { createAttempted: true });
+    if (rootKey) putThreadSession(rootKey, id, { createAttempted: true }, context);
     return { threadId: id, createThread: false, rootKey };
   }
 
@@ -314,24 +362,30 @@ export function resolveNotionThreadBinding(
   // sticky binding when both are multi-turn.
   const prefix = conversationPrefixBeforeLastUser(messages);
   if (prefix.length > 0) {
-    const exactId = readThreadSession(hashNotionConversation(spaceKey, prefix));
+    const exactId = readThreadSession(hashNotionConversation(spaceKey, prefix), context);
     if (exactId) {
-      if (rootKey) putThreadSession(rootKey, exactId, { createAttempted: true, confirmed: true });
+      if (rootKey)
+        putThreadSession(rootKey, exactId, { createAttempted: true, confirmed: true }, context);
       return { threadId: exactId, createThread: false, rootKey };
     }
   }
 
   // Sticky root (first user turn hash) — UREW + error-retry continuity
   if (rootKey) {
-    const sticky = readThreadSessionEntry(rootKey);
+    const sticky = readThreadSessionEntry(rootKey, context);
     if (sticky?.threadId) {
       // Multi-turn OpenAI history → continue the sticky Notion chat
       // (covers UREW rewrites where prefix hash may not match turn-1 store).
       if (hasHistory) {
-        putThreadSession(rootKey, sticky.threadId, {
-          confirmed: sticky.confirmed,
-          createAttempted: sticky.createAttempted,
-        });
+        putThreadSession(
+          rootKey,
+          sticky.threadId,
+          {
+            confirmed: sticky.confirmed,
+            createAttempted: sticky.createAttempted,
+          },
+          context
+        );
         return {
           threadId: sticky.threadId,
           createThread: false,
@@ -343,10 +397,15 @@ export function resolveNotionThreadBinding(
       // root but never got a successful reply. Keep the same threadId so Notion
       // is not spam-created; do not create again (Notion may already have it).
       if (sticky.createAttempted && !sticky.confirmed) {
-        putThreadSession(rootKey, sticky.threadId, {
-          confirmed: false,
-          createAttempted: true,
-        });
+        putThreadSession(
+          rootKey,
+          sticky.threadId,
+          {
+            confirmed: false,
+            createAttempted: true,
+          },
+          context
+        );
         return {
           threadId: sticky.threadId,
           createThread: false,
@@ -362,10 +421,15 @@ export function resolveNotionThreadBinding(
       // through only when no sticky exists; if sticky exists without either flag
       // it is mid-flight first bind — reuse with createThread:true once.
       if (!sticky.createAttempted && !sticky.confirmed) {
-        putThreadSession(rootKey, sticky.threadId, {
-          confirmed: false,
-          createAttempted: false,
-        });
+        putThreadSession(
+          rootKey,
+          sticky.threadId,
+          {
+            confirmed: false,
+            createAttempted: false,
+          },
+          context
+        );
         return {
           threadId: sticky.threadId,
           createThread: true,
@@ -380,26 +444,63 @@ export function resolveNotionThreadBinding(
   // failed retries reuse the same id instead of spam-creating Notion chats.
   const threadId = randomUUID();
   if (rootKey) {
-    putThreadSession(rootKey, threadId, {
-      createAttempted: false,
-      confirmed: false,
-    });
+    putThreadSession(
+      rootKey,
+      threadId,
+      {
+        createAttempted: false,
+        confirmed: false,
+      },
+      context
+    );
   }
   // Multi-turn history without sticky (e.g. process restart): still create once
   // with the full transcript so the agent can continue in a fresh Notion chat.
   return { threadId, createThread: true, rootKey };
 }
 
+export async function resolveNotionThreadBindingAsync(
+  spaceKey: string,
+  messages: NotionMessage[],
+  clientThreadId?: string
+): Promise<{ threadId: string; createThread: boolean; rootKey: string | null }> {
+  const state = getNativeThreadState();
+  await loadNativeThreadStore(state);
+  return resolveNotionThreadBindingFromCache(spaceKey, messages, clientThreadId, state.context);
+}
+
 /** Mark that we sent createThread:true for this root (even if the body errored). */
 export function notionThreadMarkCreateAttempted(rootKey: string | null, threadId: string): void {
   if (!rootKey || !threadId) return;
+  loadThreadStoreFromDisk();
   putThreadSession(rootKey, threadId, { createAttempted: true });
+}
+
+export async function notionThreadMarkCreateAttemptedAsync(
+  rootKey: string | null,
+  threadId: string
+): Promise<void> {
+  if (!rootKey || !threadId) return;
+  const state = getNativeThreadState();
+  await loadNativeThreadStore(state);
+  putThreadSession(rootKey, threadId, { createAttempted: true }, state.context);
 }
 
 /** Mark successful inference on this thread. */
 export function notionThreadMarkConfirmed(rootKey: string | null, threadId: string): void {
   if (!rootKey || !threadId) return;
+  loadThreadStoreFromDisk();
   putThreadSession(rootKey, threadId, { createAttempted: true, confirmed: true });
+}
+
+export async function notionThreadMarkConfirmedAsync(
+  rootKey: string | null,
+  threadId: string
+): Promise<void> {
+  if (!rootKey || !threadId) return;
+  const state = getNativeThreadState();
+  await loadNativeThreadStore(state);
+  putThreadSession(rootKey, threadId, { createAttempted: true, confirmed: true }, state.context);
 }
 
 function conversationHasAssistant(messages: NotionMessage[]): boolean {
@@ -410,7 +511,10 @@ function conversationHasAssistant(messages: NotionMessage[]): boolean {
 }
 
 /** Lookup-only (does not mint). Used by tests and diagnostics. */
-export function notionThreadSessionLookup(spaceId: string, messages: NotionMessage[]): string | null {
+export function notionThreadSessionLookup(
+  spaceId: string,
+  messages: NotionMessage[]
+): string | null {
   loadThreadStoreFromDisk();
   const rootKey = notionThreadRootKey(spaceId, messages);
   if (rootKey) {
@@ -434,18 +538,53 @@ export function notionThreadSessionStore(
   threadId: string
 ): void {
   if (!threadId || !spaceId) return;
+  loadThreadStoreFromDisk();
+  notionThreadSessionStoreFromCache(
+    spaceId,
+    messages,
+    assistantText,
+    threadId,
+    sqliteThreadContext
+  );
+}
+
+function notionThreadSessionStoreFromCache(
+  spaceId: string,
+  messages: NotionMessage[],
+  assistantText: string,
+  threadId: string,
+  context: ThreadCacheContext
+): void {
+  if (!threadId || !spaceId) return;
   const full: NotionMessage[] = [...messages, { role: "assistant", content: assistantText }];
-  putThreadSession(hashNotionConversation(spaceId, full), threadId, {
-    confirmed: true,
-    createAttempted: true,
-  });
+  putThreadSession(
+    hashNotionConversation(spaceId, full),
+    threadId,
+    {
+      confirmed: true,
+      createAttempted: true,
+    },
+    context
+  );
 
   // Root key for agent multi-turn clients that keep original user wording.
   const rootKey = notionThreadRootKey(spaceId, messages);
   if (rootKey) {
-    putThreadSession(rootKey, threadId, { confirmed: true, createAttempted: true });
+    putThreadSession(rootKey, threadId, { confirmed: true, createAttempted: true }, context);
   }
   void assistantText;
+}
+
+export async function notionThreadSessionStoreAsync(
+  spaceId: string,
+  messages: NotionMessage[],
+  assistantText: string,
+  threadId: string
+): Promise<void> {
+  if (!threadId || !spaceId) return;
+  const state = getNativeThreadState();
+  await loadNativeThreadStore(state);
+  notionThreadSessionStoreFromCache(spaceId, messages, assistantText, threadId, state.context);
 }
 
 /** Client-supplied thread continuity pin: body (`notion_thread_id`/`thread_id`) or
@@ -495,4 +634,88 @@ export function hashNotionCallerCookie(cookie: string): string {
   // a cookie that lands in a victim's namespace. crypto SHA-256 makes both
   // accidental and crafted collisions infeasible; the raw cookie is never stored.
   return createHash("sha256").update(raw).digest("hex").slice(0, 32);
+}
+
+function getNativeThreadState(): NativeThreadState {
+  const path = getThreadStorePath();
+  const states = (nativeGlobals[NATIVE_THREAD_STATES] ??= new Map());
+  let state = states.get(path ?? "");
+  if (!state) {
+    const created: NativeThreadState = {
+      path,
+      context: { cache: new Map(), scheduleFlush: () => scheduleNativeThreadFlush(created) },
+      loaded: false,
+      dirty: false,
+      revision: 0,
+      closing: false,
+    };
+    states.set(path ?? "", created);
+    state = created;
+  }
+  return state;
+}
+
+async function loadNativeThreadStore(state: NativeThreadState): Promise<void> {
+  if (state.loaded) return;
+  state.loading ??= withNativeThreadCacheFile(state.path, async () => {
+    const entries = await readNativeThreadCacheFile<ThreadSessionEntry>(state.path);
+    const now = Date.now();
+    for (const [key, entry] of Object.entries(entries)) {
+      if (!entry?.threadId || typeof entry.ts !== "number") continue;
+      if (now - entry.ts > THREAD_SESSION_MAX_AGE_MS) continue;
+      state.context.cache.set(key, entry);
+    }
+    state.loaded = true;
+  });
+  await state.loading;
+}
+
+function scheduleNativeThreadFlush(state: NativeThreadState): void {
+  state.dirty = true;
+  state.revision++;
+  if (state.closing || state.timer) return;
+  state.timer = setTimeout(() => {
+    state.timer = undefined;
+    void flushNativeThreadState(state).catch(() => {});
+  }, 250);
+  state.timer.unref();
+}
+
+async function flushNativeThreadState(state: NativeThreadState): Promise<void> {
+  if (!state.dirty || !state.path) return;
+  state.flushing ??= withNativeThreadCacheFile(state.path, async () => {
+    while (state.dirty) {
+      const revision = state.revision;
+      const entries = Object.fromEntries(state.context.cache);
+      if (!(await writeNativeThreadCacheFile(state.path, entries))) break;
+      if (state.revision === revision) state.dirty = false;
+    }
+  }).finally(() => {
+    state.flushing = undefined;
+  });
+  await state.flushing;
+}
+
+/** Join existing native cache writes without allocating or hydrating an unused provider. */
+export async function flushNativeNotionThreadSessions(): Promise<void> {
+  const states = nativeGlobals[NATIVE_THREAD_STATES];
+  if (!states) return;
+  await Promise.all([...states.values()].map((state) => flushNativeThreadState(state)));
+}
+
+/** Called after admitted requests drain; local cache persistence remains best-effort. */
+export async function closeNativeNotionThreadSessions(): Promise<void> {
+  const states = nativeGlobals[NATIVE_THREAD_STATES];
+  if (!states) return;
+  for (const state of states.values()) {
+    state.closing = true;
+    if (state.timer) clearTimeout(state.timer);
+    state.timer = undefined;
+  }
+  await Promise.all(
+    [...states.values()].map(async (state) => {
+      await state.loading;
+      await flushNativeThreadState(state);
+    })
+  );
 }

@@ -1,7 +1,9 @@
 import { getUpstreamTimeoutConfig } from "@/shared/utils/runtimeTimeouts";
 import { resolvePublicCred } from "../utils/publicCreds.ts";
 import type { LegacyProvider } from "./providerRegistry.ts";
-import { loadProviderCredentials } from "./credentialLoader.ts";
+import { loadProviderCredentials, loadProviderCredentialsAsync } from "./credentialLoader.ts";
+import { parseDatabaseBackend } from "../../src/lib/db/backendSelection";
+import { getServerLifecyclePhase } from "../../src/lib/serverLifecycle";
 import { generateLegacyProviders } from "./providerRegistry.ts";
 
 const upstreamTimeouts = getUpstreamTimeoutConfig(process.env, (message) => {
@@ -75,7 +77,55 @@ export const HUGGINGCHAT_MAX_BODY_BYTES = 4 * 1024 * 1024;
 // The Proxy defers `generateLegacyProviders()` + `loadProviderCredentials()`
 // from module-evaluation time to the first read of any provider property.
 let _providers: Record<string, LegacyProvider> | null = null;
+const NATIVE_PROVIDERS = Symbol.for("omniroute.nativePreparedProviders");
+type ProviderMutation =
+  { kind: "set"; property: string; value: LegacyProvider } | { kind: "delete"; property: string };
+interface NativeProviderState {
+  providers?: Record<string, LegacyProvider>;
+  preparation?: Promise<void>;
+  mutations: ProviderMutation[];
+}
+const providerGlobals = globalThis as typeof globalThis & {
+  [NATIVE_PROVIDERS]?: NativeProviderState;
+};
+
+function nativeProviderState(): NativeProviderState {
+  return (providerGlobals[NATIVE_PROVIDERS] ??= { mutations: [] });
+}
+
+export function prepareNativeProviders(): Promise<void> {
+  if (parseDatabaseBackend() !== "postgres") return Promise.resolve();
+  const state = nativeProviderState();
+  if (state.providers) return Promise.resolve();
+  if (state.preparation) return state.preparation;
+  state.preparation = Promise.resolve().then(async () => {
+    const providers = generateLegacyProviders();
+    await loadProviderCredentialsAsync(providers);
+    // Proxy writes made while file preparation was awaiting retain their original order.
+    for (const mutation of state.mutations) {
+      if (mutation.kind === "set") providers[mutation.property] = mutation.value;
+      else delete providers[mutation.property];
+    }
+    state.mutations.length = 0;
+    state.providers = providers;
+  });
+  return state.preparation;
+}
+
 function initProviders(): Record<string, LegacyProvider> {
+  if (parseDatabaseBackend() === "postgres") {
+    const state = nativeProviderState();
+    if (state.providers) return state.providers;
+    if (state.preparation || getServerLifecyclePhase() === "ready") {
+      throw new Error("Native provider configuration is not prepared");
+    }
+    // An early bootstrap getter may precede the async barrier. This is startup-only;
+    // share its fully initialized map so ready bundles never perform another cold read.
+    const providers = generateLegacyProviders();
+    loadProviderCredentials(providers);
+    state.providers = providers;
+    return providers;
+  }
   if (!_providers) {
     const p = generateLegacyProviders();
     loadProviderCredentials(p);
@@ -89,7 +139,8 @@ export const PROVIDERS: Record<string, LegacyProvider> = new Proxy(
   {
     get(_, prop) {
       if (typeof prop === "symbol") return undefined;
-      return Reflect.get(initProviders(), prop, _providers);
+      const providers = initProviders();
+      return Reflect.get(providers, prop, providers);
     },
     has(_, prop) {
       if (typeof prop === "symbol") return false;
@@ -104,11 +155,25 @@ export const PROVIDERS: Record<string, LegacyProvider> = new Proxy(
     },
     set(_, prop, value) {
       if (typeof prop === "symbol") return false;
+      if (parseDatabaseBackend() === "postgres") {
+        const state = nativeProviderState();
+        if (state.preparation && !state.providers) {
+          state.mutations.push({ kind: "set", property: prop, value });
+          return true;
+        }
+      }
       (initProviders() as Record<string, LegacyProvider>)[prop] = value;
       return true;
     },
     deleteProperty(_, prop) {
       if (typeof prop === "symbol") return false;
+      if (parseDatabaseBackend() === "postgres") {
+        const state = nativeProviderState();
+        if (state.preparation && !state.providers) {
+          state.mutations.push({ kind: "delete", property: prop });
+          return true;
+        }
+      }
       return Reflect.deleteProperty(initProviders(), prop);
     },
   }

@@ -1,6 +1,7 @@
+import { saveTierConfigAsync } from "@/lib/db/tierConfig";
 import { NextResponse } from "next/server";
 import { z } from "zod";
-import { loadTierConfig, saveTierConfig } from "@/lib/db/tierConfig";
+import { loadTierConfig } from "@/lib/db/tierConfig";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 import { setTierConfig } from "@omniroute/open-sse/services/tierResolver";
 import { buildErrorBody } from "@omniroute/open-sse/utils/error";
@@ -51,7 +52,7 @@ export async function PUT(request: Request) {
   }
   const nextConfig = { ...config, providerOverrides: nextOverrides };
 
-  saveTierConfig(nextConfig);
+  await saveTierConfigAsync(nextConfig);
   setTierConfig(nextConfig); // bust the in-process routing cache immediately
 
   return NextResponse.json(nextConfig);

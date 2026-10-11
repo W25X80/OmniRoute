@@ -33,6 +33,10 @@ import { emit } from "@/lib/events/eventBus";
 import { isAutomatedTestProcess } from "@/shared/utils/testProcess";
 import { SEARCH_VALIDATOR_CONFIGS } from "@/lib/providers/validation/searchProviders";
 
+import { parseDatabaseBackend } from "@/lib/db/backendSelection";
+import { getSelectedPersistenceIdentity } from "@/lib/db/controlPlaneContext";
+import { runPersistenceBackgroundWork } from "@/lib/db/persistenceRuntime";
+
 // ── Config ────────────────────────────────────────────────────────────────
 
 const BACKOFF_SCHEDULE = [300_000, 600_000, 1_800_000, 7_200_000]; // 5min, 10min, 30min, 2h
@@ -61,7 +65,99 @@ declare global {
     | undefined;
 }
 
+type CredentialSchedulerState = NonNullable<typeof globalThis.__omnirouteCredentialHC>;
+interface NativeCredentialScheduler {
+  identity: object;
+  state: CredentialSchedulerState;
+  generation: number;
+  intervalMs: number | null;
+  work: Promise<void> | null;
+  stopping?: Promise<void>;
+}
+const NATIVE_CREDENTIAL_SCHEDULERS = Symbol.for("omniroute.nativeCredentialSchedulers");
+const nativeCredentialGlobals = globalThis as typeof globalThis & {
+  [NATIVE_CREDENTIAL_SCHEDULERS]?: WeakMap<object, NativeCredentialScheduler>;
+};
+const nativeCredentialSchedulers = (nativeCredentialGlobals[NATIVE_CREDENTIAL_SCHEDULERS] ??=
+  new WeakMap());
+
+function selectedNativeScheduler(): NativeCredentialScheduler {
+  const identity = getSelectedPersistenceIdentity();
+  if (!identity) throw new Error("Credential health requires selected PostgreSQL persistence");
+  let scheduler = nativeCredentialSchedulers.get(identity);
+  if (!scheduler) {
+    scheduler = {
+      identity,
+      state: {
+        initialized: false,
+        sweepTimer: null,
+        sweepInProgress: false,
+        failureCounts: new Map(),
+        perConnTiming: new Map(),
+      },
+      generation: 0,
+      intervalMs: null,
+      work: null,
+    };
+    nativeCredentialSchedulers.set(identity, scheduler);
+  }
+  return scheduler;
+}
+
+function scheduleNativeSweep(scheduler: NativeCredentialScheduler, delayMs: number): void {
+  if (!scheduler.state.initialized) return;
+  const generation = scheduler.generation;
+  if (scheduler.state.sweepTimer) clearTimeout(scheduler.state.sweepTimer);
+  scheduler.state.sweepTimer = setTimeout(() => {
+    scheduler.state.sweepTimer = null;
+    if (!scheduler.state.initialized || scheduler.generation !== generation) return;
+    void dispatchNativeSweep(scheduler).catch((error) =>
+      console.error(LOG_PREFIX, "Sweep failed:", error)
+    );
+  }, delayMs);
+  scheduler.state.sweepTimer.unref?.();
+}
+
+async function dispatchNativeSweep(scheduler: NativeCredentialScheduler): Promise<void> {
+  if (scheduler.stopping) throw new Error("Credential health scheduler is stopping");
+  if (scheduler.work) return;
+  const generation = scheduler.generation;
+  const work = runPersistenceBackgroundWork(async () => {
+    if (getSelectedPersistenceIdentity() !== scheduler.identity) {
+      scheduler.state.initialized = false;
+      scheduler.generation++;
+      throw new Error("Credential health persistence authority changed");
+    }
+    await performSweep();
+  });
+  scheduler.work = work;
+  try {
+    await work;
+  } finally {
+    if (scheduler.work === work) scheduler.work = null;
+    if (scheduler.state.initialized && scheduler.generation === generation)
+      scheduleNativeSweep(scheduler, scheduler.intervalMs ?? getSweepInterval());
+  }
+}
+
+function stopNativeCredentialScheduler(scheduler: NativeCredentialScheduler): Promise<void> {
+  if (scheduler.stopping) return scheduler.stopping;
+  scheduler.state.initialized = false;
+  scheduler.generation++;
+  if (scheduler.state.sweepTimer) clearTimeout(scheduler.state.sweepTimer);
+  scheduler.state.sweepTimer = null;
+  const stopping = (async () => {
+    await scheduler.work?.catch(() => {});
+  })();
+  scheduler.stopping = stopping;
+  void stopping.finally(() => {
+    if (scheduler.stopping === stopping) scheduler.stopping = undefined;
+  });
+  return stopping;
+}
+
 function getSchedulerState() {
+  if (parseDatabaseBackend() === "postgres") return selectedNativeScheduler().state;
   if (!globalThis.__omnirouteCredentialHC) {
     globalThis.__omnirouteCredentialHC = {
       initialized: false,
@@ -157,7 +253,8 @@ export function getConnIntervalMs(
   globalIntervalMs = DEFAULT_SWEEP_INTERVAL_MS
 ): number | null {
   const minutes = conn.healthCheckInterval;
-  if (minutes === null || minutes === undefined) return globalIntervalMs;
+  if (minutes === null || minutes === undefined)
+    return globalIntervalMs > 0 ? globalIntervalMs : null;
   if (minutes <= 0) return null;
   return minutes * 60_000;
 }
@@ -309,7 +406,13 @@ async function testConnection(
 /**
  * Single sweep: test all provider connections in parallel (with concurrency limit).
  */
+/** A manual sweep is also a separately admitted native operation. */
 export async function sweep(): Promise<void> {
+  if (parseDatabaseBackend() === "postgres") await dispatchNativeSweep(selectedNativeScheduler());
+  else await performSweep();
+}
+
+async function performSweep(): Promise<void> {
   const state = getSchedulerState();
   if (state.sweepInProgress) return;
   state.sweepInProgress = true;
@@ -324,6 +427,8 @@ export async function sweep(): Promise<void> {
     } catch {
       globalIntervalMs = resolveCredentialHealthSweepInterval(null);
     }
+
+    recordSweepCadence(globalIntervalMs > 0 ? globalIntervalMs : getSweepInterval());
 
     // Get active provider connections only (API-key + OAuth). Disabled
     // connections are excluded from routing and must not consume health-check
@@ -356,6 +461,18 @@ export async function sweep(): Promise<void> {
     } catch (err) {
       console.error(LOG_PREFIX, "Failed to load provider connections:", err);
       return;
+    }
+
+    if (globalIntervalMs === 0) {
+      // Global disable still permits explicit per-connection schedules. Recheck
+      // configuration on an existing configured/default cadence, never a zero timer.
+      const overrides = connections
+        .filter(
+          (connection) =>
+            connection.healthCheckInterval != null && connection.healthCheckInterval > 0
+        )
+        .map((connection) => getConnIntervalMs(connection, globalIntervalMs)!);
+      recordSweepCadence(Math.min(getSweepInterval(), ...overrides));
     }
 
     if (connections.length === 0) return;
@@ -412,23 +529,27 @@ export async function sweep(): Promise<void> {
         )
       );
     }
-    // Remember the cadence this cycle ran at so scheduleSweep can re-arm with
-    // the operator's configured interval instead of the built-in default.
-    lastGlobalIntervalMs = globalIntervalMs;
   } finally {
     state.sweepInProgress = false;
     scheduleSweep();
   }
 }
 
+function recordSweepCadence(intervalMs: number): void {
+  if (parseDatabaseBackend() === "postgres") selectedNativeScheduler().intervalMs = intervalMs;
+  else lastGlobalIntervalMs = intervalMs;
+}
+
 let lastGlobalIntervalMs: number | null = null;
 
 /** Test-only: reset scheduler state derived from operator settings. */
 export function __test_resetCredentialHealthScheduler(): void {
-  lastGlobalIntervalMs = null;
+  if (parseDatabaseBackend() === "postgres") selectedNativeScheduler().intervalMs = null;
+  else lastGlobalIntervalMs = null;
 }
 
 function scheduleSweep(): void {
+  if (parseDatabaseBackend() === "postgres") return; // The admitted operation owns native recursion.
   const state = getSchedulerState();
   if (!state.initialized) return;
   if (state.sweepTimer) clearTimeout(state.sweepTimer);
@@ -450,6 +571,16 @@ function scheduleSweep(): void {
  * OMNIROUTE_DISABLE_CREDENTIAL_HEALTH_CHECK is set (#11016).
  */
 export function initCredentialHealthCheck(): boolean {
+  if (parseDatabaseBackend() === "postgres") {
+    if (isCredentialHealthCheckDisabled()) return false;
+    const scheduler = selectedNativeScheduler();
+    if (scheduler.stopping) throw new Error("Credential health scheduler is stopping");
+    if (scheduler.state.initialized) return true;
+    scheduler.state.initialized = true;
+    initCredentialCache();
+    scheduleNativeSweep(scheduler, INITIAL_DELAY_MS);
+    return true;
+  }
   const state = getSchedulerState();
   if (isCredentialHealthCheckDisabled()) return false;
   if (state.initialized) return true;
@@ -471,6 +602,10 @@ export function initCredentialHealthCheck(): boolean {
  * Stop the scheduler (for tests / hot-reload).
  */
 export function stopCredentialHealthCheck(): void {
+  if (parseDatabaseBackend() === "postgres") {
+    void stopNativeCredentialScheduler(selectedNativeScheduler());
+    return;
+  }
   const state = getSchedulerState();
   if (state.sweepTimer) {
     clearTimeout(state.sweepTimer);
@@ -483,11 +618,26 @@ export function stopCredentialHealthCheck(): void {
  * Force an immediate sweep (for manual refresh / testing).
  */
 export async function forceSweep(): Promise<void> {
+  if (parseDatabaseBackend() === "postgres") {
+    const scheduler = selectedNativeScheduler();
+    if (scheduler.stopping) throw new Error("Credential health scheduler is stopping");
+    scheduler.state.initialized = true;
+    initCredentialCache();
+    await dispatchNativeSweep(scheduler);
+    return;
+  }
   const state = getSchedulerState();
   state.initialized = true;
   initCredentialCache();
   await sweep();
 }
 
-// Auto-initialize on first import
-initCredentialHealthCheck();
+/** Shutdown must await every accepted native probe and its metadata/cache effects. */
+export async function stopCredentialHealthCheckAsync(): Promise<void> {
+  if (parseDatabaseBackend() === "postgres")
+    await stopNativeCredentialScheduler(selectedNativeScheduler());
+  else stopCredentialHealthCheck();
+}
+
+// Native scheduling begins only at the explicit post-readiness boot boundary.
+if (parseDatabaseBackend() === "sqlite") initCredentialHealthCheck();

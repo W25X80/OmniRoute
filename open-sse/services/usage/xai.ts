@@ -32,8 +32,9 @@ export async function getXaiUsage(connectionId: string) {
     return { message: "xAI: connection id unavailable for self-tracked usage." };
   }
   try {
-    const { getMonthlyProviderTokensForConnection } = await import("@/lib/usage/usageStats");
-    const used = getMonthlyProviderTokensForConnection("xai", connectionId);
+    const { getMonthlyProviderTokensForConnectionAsync: getMonthlyProviderTokensForConnection } =
+      await import("@/lib/usage/usageStats");
+    const used = await getMonthlyProviderTokensForConnection("xai", connectionId);
     return {
       plan: "xAI / Grok (OmniRoute-tracked)",
       quotas: {

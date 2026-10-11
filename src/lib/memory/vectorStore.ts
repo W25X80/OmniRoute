@@ -1,3 +1,4 @@
+import { getSelectedMemoryVectorStore } from "../db/memory";
 // Raw SQL allowed: sqlite-vec virtual table DDL is dynamic (dim varies). See plan 21 §D5.
 // Hard Rule #5 exception: sqlite-vec VIRTUAL TABLE cannot be created via src/lib/db/ domain modules
 // because the table dimension (N in FLOAT[N]) depends on the active embedding model at runtime.
@@ -45,7 +46,7 @@ export interface VectorStore {
   /** Ensure schema (sqlite-vec loaded, vec_memories created if needed, dim aligned). Idempotent. */
   ensureReady(resolution: EmbeddingResolution): Promise<{ ready: boolean; reason: string }>;
   /** Insert/update vector for a memory. */
-  upsertVector(memoryId: string, vector: Float32Array): Promise<void>;
+  upsertVector(memoryId: string, vector: Float32Array, expectedContent?: string): Promise<void>;
   /** Delete vector for a memory (no-op if not present). */
   deleteVector(memoryId: string): Promise<void>;
   /** KNN brute-force search. Returns top-K hits ordered by distance ASC. */
@@ -424,6 +425,8 @@ let _instance: VectorStore | null | undefined = undefined; // undefined = not ye
  * Callers should degrade gracefully to FTS5 keyword search when this returns null.
  */
 export function getVectorStore(): VectorStore | null {
+  const selected = getSelectedMemoryVectorStore();
+  if (selected) return selected;
   if (_instance !== undefined) {
     return _instance;
   }

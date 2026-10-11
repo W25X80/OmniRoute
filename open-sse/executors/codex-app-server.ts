@@ -6,7 +6,7 @@ import { PROVIDERS } from "../config/constants.ts";
 import { BaseExecutor, type ExecuteInput, type ExecutorExecuteResult } from "./base.ts";
 import { CodexAppServerClient, type CodexAppServerClientOptions } from "./codex/appServerClient.ts";
 import {
-  resolveAppServerConfig,
+  resolveAppServerConfigAsync,
   resolveThreadStartPolicy,
   type CodexAppServerConfig,
 } from "./codex/appServerConfig.ts";
@@ -233,7 +233,7 @@ export class CodexAppServerExecutor extends BaseExecutor {
 
   override async execute(input: ExecuteInput): Promise<ExecutorExecuteResult> {
     const psd = input.credentials?.providerSpecificData;
-    const config = resolveAppServerConfig(psd);
+    const config = await resolveAppServerConfigAsync(psd);
     if (!config) {
       return errorResponse(
         503,

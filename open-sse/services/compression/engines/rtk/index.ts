@@ -1,3 +1,4 @@
+import { parseDatabaseBackend } from "../../../../../src/lib/db/backendSelection";
 import { createCompressionStats, estimateCompressionTokens } from "../../stats.ts";
 import { DEFAULT_RTK_CONFIG, type CompressionResult, type RtkConfig } from "../../types.ts";
 import type { CompressionEngine } from "../types.ts";
@@ -5,12 +6,14 @@ import { detectCommandType } from "./commandDetector.ts";
 import { RTK_SCHEMA, validateRtkEngineConfig } from "./configSchema.ts";
 import { deduplicateRepeatedLines } from "./deduplicator.ts";
 import { groupSimilarLines } from "./grouper.ts";
-import { matchRtkFilter } from "./filterLoader.ts";
+import { loadRtkFiltersAsync, matchPreparedRtkFilter, matchRtkFilter } from "./filterLoader.ts";
+import type { RtkFilterDefinition } from "./filterSchema.ts";
 import { applyLineFilter } from "./lineFilter.ts";
 import { smartTruncate } from "./smartTruncate.ts";
 import { normalizeCodeLanguage, stripCode } from "./codeStripper.ts";
 import {
   maybePersistRtkRawOutput,
+  maybePersistRtkRawOutputAsync,
   scheduleRtkRawOutputPurge,
   type RtkRawOutputPointer,
 } from "./rawOutput.ts";
@@ -79,8 +82,23 @@ export interface RtkProcessResult {
   rawOutputPointers?: RtkRawOutputPointer[];
 }
 
+interface RtkInlinePreparation {
+  filters: RtkFilterDefinition[];
+  results: RtkProcessResult[];
+  captures: Array<{
+    raw: string;
+    config: RtkConfig;
+    command: string | null;
+    result: RtkProcessResult;
+  }>;
+}
+
 function mergeRtkConfig(base?: Partial<RtkConfig>, override?: Record<string, unknown>): RtkConfig {
-  const merged = { ...DEFAULT_RTK_CONFIG, ...(base ?? {}), ...(override ?? {}) };
+  const merged = {
+    ...DEFAULT_RTK_CONFIG,
+    ...(base ?? {}),
+    ...(override ?? {}),
+  };
   return {
     ...merged,
     intensity:
@@ -170,7 +188,8 @@ function codeOnlyConfig(config: RtkConfig): boolean {
 
 function processRtkCodeBlocksOnly(
   content: Message["content"],
-  config: RtkConfig
+  config: RtkConfig,
+  preparation?: RtkInlinePreparation
 ): {
   content: Message["content"];
   compressed: boolean;
@@ -184,7 +203,7 @@ function processRtkCodeBlocksOnly(
   const processText = (text: string) => {
     let compressed = false;
     const nextText = text.replace(/```([\s\S]*?)```/g, (match) => {
-      const processed = processRtkText(match, { config });
+      const processed = processRtkTextPrepared(match, { config }, preparation);
       techniquesUsed.push(...processed.techniquesUsed);
       rulesApplied.push(...processed.rulesApplied);
       if (processed.rawOutputPointers) rawOutputPointers.push(...processed.rawOutputPointers);
@@ -206,7 +225,13 @@ function processRtkCodeBlocksOnly(
     };
   }
   if (!Array.isArray(content)) {
-    return { content, compressed: false, techniquesUsed, rulesApplied, rawOutputPointers };
+    return {
+      content,
+      compressed: false,
+      techniquesUsed,
+      rulesApplied,
+      rawOutputPointers,
+    };
   }
   let compressed = false;
   const nextContent = content.map((part) => {
@@ -228,6 +253,18 @@ function processRtkCodeBlocksOnly(
 export function processRtkText(
   text: string,
   options: { command?: string | null; config?: Partial<RtkConfig>; skipFilters?: boolean } = {}
+): RtkProcessResult {
+  return processRtkTextPrepared(text, options);
+}
+
+function processRtkTextPrepared(
+  text: string,
+  options: {
+    command?: string | null;
+    config?: Partial<RtkConfig>;
+    skipFilters?: boolean;
+  } = {},
+  preparation?: RtkInlinePreparation
 ): RtkProcessResult {
   const config = mergeRtkConfig(options.config);
   const originalTokens = estimateCompressionTokens(text);
@@ -252,10 +289,12 @@ export function processRtkText(
     detection.type === "unknown" && !detection.command && !hasGenericErrorMarkers;
   let matchedFilterPatterns: string[] = [];
   if (!options.skipFilters && !isDocumentLikeRead) {
-    const filter = matchRtkFilter(text, detection.command, {
-      customFiltersEnabled: config.customFiltersEnabled,
-      trustProjectFilters: config.trustProjectFilters,
-    });
+    const filter = preparation
+      ? matchPreparedRtkFilter(preparation.filters, text, detection.command)
+      : matchRtkFilter(text, detection.command, {
+          customFiltersEnabled: config.customFiltersEnabled,
+          trustProjectFilters: config.trustProjectFilters,
+        });
     if (filter && !config.disabledFilters.includes(filter.id)) {
       if (config.enabledFilters.length === 0 || config.enabledFilters.includes(filter.id)) {
         const filtered = applyLineFilter(result, {
@@ -318,7 +357,9 @@ export function processRtkText(
   const shouldSkipDedup = Boolean(options.skipFilters);
   const deduped = shouldSkipDedup
     ? { text: result, collapsed: 0 }
-    : deduplicateRepeatedLines(result, { threshold: config.deduplicateThreshold });
+    : deduplicateRepeatedLines(result, {
+        threshold: config.deduplicateThreshold,
+      });
   if (deduped.collapsed > 0) {
     result = deduped.text;
     techniquesUsed.push("rtk-dedup");
@@ -371,7 +412,7 @@ export function processRtkText(
   }
 
   const compressedTokens = estimateCompressionTokens(result);
-  if (compressedTokens < originalTokens) {
+  if (compressedTokens < originalTokens && !preparation) {
     const pointer = maybePersistRtkRawOutput(text, {
       retention: config.rawOutputRetention,
       command: detection.command,
@@ -391,7 +432,7 @@ export function processRtkText(
       });
     }
   }
-  return {
+  const outcome: RtkProcessResult = {
     text: result,
     compressed: compressedTokens < originalTokens,
     originalTokens,
@@ -400,6 +441,13 @@ export function processRtkText(
     rulesApplied: [...new Set(rulesApplied)],
     ...(rawOutputPointers.length > 0 ? { rawOutputPointers } : {}),
   };
+  if (preparation) {
+    preparation.results.push(outcome);
+    if (outcome.compressed) {
+      preparation.captures.push({ raw: text, config, command: detection.command, result: outcome });
+    }
+  }
+  return outcome;
 }
 
 /**
@@ -410,7 +458,8 @@ export function processRtkText(
 function processToolResultBlocks(
   content: Message["content"],
   config: RtkConfig,
-  toolCallLookup: Map<string, ToolMeta>
+  toolCallLookup: Map<string, ToolMeta>,
+  preparation?: RtkInlinePreparation
 ): {
   content: Message["content"];
   compressed: boolean;
@@ -423,7 +472,13 @@ function processToolResultBlocks(
   const rawOutputPointers: RtkRawOutputPointer[] = [];
 
   if (!Array.isArray(content)) {
-    return { content, compressed: false, techniquesUsed, rulesApplied, rawOutputPointers };
+    return {
+      content,
+      compressed: false,
+      techniquesUsed,
+      rulesApplied,
+      rawOutputPointers,
+    };
   }
 
   const collect = (processed: RtkProcessResult) => {
@@ -443,7 +498,11 @@ function processToolResultBlocks(
 
     if (typeof inner === "string") {
       if (!inner) return part;
-      const processed = processRtkText(inner, { config, command, skipFilters });
+      const processed = processRtkTextPrepared(
+        inner,
+        { config, command, skipFilters },
+        preparation
+      );
       collect(processed);
       if (!processed.compressed) return part;
       compressed = true;
@@ -456,7 +515,15 @@ function processToolResultBlocks(
         if (!isTextBlock(sub) || !sub.text) return sub;
         // A text sub-block can carry its own cache breakpoint — preserve it byte-for-byte.
         if (hasCacheControlMarker(sub)) return sub;
-        const processed = processRtkText(sub.text, { config, command, skipFilters });
+        const processed = processRtkTextPrepared(
+          sub.text,
+          {
+            config,
+            command,
+            skipFilters,
+          },
+          preparation
+        );
         collect(processed);
         if (!processed.compressed) return sub;
         blockChanged = true;
@@ -481,7 +548,8 @@ function processToolResultBlocks(
 function processRtkContent(
   content: Message["content"],
   config: RtkConfig,
-  options?: { command?: string | null; skipFilters?: boolean }
+  options?: { command?: string | null; skipFilters?: boolean },
+  preparation?: RtkInlinePreparation
 ): {
   content: Message["content"];
   compressed: boolean;
@@ -490,7 +558,7 @@ function processRtkContent(
   rawOutputPointers: RtkRawOutputPointer[];
 } {
   if (codeOnlyConfig(config)) {
-    return processRtkCodeBlocksOnly(content, config);
+    return processRtkCodeBlocksOnly(content, config, preparation);
   }
   const techniquesUsed: string[] = [];
   const rulesApplied: string[] = [];
@@ -504,13 +572,23 @@ function processRtkContent(
 
   if (typeof content === "string") {
     if (!content) {
-      return { content, compressed: false, techniquesUsed, rulesApplied, rawOutputPointers };
+      return {
+        content,
+        compressed: false,
+        techniquesUsed,
+        rulesApplied,
+        rawOutputPointers,
+      };
     }
-    const processed = processRtkText(content, {
-      config,
-      command: options?.command,
-      skipFilters: options?.skipFilters,
-    });
+    const processed = processRtkTextPrepared(
+      content,
+      {
+        config,
+        command: options?.command,
+        skipFilters: options?.skipFilters,
+      },
+      preparation
+    );
     collect(processed);
     return {
       content: processed.compressed ? processed.text : content,
@@ -522,17 +600,27 @@ function processRtkContent(
   }
 
   if (!Array.isArray(content)) {
-    return { content, compressed: false, techniquesUsed, rulesApplied, rawOutputPointers };
+    return {
+      content,
+      compressed: false,
+      techniquesUsed,
+      rulesApplied,
+      rawOutputPointers,
+    };
   }
 
   let compressed = false;
   const nextContent = content.map((part) => {
     if (!isTextBlock(part) || !part.text) return part;
-    const processed = processRtkText(part.text, {
-      config,
-      command: options?.command,
-      skipFilters: options?.skipFilters,
-    });
+    const processed = processRtkTextPrepared(
+      part.text,
+      {
+        config,
+        command: options?.command,
+        skipFilters: options?.skipFilters,
+      },
+      preparation
+    );
     collect(processed);
     if (!processed.compressed) return part;
     compressed = true;
@@ -560,24 +648,84 @@ export function effectiveMaxLines(base: number, intensity: string | undefined): 
   return Math.max(1, Math.round(base * factor));
 }
 
-export function applyRtkCompression(
-  body: Record<string, unknown>,
-  options: { config?: Partial<RtkConfig>; stepConfig?: Record<string, unknown> } = {}
-): CompressionResult {
-  const start = performance.now();
+interface RtkCompressionOptions {
+  config?: Partial<RtkConfig>;
+  stepConfig?: Record<string, unknown>;
+}
+function resolveRtkCompressionConfig(options: RtkCompressionOptions): RtkConfig {
   const stepConfig =
     options.stepConfig && options.stepConfig.enabled === undefined
       ? { enabled: true, ...options.stepConfig }
       : options.stepConfig;
   const explicitConfig = options.config && Object.keys(options.config).length > 0;
   const baseConfig = !explicitConfig && !stepConfig ? { enabled: true } : (options.config ?? {});
-  const config = mergeRtkConfig(baseConfig, stepConfig);
-  if (!config.enabled) return { body, compressed: false, stats: null };
+  return mergeRtkConfig(baseConfig, stepConfig);
+}
+
+export function applyRtkCompression(
+  body: Record<string, unknown>,
+  options: RtkCompressionOptions = {}
+): CompressionResult {
+  return prepareRtkCompression(body, options)();
+}
+
+export async function applyRtkCompressionAsync(
+  body: Record<string, unknown>,
+  options: RtkCompressionOptions = {}
+): Promise<CompressionResult> {
+  if (parseDatabaseBackend() !== "postgres") return applyRtkCompression(body, options);
+  const config = resolveRtkCompressionConfig(options);
+  const messages = adaptBodyForCompression(body).body.messages as Message[] | undefined;
+  if (
+    !config.enabled ||
+    !Array.isArray(messages) ||
+    !messages.some((message) => shouldCompressMessage(message, config))
+  ) {
+    return applyRtkCompression(body, options);
+  }
+  const preparation: RtkInlinePreparation = {
+    filters: await loadRtkFiltersAsync({
+      customFiltersEnabled: config.customFiltersEnabled,
+      trustProjectFilters: config.trustProjectFilters,
+    }),
+    results: [],
+    captures: [],
+  };
+  const complete = prepareRtkCompression(body, options, preparation);
+  for (const capture of preparation.captures) {
+    const pointer = await maybePersistRtkRawOutputAsync(capture.raw, {
+      retention: capture.config.rawOutputRetention,
+      command: capture.command,
+      maxBytes: capture.config.rawOutputMaxBytes,
+    });
+    if (pointer) {
+      capture.result.rawOutputPointers = [pointer];
+      capture.result.techniquesUsed.push("rtk-raw-output-retention");
+      capture.result.rulesApplied.push("rtk:raw-output-retention");
+    }
+    if (capture.config.rawOutputRetention !== "never") {
+      scheduleRtkRawOutputPurge({
+        maxFiles: capture.config.rawOutputMaxFiles,
+        maxAgeDays: capture.config.rawOutputMaxAgeDays,
+      });
+    }
+  }
+  return complete();
+}
+
+function prepareRtkCompression(
+  body: Record<string, unknown>,
+  options: RtkCompressionOptions,
+  preparation?: RtkInlinePreparation
+): () => CompressionResult {
+  const start = performance.now();
+  const config = resolveRtkCompressionConfig(options);
+  if (!config.enabled) return () => ({ body, compressed: false, stats: null });
 
   const adapter = adaptBodyForCompression(body);
   const messages = adapter.body.messages as Message[] | undefined;
   if (!Array.isArray(messages) || messages.length === 0) {
-    return { body, compressed: false, stats: null };
+    return () => ({ body, compressed: false, stats: null });
   }
 
   const allTechniques: string[] = [];
@@ -646,7 +794,12 @@ export function applyRtkCompression(
     // role:"user") message. Compress each block's inner text, resolving the shell command
     // per block from the matching assistant `tool_use` (mirrors the OpenAI tool path).
     if (Array.isArray(message.content) && message.content.some(isAnthropicToolResultBlock)) {
-      const processed = processToolResultBlocks(message.content, config, toolCallLookup);
+      const processed = processToolResultBlocks(
+        message.content,
+        config,
+        toolCallLookup,
+        preparation
+      );
       allTechniques.push(...processed.techniquesUsed);
       allRules.push(...processed.rulesApplied);
       rawOutputPointers.push(...processed.rawOutputPointers);
@@ -662,7 +815,15 @@ export function applyRtkCompression(
       ({ command, skipFilters } = resolveToolMeta(callId, toolCallLookup));
     }
 
-    const processed = processRtkContent(message.content, config, { command, skipFilters });
+    const processed = processRtkContent(
+      message.content,
+      config,
+      {
+        command,
+        skipFilters,
+      },
+      preparation
+    );
     allTechniques.push(...processed.techniquesUsed);
     allRules.push(...processed.rulesApplied);
     rawOutputPointers.push(...processed.rawOutputPointers);
@@ -682,26 +843,37 @@ export function applyRtkCompression(
     (message, index) => message !== messages[index]
   );
   if (!anyMessageChanged) {
-    return { body, compressed: false, stats: null };
+    return () => ({ body, compressed: false, stats: null });
   }
 
-  const compressedBody = { ...adapter.body, messages: compressedMessages };
-  const stats = createCompressionStats(
-    adapter.body,
-    compressedBody,
-    "rtk",
-    [...new Set(allTechniques)],
-    allRules.length > 0 ? [...new Set(allRules)] : undefined,
-    Math.round((performance.now() - start) * 100) / 100
-  );
-  stats.engine = "rtk";
-  if (rawOutputPointers.length > 0) {
-    stats.rtkRawOutputPointers = rawOutputPointers;
-  }
-  return {
-    body: adapter.restore(compressedBody),
-    compressed: stats.compressedTokens < stats.originalTokens,
-    stats,
+  return () => {
+    const techniques = preparation
+      ? preparation.results.flatMap((result) => result.techniquesUsed)
+      : allTechniques;
+    const rules = preparation
+      ? preparation.results.flatMap((result) => result.rulesApplied)
+      : allRules;
+    const pointers = preparation
+      ? preparation.results.flatMap((result) => result.rawOutputPointers ?? [])
+      : rawOutputPointers;
+    const compressedBody = { ...adapter.body, messages: compressedMessages };
+    const stats = createCompressionStats(
+      adapter.body,
+      compressedBody,
+      "rtk",
+      [...new Set(techniques)],
+      rules.length > 0 ? [...new Set(rules)] : undefined,
+      Math.round((performance.now() - start) * 100) / 100
+    );
+    stats.engine = "rtk";
+    if (pointers.length > 0) {
+      stats.rtkRawOutputPointers = pointers;
+    }
+    return {
+      body: adapter.restore(compressedBody),
+      compressed: stats.compressedTokens < stats.originalTokens,
+      stats,
+    };
   };
 }
 
@@ -728,6 +900,12 @@ export const rtkEngine: CompressionEngine = {
       stepConfig: options?.stepConfig,
     });
   },
+  applyAsync(body, options) {
+    return applyRtkCompressionAsync(body, {
+      config: options?.config?.rtkConfig,
+      stepConfig: options?.stepConfig,
+    });
+  },
   compress(body, config) {
     return this.apply(body, { stepConfig: config });
   },
@@ -748,8 +926,10 @@ export { runRtkFilterTests } from "./verify.ts";
 export {
   maybePersistRtkRawOutput,
   readRtkRawOutput,
+  readRtkRawOutputAsync,
   redactRtkRawOutput,
   listRtkCommandSamples,
+  listRtkCommandSamplesAsync,
 } from "./rawOutput.ts";
 // RTK learn/discover: the sample-source adapter (rawOutput) feeds these pure miners.
 export { discoverRepeatedNoise, type NoiseCandidate, type CommandSample } from "./discover.ts";

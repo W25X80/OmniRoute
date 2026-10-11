@@ -1,5 +1,5 @@
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
-import { getCommandCodeAuthSessionSafeStatus } from "@/lib/db/commandCodeAuth";
+import { getCommandCodeAuthSessionSafeStatusAsync } from "@/lib/db/commandCodeAuth";
 
 import { commandCodeStateSchema, noStoreJson, stateHashFromState } from "../shared";
 
@@ -22,7 +22,9 @@ async function handle(request: Request) {
   const parsed = commandCodeStateSchema.safeParse({ state });
   if (!parsed.success) return noStoreJson({ error: "Invalid state" }, { status: 400 });
 
-  const session = getCommandCodeAuthSessionSafeStatus(stateHashFromState(parsed.data.state));
+  const session = await getCommandCodeAuthSessionSafeStatusAsync(
+    stateHashFromState(parsed.data.state)
+  );
   if (!session) return noStoreJson({ status: "not_found" }, { status: 404 });
 
   return noStoreJson({

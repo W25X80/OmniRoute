@@ -22,7 +22,7 @@ export async function POST(_request: Request, { params }: { params: Promise<{ id
   try {
     const { id } = await params;
     const registry = getJobRegistry();
-    if (!registry.listJobs().some((j) => j.id === id)) {
+    if (!(await registry.listJobsAsync()).some((j) => j.id === id)) {
       return NextResponse.json(buildErrorBody(404, "Job not found"), { status: 404 });
     }
     const timeoutMs = Number(process.env.OMNIROUTE_RUNNOW_TIMEOUT_MS) || DEFAULT_TIMEOUT_MS;

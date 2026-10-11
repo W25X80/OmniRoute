@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
-import { getConversationTurnPage } from "@/lib/db/agenticConversations";
-import { resolveTurnDisplayContent } from "@omniroute/open-sse/services/conversationTurnContent.ts";
+import { getConversationTurnPageAsync } from "@/lib/db/agenticConversations";
+import { resolveTurnDisplayContentAsync } from "@omniroute/open-sse/services/conversationTurnContent.ts";
 
 export const dynamic = "force-dynamic";
 
@@ -37,7 +37,7 @@ export async function GET(
     const { searchParams } = new URL(req.url);
     const limitParam = parseSeqParam(searchParams.get("limit"));
 
-    const { nodes, hasMore } = getConversationTurnPage(id, {
+    const { nodes, hasMore } = await getConversationTurnPageAsync(id, {
       limit: limitParam != null && limitParam > 0 ? limitParam : undefined,
       beforeSeq: parseSeqParam(searchParams.get("beforeSeq")),
       afterSeq: parseSeqParam(searchParams.get("afterSeq")),
@@ -50,7 +50,7 @@ export async function GET(
     // size-limit-omitted) falls back to an empty text placeholder rather
     // than failing the whole page — the chain/identity data is still valid
     // even when the display content underneath it aged out.
-    const displayContent = resolveTurnDisplayContent(nodes);
+    const displayContent = await resolveTurnDisplayContentAsync(nodes);
 
     return NextResponse.json({
       nodes: nodes.map((n) => {

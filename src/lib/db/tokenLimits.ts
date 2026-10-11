@@ -1,3 +1,13 @@
+import {
+  TokenLimitConflictError,
+  TokenLimitNotFoundError,
+  resetWindowIfElapsed,
+} from "./tokenLimits/persistenceSemantics";
+export {
+  TokenLimitConflictError,
+  TokenLimitNotFoundError,
+  resetWindowIfElapsed,
+} from "./tokenLimits/persistenceSemantics";
 /**
  * Per-API-Key Token Limits — Persistence Layer
  *
@@ -13,7 +23,9 @@
 
 import { randomUUID } from "crypto";
 import { getDbInstance } from "./core";
-import { getBudgetWindow, type BudgetResetInterval } from "@/domain/costRules";
+import type { BudgetResetInterval } from "@/domain/budgetWindow";
+import { getSelectedPostgresDatabase } from "./controlPlaneContext";
+import { PostgresTokenLimitRepository } from "./postgres/tokenLimitRepository";
 
 export type TokenLimitScopeType = "model" | "provider" | "global";
 
@@ -130,24 +142,6 @@ function rowToTokenLimit(row: unknown): TokenLimit {
   };
 }
 
-// ──────────────── CRUD ────────────────
-
-/** An id-targeted update that would take another limit's (scope, reset interval) slot. */
-export class TokenLimitConflictError extends Error {
-  constructor(scopeType: TokenLimitScopeType, resetInterval: BudgetResetInterval) {
-    super(`This key already has a ${resetInterval} ${scopeType} token limit for that scope.`);
-    this.name = "TokenLimitConflictError";
-  }
-}
-
-/** An id-targeted update for a token limit that does not exist. */
-export class TokenLimitNotFoundError extends Error {
-  constructor() {
-    super("Token limit not found.");
-    this.name = "TokenLimitNotFoundError";
-  }
-}
-
 function normalizeUpsertInput(input: UpsertTokenLimitInput) {
   const scopeType = normalizeScopeType(input.scopeType);
   return {
@@ -201,7 +195,9 @@ function insertOrMergeTokenLimit(row: ReturnType<typeof normalizeUpsertInput>): 
       `SELECT id FROM api_key_token_limits
        WHERE api_key_id = ? AND scope_type = ? AND scope_value = ? AND reset_interval = ?`
     )
-    .get(row.apiKeyId, row.scopeType, row.scopeValue, row.resetInterval) as { id: string };
+    .get(row.apiKeyId, row.scopeType, row.scopeValue, row.resetInterval) as {
+    id: string;
+  };
   return written.id;
 }
 
@@ -266,7 +262,11 @@ export function getTokenLimitsForRequest(
            OR (scope_type = 'provider' AND scope_value = @provider)
          )`
     )
-    .all({ apiKeyId, model: model || "", provider: provider || "" } as JsonRecord)
+    .all({
+      apiKeyId,
+      model: model || "",
+      provider: provider || "",
+    } as JsonRecord)
     .map(rowToTokenLimit);
 }
 
@@ -279,24 +279,6 @@ export function deleteTokenLimit(id: string): boolean {
   db.prepare("DELETE FROM api_key_token_limit_reset_logs WHERE limit_id = ?").run(id);
   const info = db.prepare("DELETE FROM api_key_token_limits WHERE id = ?").run(id);
   return info.changes > 0;
-}
-
-// ──────────────── Counters (concurrency-safe under WAL) ────────────────
-
-/**
- * Pure boundary calculator. Resolves the active window for a limit at `now`
- * and reports whether the window has rolled since the limit's last-known window.
- * No DB writes. Window math reused from costRules.getBudgetWindow.
- */
-export function resetWindowIfElapsed(limit: TokenLimit, now = Date.now()): TokenWindowState {
-  const window = getBudgetWindow(limit.resetInterval, limit.resetTime, now);
-  const windowStart = String(window.periodStartAt);
-  return {
-    windowStart,
-    didReset: false, // caller compares against the stored counter row to decide rollover
-    periodStartAt: window.periodStartAt,
-    nextResetAt: window.nextResetAt,
-  };
 }
 
 /**
@@ -349,4 +331,57 @@ export function logTokenLimitReset(limitId: string, prevTokens: number, windowSt
     `INSERT INTO api_key_token_limit_reset_logs (limit_id, reset_at, prev_tokens, window_start)
      VALUES (?, datetime('now'), ?, ?)`
   ).run(limitId, Math.max(0, Math.floor(toNumber(prevTokens))), windowStart);
+}
+
+export async function upsertTokenLimitAsync(...args: Parameters<typeof upsertTokenLimit>) {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? new PostgresTokenLimitRepository(database).upsert(...args)
+    : upsertTokenLimit(...args);
+}
+
+export async function listTokenLimitsAsync(...args: Parameters<typeof listTokenLimits>) {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? new PostgresTokenLimitRepository(database).list(...args)
+    : listTokenLimits(...args);
+}
+
+export async function getTokenLimitsForRequestAsync(
+  ...args: Parameters<typeof getTokenLimitsForRequest>
+) {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? new PostgresTokenLimitRepository(database).forRequest(...args)
+    : getTokenLimitsForRequest(...args);
+}
+
+export async function deleteTokenLimitAsync(...args: Parameters<typeof deleteTokenLimit>) {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? new PostgresTokenLimitRepository(database).delete(...args)
+    : deleteTokenLimit(...args);
+}
+
+export async function getWindowUsageAsync(...args: Parameters<typeof getWindowUsage>) {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? new PostgresTokenLimitRepository(database).readUsage(...args)
+    : getWindowUsage(...args);
+}
+
+export async function incrementWindowTokensAsync(
+  ...args: Parameters<typeof incrementWindowTokens>
+) {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? new PostgresTokenLimitRepository(database).increment(...args)
+    : incrementWindowTokens(...args);
+}
+
+export async function logTokenLimitResetAsync(...args: Parameters<typeof logTokenLimitReset>) {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? new PostgresTokenLimitRepository(database).logReset(...args)
+    : logTokenLimitReset(...args);
 }

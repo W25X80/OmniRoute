@@ -1,19 +1,41 @@
 /** Singleton registry of ServiceSupervisor instances. */
 
+import { parseDatabaseBackend } from "@/lib/db/backendSelection";
+import {
+  captureNativeEmbeddedServices,
+  getNativeEmbeddedServices,
+  assertNativeServiceActivation,
+} from "./nativeLifecycle";
 import type { ServiceSupervisor } from "./ServiceSupervisor";
 
 const supervisors = new Map<string, ServiceSupervisor>();
 
 export function registerSupervisor(supervisor: ServiceSupervisor): void {
+  if (parseDatabaseBackend() === "postgres") {
+    const owner = captureNativeEmbeddedServices()!;
+    assertNativeServiceActivation(owner);
+    const tool = supervisor.getStatus().tool;
+    const existing = owner.supervisors.get(tool);
+    if (existing && existing !== supervisor)
+      throw new Error("Embedded service is already registered");
+    owner.supervisors.set(tool, supervisor);
+    return;
+  }
   supervisors.set(supervisor.getStatus().tool, supervisor);
 }
 
 export function getSupervisor(tool: string): ServiceSupervisor | null {
+  if (parseDatabaseBackend() === "postgres")
+    return getNativeEmbeddedServices()?.supervisors.get(tool) ?? null;
   return supervisors.get(tool) ?? null;
 }
 
 /** Remove a supervisor by tool name. Intended for use in tests. */
 export function unregisterSupervisor(tool: string): void {
+  if (parseDatabaseBackend() === "postgres") {
+    getNativeEmbeddedServices()?.supervisors.delete(tool);
+    return;
+  }
   supervisors.delete(tool);
 }
 
@@ -38,5 +60,7 @@ function handleShutdownSignal(signal: NodeJS.Signals): void {
     });
 }
 
-process.once("SIGINT", () => handleShutdownSignal("SIGINT"));
-process.once("SIGTERM", () => handleShutdownSignal("SIGTERM"));
+if (parseDatabaseBackend() === "sqlite") {
+  process.once("SIGINT", () => handleShutdownSignal("SIGINT"));
+  process.once("SIGTERM", () => handleShutdownSignal("SIGTERM"));
+}

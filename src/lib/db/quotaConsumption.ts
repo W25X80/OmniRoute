@@ -13,6 +13,8 @@
  */
 
 import { getDbInstance } from "./core";
+import { getSelectedPostgresDatabase } from "./controlPlaneContext";
+import { PostgresQuotaRepository } from "./postgres/quotaRepository";
 
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -67,11 +69,7 @@ export interface ConsumptionEvent {
 /**
  * Read the consumed value for a single bucket. Returns 0 if no row exists.
  */
-export function getBucket(
-  apiKeyId: string,
-  dimensionKey: string,
-  bucketIndex: number
-): number {
+export function getBucket(apiKeyId: string, dimensionKey: string, bucketIndex: number): number {
   const row = getDb()
     .prepare<BucketRow>(
       `SELECT consumed FROM quota_consumption
@@ -204,12 +202,6 @@ export function listConsumptionForPool(poolId: string, limit: number): Consumpti
 // Pool-wide aggregate
 // ---------------------------------------------------------------------------
 
-interface BucketPairRow {
-  api_key_id: string;
-  curr: number;
-  prev: number;
-}
-
 /**
  * Sum the consumed values for a given (dimensionKey, currentBucketIndex) and
  * (dimensionKey, currentBucketIndex - 1) across ALL api_key_id values.
@@ -271,4 +263,69 @@ export function gcOlderThan(maxUpdatedAtMs: number): number {
     .prepare("DELETE FROM quota_consumption WHERE updated_at < ?")
     .run(maxUpdatedAtMs);
   return result.changes;
+}
+
+function selectedQuotaRepository(): PostgresQuotaRepository | undefined {
+  const database = getSelectedPostgresDatabase();
+  return database ? new PostgresQuotaRepository(database) : undefined;
+}
+
+export async function getBucketAsync(
+  apiKeyId: string,
+  dimensionKey: string,
+  bucketIndex: number
+): Promise<number> {
+  const repository = selectedQuotaRepository();
+  return repository
+    ? repository.getBucket(apiKeyId, dimensionKey, bucketIndex)
+    : getBucket(apiKeyId, dimensionKey, bucketIndex);
+}
+
+export async function incrementBucketAsync(
+  apiKeyId: string,
+  dimensionKey: string,
+  bucketIndex: number,
+  delta: number,
+  nowMs: number
+): Promise<void> {
+  const repository = selectedQuotaRepository();
+  if (repository)
+    await repository.incrementBucket(apiKeyId, dimensionKey, bucketIndex, delta, nowMs);
+  else incrementBucket(apiKeyId, dimensionKey, bucketIndex, delta, nowMs);
+}
+
+export async function getPairAsync(
+  apiKeyId: string,
+  dimensionKey: string,
+  currentBucket: number
+): Promise<{ curr: number; prev: number }> {
+  const repository = selectedQuotaRepository();
+  return repository
+    ? repository.getPair(apiKeyId, dimensionKey, currentBucket)
+    : getPair(apiKeyId, dimensionKey, currentBucket);
+}
+
+export async function sumPoolDimensionAsync(
+  dimensionKey: string,
+  currentBucket: number
+): Promise<{ currTotal: number; prevTotal: number }> {
+  const repository = selectedQuotaRepository();
+  return repository
+    ? repository.sumPoolDimension(dimensionKey, currentBucket)
+    : sumPoolDimension(dimensionKey, currentBucket);
+}
+
+export async function listConsumptionForPoolAsync(
+  poolId: string,
+  limit: number
+): Promise<ConsumptionEvent[]> {
+  const repository = selectedQuotaRepository();
+  return repository
+    ? repository.listConsumptionForPool(poolId, limit)
+    : listConsumptionForPool(poolId, limit);
+}
+
+export async function gcOlderThanAsync(maxUpdatedAtMs: number): Promise<number> {
+  const repository = selectedQuotaRepository();
+  return repository ? repository.gcOlderThan(maxUpdatedAtMs) : gcOlderThan(maxUpdatedAtMs);
 }

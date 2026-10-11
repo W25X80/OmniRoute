@@ -1,5 +1,5 @@
 import { CORS_HEADERS, handleCorsOptions } from "@/shared/utils/cors";
-import { getFile, deleteFile, formatFileResponse } from "@/lib/db/files";
+import { getFileAsync, deleteFileAsync, formatFileResponse } from "@/lib/db/files";
 import { NextResponse } from "next/server";
 import {
   getApiKeyRequestScope,
@@ -43,7 +43,7 @@ export async function GET(request: Request, { params }: { params: Promise<{ id: 
   if (policy.rejection) return policy.rejection;
 
   const { id } = await params;
-  const file = getFile(id);
+  const file = await getFileAsync(id);
 
   // A key resolved only via the ungated x-api-key/x-goog-api-key transport
   // never sets scope.apiKeyId — fall back to the id enforceApiKeyPolicy()
@@ -94,7 +94,7 @@ export async function DELETE(request: Request, { params }: { params: Promise<{ i
   if (policy.rejection) return policy.rejection;
 
   const { id } = await params;
-  const file = getFile(id);
+  const file = await getFileAsync(id);
 
   // A key resolved only via the ungated x-api-key/x-goog-api-key transport
   // never sets scope.apiKeyId — fall back to the id enforceApiKeyPolicy()
@@ -109,7 +109,7 @@ export async function DELETE(request: Request, { params }: { params: Promise<{ i
     );
   }
 
-  deleteFile(id);
+  await deleteFileAsync(id);
 
   return NextResponse.json(
     {

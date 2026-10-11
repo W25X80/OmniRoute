@@ -1,3 +1,5 @@
+import * as postgres from "./postgres/usageAnalyticsRepository";
+import { getPostgresUsageDatabase } from "./postgres/usageQueries";
 /**
  * db/usageAnalytics.ts — Read-only aggregation queries over `usage_history`
  * and `daily_usage_summary` extracted from route handlers.
@@ -12,7 +14,18 @@
 import { getDbInstance } from "./core";
 import type { AnalyticsParams } from "./usageAnalytics/sources";
 
-export { buildUnifiedSource, buildPresetUnifiedSource } from "./usageAnalytics/sources";
+import * as sqliteSources from "./usageAnalytics/sources";
+import * as postgresSources from "./postgres/usageSources";
+export function buildUnifiedSource(options: sqliteSources.BuildUnifiedSourceOptions) {
+  return getPostgresUsageDatabase()
+    ? postgresSources.buildUnifiedSource(options)
+    : sqliteSources.buildUnifiedSource(options);
+}
+export function buildPresetUnifiedSource(options: sqliteSources.BuildUnifiedSourceOptions) {
+  return getPostgresUsageDatabase()
+    ? postgresSources.buildPresetUnifiedSource(options)
+    : sqliteSources.buildPresetUnifiedSource(options);
+}
 export type {
   AnalyticsParams,
   BuildUnifiedSourceOptions,
@@ -853,4 +866,176 @@ export function getAllDomainCostHistory(): Record<string, unknown>[] {
 export function getAllDomainBudgets(): Record<string, unknown>[] {
   const db = getDbInstance();
   return db.prepare("SELECT * FROM domain_budgets").all() as Record<string, unknown>[];
+}
+
+export async function getUsageSummaryAsync(
+  unifiedSource: string,
+  params: AnalyticsParams
+): Promise<UsageSummaryRow> {
+  const database = getPostgresUsageDatabase();
+  return database
+    ? postgres.getUsageSummary(database, unifiedSource, params)
+    : getUsageSummary(unifiedSource, params);
+}
+
+export async function getDailyUsageAsync(
+  unifiedSource: string,
+  params: AnalyticsParams
+): Promise<DailyUsageRow[]> {
+  const database = getPostgresUsageDatabase();
+  return database
+    ? postgres.getDailyUsage(database, unifiedSource, params)
+    : getDailyUsage(unifiedSource, params);
+}
+
+export async function getDailyCostRowsAsync(
+  unifiedSource: string,
+  params: AnalyticsParams
+): Promise<DailyCostRow[]> {
+  const database = getPostgresUsageDatabase();
+  return database
+    ? postgres.getDailyCostRows(database, unifiedSource, params)
+    : getDailyCostRows(unifiedSource, params);
+}
+
+export async function getHeatmapRowsAsync(
+  heatmapConditions: string[],
+  params: AnalyticsParams
+): Promise<HeatmapRow[]> {
+  const database = getPostgresUsageDatabase();
+  return database
+    ? postgres.getHeatmapRows(database, heatmapConditions, params)
+    : getHeatmapRows(heatmapConditions, params);
+}
+
+export async function getModelUsageRowsAsync(
+  unifiedSource: string,
+  params: AnalyticsParams
+): Promise<ModelUsageRow[]> {
+  const database = getPostgresUsageDatabase();
+  return database
+    ? postgres.getModelUsageRows(database, unifiedSource, params)
+    : getModelUsageRows(unifiedSource, params);
+}
+
+export async function getProviderCostRowsAsync(
+  unifiedSource: string,
+  params: AnalyticsParams
+): Promise<ProviderCostRow[]> {
+  const database = getPostgresUsageDatabase();
+  return database
+    ? postgres.getProviderCostRows(database, unifiedSource, params)
+    : getProviderCostRows(unifiedSource, params);
+}
+
+export async function getProviderUsageRowsAsync(
+  unifiedSource: string,
+  params: AnalyticsParams
+): Promise<ProviderUsageRow[]> {
+  const database = getPostgresUsageDatabase();
+  return database
+    ? postgres.getProviderUsageRows(database, unifiedSource, params)
+    : getProviderUsageRows(unifiedSource, params);
+}
+
+export async function getAccountCostRowsAsync(
+  whereClause: string,
+  params: AnalyticsParams
+): Promise<AccountCostRow[]> {
+  const database = getPostgresUsageDatabase();
+  return database
+    ? postgres.getAccountCostRows(database, whereClause, params)
+    : getAccountCostRows(whereClause, params);
+}
+
+export async function getAccountUsageRowsAsync(
+  whereClause: string,
+  params: AnalyticsParams
+): Promise<AccountUsageRow[]> {
+  const database = getPostgresUsageDatabase();
+  return database
+    ? postgres.getAccountUsageRows(database, whereClause, params)
+    : getAccountUsageRows(whereClause, params);
+}
+
+export async function getApiKeyUsageRowsAsync(
+  apiKeyWhereClause: string,
+  params: AnalyticsParams
+): Promise<ApiKeyUsageRow[]> {
+  const database = getPostgresUsageDatabase();
+  return database
+    ? postgres.getApiKeyUsageRows(database, apiKeyWhereClause, params)
+    : getApiKeyUsageRows(apiKeyWhereClause, params);
+}
+
+export async function getServiceTierUsageRowsAsync(
+  unifiedSource: string,
+  params: AnalyticsParams
+): Promise<ServiceTierUsageRow[]> {
+  const database = getPostgresUsageDatabase();
+  return database
+    ? postgres.getServiceTierUsageRows(database, unifiedSource, params)
+    : getServiceTierUsageRows(unifiedSource, params);
+}
+
+export async function getApiKeyMetadataRowsAsync(
+  apiKeyWhereClause: string,
+  params: AnalyticsParams
+): Promise<ApiKeyMetadataRow[]> {
+  const database = getPostgresUsageDatabase();
+  return database
+    ? postgres.getApiKeyMetadataRows(database, apiKeyWhereClause, params)
+    : getApiKeyMetadataRows(apiKeyWhereClause, params);
+}
+
+export async function getWeeklyPatternRowsAsync(
+  unifiedSource: string,
+  params: AnalyticsParams
+): Promise<WeeklyPatternRow[]> {
+  const database = getPostgresUsageDatabase();
+  return database
+    ? postgres.getWeeklyPatternRows(database, unifiedSource, params)
+    : getWeeklyPatternRows(unifiedSource, params);
+}
+
+export async function getPresetCostModelRowsAsync(
+  presetUnifiedSource: string,
+  params: AnalyticsParams
+): Promise<PresetCostModelRow[]> {
+  const database = getPostgresUsageDatabase();
+  return database
+    ? postgres.getPresetCostModelRows(database, presetUnifiedSource, params)
+    : getPresetCostModelRows(presetUnifiedSource, params);
+}
+
+export async function getEndpointUsageRowsAsync(
+  params: EndpointUsageParams = {}
+): Promise<EndpointUsageRow[]> {
+  const database = getPostgresUsageDatabase();
+  return database ? postgres.getEndpointUsageRows(database, params) : getEndpointUsageRows(params);
+}
+
+export async function getProviderDailyUsageRowsAsync(
+  unifiedSource: string,
+  params: AnalyticsParams
+): Promise<ProviderDailyUsageRow[]> {
+  const database = getPostgresUsageDatabase();
+  return database
+    ? postgres.getProviderDailyUsageRows(database, unifiedSource, params)
+    : getProviderDailyUsageRows(unifiedSource, params);
+}
+
+export async function getAllUsageHistoryAsync(): Promise<Record<string, unknown>[]> {
+  const database = getPostgresUsageDatabase();
+  return database ? postgres.getAllUsageHistory(database) : getAllUsageHistory();
+}
+
+export async function getAllDomainCostHistoryAsync(): Promise<Record<string, unknown>[]> {
+  const database = getPostgresUsageDatabase();
+  return database ? postgres.getAllDomainCostHistory(database) : getAllDomainCostHistory();
+}
+
+export async function getAllDomainBudgetsAsync(): Promise<Record<string, unknown>[]> {
+  const database = getPostgresUsageDatabase();
+  return database ? postgres.getAllDomainBudgets(database) : getAllDomainBudgets();
 }

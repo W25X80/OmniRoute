@@ -1,3 +1,6 @@
+import fsPromises from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { parseDatabaseBackend } from "../../lib/db/backendSelection";
 import { execFileSync, execSync } from "child_process";
 import { existsSync, readFileSync } from "fs";
 import os from "os";
@@ -15,6 +18,7 @@ let cachedRawId: string | null = null;
  */
 export function resetMachineIdCache(): void {
   cachedRawId = null;
+  delete rawIdGlobals[NATIVE_RAW_MACHINE_ID];
 }
 
 /**
@@ -161,10 +165,11 @@ async function getRandomMachineFallbackId() {
  * @param {string} salt - Optional salt to use (defaults to environment variable)
  * @returns {Promise<string>} Machine ID (16-character base32)
  */
-export async function getConsistentMachineId(salt = null) {
+export async function getConsistentMachineId(salt: string | null = null): Promise<string> {
   const saltValue = salt || process.env.MACHINE_ID_SALT || "endpoint-proxy-salt";
   try {
-    const rawMachineId = getMachineIdRaw();
+    const rawMachineId =
+      parseDatabaseBackend() === "postgres" ? await getMachineIdRawAsync() : getMachineIdRaw();
     // Create consistent ID using salt
     const crypto = await import("crypto");
     const hashedMachineId = crypto
@@ -186,7 +191,7 @@ export async function getConsistentMachineId(salt = null) {
  */
 export async function getRawMachineId() {
   try {
-    return getMachineIdRaw();
+    return parseDatabaseBackend() === "postgres" ? await getMachineIdRawAsync() : getMachineIdRaw();
   } catch (error) {
     console.log("Error getting raw machine ID:", error);
     // Fallback to random ID if node-machine-id fails
@@ -200,4 +205,97 @@ export async function getRawMachineId() {
  */
 export function isBrowser() {
   return typeof window !== "undefined";
+}
+
+const NATIVE_RAW_MACHINE_ID = Symbol.for("omniroute.nativeRawMachineId");
+interface NativeRawMachineIdState {
+  value?: string;
+  preparation?: Promise<string>;
+}
+const rawIdGlobals = globalThis as typeof globalThis & {
+  [NATIVE_RAW_MACHINE_ID]?: NativeRawMachineIdState;
+};
+
+function executeMachineIdCommand(file: string, args: string[]): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFile(file, args, { encoding: "utf8", timeout: 5000 }, (error, stdout) => {
+      if (error) reject(error);
+      else resolve(stdout);
+    });
+  });
+}
+
+async function resolveMachineIdRawAsync(): Promise<string> {
+  const platform = process.platform;
+  const sysRoot = process.env.SystemRoot || process.env.windir || "C:\\Windows";
+  const disableIoreg = process.env.DISABLE_IOREG_STRATEGY === "1";
+  try {
+    if (platform === "win32") {
+      const regPath = `${sysRoot}\\System32\\REG.exe`;
+      await fsPromises.access(regPath);
+      const output = await executeMachineIdCommand(regPath, [
+        "QUERY",
+        "HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Cryptography",
+        "/v",
+        "MachineGuid",
+      ]);
+      const id = output
+        .split("REG_SZ")[1]
+        ?.replace(/\r+|\n+|\s+/gi, "")
+        ?.toLowerCase();
+      if (id && id.length > 8) return id;
+    }
+  } catch {
+    // Same Windows failure waterfall as the synchronous source.
+  }
+  try {
+    if (platform === "darwin" && !disableIoreg) {
+      const output = await executeMachineIdCommand("ioreg", [
+        "-rd1",
+        "-c",
+        "IOPlatformExpertDevice",
+      ]);
+      if (output.includes("IOPlatformUUID")) {
+        const id = output
+          .split("IOPlatformUUID")[1]
+          ?.split("\n")[0]
+          ?.replace(/=|\s+|"/gi, "")
+          ?.toLowerCase();
+        if (id && id.length > 8) return id;
+      }
+    }
+  } catch {
+    // Same macOS failure waterfall as the synchronous source.
+  }
+  for (const filePath of ["/etc/machine-id", "/var/lib/dbus/machine-id"]) {
+    try {
+      const content = (await fsPromises.readFile(filePath, "utf8")).trim().toLowerCase();
+      if (content.length > 8) return content;
+    } catch {
+      // Keep exact source candidate order, including on an OS-query fallback.
+    }
+  }
+  try {
+    const hostname = os.hostname().toLowerCase();
+    if (hostname) return hostname;
+  } catch {
+    // Same direct hostname fallback.
+  }
+  try {
+    const hostname = (await executeMachineIdCommand("hostname", [])).trim().toLowerCase();
+    if (hostname) return hostname;
+  } catch {
+    // Same final constant fallback.
+  }
+  return "unknown-machine";
+}
+
+function getMachineIdRawAsync(): Promise<string> {
+  const state = (rawIdGlobals[NATIVE_RAW_MACHINE_ID] ??= {});
+  if (state.value !== undefined) return Promise.resolve(state.value);
+  state.preparation ??= resolveMachineIdRawAsync().then((value) => {
+    if (rawIdGlobals[NATIVE_RAW_MACHINE_ID] === state) state.value = value;
+    return value;
+  });
+  return state.preparation;
 }

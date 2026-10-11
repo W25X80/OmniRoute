@@ -104,9 +104,9 @@ function buildEngineBreakdownRows(stats: CompressionStats, requestId: string) {
 export function writeCompressionSkip(opts: WriteOpts, skipReason: string): Promise<void> {
   return (async () => {
     try {
-      const { insertCompressionAnalyticsRow } = await import("@/lib/db/compressionAnalytics");
+      const { insertCompressionAnalyticsRowAsync } = await import("@/lib/db/compressionAnalytics");
       const { stats } = opts;
-      insertCompressionAnalyticsRow({
+      await insertCompressionAnalyticsRowAsync({
         timestamp: new Date().toISOString(),
         combo_id: opts.comboName ?? null,
         provider: opts.provider ?? null,
@@ -136,7 +136,7 @@ export function writeCompressionAnalytics(
 ): Promise<void> {
   return (async () => {
     try {
-      const { insertCompressionAnalyticsRow, insertCompressionEngineBreakdown } =
+      const { insertCompressionAnalyticsRowAsync, insertCompressionEngineBreakdownAsync } =
         await import("@/lib/db/compressionAnalytics");
       const { stats } = opts;
       const tokensSaved = Math.max(0, stats.originalTokens - stats.compressedTokens);
@@ -160,12 +160,12 @@ export function writeCompressionAnalytics(
           "Compression cost estimate skipped: " + (err instanceof Error ? err.message : String(err))
         );
       }
-      insertCompressionAnalyticsRow(
+      await insertCompressionAnalyticsRowAsync(
         buildAnalyticsRow(opts, tokensSaved, rtkPointers, estimatedUsdSaved)
       );
       const breakdownRows = buildEngineBreakdownRows(stats, opts.skillRequestId);
       if (breakdownRows.length > 0) {
-        insertCompressionEngineBreakdown(breakdownRows);
+        await insertCompressionEngineBreakdownAsync(breakdownRows);
       }
     } catch (err) {
       opts.log?.warn?.(

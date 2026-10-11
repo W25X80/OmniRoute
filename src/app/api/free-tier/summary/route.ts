@@ -7,8 +7,11 @@ import {
   FREE_MODEL_BUDGETS,
 } from "@omniroute/open-sse/config/freeModelCatalog.data.ts";
 import type { MergedEntry } from "@/lib/radar/applyFeed";
-import { getCatalogWithoutOverlay, getRadarCatalog } from "@/lib/radar";
-import { sumUsageTokensThisMonth } from "@/lib/db/usageSummary";
+import {
+  getCatalogWithoutOverlayAsync as getCatalogWithoutOverlay,
+  getRadarCatalogAsync as getRadarCatalog,
+} from "@/lib/radar";
+import { sumUsageTokensThisMonthAsync as sumUsageTokensThisMonth } from "@/lib/db/usageSummary";
 import { isAuthenticated } from "@/shared/utils/apiAuth";
 import { listNoCredentialProviders } from "@/shared/utils/providerCredentialRequirement";
 
@@ -63,7 +66,7 @@ export async function GET(req: Request): Promise<Response> {
   // Same catalog resolution as the dashboard screens: one source of
   // truth, with meta === null meaning "the baseline answered" (flag off, no
   // cache, or corrupt cache).
-  const { entries, meta } = getRadarCatalog();
+  const { entries, meta } = await getRadarCatalog();
 
   // Entitlement follows the feed server's own download-time decision: the
   // community feed is the free public catalog, so it serves everyone; the
@@ -98,7 +101,7 @@ export async function GET(req: Request): Promise<Response> {
     : overlayWithheldAsStale
       ? computeFreeModelTotals({
           excludeTosAvoid,
-          entries: getCatalogWithoutOverlay().map(toBudgetEntry),
+          entries: (await getCatalogWithoutOverlay()).map(toBudgetEntry),
         })
       : computeFreeModelTotals({ excludeTosAvoid });
 
@@ -106,7 +109,7 @@ export async function GET(req: Request): Promise<Response> {
   // unlike the catalog totals, that is not meant to be public. Withhold both
   // from unauthenticated callers instead of gating the whole route, so the
   // intentionally-public catalog fields stay served to everyone.
-  const usedThisMonth = authed ? sumUsageTokensThisMonth() : null;
+  const usedThisMonth = authed ? await sumUsageTokensThisMonth() : null;
   const body = {
     ...totals,
     usedThisMonth,

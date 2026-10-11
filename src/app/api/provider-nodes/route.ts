@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { createProviderNode, getProviderNodes } from "@/models";
-import { getProviderNodesCount } from "@/lib/db/providers/nodes";
+import { getProviderNodesCountAsync } from "@/lib/db/providers/nodes";
 import {
   OPENAI_COMPATIBLE_PREFIX,
   ANTHROPIC_COMPATIBLE_PREFIX,
@@ -54,9 +54,8 @@ async function registerMoonshotFetchersForCreatedNode(node: {
   baseUrl?: unknown;
 }): Promise<void> {
   try {
-    const { registerMoonshotFetchersForNodes } = await import(
-      "@omniroute/open-sse/services/moonshotQuotaFetcher.ts"
-    );
+    const { registerMoonshotFetchersForNodes } =
+      await import("@omniroute/open-sse/services/moonshotQuotaFetcher.ts");
     registerMoonshotFetchersForNodes([
       {
         id: typeof node.id === "string" ? node.id : null,
@@ -100,7 +99,7 @@ export async function GET(request?: Request) {
     const offset =
       Number.isInteger(parsedOffset) && parsedOffset && parsedOffset > 0 ? parsedOffset : 0;
 
-    const total = getProviderNodesCount();
+    const total = await getProviderNodesCountAsync();
     const nodes = await getProviderNodes({}, limit, offset);
     return NextResponse.json({
       nodes,

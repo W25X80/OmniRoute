@@ -2,8 +2,8 @@ import { NextResponse } from "next/server";
 import { getTaskManager } from "@/lib/a2a/taskManager";
 import { authorizeA2ATaskRoute } from "@/app/api/a2a/_auth";
 import {
-  getA2ATaskHistoryById,
-  listA2ATaskEvents,
+  getA2ATaskHistoryByIdAsync,
+  listA2ATaskEventsAsync,
   type A2ATaskHistoryRow,
 } from "@/lib/db/a2aTasks";
 import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
@@ -62,13 +62,13 @@ function parseMemoryHits(dataJson: string | null | undefined): MemoryHit[] {
  * `A2ATaskManager.persist()` writes one `state:<TaskState>` event per transition — the runtime
  * state each event represents is recovered by stripping that prefix.
  */
-function reconstituteHistoricalTask(row: A2ATaskHistoryRow) {
+async function reconstituteHistoricalTask(row: A2ATaskHistoryRow) {
   const input = safeJsonParse<{
     skill: string;
     messages: Array<{ role: string; content: string }>;
   }>(row.input_json, { skill: row.skill_id ?? "", messages: [] });
   const artifacts = safeJsonParse<unknown[]>(row.output_json, []);
-  const eventRows = listA2ATaskEvents(row.id);
+  const eventRows = await listA2ATaskEventsAsync(row.id);
 
   // `memory_hits` is observability, not a state transition — it is hydrated into `metadata`
   // (Fase 3, Task C1) and kept out of the timeline the drawer renders.
@@ -126,9 +126,9 @@ export async function GET(request: Request, { params }: { params: Promise<{ id: 
     // matches `listA2ATaskHistory`'s existing owner rule (management/keyless callers see
     // everything, same posture as `listTasks`) — intentional, not a bug. Do not "fix" it by
     // passing a stricter owner clause into the history fallback.
-    const historyRow = getA2ATaskHistoryById(id, auth.owner);
+    const historyRow = await getA2ATaskHistoryByIdAsync(id, auth.owner);
     if (historyRow) {
-      return NextResponse.json({ task: reconstituteHistoricalTask(historyRow) });
+      return NextResponse.json({ task: await reconstituteHistoricalTask(historyRow) });
     }
 
     return NextResponse.json({ error: `Task not found: ${id}` }, { status: 404 });

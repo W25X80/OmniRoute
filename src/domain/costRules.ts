@@ -1,3 +1,7 @@
+import { getBudgetWindow, normalizeResetTime } from "./budgetWindow";
+import type { BudgetResetInterval } from "./budgetWindow";
+export { getBudgetWindow } from "./budgetWindow";
+export type { BudgetResetInterval } from "./budgetWindow";
 /**
  * Cost Rules — Domain Layer (T-19)
  *
@@ -26,11 +30,12 @@ import {
   resetSpendBatchWriterForTests,
   spendBatchWriter,
 } from "@/lib/spend/batchWriter";
-import { recordLedgerFromCost } from "@/lib/usage/costLedgerRecorder";
+import { recordLedgerFromCost, type CostLedgerRecorderInput } from "@/lib/usage/costLedgerRecorder";
+import { getSelectedPostgresDatabase } from "@/lib/db/controlPlaneContext";
+import * as postgresBudget from "@/lib/db/postgres/budgetRepository";
+import { runPersistenceBackgroundWork } from "@/lib/db/persistenceRuntime";
 
-export type BudgetResetInterval = "daily" | "weekly" | "monthly";
-
-interface BudgetConfig {
+export interface BudgetConfig {
   dailyLimitUsd?: number;
   weeklyLimitUsd?: number;
   monthlyLimitUsd?: number;
@@ -43,7 +48,7 @@ interface BudgetConfig {
   warningPeriodStart?: number | null;
 }
 
-interface NormalizedBudgetConfig {
+export interface NormalizedBudgetConfig {
   dailyLimitUsd: number;
   weeklyLimitUsd: number;
   monthlyLimitUsd: number;
@@ -61,17 +66,12 @@ interface CostEntry {
   timestamp: number;
 }
 
-interface BudgetWindow {
-  periodStartAt: number;
-  nextResetAt: number;
-}
-
 interface SyncBudgetScheduleOptions {
   logReset?: boolean;
   persist?: boolean;
 }
 
-interface BudgetSummary {
+export interface BudgetSummary {
   dailyTotal: number;
   monthlyTotal: number;
   totalEntries: number;
@@ -93,7 +93,6 @@ interface BudgetSummary {
 }
 
 const VALID_RESET_INTERVALS = new Set<BudgetResetInterval>(["daily", "weekly", "monthly"]);
-const RESET_TIME_REGEX = /^(\d{2}):(\d{2})$/;
 
 /** @type {Map<string, NormalizedBudgetConfig>} In-memory cache for budgets */
 const budgets = new Map<string, NormalizedBudgetConfig>();
@@ -135,24 +134,12 @@ function normalizeResetInterval(value: unknown): BudgetResetInterval {
   return "daily";
 }
 
-function normalizeResetTime(value: unknown): string {
-  if (typeof value === "string") {
-    const match = value.trim().match(RESET_TIME_REGEX);
-    if (match) {
-      const hours = Math.min(Math.max(parseInt(match[1], 10), 0), 23);
-      const minutes = Math.min(Math.max(parseInt(match[2], 10), 0), 59);
-      return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}`;
-    }
-  }
-  return "00:00";
-}
-
 function normalizeTimestamp(value: unknown): number | null {
   const numeric = toNumber(value, Number.NaN);
   return Number.isFinite(numeric) && numeric > 0 ? numeric : null;
 }
 
-function normalizeBudgetConfig(config: BudgetConfig): NormalizedBudgetConfig {
+export function normalizeBudgetConfig(config: BudgetConfig): NormalizedBudgetConfig {
   return {
     dailyLimitUsd: Math.max(0, toNumber(config.dailyLimitUsd)),
     weeklyLimitUsd: Math.max(0, toNumber(config.weeklyLimitUsd)),
@@ -167,67 +154,7 @@ function normalizeBudgetConfig(config: BudgetConfig): NormalizedBudgetConfig {
   };
 }
 
-function getResetTimeParts(resetTime: string): [number, number] {
-  const match = resetTime.match(RESET_TIME_REGEX);
-  if (!match) return [0, 0];
-  return [parseInt(match[1], 10), parseInt(match[2], 10)];
-}
-
-function getUtcDateMs(year: number, month: number, day: number, hours: number, minutes: number) {
-  return Date.UTC(year, month, day, hours, minutes, 0, 0);
-}
-
-export function getBudgetWindow(
-  resetInterval: BudgetResetInterval,
-  resetTime = "00:00",
-  now = Date.now()
-): BudgetWindow {
-  const current = new Date(now);
-  const [hours, minutes] = getResetTimeParts(normalizeResetTime(resetTime));
-  const year = current.getUTCFullYear();
-  const month = current.getUTCMonth();
-  const day = current.getUTCDate();
-
-  if (resetInterval === "weekly") {
-    const daysSinceMonday = (current.getUTCDay() + 6) % 7;
-    const thisWeekReset = getUtcDateMs(year, month, day - daysSinceMonday, hours, minutes);
-    return now >= thisWeekReset
-      ? {
-          periodStartAt: thisWeekReset,
-          nextResetAt: getUtcDateMs(year, month, day - daysSinceMonday + 7, hours, minutes),
-        }
-      : {
-          periodStartAt: getUtcDateMs(year, month, day - daysSinceMonday - 7, hours, minutes),
-          nextResetAt: thisWeekReset,
-        };
-  }
-
-  if (resetInterval === "monthly") {
-    const thisMonthReset = getUtcDateMs(year, month, 1, hours, minutes);
-    return now >= thisMonthReset
-      ? {
-          periodStartAt: thisMonthReset,
-          nextResetAt: getUtcDateMs(year, month + 1, 1, hours, minutes),
-        }
-      : {
-          periodStartAt: getUtcDateMs(year, month - 1, 1, hours, minutes),
-          nextResetAt: thisMonthReset,
-        };
-  }
-
-  const todayReset = getUtcDateMs(year, month, day, hours, minutes);
-  return now >= todayReset
-    ? {
-        periodStartAt: todayReset,
-        nextResetAt: getUtcDateMs(year, month, day + 1, hours, minutes),
-      }
-    : {
-        periodStartAt: getUtcDateMs(year, month, day - 1, hours, minutes),
-        nextResetAt: todayReset,
-      };
-}
-
-function getActiveBudgetLimit(budget: NormalizedBudgetConfig): number {
+export function getActiveBudgetLimit(budget: NormalizedBudgetConfig): number {
   if (budget.resetInterval === "monthly") {
     return budget.monthlyLimitUsd > 0 ? budget.monthlyLimitUsd : budget.dailyLimitUsd;
   }
@@ -263,7 +190,7 @@ function getBudgetWindowRangeTotal(
   }
 }
 
-function emitBudgetWarning(
+export function emitBudgetWarning(
   apiKeyId: string,
   budget: NormalizedBudgetConfig,
   projectedTotal: number,
@@ -348,7 +275,10 @@ function syncBudgetSchedule(
  * @param {BudgetConfig} config
  */
 export function setBudget(apiKeyId: string, config: BudgetConfig) {
-  return syncBudgetSchedule(apiKeyId, config, Date.now(), { logReset: false, persist: true });
+  return syncBudgetSchedule(apiKeyId, config, Date.now(), {
+    logReset: false,
+    persist: true,
+  });
 }
 
 /**
@@ -391,6 +321,24 @@ export function deleteBudget(apiKeyId: string) {
   }
 }
 
+function costLedgerInput(
+  apiKeyId: string,
+  cost: number,
+  details: RecordCostDetails
+): CostLedgerRecorderInput {
+  return {
+    apiKeyId,
+    provider: details.provider,
+    model: details.model,
+    tokens: details.tokens,
+    amountUsd: cost,
+    serviceTier: details.serviceTier,
+    success: details.success,
+    timestamp: details.timestamp,
+    requestId: details.requestId,
+  };
+}
+
 /**
  * Record a cost for an API key.
  *
@@ -409,17 +357,9 @@ export function recordCost(apiKeyId: string, cost: number, details?: RecordCostD
     spendBatchWriter.increment(apiKeyId, cost, Date.now());
     if (details) {
       // Fire-and-forget — never block the response on ledger I/O.
-      void recordLedgerFromCost({
-        apiKeyId,
-        provider: details.provider,
-        model: details.model,
-        tokens: details.tokens,
-        amountUsd: cost,
-        serviceTier: details.serviceTier,
-        success: details.success,
-        timestamp: details.timestamp,
-        requestId: details.requestId,
-      });
+      void runPersistenceBackgroundWork(() =>
+        recordLedgerFromCost(costLedgerInput(apiKeyId, cost, details))
+      ).catch((error) => console.error("[CostLedger] Failed to persist accounting", error));
     }
   } catch {
     // Non-critical.
@@ -439,6 +379,8 @@ export interface RecordCostDetails {
   success?: boolean;
   timestamp?: string;
   requestId?: string | null;
+  /** Internal native admission clock captured at terminal completion; never sent to providers. */
+  completedAt?: number;
 }
 
 /**
@@ -483,7 +425,10 @@ export function syncAllBudgetSchedules(now = Date.now()) {
     const allBudgets = loadAllBudgets();
     for (const [apiKeyId, budget] of Object.entries(allBudgets)) {
       processed += 1;
-      const synced = syncBudgetSchedule(apiKeyId, budget, now, { logReset: true, persist: true });
+      const synced = syncBudgetSchedule(apiKeyId, budget, now, {
+        logReset: true,
+        persist: true,
+      });
       if (budget.lastBudgetResetAt !== synced.lastBudgetResetAt) {
         resetCount += 1;
       }
@@ -696,4 +641,78 @@ export function resetCostData() {
   } catch {
     // Non-critical.
   }
+}
+/** Native ledger attempts finish in the caller's admitted scope; spend remains buffered. */
+export async function recordCostAsync(
+  id: string,
+  cost: number,
+  details?: RecordCostDetails
+): Promise<void> {
+  if (!getSelectedPostgresDatabase()) {
+    recordCost(id, cost, details);
+    return;
+  }
+  const completedAt = details?.completedAt;
+  if (
+    completedAt !== undefined &&
+    (!Number.isSafeInteger(completedAt) || completedAt < 0 || completedAt > 8_640_000_000_000_000)
+  )
+    throw new RangeError("Invalid native cost completion time");
+  try {
+    spendBatchWriter.increment(id, cost, completedAt === undefined ? Date.now() : completedAt);
+    if (details) await recordLedgerFromCost(costLedgerInput(id, cost, details));
+  } catch {
+    // Ledger/persistence failures remain non-critical, as in the synchronous source path.
+  }
+}
+
+export async function recordChatCallCostAsync(
+  ...args: Parameters<typeof recordChatCallCost>
+): Promise<void> {
+  const [apiKeyInfo, estimatedCost, context, success] = args;
+  if (!apiKeyInfo?.id || estimatedCost <= 0) return;
+  await recordCostAsync(apiKeyInfo.id, estimatedCost, { ...context, success });
+}
+
+export async function setBudgetAsync(...args: Parameters<typeof setBudget>) {
+  const database = getSelectedPostgresDatabase();
+  return database ? postgresBudget.setBudgetPostgres(database, ...args) : setBudget(...args);
+}
+
+export async function getBudgetAsync(...args: Parameters<typeof getBudget>) {
+  const database = getSelectedPostgresDatabase();
+  return database ? postgresBudget.getBudgetPostgres(database, ...args) : getBudget(...args);
+}
+
+export async function deleteBudgetAsync(...args: Parameters<typeof deleteBudget>) {
+  const database = getSelectedPostgresDatabase();
+  return database ? postgresBudget.deleteBudgetPostgres(database, ...args) : deleteBudget(...args);
+}
+
+export async function checkBudgetAsync(...args: Parameters<typeof checkBudget>) {
+  const database = getSelectedPostgresDatabase();
+  return database ? postgresBudget.checkBudgetPostgres(database, ...args) : checkBudget(...args);
+}
+
+export async function getDailyTotalAsync(...args: Parameters<typeof getDailyTotal>) {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? postgresBudget.getDailyTotalPostgres(database, ...args)
+    : getDailyTotal(...args);
+}
+
+export async function getCostSummaryAsync(...args: Parameters<typeof getCostSummary>) {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? postgresBudget.getCostSummaryPostgres(database, ...args)
+    : getCostSummary(...args);
+}
+
+export async function syncAllBudgetSchedulesAsync(
+  ...args: Parameters<typeof syncAllBudgetSchedules>
+) {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? postgresBudget.syncAllBudgetSchedulesPostgres(database, ...args)
+    : syncAllBudgetSchedules(...args);
 }

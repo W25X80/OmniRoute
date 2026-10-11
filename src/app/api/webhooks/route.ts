@@ -7,7 +7,7 @@
 import { z } from "zod";
 import { NextResponse } from "next/server";
 import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
-import { getWebhooks, createWebhook } from "@/lib/db/webhooks";
+import { getWebhooksAsync, createWebhookAsync } from "@/lib/db/webhooks";
 import { validateBody, isValidationFailure } from "@/shared/validation/helpers";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 import { encryptMetadata } from "@/lib/webhookDispatcher";
@@ -26,7 +26,7 @@ const createWebhookSchema = z
     secret: z.string().max(500).optional(),
     description: z.string().max(1000).optional().default(""),
     kind: z.enum(WEBHOOK_KINDS).optional().default("custom"),
-    metadata: z.record(z.string()).optional(),
+    metadata: z.record(z.string(), z.string()).optional(),
   })
   .superRefine((data, ctx) => {
     if (data.kind === "telegram") return;
@@ -49,7 +49,7 @@ export async function GET(request: Request) {
     const { searchParams } = new URL(request.url);
     const limit = searchParams.has("limit") ? Number(searchParams.get("limit")) : undefined;
     const offset = searchParams.has("offset") ? Number(searchParams.get("offset")) : 0;
-    const result = getWebhooks(limit !== undefined ? { limit, offset } : undefined);
+    const result = await getWebhooksAsync(limit !== undefined ? { limit, offset } : undefined);
     // Mask secrets in listing
     const masked = result.webhooks.map((w) => ({
       ...w,
@@ -85,7 +85,7 @@ export async function POST(request: Request) {
     }
 
     const metadataEncrypted = data.metadata ? encryptMetadata(data.metadata) : undefined;
-    const webhook = createWebhook({
+    const webhook = await createWebhookAsync({
       url: data.url,
       events: data.events,
       secret: data.secret,

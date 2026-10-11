@@ -1,11 +1,13 @@
 import { NextResponse } from "next/server";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 import type { MultiTurnConversationRow } from "@/lib/db/agenticConversations";
-import { listMultiTurnConversations } from "@/lib/db/agenticConversations";
+import { listMultiTurnConversationsAsync } from "@/lib/db/agenticConversations";
 import { getPendingById } from "@/lib/usage/usageHistory";
 import {
   isGenuineContinuationTurn,
+  isGenuineContinuationTurnAsync,
   resolveConversationStalledState,
+  resolveConversationStalledStateAsync,
 } from "@/lib/db/responsesContinuationStore";
 
 export const dynamic = "force-dynamic";
@@ -71,19 +73,44 @@ export async function GET(req: Request) {
     const limit = Number(searchParams.get("limit") ?? "50");
     const offset = Number(searchParams.get("offset") ?? "0");
 
-    const { rows, total } = listMultiTurnConversations({
+    const { rows, total } = await listMultiTurnConversationsAsync({
       limit: Number.isFinite(limit) ? limit : undefined,
       offset: Number.isFinite(offset) ? offset : undefined,
     });
 
     const activeCallLogIdByConversation = buildActiveCallLogIdByConversation();
-    const conversations = rows.map((row) =>
-      annotateConversationRow(row, activeCallLogIdByConversation)
-    );
+    const conversations: Awaited<ReturnType<typeof annotateConversationRowAsync>>[] = [];
+    for (const row of rows) {
+      conversations.push(await annotateConversationRowAsync(row, activeCallLogIdByConversation));
+    }
 
     return NextResponse.json({ conversations, total });
   } catch (err) {
     console.error("[API ERROR] /api/conversations failed:", err);
     return NextResponse.json({ error: "Failed to fetch conversations" }, { status: 500 });
   }
+}
+
+export async function annotateConversationRowAsync(
+  row: MultiTurnConversationRow,
+  activeCallLogIdByConversation: ReadonlyMap<string, string>
+) {
+  const { lastArtifactRelPath, lastApiKeyId, ...rest } = row;
+  const isActive = activeCallLogIdByConversation.has(row.id);
+  return {
+    ...rest,
+    isActive,
+    activeCallLogId: activeCallLogIdByConversation.get(row.id) ?? null,
+    isGenuineContinuation: await isGenuineContinuationTurnAsync(lastArtifactRelPath, lastApiKeyId),
+    // "Didn't end in stop" badge: a truncated/failed stream, or a tool call
+    // still unanswered 5+ minutes after lastSeenAt with nothing having
+    // continued. See resolveConversationStalledState's own doc comment for
+    // why a bare tool call alone isn't enough (that's completely normal
+    // seconds after it lands -- only the grace-period-elapsed case counts).
+    isStalled: await resolveConversationStalledStateAsync({
+      artifactRelPath: lastArtifactRelPath,
+      lastSeenAt: row.lastSeenAt,
+      isActive,
+    }),
+  };
 }

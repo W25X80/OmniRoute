@@ -7,6 +7,7 @@ import {
   sqliteComboRepository,
 } from "./sqliteComboRepository";
 import { sqliteModelComboMappingRepository } from "./sqliteModelComboMappingRepository";
+import { getSelectedControlPlane, UnsupportedPersistenceDomainError } from "../controlPlaneContext";
 
 export interface RoutingConfigRepositories {
   combos: ComboRepository;
@@ -17,15 +18,22 @@ export interface RoutingConfigRepositories {
 }
 
 /**
- * SQLite-only composition root for the first repository slice.
- *
- * Backend selection deliberately does not exist yet. Keeping the binding in one
- * place prevents compatibility facades from constructing or reaching through a
- * concrete driver when a later, separately approved backend is introduced.
+ * Domain selection is evaluated at each operation, including after module import.
+ * Legacy synchronous counts retain their SQLite implementation.
  */
 export const routingConfigRepositories: RoutingConfigRepositories = {
-  combos: sqliteComboRepository,
-  modelComboMappings: sqliteModelComboMappingRepository,
+  get combos() {
+    const selected = getSelectedControlPlane();
+    if (!selected) return sqliteComboRepository;
+    if (!selected.combos) throw new UnsupportedPersistenceDomainError();
+    return selected.combos;
+  },
+  get modelComboMappings() {
+    const selected = getSelectedControlPlane();
+    if (!selected) return sqliteModelComboMappingRepository;
+    if (!selected.modelComboMappings) throw new UnsupportedPersistenceDomainError();
+    return selected.modelComboMappings;
+  },
   legacySync: {
     getCombosCount: getSqliteCombosCount,
   },

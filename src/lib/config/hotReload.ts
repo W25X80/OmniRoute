@@ -2,6 +2,9 @@ import fs from "node:fs";
 import path from "node:path";
 import { SQLITE_FILE } from "@/lib/db/core";
 import { getSettings } from "@/lib/db/settings";
+import { parseDatabaseBackend } from "@/lib/db/backendSelection";
+import { runPersistenceBackgroundWork } from "@/lib/db/persistenceRuntime";
+import { createPersistencePoller, type PersistencePoller } from "./persistencePoller";
 import { applyRuntimeSettings, type RuntimeReloadChange } from "./runtimeSettings";
 
 const DEFAULT_POLL_INTERVAL_MS = 5_000;
@@ -11,6 +14,7 @@ let activeCheck: Promise<void> | null = null;
 let queuedSource: string | null = null;
 let pollTimer: ReturnType<typeof setInterval> | null = null;
 let sqliteWatcher: fs.FSWatcher | null = null;
+let postgresPoller: PersistencePoller | null = null;
 
 function getPollIntervalMs() {
   const parsed = Number.parseInt(process.env.OMNIROUTE_CONFIG_HOT_RELOAD_MS || "", 10);
@@ -63,7 +67,29 @@ function queueHotReloadCheck(source: string) {
     });
 }
 
+function startPostgresConfigHotReload(pollIntervalMs: number): void {
+  if (postgresPoller) return;
+  postgresPoller = createPersistencePoller({
+    intervalMs: pollIntervalMs,
+    initialDelayMs: 0,
+    overlap: "coalesce",
+    check: (source) =>
+      runPersistenceBackgroundWork(async () => runHotReloadCheck(`hot-reload:${source}`)),
+    onFailure: () => console.warn("[HOT_RELOAD] PostgreSQL runtime config reload failed"),
+  });
+  postgresPoller.start();
+  console.log(
+    `[HOT_RELOAD] Runtime config hot-reload started (poll=${pollIntervalMs}ms, fsWatch=off)`
+  );
+}
+
 export function startRuntimeConfigHotReload(options: { pollIntervalMs?: number } = {}) {
+  if (parseDatabaseBackend() === "postgres") {
+    startPostgresConfigHotReload(
+      Math.max(options.pollIntervalMs || getPollIntervalMs(), MIN_POLL_INTERVAL_MS)
+    );
+    return;
+  }
   if (pollTimer || sqliteWatcher) return;
 
   const pollIntervalMs = Math.max(
@@ -81,7 +107,8 @@ export function startRuntimeConfigHotReload(options: { pollIntervalMs?: number }
   if (SQLITE_FILE) {
     try {
       sqliteWatcher = fs.watch(path.dirname(SQLITE_FILE), (_eventType, filename) => {
-        const normalizedFilename = typeof filename === "string" ? filename : filename?.toString();
+        const normalizedFilename =
+          typeof filename === "string" ? filename : (filename as Buffer | null)?.toString();
         if (isRelevantSqliteChange(normalizedFilename || null)) {
           queueHotReloadCheck("hot-reload:fs-watch");
         }
@@ -103,7 +130,13 @@ export function startRuntimeConfigHotReload(options: { pollIntervalMs?: number }
   queueHotReloadCheck("hot-reload:start");
 }
 
-export function stopRuntimeConfigHotReloadForTests() {
+export function stopRuntimeConfigHotReloadForTests(): void | Promise<void> {
+  if (postgresPoller) {
+    const poller = postgresPoller;
+    return poller.stop().finally(() => {
+      if (postgresPoller === poller) postgresPoller = null;
+    });
+  }
   if (pollTimer) {
     clearInterval(pollTimer);
     pollTimer = null;
@@ -112,4 +145,9 @@ export function stopRuntimeConfigHotReloadForTests() {
   sqliteWatcher = null;
   queuedSource = null;
   activeCheck = null;
+}
+
+/** Stop periodic admission and await every admitted PostgreSQL preparation/check. */
+export async function stopRuntimeConfigHotReload(): Promise<void> {
+  await stopRuntimeConfigHotReloadForTests();
 }

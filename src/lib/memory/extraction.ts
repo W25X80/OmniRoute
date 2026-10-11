@@ -1,3 +1,6 @@
+import { getSelectedMemoryRepository } from "../db/memory";
+import { runPersistenceBackgroundWork } from "../db/persistenceRuntime";
+import { sanitizeErrorMessage } from "../../../open-sse/utils/error";
 /**
  * Fact extraction from LLM responses.
  * Parses text for user preferences, decisions, and patterns.
@@ -207,12 +210,41 @@ export function extractFactsFromText(text: string): ExtractedFact[] {
  * @param apiKeyId - API key owning this memory
  * @param sessionId - Session context for the memory
  */
-export function extractFacts(response: string, apiKeyId: string, sessionId: string): void {
+export function extractFacts(
+  response: string,
+  apiKeyId: string,
+  sessionId: string
+): void | Promise<void> {
   if (!response || !apiKeyId || !sessionId) return;
 
   const cappedResponse = capExtractionText(response);
 
   log.info("memory.extraction.start", { apiKeyId });
+
+  if (getSelectedMemoryRepository()) {
+    return runPersistenceBackgroundWork(async () => {
+      const facts = extractFactsFromText(cappedResponse);
+      for (const fact of facts)
+        await createMemory({
+          apiKeyId,
+          sessionId,
+          type: fact.type,
+          key: fact.key,
+          content: fact.content,
+          metadata: {
+            category: fact.category,
+            extractedAt: new Date().toISOString(),
+            source: "llm_response",
+          },
+          expiresAt: null,
+        });
+    }).catch((error) =>
+      log.error("memory.extraction.background.failed", {
+        error: sanitizeErrorMessage(error instanceof Error ? error.message : String(error)),
+        apiKeyId,
+      })
+    );
+  }
 
   // Non-blocking: schedule after current event loop tick
   setImmediate(() => {
@@ -220,7 +252,10 @@ export function extractFacts(response: string, apiKeyId: string, sessionId: stri
     if (facts.length === 0) return;
 
     for (const fact of facts) {
-      log.debug("memory.extraction.fact_found", { key: fact.key, category: fact.category });
+      log.debug("memory.extraction.fact_found", {
+        key: fact.key,
+        category: fact.category,
+      });
 
       createMemory({
         apiKeyId,
@@ -235,10 +270,16 @@ export function extractFacts(response: string, apiKeyId: string, sessionId: stri
         },
         expiresAt: null,
       }).catch((err) => {
-        log.error("memory.extraction.background.failed", { err: err?.message, apiKeyId });
+        log.error("memory.extraction.background.failed", {
+          err: err?.message,
+          apiKeyId,
+        });
       });
     }
 
-    log.info("memory.extraction.complete", { apiKeyId, factCount: facts.length });
+    log.info("memory.extraction.complete", {
+      apiKeyId,
+      factCount: facts.length,
+    });
   });
 }

@@ -23,24 +23,24 @@ export async function updateScore(
   scope: LeaderboardScope,
   points: number
 ): Promise<void> {
-  const { updateScore: dbUpdateScore } = await import("../db/gamification");
-  dbUpdateScore(apiKeyId, scope, points);
+  const { updateScoreAsync: dbUpdateScore } = await import("../db/gamification");
+  await dbUpdateScore(apiKeyId, scope, points);
 }
 
 /**
  * Get rank for an API key in a scope.
  */
 export async function getRank(apiKeyId: string, scope: LeaderboardScope): Promise<number> {
-  const { getRank: dbGetRank } = await import("../db/gamification");
-  return dbGetRank(apiKeyId, scope);
+  const { getRankAsync: dbGetRank } = await import("../db/gamification");
+  return await dbGetRank(apiKeyId, scope);
 }
 
 /**
  * Get top N entries for a scope.
  */
 export async function getTopN(scope: LeaderboardScope, limit: number = 50, offset: number = 0) {
-  const { getTopN: dbGetTopN } = await import("../db/gamification");
-  return dbGetTopN(scope, limit, offset);
+  const { getTopNAsync: dbGetTopN } = await import("../db/gamification");
+  return await dbGetTopN(scope, limit, offset);
 }
 
 /**
@@ -51,14 +51,16 @@ export async function getNeighbors(
   scope: LeaderboardScope,
   radius: number = 5
 ): Promise<{ above: LeaderboardEntry[]; below: LeaderboardEntry[] }> {
-  const { getLeaderboardNeighbors } = await import("../db/gamification");
-  return getLeaderboardNeighbors(apiKeyId, scope, radius);
+  const { getLeaderboardNeighborsAsync: getLeaderboardNeighbors } =
+    await import("../db/gamification");
+  return await getLeaderboardNeighbors(apiKeyId, scope, radius);
 }
 
 /**
  * Rotate weekly/monthly scopes. Archive old data, reset current.
  */
 export async function rotateScope(scope: "weekly" | "monthly"): Promise<void> {
-  const { rotateLeaderboardScope } = await import("../db/gamification");
-  rotateLeaderboardScope(scope);
+  const { rotateLeaderboardScopeAsync: rotateLeaderboardScope } =
+    await import("../db/gamification");
+  await rotateLeaderboardScope(scope);
 }

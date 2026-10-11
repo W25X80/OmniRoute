@@ -6,8 +6,8 @@ import {
 } from "@omniroute/open-sse/services/sessionManager.ts";
 import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
 import { getExclusiveLeaseConnectionIds } from "@/lib/db/apiKeys";
-import { getExclusiveLeaseOccupancy } from "@/lib/db/exclusiveConnectionLeases";
-import { getProviderConnectionDisplayMetadata } from "@/lib/db/providers";
+import { getExclusiveLeaseOccupancyAsync } from "@/lib/db/exclusiveConnectionLeases";
+import { getProviderConnectionDisplayMetadataAsync } from "@/lib/db/providers";
 import { getAccountDisplayName } from "@/lib/display/names";
 import { getPendingRequests } from "@/lib/usage/usageHistory";
 import {
@@ -30,13 +30,12 @@ export async function GET() {
       // the managed candidate set; SQLite occupancy is the source of truth for
       // which of those connections are actually leased right now.
       const managedConnectionIds = Array.from(await getExclusiveLeaseConnectionIds());
-      const occupancy = getExclusiveLeaseOccupancy(managedConnectionIds);
+      const occupancy = await getExclusiveLeaseOccupancyAsync(managedConnectionIds);
       const leasedConnectionIds = new Set(occupancy.keys());
       const connectionNames = new Map(
-        getProviderConnectionDisplayMetadata([...leasedConnectionIds]).map((connection) => [
-          connection.id,
-          getAccountDisplayName(connection),
-        ])
+        (await getProviderConnectionDisplayMetadataAsync([...leasedConnectionIds])).map(
+          (connection) => [connection.id, getAccountDisplayName(connection)]
+        )
       );
       exclusiveSessions = buildExclusiveDashboardSessions(
         leasedConnectionIds,

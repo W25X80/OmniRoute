@@ -1,3 +1,4 @@
+import { getSelectedPostgresDatabase } from "./controlPlaneContext";
 /**
  * CLI Tool State Persistence
  *
@@ -156,4 +157,95 @@ export function deleteCliToolInitialConfig(toolId: string): void {
     "cliToolInitialConfig",
     toolId
   );
+}
+
+export async function saveCliToolLastConfiguredAsync(
+  ...args: Parameters<typeof saveCliToolLastConfigured>
+): Promise<ReturnType<typeof saveCliToolLastConfigured>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceOperations");
+    return postgres.transaction((transaction) =>
+      native.saveCliToolLastConfigured(transaction, ...args)
+    );
+  }
+  return saveCliToolLastConfigured(...args);
+}
+
+export async function getCliToolLastConfiguredAsync(
+  ...args: Parameters<typeof getCliToolLastConfigured>
+): Promise<ReturnType<typeof getCliToolLastConfigured>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceOperations");
+    return postgres.transaction((transaction) =>
+      native.getCliToolLastConfigured(transaction, ...args)
+    );
+  }
+  return getCliToolLastConfigured(...args);
+}
+
+export async function getAllCliToolLastConfiguredAsync(
+  ...args: Parameters<typeof getAllCliToolLastConfigured>
+): Promise<ReturnType<typeof getAllCliToolLastConfigured>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceOperations");
+    return postgres.transaction((transaction) =>
+      native.getAllCliToolLastConfigured(transaction, ...args)
+    );
+  }
+  return getAllCliToolLastConfigured(...args);
+}
+
+export async function deleteCliToolLastConfiguredAsync(
+  ...args: Parameters<typeof deleteCliToolLastConfigured>
+): Promise<ReturnType<typeof deleteCliToolLastConfigured>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceOperations");
+    return postgres.transaction((transaction) =>
+      native.deleteCliToolLastConfigured(transaction, ...args)
+    );
+  }
+  return deleteCliToolLastConfigured(...args);
+}
+
+export async function saveCliToolInitialConfigAsync(
+  ...args: Parameters<typeof saveCliToolInitialConfig>
+): Promise<ReturnType<typeof saveCliToolInitialConfig>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceOperations");
+    return postgres.transaction((transaction) =>
+      native.saveCliToolInitialConfig(transaction, ...args)
+    );
+  }
+  return saveCliToolInitialConfig(...args);
+}
+
+export async function getCliToolInitialConfigAsync(
+  ...args: Parameters<typeof getCliToolInitialConfig>
+): Promise<ReturnType<typeof getCliToolInitialConfig>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceOperations");
+    return postgres.transaction((transaction) =>
+      native.getCliToolInitialConfig(transaction, ...args)
+    );
+  }
+  return getCliToolInitialConfig(...args);
+}
+
+export async function deleteCliToolInitialConfigAsync(
+  ...args: Parameters<typeof deleteCliToolInitialConfig>
+): Promise<ReturnType<typeof deleteCliToolInitialConfig>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceOperations");
+    return postgres.transaction((transaction) =>
+      native.deleteCliToolInitialConfig(transaction, ...args)
+    );
+  }
+  return deleteCliToolInitialConfig(...args);
 }

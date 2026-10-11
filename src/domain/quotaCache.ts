@@ -21,11 +21,7 @@ import { getCachedProviderConnectionById } from "@/lib/db/readCache";
 import { resolveProxyForConnection } from "@/lib/db/settings";
 import { runWithProxyContext } from "@omniroute/open-sse/utils/proxyFetch.ts";
 import { safePercentage } from "@/shared/utils/formatting";
-import {
-  saveQuotaSnapshot,
-  cleanupOldSnapshots,
-  getLatestQuotaSnapshotsForConnection,
-} from "@/lib/db/quotaSnapshots";
+import { saveQuotaSnapshot, getLatestQuotaSnapshotsForConnection } from "@/lib/db/quotaSnapshots";
 import { recordProviderQuotaResetEventIfChanged } from "@/lib/db/quotaResetEvents";
 import {
   CODEX_SPARK_QUOTA_SESSION,
@@ -58,6 +54,19 @@ import {
   isQuotaHealthy,
 } from "./quotaCacheState";
 import { isCodexPaidCreditsEnabled } from "@/lib/providers/codexPaidCredits";
+import {
+  getSelectedPostgresDatabase,
+  getSelectedPersistenceIdentity,
+} from "@/lib/db/controlPlaneContext";
+import {
+  saveQuotaSnapshotAsync,
+  cleanupOldSnapshotsAsync,
+  getLatestQuotaSnapshotsForConnectionAsync,
+  getAllLatestQuotaSnapshotsAsync,
+} from "@/lib/db/quotaSnapshots";
+import { recordProviderQuotaResetEventIfChangedAsync } from "@/lib/db/quotaResetEvents";
+import { setQuotaCacheIdentityResolver } from "./quotaCacheState";
+import { runPersistenceBackgroundWork } from "@/lib/db/persistenceRuntime";
 
 // Keep markQuotaHealthy's public import path; the remaining leaf state stays internal.
 export { markQuotaHealthy } from "./quotaCacheState";
@@ -705,6 +714,12 @@ export function setQuotaCache(
   rawQuotas: Record<string, unknown>,
   rawModelQuotas: Record<string, unknown> = {}
 ) {
+  if (getSelectedPostgresDatabase()) {
+    void runPersistenceBackgroundWork(() =>
+      setQuotaCacheAsync(connectionId, provider, rawQuotas, rawModelQuotas)
+    ).catch((error) => console.error("[quotaCache] Failed to persist snapshots:", error));
+    return;
+  }
   const quotas = normalizeQuotas(rawQuotas);
   const modelQuotas = normalizeQuotas(rawModelQuotas);
   const exhausted = isExhausted(quotas);
@@ -796,13 +811,21 @@ export function getQuotaCache(connectionId: string): QuotaCacheEntry | null {
 function hydrateQuotaCacheFromSnapshots(connectionId: string): QuotaCacheEntry | null {
   const { cache } = getState();
   if (cache.has(connectionId)) return cache.get(connectionId) || null;
-
-  let snapshots;
+  // Native startup hydrates this optional telemetry before requests. A never-observed
+  // account is unknown, as in the existing quota policy, without a SQLite read.
+  if (getSelectedPostgresDatabase()) return null;
   try {
-    snapshots = getLatestQuotaSnapshotsForConnection(connectionId);
+    return hydrateSnapshotRows(connectionId, getLatestQuotaSnapshotsForConnection(connectionId));
   } catch {
     return null;
   }
+}
+
+function hydrateSnapshotRows(
+  connectionId: string,
+  snapshots: ReturnType<typeof getLatestQuotaSnapshotsForConnection>
+): QuotaCacheEntry | null {
+  const { cache } = getState();
   if (!snapshots.length) return null;
 
   const quotas: Record<string, QuotaInfo> = {};
@@ -1069,7 +1092,7 @@ async function refreshEntry(entry: QuotaCacheEntry) {
     );
 
     if (usage?.quotas) {
-      setQuotaCache(
+      await setQuotaCacheAsync(
         entry.connectionId,
         entry.provider,
         usage.quotas,
@@ -1104,7 +1127,7 @@ async function backgroundRefreshTick() {
   state.tickRunning = true;
 
   try {
-    cleanupOldSnapshots();
+    await cleanupOldSnapshotsAsync();
     const now = Date.now();
     const pending = [...state.cache.values()].filter((e) => needsRefresh(e, now));
 
@@ -1124,7 +1147,11 @@ async function backgroundRefreshTick() {
 export function startBackgroundRefresh() {
   const state = getState();
   if (state.refreshTimer) return;
-  state.refreshTimer = setInterval(backgroundRefreshTick, REFRESH_INTERVAL_MS);
+  state.refreshTimer = setInterval(() => {
+    void runPersistenceBackgroundWork(backgroundRefreshTick).catch((error) =>
+      console.error("[quotaCache] Background refresh failed:", error)
+    );
+  }, REFRESH_INTERVAL_MS);
   state.refreshTimer?.unref?.();
 }
 
@@ -1163,4 +1190,120 @@ export function getQuotaCacheStats() {
   }
 
   return { total: cache.size, entries };
+}
+
+/** Await before server readiness; synchronous policy readers then use the same source cache. */
+export async function initializeQuotaSnapshotCache(): Promise<void> {
+  setQuotaCacheIdentityResolver(getSelectedPersistenceIdentity);
+  const rows = await getAllLatestQuotaSnapshotsAsync();
+  const byConnection = new Map<string, typeof rows>();
+  for (const row of rows) {
+    const camel = row as unknown as { connectionId?: string };
+    const id = camel.connectionId ?? row.connection_id;
+    if (!id) continue;
+    const list = byConnection.get(id) ?? [];
+    list.push(row);
+    byConnection.set(id, list);
+  }
+  for (const [id, snapshots] of byConnection)
+    if (!getState().cache.has(id)) hydrateSnapshotRows(id, snapshots);
+}
+
+export async function hydrateCodexQuotaCacheForRequestAsync(
+  ...args: Parameters<typeof hydrateCodexQuotaCacheForRequest>
+): Promise<void> {
+  if (getSelectedPostgresDatabase() && !getState().cache.has(args[0].id)) {
+    const snapshots = await getLatestQuotaSnapshotsForConnectionAsync(args[0].id);
+    hydrateSnapshotRows(args[0].id, snapshots);
+  }
+  hydrateCodexQuotaCacheForRequest(...args);
+}
+
+export async function setQuotaCacheAsync(
+  connectionId: string,
+  provider: string,
+  rawQuotas: Record<string, unknown>,
+  rawModelQuotas: Record<string, unknown> = {}
+) {
+  if (!getSelectedPostgresDatabase())
+    return setQuotaCache(connectionId, provider, rawQuotas, rawModelQuotas);
+  const quotas = normalizeQuotas(rawQuotas);
+  const modelQuotas = normalizeQuotas(rawModelQuotas);
+  const exhausted = isExhausted(quotas);
+  // #4438 — capture the prior entry BEFORE overwriting the cache so we can skip
+  // redundant snapshot writes for idle connections whose quota didn't change.
+  const prior = getState().cache.get(connectionId);
+  // A telemetry-only refresh is not evidence that a real upstream 429 has
+  // recovered. Keep its original timestamp so it can still expire normally.
+  if (
+    prior?.exhausted &&
+    Object.keys(prior.quotas).length === 0 &&
+    isStandardQuotaExhausted(prior, Date.now()) &&
+    Object.keys(modelQuotas).length === 0 &&
+    Object.values(quotas).every((q) => q.fractionReported === false)
+  ) {
+    return;
+  }
+  const entry: QuotaCacheEntry = {
+    connectionId,
+    provider,
+    quotas,
+    modelQuotas,
+    fetchedAt: Date.now(),
+    exhausted,
+    // #14359 — cap the park; keep the prior deadline while the streak continues (monitor rewrites must not extend it).
+    nextResetAt: exhausted ? preserveParkDeadline(earliestResetAt(quotas), prior) : null,
+  };
+  getState().cache.set(connectionId, entry);
+
+  if (entry && rawQuotas) {
+    for (const [windowKey, quotaInfo] of Object.entries(rawQuotas)) {
+      if (!quotaInfo || typeof quotaInfo !== "object") continue;
+      const normalized = quotas[windowKey];
+      if (!normalized) continue;
+      const { remainingPercentage } = normalized;
+      const fractionReported = normalized.fractionReported !== false;
+      if (fractionReported) {
+        await recordProviderQuotaResetEventIfChangedAsync({
+          provider,
+          connectionId,
+          windowKey,
+          currentResetAt: normalized.resetAt,
+          currentRemainingPercentage: remainingPercentage,
+          previousObservation: prior?.quotas?.[windowKey]
+            ? {
+                resetAt: prior.quotas[windowKey].resetAt,
+                remainingPercentage: prior.quotas[windowKey].remainingPercentage,
+              }
+            : null,
+        });
+      }
+      // #5923 (Finding #5) — is_exhausted must reflect THIS window's own remaining
+      // percentage, not the connection-wide AND-across-all-windows aggregate
+      // (`entry.exhausted`). A connection with one 0% window and other non-zero
+      // windows previously never flagged that window's row as exhausted.
+      const windowExhausted = fractionReported && remainingPercentage <= 0;
+      // #4438 — only persist on the first observation or a real change.
+      if (
+        !quotaSnapshotChanged(prior, windowKey, remainingPercentage, windowExhausted) &&
+        prior?.quotas?.[windowKey]?.fractionReported === normalized.fractionReported
+      )
+        continue;
+      try {
+        await saveQuotaSnapshotAsync({
+          provider,
+          connection_id: connectionId,
+          window_key: windowKey,
+          remaining_percentage: remainingPercentage,
+          is_exhausted: windowExhausted ? 1 : 0,
+          next_reset_at: normalized.resetAt,
+          window_duration_ms: entry.windowDurationMs ?? null,
+          // Persist only the interpretation, never the raw provider payload.
+          raw_data: fractionReported ? null : JSON.stringify({ fractionReported: false }),
+        });
+      } catch (error) {
+        console.error("[quotaCache] Failed to save snapshot:", error);
+      }
+    }
+  }
 }

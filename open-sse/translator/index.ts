@@ -1,3 +1,6 @@
+import type { createRequestLogger } from "../utils/requestLogger.ts";
+import { withPreparedGeminiThoughtSignatures } from "../services/geminiThoughtSignatureStore.ts";
+import { hydrateReasoningReplay, withReasoningReplaySnapshot } from "../services/reasoningCache";
 import { FORMATS } from "./formats.ts";
 import {
   ensureToolCallIds,
@@ -330,7 +333,7 @@ const OPENAI_INCOMPATIBLE_ECHO_FIELDS = [
   "cache_control",
 ];
 
-export function translateRequest(
+function* translateRequestSteps(
   sourceFormat,
   targetFormat,
   model,
@@ -338,7 +341,7 @@ export function translateRequest(
   stream = true,
   credentials = null,
   provider = null,
-  reqLogger = null,
+  reqLogger: Awaited<ReturnType<typeof createRequestLogger>> | null = null,
   options?: {
     normalizeToolCallId?: boolean;
     preserveDeveloperRole?: boolean;
@@ -360,6 +363,7 @@ export function translateRequest(
   }
 ) {
   let result = normalizeReasoningRequest(body, provider);
+  yield { body: result, scope: options?.reasoningCacheScope };
   const use9CharId = options?.normalizeToolCallId === true;
   const preserveDeveloperRole = options?.preserveDeveloperRole;
   const connectionCacheOverride = resolveConnectionCacheOverride(
@@ -556,6 +560,7 @@ export function translateRequest(
         isReasoner &&
         Array.isArray(result.messages)
       ) {
+        yield { body: result, scope: options?.reasoningCacheScope };
         const messages = result.messages as Array<Record<string, unknown>>;
         const replayOptions: OpenAIReplayOptions = {
           canReplayReasoningOnly: isReasoningOnlyReplayTarget(normalizedProvider, normalizedModel),
@@ -726,6 +731,7 @@ export function translateRequest(
   // resolved up-front (before the OpenAI-format filter) so the #4849 reasoning strip
   // could honor reasoning-replay providers.
   if (isReasoner && result.messages && Array.isArray(result.messages)) {
+    yield { body: result, scope: options?.reasoningCacheScope };
     const canReplayReasoningOnly = isReasoningOnlyReplayTarget(normalizedProvider, normalizedModel);
 
     for (const [messageIndex, msg] of result.messages.entries()) {
@@ -883,6 +889,30 @@ export function translateRequest(
   return result;
 }
 
+/** Legacy synchronous runner; embedded SQLite keeps its existing replay path. */
+export function translateRequest(...args: Parameters<typeof translateRequestSteps>) {
+  const steps = translateRequestSteps(...args);
+  let step = steps.next();
+  while (!step.done) step = steps.next();
+  return step.value;
+}
+
+/** Await native persistence only at explicit normalization/replay boundaries. */
+export async function translateRequestAsync(...args: Parameters<typeof translateRequestSteps>) {
+  const translate = () =>
+    withReasoningReplaySnapshot(async () => {
+      const steps = translateRequestSteps(...args);
+      let step = steps.next();
+      while (!step.done) {
+        if (!args[8]?.videoTranscriptSensitive)
+          await hydrateReasoningReplay(step.value.body, step.value.scope);
+        step = steps.next();
+      }
+      return step.value;
+    });
+  return args[1] === FORMATS.GEMINI ? withPreparedGeminiThoughtSignatures(translate) : translate();
+}
+
 // Translate response chunk: target -> openai -> source
 export function translateResponse(targetFormat, sourceFormat, chunk, state) {
   // If same format, return as-is — but never propagate the null/flush signal as a
@@ -893,7 +923,7 @@ export function translateResponse(targetFormat, sourceFormat, chunk, state) {
   }
 
   let results = [chunk];
-  let openaiResults = null; // Store OpenAI intermediate results
+  let openaiResults: unknown[] | null = null; // Store OpenAI intermediate results
 
   // Check for direct translation path first (e.g., Gemini → Claude)
   const directTranslator = getResponseTranslator(targetFormat, sourceFormat);
@@ -925,7 +955,7 @@ export function translateResponse(targetFormat, sourceFormat, chunk, state) {
   if (sourceFormat !== FORMATS.OPENAI) {
     const fromOpenAI = getResponseTranslator(FORMATS.OPENAI, sourceFormat);
     if (fromOpenAI) {
-      const finalResults = [];
+      const finalResults: unknown[] = [];
       for (const r of results) {
         const converted = fromOpenAI(r, state);
         if (converted) {

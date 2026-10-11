@@ -7,7 +7,11 @@
 
 import { buildErrorBody, sanitizeErrorMessage } from "@omniroute/open-sse/utils/error.ts";
 import { z } from "zod";
-import { removeCustomHost, toggleCustomHost, listCustomHosts } from "@/lib/db/inspectorCustomHosts";
+import {
+  removeCustomHostAsync,
+  toggleCustomHostAsync,
+  listCustomHostsAsync,
+} from "@/lib/db/inspectorCustomHosts";
 import { getCachedPassword } from "@/mitm/manager";
 import { removeDNSEntries } from "@/mitm/dns/dnsConfig";
 
@@ -24,7 +28,7 @@ export async function DELETE(_request: Request, { params }: Params): Promise<Res
   const decodedHost = decodeURIComponent(host);
 
   try {
-    removeCustomHost(decodedHost);
+    await removeCustomHostAsync(decodedHost);
   } catch (err) {
     const msg = sanitizeErrorMessage(err);
     return new Response(JSON.stringify(buildErrorBody(500, msg || "Failed to remove host")), {
@@ -84,9 +88,9 @@ export async function PATCH(request: Request, { params }: Params): Promise<Respo
   }
 
   try {
-    toggleCustomHost(decodedHost, parsed.data.enabled);
+    await toggleCustomHostAsync(decodedHost, parsed.data.enabled);
     // Return updated record
-    const hosts = listCustomHosts();
+    const hosts = await listCustomHostsAsync();
     const updated = hosts.find((h) => h.host === decodedHost);
     if (!updated) {
       return new Response(JSON.stringify(buildErrorBody(404, "Host not found")), {

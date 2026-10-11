@@ -9,7 +9,22 @@ interface StatementLike {
 }
 
 interface DbLike {
-  prepare: <TRow = unknown>(sql: string) => StatementLike;
+  prepare: <_TRow = unknown>(sql: string) => StatementLike;
+}
+
+export interface CodexUsageHistoryReconciliationInput {
+  connectionId: string;
+  existing: JsonRecord;
+  merged: JsonRecord;
+  matchedExistingCodexByWorkspace?: boolean;
+}
+
+export interface CodexUsageHistoryReconciliation {
+  connectionId: string;
+  oldAccountKey: string;
+  newAccountKey: string;
+  newLabel: string;
+  newLabelPriority: number;
 }
 
 function nonEmptyString(value: unknown): string | null {
@@ -41,19 +56,12 @@ function isSafeCodexIdentityEnrichment(existing: JsonRecord, merged: JsonRecord)
 }
 
 /**
- * Reconcile usage-history identity after a Codex connection gains its stable
- * user identity. The caller invokes this inside the same transaction as the
- * provider row update, so history and connection identity cannot diverge.
+ * Derive the admitted usage-history identity change without accessing storage.
+ * Both backends apply these parameters in the provider row update transaction.
  */
-export function reconcileCodexUsageHistory(
-  db: DbLike,
-  input: {
-    connectionId: string;
-    existing: JsonRecord;
-    merged: JsonRecord;
-    matchedExistingCodexByWorkspace?: boolean;
-  }
-): void {
+export function getCodexUsageHistoryReconciliation(
+  input: CodexUsageHistoryReconciliationInput
+): CodexUsageHistoryReconciliation | null {
   const oldIdentity = resolveUsageAccountIdentity(input.existing);
   const newIdentity = resolveUsageAccountIdentity(input.merged);
   const identityChanged = oldIdentity.accountKey !== newIdentity.accountKey;
@@ -61,7 +69,24 @@ export function reconcileCodexUsageHistory(
     input.matchedExistingCodexByWorkspace === true ||
     isSafeCodexIdentityEnrichment(input.existing, input.merged);
 
-  if (!identityChanged || !permitted) return;
+  if (!identityChanged || !permitted) return null;
+
+  return {
+    connectionId: input.connectionId,
+    oldAccountKey: oldIdentity.accountKey,
+    newAccountKey: newIdentity.accountKey,
+    newLabel: newIdentity.accountLabel,
+    newLabelPriority: newIdentity.accountLabelPriority,
+  };
+}
+
+/** SQLite execution of the shared identity-change predicate. */
+export function reconcileCodexUsageHistory(
+  db: DbLike,
+  input: CodexUsageHistoryReconciliationInput
+): void {
+  const reconciliation = getCodexUsageHistoryReconciliation(input);
+  if (!reconciliation) return;
 
   db.prepare(
     `UPDATE usage_history
@@ -77,11 +102,5 @@ export function reconcileCodexUsageHistory(
          )
      WHERE connection_id = @connectionId
        AND account_key = @oldAccountKey`
-  ).run({
-    connectionId: input.connectionId,
-    oldAccountKey: oldIdentity.accountKey,
-    newAccountKey: newIdentity.accountKey,
-    newLabel: newIdentity.accountLabel,
-    newLabelPriority: newIdentity.accountLabelPriority,
-  });
+  ).run(reconciliation);
 }

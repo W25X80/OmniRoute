@@ -57,7 +57,7 @@ export const EXHAUSTED_MAX_PARK_MS = 30 * 60 * 1000;
 // `src/lib/pricingSync.ts` (commit de9d748dac, #6325) and the same pattern in
 // `src/lib/credentialHealth/cache.ts`.
 
-interface QuotaCacheState {
+export interface QuotaCacheState {
   cache: Map<string, QuotaCacheEntry>;
   refreshingSet: Set<string>;
   // #14359 — connectionId → epoch ms the healthy override stands the predicates down; shared state per #8065.
@@ -68,9 +68,27 @@ interface QuotaCacheState {
 
 declare global {
   var __omnirouteQuotaCacheState: QuotaCacheState | undefined;
+  var __omnirouteQuotaCacheIdentity: (() => object | undefined) | undefined;
+  var __omnirouteQuotaCacheNativeStates: WeakMap<object, QuotaCacheState> | undefined;
 }
 
 export function getQuotaCacheState(): QuotaCacheState {
+  const identity = globalThis.__omnirouteQuotaCacheIdentity?.();
+  if (identity) {
+    const states = (globalThis.__omnirouteQuotaCacheNativeStates ??= new WeakMap());
+    let state = states.get(identity);
+    if (!state) {
+      state = {
+        cache: new Map(),
+        refreshingSet: new Set(),
+        healthyUntil: new Map(),
+        refreshTimer: null,
+        tickRunning: false,
+      };
+      states.set(identity, state);
+    }
+    return state;
+  }
   if (!globalThis.__omnirouteQuotaCacheState) {
     globalThis.__omnirouteQuotaCacheState = {
       cache: new Map(),
@@ -99,4 +117,9 @@ export function unmarkQuotaHealthy(connectionId: string): void {
 export function isQuotaHealthy(connectionId: string): boolean {
   const until = getQuotaCacheState().healthyUntil.get(connectionId);
   return until !== undefined && until > Date.now();
+}
+
+/** Install an optional identity resolver without introducing a runtime import cycle. */
+export function setQuotaCacheIdentityResolver(resolve: () => object | undefined): void {
+  globalThis.__omnirouteQuotaCacheIdentity = resolve;
 }

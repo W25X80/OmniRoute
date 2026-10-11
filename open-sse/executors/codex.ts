@@ -77,7 +77,8 @@ import {
   CODEX_REASONING_REPLAY_ERROR_CODE,
   readCodexReasoningReplayRejection,
 } from "./codex/reasoningReplayRejection.ts";
-import { resolveAppServerConfig } from "./codex/appServerConfig.ts";
+import { resolveAppServerConfig, resolveAppServerConfigAsync } from "./codex/appServerConfig.ts";
+import { parseDatabaseBackend } from "@/lib/db/backendSelection";
 import { getResponsesSubpath } from "./codex/responsesSubpath.ts";
 import { CodexAppServerExecutor } from "./codex-app-server.ts";
 // Re-exported for external importers (tests + provider services).
@@ -394,6 +395,17 @@ export function isCodexAppServerRequired(credentials: unknown): boolean {
       : null;
   if (providerSpecificData?.codexTransport !== "app-server") return false;
   return !!resolveAppServerConfig(providerSpecificData);
+}
+
+export async function isCodexAppServerRequiredAsync(credentials: unknown): Promise<boolean> {
+  if (parseDatabaseBackend() === "sqlite") return isCodexAppServerRequired(credentials);
+  if (!isCodexAppServerGloballyEnabled()) return false;
+  const providerSpecificData =
+    credentials && typeof credentials === "object"
+      ? (credentials as { providerSpecificData?: Record<string, unknown> }).providerSpecificData
+      : null;
+  if (providerSpecificData?.codexTransport !== "app-server") return false;
+  return !!(await resolveAppServerConfigAsync(providerSpecificData));
 }
 
 export function isCodexResponsesWebSocketRequired(_model: string, credentials: unknown): boolean {
@@ -796,7 +808,7 @@ export class CodexExecutor extends BaseExecutor {
       };
     }
 
-    if (isCodexAppServerRequired(nextInput.credentials)) {
+    if (await isCodexAppServerRequiredAsync(nextInput.credentials)) {
       // The app-server adapter does not forward service tiers. Never silently
       // ignore an API-key override (especially a cost-controlling Standard mode).
       if (getApiKeyCodexServiceTier(nextInput.credentials)) {

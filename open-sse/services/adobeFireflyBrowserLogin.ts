@@ -15,10 +15,18 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { access, mkdir, readFile } from "node:fs/promises";
+import { parseDatabaseBackend } from "@/lib/db/backendSelection";
+import { withNativeThreadCacheFile } from "../utils/nativeThreadCacheFile.ts";
 import http from "node:http";
 import { createServer } from "node:net";
 import { join } from "node:path";
-import { ensureSecureDir, writeSecureFile } from "../utils/secureFileWrite.ts";
+import {
+  ensureSecureDir,
+  ensureSecureDirAsync,
+  writeSecureFile,
+  writeSecureFileAsync,
+} from "../utils/secureFileWrite.ts";
 import {
   decodeAdobeJwtPayload,
   isAdobeUserAccessToken,
@@ -174,12 +182,17 @@ export function extractUserJwtFromStorageRaw(raw: string): string {
   return "";
 }
 
-function resolveAdobeFireflyDataRoot(): string {
+function adobeFireflyDataRootPath(): string {
   const dataRoot =
     String(process.env.DATA_DIR || process.env.OMNIROUTE_DATA_DIR || "").trim() ||
     (process.env.LOCALAPPDATA
       ? join(process.env.LOCALAPPDATA, "OmniRoute")
       : join(process.cwd(), ".data"));
+  return dataRoot;
+}
+
+function resolveAdobeFireflyDataRoot(): string {
+  const dataRoot = adobeFireflyDataRootPath();
   mkdirSync(dataRoot, { recursive: true });
   return dataRoot;
 }
@@ -197,6 +210,21 @@ export function resolveAdobeFireflyBrowserProfileDir(sessionKey?: string): strin
     adobeFireflyBrowserSessionKey(sessionKey)
   );
   mkdirSync(profile, { recursive: true });
+  return profile;
+}
+
+export async function resolveAdobeFireflyBrowserProfileDirAsync(
+  sessionKey?: string
+): Promise<string> {
+  if (parseDatabaseBackend() === "sqlite") return resolveAdobeFireflyBrowserProfileDir(sessionKey);
+  const dataRoot = adobeFireflyDataRootPath();
+  const profile = join(
+    dataRoot,
+    "adobe-chrome-profiles",
+    adobeFireflyBrowserSessionKey(sessionKey)
+  );
+  await mkdir(dataRoot, { recursive: true });
+  await mkdir(profile, { recursive: true });
   return profile;
 }
 
@@ -289,14 +317,11 @@ export async function resolveAdobeAccountLabel(
 }
 
 /** Resolve system Chrome/Edge executable. Exported for unit tests. */
-export function resolveSystemBrowserExecutable(): string | null {
-  const configured = process.env.OMNIROUTE_LOGIN_BROWSER_PATH?.trim();
-  if (configured && existsSync(configured)) return configured;
-
+function systemBrowserCandidates(): string[] {
   const pf = process.env.ProgramFiles || "C:\\Program Files";
   const pf86 = process.env["ProgramFiles(x86)"] || "C:\\Program Files (x86)";
   const local = process.env.LOCALAPPDATA || "";
-  const candidates = [
+  return [
     join(pf, "Google", "Chrome", "Application", "chrome.exe"),
     join(pf86, "Google", "Chrome", "Application", "chrome.exe"),
     join(local, "Google", "Chrome", "Application", "chrome.exe"),
@@ -312,8 +337,29 @@ export function resolveSystemBrowserExecutable(): string | null {
     "/usr/bin/microsoft-edge",
     "/usr/bin/microsoft-edge-stable",
   ];
-  for (const path of candidates) {
+}
+
+export function resolveSystemBrowserExecutable(): string | null {
+  const configured = process.env.OMNIROUTE_LOGIN_BROWSER_PATH?.trim();
+  if (configured && existsSync(configured)) return configured;
+  for (const path of systemBrowserCandidates()) {
     if (path && existsSync(path)) return path;
+  }
+  return null;
+}
+
+export async function resolveSystemBrowserExecutableAsync(): Promise<string | null> {
+  if (parseDatabaseBackend() === "sqlite") return resolveSystemBrowserExecutable();
+  const configured = process.env.OMNIROUTE_LOGIN_BROWSER_PATH?.trim();
+  const paths = [...(configured ? [configured] : []), ...systemBrowserCandidates()];
+  for (const path of paths) {
+    if (!path) continue;
+    try {
+      await access(path);
+      return path;
+    } catch {
+      /* try the next source candidate */
+    }
   }
   return null;
 }
@@ -434,6 +480,43 @@ function saveAdobeBrowserCookies(sessionKey: string, cookies: CdpCookie[]): void
     );
   } catch {
     // Best-effort: login still returns the portable JWT + Firefly risk cookies.
+  }
+}
+
+function runNativeBrowserCookieFile<T>(
+  sessionKey: string,
+  body: (path: string) => Promise<T>
+): Promise<T> {
+  const dataRoot = adobeFireflyDataRootPath();
+  const dir = join(dataRoot, "adobe-browser-sessions");
+  const path = join(dir, `${adobeFireflyBrowserSessionKey(sessionKey)}.json`);
+  return withNativeThreadCacheFile(path, async () => {
+    await mkdir(dataRoot, { recursive: true });
+    await ensureSecureDirAsync(dir);
+    return body(path);
+  });
+}
+
+async function loadAdobeBrowserCookiesAsync(sessionKey: string): Promise<AdobeBrowserCookie[]> {
+  try {
+    return await runNativeBrowserCookieFile(sessionKey, async (path) => {
+      const parsed = JSON.parse(await readFile(path, "utf8"));
+      return Array.isArray(parsed) ? filterAdobeBrowserCookies(parsed as CdpCookie[]) : [];
+    });
+  } catch {
+    return [];
+  }
+}
+
+async function saveAdobeBrowserCookiesAsync(
+  sessionKey: string,
+  cookies: CdpCookie[]
+): Promise<void> {
+  try {
+    const contents = JSON.stringify(filterAdobeBrowserCookies(cookies));
+    await runNativeBrowserCookieFile(sessionKey, (path) => writeSecureFileAsync(path, contents));
+  } catch {
+    // Keep successful login independent of optional cookie-jar persistence.
   }
 }
 
@@ -1156,7 +1239,10 @@ async function runAdobeFireflyCdpBrowser(opts: {
   accessToken?: string;
   log?: AdobeFireflyBrowserLog;
 }): Promise<AdobeFireflyBrowserLoginResult> {
-  const browserPath = resolveSystemBrowserExecutable();
+  const native = parseDatabaseBackend() === "postgres";
+  const browserPath = native
+    ? await resolveSystemBrowserExecutableAsync()
+    : resolveSystemBrowserExecutable();
   if (!browserPath) {
     return {
       success: false,
@@ -1169,7 +1255,9 @@ async function runAdobeFireflyCdpBrowser(opts: {
 
   let child: ChildProcess | null = null;
   try {
-    const userDataDir = resolveAdobeFireflyBrowserProfileDir(opts.sessionKey);
+    const userDataDir = native
+      ? await resolveAdobeFireflyBrowserProfileDirAsync(opts.sessionKey)
+      : resolveAdobeFireflyBrowserProfileDir(opts.sessionKey);
     // Isolate interactive sign-in profiles so a prior hung CDP instance cannot lock the dir.
     // freshSession uses a per-attempt suffix; background warm keeps the stable key for SSO reuse.
     const launchUserDataDir =
@@ -1177,7 +1265,8 @@ async function runAdobeFireflyCdpBrowser(opts: {
         ? `${userDataDir}-login-${Date.now().toString(36)}`
         : userDataDir;
     try {
-      mkdirSync(launchUserDataDir, { recursive: true });
+      if (native) await mkdir(launchUserDataDir, { recursive: true });
+      else mkdirSync(launchUserDataDir, { recursive: true });
     } catch {
       /* parent resolve already mkdir'd base */
     }
@@ -1196,7 +1285,8 @@ async function runAdobeFireflyCdpBrowser(opts: {
           ? `${launchUserDataDir}-a${launchAttempt}`
           : launchUserDataDir;
       try {
-        mkdirSync(attemptUserDataDir, { recursive: true });
+        if (native) await mkdir(attemptUserDataDir, { recursive: true });
+        else mkdirSync(attemptUserDataDir, { recursive: true });
       } catch {
         /* best-effort */
       }
@@ -1279,13 +1369,16 @@ async function runAdobeFireflyCdpBrowser(opts: {
           seedBrowserCookies:
             opts.interactive && opts.freshSession !== false
               ? []
-              : loadAdobeBrowserCookies(opts.sessionKey),
+              : native
+                ? await loadAdobeBrowserCookiesAsync(opts.sessionKey)
+                : loadAdobeBrowserCookies(opts.sessionKey),
           waitForRiskRefresh: !opts.interactive,
         });
 
         const cookie = buildAdobeFireflyCookieHeader(captured.cookies);
         // Persist risk cookies under the stable session key (not the -login- temp dir).
-        saveAdobeBrowserCookies(opts.sessionKey, captured.cookies);
+        if (native) await saveAdobeBrowserCookiesAsync(opts.sessionKey, captured.cookies);
+        else saveAdobeBrowserCookies(opts.sessionKey, captured.cookies);
         const account = await resolveAdobeAccountLabel(captured.accessToken);
         opts.log?.info?.(
           "ADOBE-FIREFLY",

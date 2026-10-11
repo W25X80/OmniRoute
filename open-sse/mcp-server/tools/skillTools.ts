@@ -107,7 +107,7 @@ export const skillTools = {
     }),
     handler: async (args: { apiKeyId?: string; limit?: number }, extra?: McpToolExtraLike) => {
       const owner = await resolveMcpToolOwnerId(extra, args.apiKeyId);
-      const executions = skillExecutor.listExecutions(owner, args.limit || 50);
+      const executions = await skillExecutor.listExecutionsAsync(owner, args.limit || 50);
 
       return {
         executions: executions.map((e) => ({

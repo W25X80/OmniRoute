@@ -11,13 +11,13 @@
 
 import { buildErrorBody, sanitizeErrorMessage } from "@omniroute/open-sse/utils/error.ts";
 import { InspectorCustomHostSchema } from "@/shared/schemas/inspector";
-import { listCustomHosts, addCustomHost } from "@/lib/db/inspectorCustomHosts";
+import { listCustomHostsAsync, addCustomHostAsync } from "@/lib/db/inspectorCustomHosts";
 import { getCachedPassword } from "@/mitm/manager";
 import { addDNSEntries } from "@/mitm/dns/dnsConfig";
 
 export async function GET(): Promise<Response> {
   try {
-    const hosts = listCustomHosts();
+    const hosts = await listCustomHostsAsync();
     return Response.json({ hosts });
   } catch (err) {
     const msg = sanitizeErrorMessage(err);
@@ -50,7 +50,7 @@ export async function POST(request: Request): Promise<Response> {
   const { host, kind, label } = parsed.data;
 
   try {
-    addCustomHost(host, kind, label ?? undefined);
+    await addCustomHostAsync(host, kind, label ?? undefined);
   } catch (err) {
     const msg = sanitizeErrorMessage(err);
     return new Response(JSON.stringify(buildErrorBody(500, msg || "Failed to add host")), {

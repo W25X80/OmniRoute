@@ -7,8 +7,6 @@
 // generation counter (addProxyToScopePool, removeProxyFromScopePool,
 // setScopeRotationStrategy) stay in ../proxies.ts and import the pure helpers here.
 import { randomInt } from "crypto";
-import { getDbInstance } from "../core";
-import { pickByLatency } from "../proxyLatency";
 import {
   hasProxyRefusals,
   isProxyAvoided,
@@ -22,8 +20,17 @@ import {
   isProxyPoolSharedEgressOrderEnabled,
 } from "@/shared/utils/featureFlags";
 import { getCachedProxyHealth } from "@/lib/proxyHealth";
-import { getRecentEgressIpForProxy, getRecentEgressIpsForProxy } from "../proxyLogs";
 import { normalizeEgressAddress } from "@/shared/network/egressAddress";
+import {
+  hasPostgresCatalogSnapshot,
+  withPostgresCatalogSnapshot,
+} from "../postgres/catalogSnapshot";
+import { createPostgresOperatorEgressRepository } from "../postgres/proxyOperatorEgressRepository";
+import { getSelectedPostgresDatabase } from "../controlPlaneContext";
+import { createPostgresProxyRepository } from "../postgres/proxyRepository";
+import { getDbInstance } from "../core";
+import { pickByLatency } from "../proxyLatency";
+import { getRecentEgressIpForProxy, getRecentEgressIpsForProxy } from "../proxyLogs";
 import { readOperatorEgressForMember } from "../proxyOperatorEgress";
 import type { JsonRecord, ProxyScope, ProxyRotationStrategy } from "./types";
 import { PROXY_ROTATION_STRATEGIES, DEFAULT_PROXY_ROTATION_STRATEGY } from "./types";
@@ -33,7 +40,6 @@ import {
   normalizeScope,
   normalizeAssignmentScopeId,
 } from "./mappers";
-
 // Rotation state keys off the SAME normalized scope_id as assignments so a global
 // pool ('__global__') and a per-scope pool share one deterministic cursor row.
 export function normalizeRotationScopeId(scope: ProxyScope, scopeId?: string | null): string {
@@ -73,6 +79,9 @@ export function normalizeRotationStrategy(strategy: unknown): ProxyRotationStrat
  * members should filter by proxy status themselves.
  */
 export async function getScopeProxyPool(scope: string, scopeId?: string | null) {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) return createPostgresProxyRepository(postgres).pool(scope, scopeId);
+
   const normalizedScope = normalizeScope(scope);
   const normalizedScopeId = normalizeAssignmentScopeId(normalizedScope, scopeId);
   const db = getDbInstance();
@@ -89,6 +98,9 @@ export async function getScopeRotationStrategy(
   scope: string,
   scopeId?: string | null
 ): Promise<ProxyRotationStrategy> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) return createPostgresProxyRepository(postgres).strategy(scope, scopeId);
+
   const normalizedScope = normalizeScope(scope);
   const rotationScopeId = normalizeRotationScopeId(normalizedScope, scopeId);
   const db = getDbInstance();
@@ -196,7 +208,11 @@ const DEFAULT_POOL_RANK_SIGNALS: PoolRankSignals = {
 // Relay entries carry the relay URL in `host` and no dispatcher: not rankable.
 const RELAY_TYPES = new Set(["vercel", "deno", "cloudflare"]);
 // Same scheme defaults as proxyConfigToUrl() so the rebuilt URL hits the probe cache key.
-const DEFAULT_PORTS: Record<string, string> = { http: "8080", https: "443", socks5: "1080" };
+const DEFAULT_PORTS: Record<string, string> = {
+  http: "8080",
+  https: "443",
+  socks5: "1080",
+};
 
 function isRankableProxyType(type: string): boolean {
   return !RELAY_TYPES.has(type) && type in DEFAULT_PORTS;
@@ -406,7 +422,10 @@ function readOperatorEgressForMemberSafe(
   host: string,
   port: number,
   nowMs: number
-): { addresses: Set<string>; freshest: { address: string; at: string } | null } {
+): {
+  addresses: Set<string>;
+  freshest: { address: string; at: string } | null;
+} {
   try {
     return readOperatorEgressForMember(host, port, nowMs);
   } catch {
@@ -673,7 +692,11 @@ function resolveScopePoolInternal(
   db: ReturnType<typeof getDbInstance>,
   scope: ProxyScope,
   levelId: string | null,
-  options: { rotationScopeId: string; matchAnyScopeId?: boolean; scopeIdFilter?: string | null }
+  options: {
+    rotationScopeId: string;
+    matchAnyScopeId?: boolean;
+    scopeIdFilter?: string | null;
+  }
 ): ReturnType<typeof toRegistryProxyResolution> | null {
   const rows = fetchAlivePoolRows(
     db,
@@ -700,7 +723,11 @@ function resolvePoolProvider(
   db: ReturnType<typeof getDbInstance>,
   scope: ProxyScope,
   levelId: string | null,
-  options: { rotationScopeId: string; matchAnyScopeId?: boolean; scopeIdFilter?: string | null }
+  options: {
+    rotationScopeId: string;
+    matchAnyScopeId?: boolean;
+    scopeIdFilter?: string | null;
+  }
 ): string | null {
   if (scope === "provider") return levelId;
   if (scope !== "account" || !options.scopeIdFilter) return null;
@@ -721,6 +748,14 @@ function resolvePoolProvider(
 }
 
 export async function resolveProxyForConnectionFromRegistry(connectionId: string) {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const resolve = () => createPostgresProxyRepository(postgres).resolveConnection(connectionId);
+    return hasPostgresCatalogSnapshot(postgres)
+      ? resolve()
+      : withPostgresCatalogSnapshot(postgres, resolve);
+  }
+
   try {
     const db = getDbInstance();
 
@@ -757,6 +792,14 @@ export async function resolveProxyForConnectionFromRegistry(connectionId: string
 }
 
 export async function resolveProxyForScopeFromRegistry(scope: string, scopeId?: string | null) {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const resolve = () => createPostgresProxyRepository(postgres).resolveScope(scope, scopeId);
+    return hasPostgresCatalogSnapshot(postgres)
+      ? resolve()
+      : withPostgresCatalogSnapshot(postgres, resolve);
+  }
+
   try {
     const db = getDbInstance();
     const normalizedScope = normalizeScope(scope);
@@ -780,4 +823,33 @@ export async function resolveProxyForScopeFromRegistry(scope: string, scopeId?: 
     if (msg.includes("no such table")) return null;
     throw error;
   }
+}
+
+export async function getScopePoolEgressRowsAsync(
+  scope: string,
+  scopeId: string | null
+): Promise<JsonRecord[]> {
+  const postgres = getSelectedPostgresDatabase();
+  return postgres
+    ? createPostgresProxyRepository(postgres).egressRows(scope, scopeId)
+    : getScopePoolEgressRows(scope, scopeId);
+}
+
+export async function readEgressAddressSetForMemberAsync(
+  row: unknown,
+  nowMs = Date.now()
+): Promise<EgressAddressSet> {
+  const postgres = getSelectedPostgresDatabase();
+  if (!postgres) return readEgressAddressSetForMember(row, nowMs);
+  const record = row as Record<string, unknown>;
+  const read = () =>
+    createPostgresOperatorEgressRepository(postgres).merged(
+      typeof record.host === "string" ? record.host : "",
+      Number(record.port),
+      isOperatorEgressEnabled(),
+      nowMs
+    );
+  return hasPostgresCatalogSnapshot(postgres)
+    ? read()
+    : withPostgresCatalogSnapshot(postgres, read);
 }

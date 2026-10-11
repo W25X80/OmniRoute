@@ -114,6 +114,11 @@ export function bridgeToResponsesSSE(
       response: Record<string, unknown>,
       providerState?: CodexProviderContinuationState
     ) => void;
+    /** Native cache attempt settles before the terminal; default sync callback is unchanged. */
+    onCompletedResponseAsync?: (
+      response: Record<string, unknown>,
+      providerState?: CodexProviderContinuationState
+    ) => Promise<void>;
     /** Test seam for the platform-specific Bun stream transport. */
     streamPlatform?: NodeJS.Platform;
   }
@@ -192,6 +197,18 @@ export function bridgeToResponsesSSE(
   let emittedFrames = 0;
   let gated = false;
   let stepping = false;
+  let nativeCompletionPending = false;
+  const awaitNativeCompletion = async (
+    response: Record<string, unknown>,
+    providerState?: CodexProviderContinuationState
+  ) => {
+    nativeCompletionPending = true;
+    try {
+      await options!.onCompletedResponseAsync!(response, providerState);
+    } finally {
+      nativeCompletionPending = false;
+    }
+  };
   const emit = (name: string, data: Record<string, unknown>) => {
     if (closed) return;
     activity = true;
@@ -780,7 +797,9 @@ export function bridgeToResponsesSSE(
               };
               // Cache max-output partials so previous_response_id replay can continue them;
               // rememberResponseState rejects content-filtered incomplete responses.
-              options?.onCompletedResponse?.(response, event.providerState);
+              if (options?.onCompletedResponseAsync)
+                await awaitNativeCompletion(response, event.providerState);
+              else options?.onCompletedResponse?.(response, event.providerState);
               emit("response.incomplete", { response });
               reportTerminal("incomplete");
             } else {
@@ -788,7 +807,9 @@ export function bridgeToResponsesSSE(
                 ...responseSnapshot("completed", finishedItems, event.endTurn),
                 usage: responsesUsage(event.usage),
               };
-              options?.onCompletedResponse?.(response, event.providerState);
+              if (options?.onCompletedResponseAsync)
+                await awaitNativeCompletion(response, event.providerState);
+              else options?.onCompletedResponse?.(response, event.providerState);
               emit("response.completed", {
                 response,
               });
@@ -919,6 +940,15 @@ export function bridgeToResponsesSSE(
     gated = true;
     beat = setInterval(() => {
       if (closed || gated) return;
+      if (nativeCompletionPending) {
+        try {
+          controller.enqueue(heartbeatFrame);
+          emittedFrames++;
+        } catch {
+          closed = true;
+        }
+        return;
+      }
       if (activity) {
         activity = false;
         stallTicks = 0;

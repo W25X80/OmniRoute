@@ -28,7 +28,7 @@ import { getModelLockoutInfo, isModelLocked } from "../accountFallback.ts";
 import { parseAutoPrefix } from "../autoCombo/autoPrefix.ts";
 import { handlePipelineCombo, buildPipelineResponse } from "../autoCombo/pipelineRouter.ts";
 import type { resolveComboSetupConfig } from "../comboConfig.ts";
-import { orderTargetsByEvalScores } from "../evalRouting.ts";
+import { orderTargetsByEvalScoresAsync } from "../evalRouting.ts";
 import { parseModel } from "../model.ts";
 import { getRemainingCooldownMs, isProviderInCooldown } from "../providerCooldownTracker.ts";
 import {
@@ -51,7 +51,7 @@ import {
   resolveWeightedTargets,
 } from "./comboStructure.ts";
 import { applyContextRequirements } from "./contextRequirements.ts";
-import { recordComboFailure } from "./failureTracker.ts";
+import { recordComboFailureAsync } from "./failureTracker.ts";
 import {
   buildAllTargetsCoolingDownResponse,
   buildEmptyComboTargetsPayload,
@@ -553,7 +553,7 @@ async function applyContinuityFilters(
       );
   let orderedTargets = sticky.targets;
   if (!cacheStrategyAffinityApplied) {
-    orderedTargets = orderTargetsByEvalScores(orderedTargets, config.evalRouting, log);
+    orderedTargets = await orderTargetsByEvalScoresAsync(orderedTargets, config.evalRouting, log);
   }
   // #8488 / #8494: fail closed when hard capability filters empty the pool.
   // Opt-in escape hatch: combo.config.compatFilterFailOpen OR settings.compatFilterFailOpen.
@@ -572,7 +572,7 @@ async function applyContinuityFilters(
       const effectiveSessionId: string | null = combo.context_cache_protection
         ? (relayOptions?.sessionId ?? null)
         : null;
-      recordComboFailure(effectiveSessionId, combo.name);
+      await recordComboFailureAsync(effectiveSessionId, combo.name);
       return {
         earlyResponse: errorResponseWithComboDiagnostics(
           400,
@@ -598,7 +598,7 @@ async function applyContinuityFilters(
     const effectiveSessionId: string | null = combo.context_cache_protection
       ? (relayOptions?.sessionId ?? null)
       : null;
-    recordComboFailure(effectiveSessionId, combo.name);
+    await recordComboFailureAsync(effectiveSessionId, combo.name);
     const { message, diagnostics } = buildEmptyComboTargetsPayload(
       preContextTargets,
       config.contextRequirements?.minContextWindow
@@ -744,11 +744,11 @@ async function applyPromptCacheStage(
   return nextTargets;
 }
 
-function buildWeightedExhaustionResponse(
+async function buildWeightedExhaustionResponse(
   deps: ResolveComboTargetPipelineDeps,
   weightedResolution: WeightedResolution,
   exclusions: PreDispatchExclusion[]
-): Response | null {
+): Promise<Response | null> {
   if (
     !getStrategyTraits(deps.strategy).weightedSteps ||
     (weightedResolution?.orderedTargets.length ?? 0) > 0
@@ -765,7 +765,7 @@ function buildWeightedExhaustionResponse(
     "COMBO",
     `Weighted selection: every target excluded before dispatch — ${formatPreDispatchExclusions(exclusions)}`
   );
-  recordComboFailure(
+  await recordComboFailureAsync(
     deps.combo.context_cache_protection ? (deps.relayOptions?.sessionId ?? null) : null,
     deps.combo.name
   );
@@ -825,7 +825,11 @@ export async function resolveComboTargetPipeline(
     stickyWeightedLimit
   );
   const getWeightedStepKeyForTarget = buildWeightedStepKeyMapper(weightedResolution);
-  const weightedExhaustion = buildWeightedExhaustionResponse(deps, weightedResolution, exclusions);
+  const weightedExhaustion = await buildWeightedExhaustionResponse(
+    deps,
+    weightedResolution,
+    exclusions
+  );
   if (weightedExhaustion) return { earlyResponse: weightedExhaustion };
   let orderedTargets = traits.weightedSteps
     ? weightedResolution?.orderedTargets || []

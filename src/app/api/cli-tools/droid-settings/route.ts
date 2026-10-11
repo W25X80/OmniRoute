@@ -10,7 +10,10 @@ import {
   getCliRuntimeStatus,
 } from "@/shared/services/cliRuntime";
 import { createBackup } from "@/shared/services/backupService";
-import { saveCliToolLastConfigured, deleteCliToolLastConfigured } from "@/lib/db/cliToolState";
+import {
+  saveCliToolLastConfiguredAsync,
+  deleteCliToolLastConfiguredAsync,
+} from "@/lib/db/cliToolState";
 import { cliMultiModelConfigSchema } from "@/shared/validation/schemas";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
 import { resolveApiKey } from "@/shared/services/apiKeyResolver";
@@ -125,9 +128,7 @@ export async function POST(request: Request) {
         {
           error: {
             message: "Invalid request",
-            details: [
-              { field: "models", message: "baseUrl and at least one model are required" },
-            ],
+            details: [{ field: "models", message: "baseUrl and at least one model are required" }],
           },
         },
         { status: 400 }
@@ -176,7 +177,7 @@ export async function POST(request: Request) {
 
     // Persist last-configured timestamp
     try {
-      saveCliToolLastConfigured("droid");
+      await saveCliToolLastConfiguredAsync("droid");
     } catch {
       /* non-critical */
     }
@@ -238,7 +239,7 @@ export async function DELETE(request: Request) {
 
     // Clear last-configured timestamp
     try {
-      deleteCliToolLastConfigured("droid");
+      await deleteCliToolLastConfiguredAsync("droid");
     } catch {
       /* non-critical */
     }

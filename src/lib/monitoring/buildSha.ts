@@ -16,6 +16,8 @@
  */
 
 import fs from "node:fs";
+import fsPromises from "node:fs/promises";
+import { parseDatabaseBackend } from "../db/backendSelection";
 import path from "node:path";
 
 const SENTINEL_PATHS = [
@@ -27,6 +29,11 @@ const SENTINEL_PATHS = [
 let cached: string | null | undefined;
 
 export function readRunningBuildSha(cwd: string = process.cwd()): string | null {
+  if (parseDatabaseBackend() === "postgres") {
+    const state = buildShaGlobals[NATIVE_BUILD_SHA];
+    if (state?.loaded) return state.value ?? null;
+    throw new Error("Native build identity requires asynchronous lookup");
+  }
   if (cached !== undefined) return cached;
 
   const fromEnv = process.env.OMNIROUTE_BUILD_SHA?.trim();
@@ -49,4 +56,42 @@ export function readRunningBuildSha(cwd: string = process.cwd()): string | null 
 
   cached = null;
   return cached;
+}
+
+const NATIVE_BUILD_SHA = Symbol.for("omniroute.nativeRunningBuildSha");
+interface NativeBuildShaState {
+  loaded: boolean;
+  value?: string | null;
+  preparation?: Promise<string | null>;
+}
+const buildShaGlobals = globalThis as typeof globalThis & {
+  [NATIVE_BUILD_SHA]?: NativeBuildShaState;
+};
+
+export function readRunningBuildShaAsync(cwd: string = process.cwd()): Promise<string | null> {
+  if (parseDatabaseBackend() !== "postgres") return Promise.resolve(readRunningBuildSha(cwd));
+  const state = (buildShaGlobals[NATIVE_BUILD_SHA] ??= { loaded: false });
+  if (state.loaded) return Promise.resolve(state.value ?? null);
+  if (state.preparation) return state.preparation;
+  const fromEnv = process.env.OMNIROUTE_BUILD_SHA?.trim();
+  state.preparation = Promise.resolve().then(async () => {
+    let value: string | null = fromEnv || null;
+    if (!value) {
+      for (const segments of SENTINEL_PATHS) {
+        try {
+          const candidate = (await fsPromises.readFile(path.join(cwd, ...segments), "utf8")).trim();
+          if (candidate) {
+            value = candidate;
+            break;
+          }
+        } catch {
+          // Exact source sentinel priority and absent/unreadable fallback.
+        }
+      }
+    }
+    state.value = value;
+    state.loaded = true;
+    return value;
+  });
+  return state.preparation;
 }

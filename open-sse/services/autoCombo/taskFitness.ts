@@ -1,3 +1,12 @@
+import { getSelectedPostgresDatabase } from "../../../src/lib/db/controlPlaneContext";
+import {
+  requirePostgresCatalogSnapshot,
+  catalogTableRows,
+} from "../../../src/lib/db/postgres/catalogSnapshot";
+import {
+  setUserFitnessOverrideEntryAsync,
+  deleteUserFitnessOverrideEntryAsync,
+} from "../../../src/lib/db/modelIntelligence.ts";
 /**
  * Task Fitness Lookup Table
  *
@@ -45,6 +54,9 @@ import {
   deleteUserFitnessOverrideEntry,
 } from "../../../src/lib/db/modelIntelligence.ts";
 import { readFileSync } from "node:fs";
+import fsPromises from "node:fs/promises";
+import { parseDatabaseBackend } from "../../../src/lib/db/backendSelection";
+import { getServerLifecyclePhase } from "../../../src/lib/serverLifecycle";
 import { resolveScoresAs } from "./scoresAs.ts";
 import { isVendorRetiredId } from "../modelLifecycle.ts";
 
@@ -52,14 +64,53 @@ import { isVendorRetiredId } from "../modelLifecycle.ts";
 // must never earn a capability-derived tier score: models.dev keeps listing
 // retired models with their capabilities, so without this veto layer 3
 // recreates the ranking inversion that #11503 removed from layer 4.
-const LIFECYCLE_JSON_URL = new URL(
-  "../../../config/quality/model-lifecycle.json",
-  import.meta.url,
-);
+const LIFECYCLE_JSON_URL = new URL("../../../config/quality/model-lifecycle.json", import.meta.url);
 let _retiredModels: Set<string> | null = null;
+const NATIVE_FITNESS_RETIRED = Symbol.for("omniroute.nativeFitnessRetiredModels");
+interface NativeFitnessRetiredState {
+  value?: Set<string>;
+  preparation?: Promise<void>;
+}
+const fitnessRetiredGlobals = globalThis as typeof globalThis & {
+  [NATIVE_FITNESS_RETIRED]?: NativeFitnessRetiredState;
+};
+function nativeFitnessRetiredState(): NativeFitnessRetiredState {
+  return (fitnessRetiredGlobals[NATIVE_FITNESS_RETIRED] ??= {});
+}
+
+export function prepareNativeFitnessRetiredModels(): Promise<void> {
+  if (parseDatabaseBackend() !== "postgres") return Promise.resolve();
+  const state = nativeFitnessRetiredState();
+  if (state.value) return Promise.resolve();
+  state.preparation ??= Promise.resolve().then(async () => {
+    const retired = new Set<string>();
+    try {
+      const parsed = JSON.parse(await fsPromises.readFile(LIFECYCLE_JSON_URL, "utf8")) as {
+        retired?: Record<string, { status?: string }>;
+      };
+      for (const [id, entry] of Object.entries(parsed.retired ?? {})) {
+        if (entry?.status === "retired") retired.add(id.toLowerCase());
+      }
+    } catch {
+      // Match the legacy neutral missing/corrupt snapshot result.
+    }
+    state.value = retired;
+  });
+  return state.preparation;
+}
 
 function loadRetiredModels(): Set<string> {
-  if (_retiredModels) return _retiredModels;
+  if (parseDatabaseBackend() === "postgres") {
+    const state = nativeFitnessRetiredState();
+    if (state.value) return state.value;
+    if (state.preparation || getServerLifecyclePhase() === "ready") {
+      throw new Error("Native fitness lifecycle snapshot is not prepared");
+    }
+  }
+  if (_retiredModels) {
+    if (parseDatabaseBackend() === "postgres") nativeFitnessRetiredState().value = _retiredModels;
+    return _retiredModels;
+  }
   const retired = new Set<string>();
   try {
     const parsed = JSON.parse(readFileSync(LIFECYCLE_JSON_URL, "utf8")) as {
@@ -73,6 +124,7 @@ function loadRetiredModels(): Set<string> {
     // the file is a curated aid, and its absence must not disable routing.
   }
   _retiredModels = retired;
+  if (parseDatabaseBackend() === "postgres") nativeFitnessRetiredState().value = retired;
   return retired;
 }
 
@@ -205,14 +257,16 @@ const _intelligenceCache = new Map<string, number | null>();
 
 function queryModelIntelligence(model: string, category: string, source: string): number | null {
   const cacheKey = `${model}:${category}:${source}`;
-  if (_intelligenceCache.has(cacheKey)) {
+  const native = Boolean(getSelectedPostgresDatabase());
+  if (native) requirePostgresCatalogSnapshot();
+  if (!native && _intelligenceCache.has(cacheKey)) {
     return _intelligenceCache.get(cacheKey)!;
   }
 
   try {
     const entry = getModelIntelligenceBySource(model, source, category);
     if (entry) {
-      _intelligenceCache.set(cacheKey, entry.score);
+      if (!native) _intelligenceCache.set(cacheKey, entry.score);
       return entry.score;
     }
     return null;
@@ -251,16 +305,24 @@ function deriveTierFromCapabilities(cap: ModelCapRow): string {
  * that carry one. Both are deterministic and independent of row order.
  */
 function loadModelCapabilities(): Record<string, ModelCapRow> | null {
-  if (_capabilitiesCache) return _capabilitiesCache;
+  const native = Boolean(getSelectedPostgresDatabase());
+  if (native) requirePostgresCatalogSnapshot();
+  if (!native && _capabilitiesCache) return _capabilitiesCache;
 
   try {
-    const db = getDbInstance();
-    const tableExists = db
-      .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='model_capabilities'")
-      .get();
+    const db = native ? undefined : getDbInstance();
+    const tableExists = native
+      ? true
+      : db!
+          .prepare(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='model_capabilities'"
+          )
+          .get();
     if (!tableExists) return null;
 
-    const rows = db.prepare("SELECT * FROM model_capabilities").all() as Record<string, unknown>[];
+    const rows = native
+      ? catalogTableRows("model_capabilities")
+      : (db!.prepare("SELECT * FROM model_capabilities").all() as Record<string, unknown>[]);
 
     interface CapAccumulator {
       toolTrue: boolean;
@@ -322,7 +384,7 @@ function loadModelCapabilities(): Record<string, ModelCapRow> | null {
       };
     }
 
-    _capabilitiesCache = cache;
+    if (!native) _capabilitiesCache = cache;
     return cache;
   } catch {
     return null;
@@ -516,7 +578,10 @@ export function getTaskFitnessWithSource(
       return { score: staticScore, source: "fitness_table" };
     }
 
-    return { score: lookupWildcardBoosts(normalizedModel, normalizedTask), source: "wildcard_boost" };
+    return {
+      score: lookupWildcardBoosts(normalizedModel, normalizedTask),
+      source: "wildcard_boost",
+    };
   }
 
   // Retired: 0.5 is "no evidence", never a quality claim and never a *codex boost.
@@ -578,4 +643,22 @@ export function getTaskTypes(): string[] {
 export function invalidateFitnessCache(): void {
   _capabilitiesCache = null;
   _intelligenceCache.clear();
+}
+
+export async function setUserFitnessOverrideAsync(
+  model: string,
+  category: string,
+  score: number
+): Promise<void> {
+  if (!getSelectedPostgresDatabase()) return setUserFitnessOverride(model, category, score);
+  await setUserFitnessOverrideEntryAsync(model.toLowerCase(), category.toLowerCase(), score);
+  invalidateFitnessCache();
+}
+export async function clearUserFitnessOverrideAsync(
+  model: string,
+  category: string
+): Promise<void> {
+  if (!getSelectedPostgresDatabase()) return clearUserFitnessOverride(model, category);
+  await deleteUserFitnessOverrideEntryAsync(model.toLowerCase(), category.toLowerCase());
+  invalidateFitnessCache();
 }

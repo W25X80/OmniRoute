@@ -1,3 +1,5 @@
+import { getSelectedPostgresDatabase } from "./controlPlaneContext";
+import { createPostgresSessionRepository } from "./postgres/sessionRepository";
 import { createHash, randomBytes, randomUUID } from "crypto";
 import { getDbInstance } from "./core";
 import { type AccessScope, normalizeScope } from "../accessTokens/scopes";
@@ -228,4 +230,49 @@ export function revokeAccessToken(idOrPrefix: string): RevokeAccessTokenResult {
   }
   // Lost the race to another revoke of this same id.
   return { revoked: true, alreadyRevoked: true, ambiguous: false };
+}
+
+export async function createAccessTokenAsync(
+  ...args: Parameters<typeof createAccessToken>
+): Promise<ReturnType<typeof createAccessToken>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresSessionRepository(database).createAccessToken(...args)
+    : createAccessToken(...args);
+}
+
+export async function verifyAccessTokenAsync(
+  ...args: Parameters<typeof verifyAccessToken>
+): Promise<ReturnType<typeof verifyAccessToken>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresSessionRepository(database).verifyAccessToken(...args)
+    : verifyAccessToken(...args);
+}
+
+export async function listAccessTokensAsync(
+  ...args: Parameters<typeof listAccessTokens>
+): Promise<ReturnType<typeof listAccessTokens>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresSessionRepository(database).listAccessTokens(...args)
+    : listAccessTokens(...args);
+}
+
+export async function getAccessTokenAsync(
+  ...args: Parameters<typeof getAccessToken>
+): Promise<ReturnType<typeof getAccessToken>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresSessionRepository(database).getAccessToken(...args)
+    : getAccessToken(...args);
+}
+
+export async function revokeAccessTokenAsync(
+  ...args: Parameters<typeof revokeAccessToken>
+): Promise<ReturnType<typeof revokeAccessToken>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresSessionRepository(database).revokeAccessToken(...args)
+    : revokeAccessToken(...args);
 }

@@ -1,3 +1,6 @@
+import { runPersistenceBackgroundWork } from "./persistenceRuntime";
+import { getSelectedPostgresDatabase } from "./controlPlaneContext";
+import { createPostgresSessionRepository } from "./postgres/sessionRepository";
 import { createHash } from "crypto";
 
 import { getDbInstance } from "./core";
@@ -203,4 +206,79 @@ export function startSessionAccountAffinityCleanup(): void {
     }
   }, CLEANUP_INTERVAL_MS);
   if (typeof cleanupTimer === "object" && "unref" in cleanupTimer) cleanupTimer.unref?.();
+}
+
+export async function getSessionAccountAffinityAsync(
+  ...args: Parameters<typeof getSessionAccountAffinity>
+): Promise<ReturnType<typeof getSessionAccountAffinity>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresSessionRepository(database).getSessionAccountAffinity(...args)
+    : getSessionAccountAffinity(...args);
+}
+
+export async function upsertSessionAccountAffinityAsync(
+  ...args: Parameters<typeof upsertSessionAccountAffinity>
+): Promise<ReturnType<typeof upsertSessionAccountAffinity>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresSessionRepository(database).upsertSessionAccountAffinity(...args)
+    : upsertSessionAccountAffinity(...args);
+}
+
+export async function touchSessionAccountAffinityAsync(
+  ...args: Parameters<typeof touchSessionAccountAffinity>
+): Promise<ReturnType<typeof touchSessionAccountAffinity>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresSessionRepository(database).touchSessionAccountAffinity(...args)
+    : touchSessionAccountAffinity(...args);
+}
+
+export async function deleteSessionAccountAffinityAsync(
+  ...args: Parameters<typeof deleteSessionAccountAffinity>
+): Promise<ReturnType<typeof deleteSessionAccountAffinity>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresSessionRepository(database).deleteSessionAccountAffinity(...args)
+    : deleteSessionAccountAffinity(...args);
+}
+
+export async function evictSessionAccountAffinityForConnectionAsync(
+  ...args: Parameters<typeof evictSessionAccountAffinityForConnection>
+): Promise<ReturnType<typeof evictSessionAccountAffinityForConnection>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresSessionRepository(database).evictSessionAccountAffinityForConnection(...args)
+    : evictSessionAccountAffinityForConnection(...args);
+}
+
+export async function cleanupStaleSessionAccountAffinitiesAsync(
+  ...args: Parameters<typeof cleanupStaleSessionAccountAffinities>
+): Promise<ReturnType<typeof cleanupStaleSessionAccountAffinities>> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresSessionRepository(database).cleanupStaleSessionAccountAffinities(...args)
+    : cleanupStaleSessionAccountAffinities(...args);
+}
+
+export async function startSessionAccountAffinityCleanupAsync(): Promise<void> {
+  if (!getSelectedPostgresDatabase()) return startSessionAccountAffinityCleanup();
+  if (cleanupTimer) return;
+  try {
+    await cleanupStaleSessionAccountAffinitiesAsync();
+  } catch (error) {
+    console.warn("[SESSION_AFFINITY] Startup cleanup failed:", error);
+  }
+  cleanupTimer = setInterval(() => {
+    void runPersistenceBackgroundWork(() => cleanupStaleSessionAccountAffinitiesAsync()).catch(
+      (error) => console.warn("[SESSION_AFFINITY] Periodic cleanup failed:", error)
+    );
+  }, CLEANUP_INTERVAL_MS);
+  cleanupTimer.unref?.();
+}
+
+export function stopSessionAccountAffinityCleanup(): void {
+  if (cleanupTimer) clearInterval(cleanupTimer);
+  cleanupTimer = null;
 }

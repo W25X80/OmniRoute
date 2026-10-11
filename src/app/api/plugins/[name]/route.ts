@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { CORS_HEADERS, handleCorsOptions } from "@/shared/utils/cors";
 import { buildErrorBody } from "@omniroute/open-sse/utils/error";
-import { getPluginByName } from "@/lib/db/plugins";
+import { getPluginByNameAsync } from "@/lib/db/plugins";
 import { pluginManager } from "@/lib/plugins/manager";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 
@@ -16,7 +16,7 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
   const authError = await requireManagementAuth(request);
   if (authError) return authError;
   const { name } = await params;
-  const plugin = getPluginByName(name);
+  const plugin = await getPluginByNameAsync(name);
 
   if (!plugin) {
     return NextResponse.json(

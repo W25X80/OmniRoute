@@ -41,6 +41,7 @@ const PREFIX = "enc:v1:";
 const STATIC_SALT = "omniroute-field-encryption-v1";
 
 let _staticKey: Buffer | null = null;
+let _staticSecret: string | null = null;
 let _legacyDynamicKey: Buffer | null = null;
 /** Connection object with potentially encrypted credential fields. */
 export interface ConnectionFields {
@@ -129,6 +130,7 @@ function getStaticKey(): Buffer | null {
 
   try {
     _staticKey = scryptSync(secret, STATIC_SALT, KEY_LENGTH);
+    _staticSecret = secret;
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
     console.error(
@@ -165,6 +167,15 @@ function getLegacyDynamicKey(): Buffer | null {
 /** Check if encryption is enabled. */
 export function isEncryptionEnabled(): boolean {
   return !!ensureSecretLoaded();
+}
+
+/** PG bootstrap requires an explicit, stable key; it must not discover local .env files. */
+export function requireExplicitStorageEncryptionKey(): void {
+  const secret = process.env.STORAGE_ENCRYPTION_KEY;
+  if (!secret || secret.trim() === "" || (_staticKey && _staticSecret !== secret)) {
+    throw new Error("PostgreSQL requires a stable explicit STORAGE_ENCRYPTION_KEY");
+  }
+  if (!getStaticKey()) throw new Error("Storage encryption key is unavailable");
 }
 
 /**

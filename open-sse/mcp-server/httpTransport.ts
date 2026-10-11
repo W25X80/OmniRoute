@@ -10,7 +10,7 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { createMcpServer } from "./server.ts";
+import { createMcpServerAsync } from "./server.ts";
 import { resolveMcpCallerAuthInfo, withMcpHttpAuthContext } from "./httpAuthContext.ts";
 import { sanitizeErrorMessage } from "../utils/error.ts";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
@@ -19,6 +19,12 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 let _sseServer: McpServer | null = null;
 let _sseTransport: WebStandardStreamableHTTPServerTransport | null = null;
 let _sseStartedAt: number | null = null;
+type SseServer = {
+  server: McpServer;
+  transport: WebStandardStreamableHTTPServerTransport;
+};
+let _sseInitialization: Promise<SseServer> | null = null;
+let _sseGeneration = 0;
 
 type StreamableSession = {
   sessionId: string;
@@ -47,6 +53,8 @@ if (typeof _mcpSessionSweep === "object" && "unref" in _mcpSessionSweep) {
 }
 
 function closeSseTransport(): void {
+  _sseGeneration++;
+  _sseInitialization = null;
   if (_sseTransport) {
     try {
       _sseTransport.close();
@@ -79,33 +87,44 @@ function closeAllStreamableSessions(): void {
   }
 }
 
-function ensureSseServer(): {
-  server: McpServer;
-  transport: WebStandardStreamableHTTPServerTransport;
-} {
-  if (_sseServer && _sseTransport) {
-    return { server: _sseServer, transport: _sseTransport };
-  }
-
+async function ensureSseServer(): Promise<SseServer> {
+  if (_sseServer && _sseTransport) return { server: _sseServer, transport: _sseTransport };
+  if (_sseInitialization) return _sseInitialization;
   closeAllStreamableSessions();
-
-  _sseServer = createMcpServer();
-  _sseTransport = new WebStandardStreamableHTTPServerTransport({
-    sessionIdGenerator: () => randomUUID(),
-  });
-  _sseStartedAt = Date.now();
-
-  void _sseServer.connect(_sseTransport);
-
-  console.log("[MCP] HTTP transport started (sse)");
-  return { server: _sseServer, transport: _sseTransport };
+  const generation = _sseGeneration;
+  const initialization = (async () => {
+    const server = await createMcpServerAsync();
+    const transport = new WebStandardStreamableHTTPServerTransport({
+      sessionIdGenerator: () => randomUUID(),
+    });
+    try {
+      await server.connect(transport);
+      if (generation !== _sseGeneration) {
+        throw new Error("MCP transport initialization was superseded");
+      }
+      _sseServer = server;
+      _sseTransport = transport;
+      _sseStartedAt = Date.now();
+      console.log("[MCP] HTTP transport started (sse)");
+      return { server, transport };
+    } catch (error) {
+      await server.close().catch(() => {});
+      throw error;
+    }
+  })();
+  _sseInitialization = initialization;
+  try {
+    return await initialization;
+  } finally {
+    if (_sseInitialization === initialization) _sseInitialization = null;
+  }
 }
 
-function createStreamableSession(): StreamableSession {
+async function createStreamableSession(): Promise<StreamableSession> {
   closeSseTransport();
 
   const sessionId = randomUUID();
-  const server = createMcpServer();
+  const server = await createMcpServerAsync();
   const transport = new WebStandardStreamableHTTPServerTransport({
     sessionIdGenerator: () => sessionId,
   });
@@ -117,7 +136,7 @@ function createStreamableSession(): StreamableSession {
     lastActivityAt: Date.now(),
   };
 
-  void server.connect(transport);
+  await server.connect(transport);
   _streamableSessions.set(sessionId, session);
   console.log(`[MCP] HTTP transport started (streamable-http:${sessionId})`);
   return session;
@@ -230,14 +249,16 @@ async function handleStreamableRequest(request: Request): Promise<Response> {
       // initialization rather than hard-failing with 404. This avoids requiring users
       // to manually restart their MCP client after every server restart.
       if (await isInitializeRequest(request)) {
-        const newSession = createStreamableSession();
+        let newSession: StreamableSession | undefined;
         try {
+          const activeSession = await createStreamableSession();
+          newSession = activeSession;
           const response = await withMcpHttpAuthContext(request, () =>
-            handleRequestWithAuthInfo(newSession.transport, request)
+            handleRequestWithAuthInfo(activeSession.transport, request)
           );
           return withSessionHeader(response, newSession.sessionId);
         } catch (err) {
-          closeStreamableSession(newSession.sessionId);
+          if (newSession) closeStreamableSession(newSession.sessionId);
           console.error("[MCP] Streamable HTTP error during stale-session recovery:", err);
           return new Response(JSON.stringify({ error: "MCP transport error" }), {
             status: 500,
@@ -273,15 +294,16 @@ async function handleStreamableRequest(request: Request): Promise<Response> {
     return errorResponse("Bad Request: Mcp-Session-Id header is required", -32000);
   }
 
-  const session = createStreamableSession();
-
+  let session: StreamableSession | undefined;
   try {
+    const activeSession = await createStreamableSession();
+    session = activeSession;
     const response = await withMcpHttpAuthContext(request, () =>
-      handleRequestWithAuthInfo(session.transport, request)
+      handleRequestWithAuthInfo(activeSession.transport, request)
     );
     return withSessionHeader(response, session.sessionId);
   } catch (err) {
-    closeStreamableSession(session.sessionId);
+    if (session) closeStreamableSession(session.sessionId);
     console.error("[MCP] Streamable HTTP error:", err);
     return new Response(JSON.stringify({ error: "MCP transport error" }), {
       status: 500,
@@ -322,9 +344,8 @@ export async function handleMcpSSE(request: Request): Promise<Response> {
       }
     } catch (err) {}
   }
-  const { transport } = ensureSseServer();
-
   try {
+    const { transport } = await ensureSseServer();
     const response = await withMcpHttpAuthContext(request, () =>
       handleRequestWithAuthInfo(transport, request)
     );

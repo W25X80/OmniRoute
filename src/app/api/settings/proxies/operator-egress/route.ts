@@ -2,7 +2,7 @@ import { createErrorResponse, createErrorResponseFromUnknown } from "@/lib/api/e
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 import {
   OPERATOR_EGRESS_FUTURE_TOLERANCE_MS,
-  upsertOperatorEgress,
+  upsertOperatorEgressAsync,
 } from "@/lib/db/proxyOperatorEgress";
 import { isRoutableEgressAddress } from "@/shared/network/egressAddress";
 import { isOperatorEgressEnabled } from "@/shared/utils/featureFlags";
@@ -108,7 +108,7 @@ export async function POST(request: Request) {
       if (live !== null) accepted.push(live);
     }
 
-    const result = upsertOperatorEgress(accepted);
+    const result = await upsertOperatorEgressAsync(accepted);
     const allRejected = [...rejected, ...result.rejected];
     if (accepted.length === 0 && allRejected.length > 0) {
       return createErrorResponse({

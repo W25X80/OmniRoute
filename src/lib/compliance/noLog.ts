@@ -1,5 +1,7 @@
 import type { SqliteAdapter } from "@/lib/db/adapters/types";
 import { getDbInstance } from "../db/core";
+import { assertSqliteBackendAllowed } from "../db/controlPlaneContext";
+import { getPostgresAuditRepository } from "../db/audit";
 
 // #2650: extracted from compliance/index.ts to break the
 // callLogs.ts → compliance/index.ts → callLogs.ts cycle that deadlocks
@@ -42,7 +44,9 @@ function ensureNoLogColumn(db: SqliteAdapter): boolean {
   }
 
   try {
-    const columns = db.prepare("PRAGMA table_info(api_keys)").all() as Array<{ name: string }>;
+    const columns = db.prepare("PRAGMA table_info(api_keys)").all() as Array<{
+      name: string;
+    }>;
     hasNoLogColumn = columns.some((column) => column.name === "no_log");
   } catch {
     hasNoLogColumn = false;
@@ -64,8 +68,7 @@ function readNoLogFromDb(apiKeyId: string): boolean {
 
   try {
     const row = db.prepare("SELECT no_log FROM api_keys WHERE id = ?").get(apiKeyId) as
-      | { no_log?: number }
-      | undefined;
+      { no_log?: number } | undefined;
     const value = Boolean(row && Number(row.no_log) === 1);
     noLogDbCache.set(apiKeyId, { value, timestamp: Date.now() });
     return value;
@@ -76,6 +79,7 @@ function readNoLogFromDb(apiKeyId: string): boolean {
 
 export function isNoLog(apiKeyId: string): boolean {
   if (!apiKeyId) return false;
+  assertSqliteBackendAllowed();
   if (noLogKeys.has(apiKeyId)) return true;
 
   const persistedNoLog = readNoLogFromDb(apiKeyId);
@@ -83,4 +87,19 @@ export function isNoLog(apiKeyId: string): boolean {
     noLogKeys.add(apiKeyId);
   }
   return persistedNoLog;
+}
+
+/** Explicit process policy; preserves the environment captured at module initialization. */
+export function isExplicitNoLogApiKey(apiKeyId: string | null | undefined): boolean {
+  return Boolean(apiKeyId && noLogIdsFromEnv.includes(apiKeyId));
+}
+
+/** Selected PostgreSQL traffic writers must await durable privacy policy on every write. */
+export async function isNoLogAsync(apiKeyId: string): Promise<boolean> {
+  const postgres = getPostgresAuditRepository();
+  if (!postgres) return isNoLog(apiKeyId);
+  if (!apiKeyId) return false;
+  if (isExplicitNoLogApiKey(apiKeyId)) return true;
+  // Propagate database errors: the traffic writer omits payloads rather than failing open.
+  return postgres.noLog(apiKeyId);
 }

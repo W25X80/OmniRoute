@@ -136,6 +136,7 @@ export { runRtkFilterTests } from "./engines/rtk/verify.ts";
 export {
   maybePersistRtkRawOutput,
   readRtkRawOutput,
+  readRtkRawOutputAsync,
   redactRtkRawOutput,
 } from "./engines/rtk/rawOutput.ts";
 export {

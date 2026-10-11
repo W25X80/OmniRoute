@@ -5,9 +5,9 @@ import { isCommonChatGptWebRetirementError } from "@/shared/constants/chatgptWeb
 import { enforceApiKeyPolicy } from "@/shared/utils/apiKeyPolicy";
 import { CORS_HEADERS, handleCorsOptions } from "@/shared/utils/cors";
 import {
-  getExclusiveConnectionLeaseStatus,
-  releaseExclusiveConnectionLease,
-  renewExclusiveConnectionLease,
+  getExclusiveConnectionLeaseStatusAsync,
+  releaseExclusiveConnectionLeaseAsync,
+  renewExclusiveConnectionLeaseAsync,
 } from "@/lib/db/exclusiveConnectionLeases";
 import { getProviderDisplayName } from "@/lib/display/names";
 import {
@@ -26,7 +26,7 @@ import {
 import { getModelInfo } from "@/sse/services/model";
 import { buildErrorBody } from "@omniroute/open-sse/utils/error.ts";
 
-const action = <T extends string>(name: T, shape: z.ZodRawShape) =>
+const action = <T extends string, Shape extends z.ZodRawShape>(name: T, shape: Shape) =>
   z.object({ action: z.literal(name), ...shape });
 const generation = z.number().int().positive().safe();
 const actionSchema = z.discriminatedUnion("action", [
@@ -99,7 +99,7 @@ export async function POST(request: Request): Promise<Response> {
         apiKeyId: policy.apiKeyInfo.id,
       };
       if (parsed.data.action === "status") {
-        const status = getExclusiveConnectionLeaseStatus(input);
+        const status = await getExclusiveConnectionLeaseStatusAsync(input);
         return status
           ? json(200, {
               ...lifecycle(status.lease),
@@ -112,8 +112,8 @@ export async function POST(request: Request): Promise<Response> {
       }
       const result =
         parsed.data.action === "renew"
-          ? renewExclusiveConnectionLease(input)
-          : releaseExclusiveConnectionLease({ ...input, reason: parsed.data.reason });
+          ? await renewExclusiveConnectionLeaseAsync(input)
+          : await releaseExclusiveConnectionLeaseAsync({ ...input, reason: parsed.data.reason });
       return result.kind !== "STALE"
         ? json(200, lifecycle(result.lease))
         : error(409, "LEASE_FENCE_STALE", "The lease generation is stale");
@@ -143,7 +143,9 @@ export async function POST(request: Request): Promise<Response> {
         "No eligible connection satisfies the managed key policy"
       );
     }
-    const failure = buildManagedLeaseSelectionErrorResponse(selection);
+    const failure = buildManagedLeaseSelectionErrorResponse(
+      selection as Parameters<typeof buildManagedLeaseSelectionErrorResponse>[0]
+    );
     if (failure) {
       for (const [name, value] of Object.entries(CORS_HEADERS)) failure.headers.set(name, value);
       return failure;

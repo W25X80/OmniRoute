@@ -15,13 +15,13 @@ export async function syncInChunksWithSpacing<T, R>(
   chunkSize: number,
   spacingMs: number,
   fetcher: (item: T) => Promise<R>,
-  onChunkResults: (chunk: T[], results: PromiseSettledResult<R>[]) => void
+  onChunkResults: (chunk: T[], results: PromiseSettledResult<R>[]) => void | Promise<void>
 ): Promise<void> {
   const size = chunkSize > 0 ? chunkSize : 1;
   for (let i = 0; i < items.length; i += size) {
     const chunk = items.slice(i, i + size);
     const results = await Promise.allSettled(chunk.map(fetcher));
-    onChunkResults(chunk, results);
+    await onChunkResults(chunk, results);
     const isLastChunk = i + size >= items.length;
     if (spacingMs > 0 && !isLastChunk) {
       await new Promise<void>((resolve) => setTimeout(resolve, spacingMs));

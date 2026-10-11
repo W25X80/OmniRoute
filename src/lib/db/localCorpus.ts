@@ -1,3 +1,5 @@
+import { getSelectedPostgresDatabase, assertSqliteBackendAllowed } from "./controlPlaneContext";
+import { createPostgresKnowledgeRepository } from "./postgres/knowledgeRepository";
 import { getDbInstance } from "./core";
 
 const LOCAL_CORPUS_NAMESPACE = "local_corpus";
@@ -13,6 +15,7 @@ export interface LocalCorpusConfig {
 }
 
 export function getLocalCorpusRoot(): string | null {
+  assertSqliteBackendAllowed();
   try {
     const row = getDbInstance()
       .prepare("SELECT value FROM key_value WHERE namespace = ? AND key = ?")
@@ -26,18 +29,50 @@ export function getLocalCorpusRoot(): string | null {
 }
 
 export function setLocalCorpusRoot(rootPath: string): void {
+  assertSqliteBackendAllowed();
   getDbInstance()
     .prepare("INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES (?, ?, ?)")
     .run(LOCAL_CORPUS_NAMESPACE, LOCAL_CORPUS_ROOT_KEY, JSON.stringify(rootPath));
 }
 
 export function clearLocalCorpusRoot(): void {
+  assertSqliteBackendAllowed();
   getDbInstance()
     .prepare("DELETE FROM key_value WHERE namespace = ? AND key = ?")
     .run(LOCAL_CORPUS_NAMESPACE, LOCAL_CORPUS_ROOT_KEY);
 }
 
 export function getLocalCorpusConfig(): LocalCorpusConfig {
+  assertSqliteBackendAllowed();
   const rootPath = getLocalCorpusRoot();
+  return { rootPath, configured: rootPath !== null };
+}
+
+export async function getLocalCorpusRootAsync(): Promise<string | null> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return getLocalCorpusRoot();
+  const repository = createPostgresKnowledgeRepository(database);
+  const value = await repository.read("local_corpus", "root_path");
+  return typeof value === "string" && value.trim() ? value : null;
+}
+
+export async function setLocalCorpusRootAsync(rootPath: string): Promise<void> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return setLocalCorpusRoot(rootPath);
+  const repository = createPostgresKnowledgeRepository(database);
+  return repository.write("local_corpus", "root_path", rootPath);
+}
+
+export async function clearLocalCorpusRootAsync(): Promise<void> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return clearLocalCorpusRoot();
+  const repository = createPostgresKnowledgeRepository(database);
+  return repository.remove("local_corpus", "root_path");
+}
+
+export async function getLocalCorpusConfigAsync(): Promise<LocalCorpusConfig> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return getLocalCorpusConfig();
+  const rootPath = await getLocalCorpusRootAsync();
   return { rootPath, configured: rootPath !== null };
 }

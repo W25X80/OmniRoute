@@ -20,6 +20,12 @@
  */
 import { getDbInstance } from "@/lib/db/core";
 import { createLogger } from "@/shared/utils/logger";
+import { getSelectedPostgresDatabase } from "@/lib/db/controlPlaneContext";
+import {
+  readProviderQuotaRows,
+  writeProviderQuotaUsage,
+  deleteProviderQuotaRows,
+} from "@/lib/db/postgres/providerQuotaRepository";
 
 const log = createLogger("quota:provider-state");
 
@@ -197,5 +203,72 @@ export function clearProviderQuota(connectionId: string): void {
       .run(connectionId);
   } catch {
     // best-effort
+  }
+}
+
+export async function getProviderQuotaAsync(
+  id: string,
+  model: string
+): Promise<ProviderQuotaSnapshot | null> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return getProviderQuota(id, model);
+  if (!id || !model) return null;
+  try {
+    const row = (await readProviderQuotaRows(database, id, model))[0];
+    if (!row) return null;
+    const normalized = normalizeRow(row);
+    if (normalized.windowReset > 0 && Date.now() > normalized.windowReset)
+      return {
+        known: false,
+        tokensUsed: 0,
+        tokenLimit: 0,
+        tokensRemaining: 0,
+        remainingRatio: 1,
+        windowReset: normalized.windowReset,
+      };
+    const limit = Math.max(0, normalized.tokenLimit),
+      used = Math.max(0, normalized.tokensUsed),
+      remaining = limit > 0 ? Math.max(0, limit - used) : 0;
+    return {
+      known: true,
+      tokensUsed: used,
+      tokenLimit: limit,
+      tokensRemaining: remaining,
+      remainingRatio: limit > 0 ? Math.min(1, Math.max(0, remaining / limit)) : 1,
+      windowReset: normalized.windowReset,
+    };
+  } catch (error) {
+    log.warn({ err: (error as Error)?.message, id, model }, "getProviderQuota failed — fail-open");
+    return null;
+  }
+}
+
+export async function recordProviderQuotaUsageAsync(
+  id: string,
+  model: string,
+  delta: number,
+  opts: { tokenLimit?: number; windowMs?: number } = {}
+): Promise<void> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return recordProviderQuotaUsage(id, model, delta, opts);
+  if (!id || !model || !(delta > 0)) return;
+  try {
+    await writeProviderQuotaUsage(database, id, model, delta, opts);
+  } catch (error) {
+    log.warn(
+      { err: (error as Error)?.message, id, model },
+      "recordProviderQuotaUsage failed — best-effort"
+    );
+  }
+}
+
+export async function clearProviderQuotaAsync(id: string): Promise<void> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return clearProviderQuota(id);
+  if (!id) return;
+  try {
+    await deleteProviderQuotaRows(database, id);
+  } catch {
+    /* best-effort */
   }
 }

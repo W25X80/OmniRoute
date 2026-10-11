@@ -1,6 +1,6 @@
 import { errorResponse } from "@omniroute/open-sse/utils/error";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
-import { readPoolEgressObservation } from "@/lib/proxyPoolEgressObservation";
+import { readPoolEgressObservationAsync as readPoolEgressObservation } from "@/lib/proxyPoolEgressObservation";
 import { proxyPoolEgressObservationQuerySchema } from "@/shared/validation/schemas";
 import {
   formatValidationMessage,
@@ -34,7 +34,7 @@ export async function GET(request: Request) {
     }
     const { scope, scopeId } = validation.data;
     return Response.json(
-      readPoolEgressObservation(scope, scope === "global" ? null : (scopeId ?? null))
+      await readPoolEgressObservation(scope, scope === "global" ? null : (scopeId ?? null))
     );
   } catch {
     return errorResponse(500, "Failed to load pool egress observation");

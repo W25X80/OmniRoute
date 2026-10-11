@@ -59,5 +59,12 @@ export type SkillHandler = (
   input: Record<string, unknown>,
   // provider/model (#7339): optional so existing handlers stay untouched — only the
   // web_fetch builtin uses them to resolve a per-model pinned fetch backend.
-  context: { apiKeyId: string; sessionId: string; provider?: string; model?: string }
+  context: {
+    apiKeyId: string;
+    sessionId: string;
+    provider?: string;
+    model?: string;
+    /** Internal native deadline; never populated from skill input. */
+    abortSignal?: AbortSignal;
+  }
 ) => Promise<Record<string, unknown>>;

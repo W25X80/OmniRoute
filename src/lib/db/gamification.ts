@@ -1,3 +1,5 @@
+import { getSelectedPostgresDatabase } from "./controlPlaneContext";
+import { createPostgresGamificationRepository } from "./postgres/gamificationRepository";
 /**
  * gamification.ts — DB domain module for the Gamification & Leaderboard system.
  *
@@ -601,7 +603,10 @@ export function getLeaderboardNeighbors(
        WHERE scope = ? AND score > ?
        ORDER BY score ASC LIMIT ?`
     )
-    .all(scope, scoreRow.score, radius) as Array<{ api_key_id: string; score: number }>;
+    .all(scope, scoreRow.score, radius) as Array<{
+    api_key_id: string;
+    score: number;
+  }>;
 
   const below = d
     .prepare(
@@ -609,7 +614,10 @@ export function getLeaderboardNeighbors(
        WHERE scope = ? AND score < ?
        ORDER BY score DESC LIMIT ?`
     )
-    .all(scope, scoreRow.score, radius) as Array<{ api_key_id: string; score: number }>;
+    .all(scope, scoreRow.score, radius) as Array<{
+    api_key_id: string;
+    score: number;
+  }>;
 
   return {
     above: above.reverse().map((r) => ({ apiKeyId: r.api_key_id, score: r.score })),
@@ -638,7 +646,11 @@ export function rotateLeaderboardScope(scope: "weekly" | "monthly"): void {
   // Step 1: SELECT rows into memory
   const rows = d
     .prepare("SELECT api_key_id, score, updated_at FROM leaderboard WHERE scope = ?")
-    .all(scope) as Array<{ api_key_id: string; score: number; updated_at: string }>;
+    .all(scope) as Array<{
+    api_key_id: string;
+    score: number;
+    updated_at: string;
+  }>;
 
   // Step 2: INSERT with parameters (no string interpolation)
   if (rows.length > 0) {
@@ -651,4 +663,220 @@ export function rotateLeaderboardScope(scope: "weekly" | "monthly"): void {
   }
 
   d.prepare("DELETE FROM leaderboard WHERE scope = ?").run(scope);
+}
+
+export async function updateScoreAsync(
+  apiKeyId: string,
+  scope: string,
+  points: number
+): Promise<void> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return updateScore(apiKeyId, scope, points);
+  return createPostgresGamificationRepository(database).updateScore(apiKeyId, scope, points);
+}
+
+export async function getRankAsync(apiKeyId: string, scope: string): Promise<number> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return getRank(apiKeyId, scope);
+  return createPostgresGamificationRepository(database).getRank(apiKeyId, scope);
+}
+
+export async function getTopNAsync(
+  scope: string,
+  limit: number,
+  offset: number = 0
+): Promise<LeaderboardRow[]> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return getTopN(scope, limit, offset);
+  return createPostgresGamificationRepository(database).getTopN(scope, limit, offset);
+}
+
+export async function addXpAsync(
+  apiKeyId: string,
+  action: string,
+  amount: number,
+  metadata?: string
+): Promise<void> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return addXp(apiKeyId, action, amount, metadata);
+  return createPostgresGamificationRepository(database).addXp(apiKeyId, action, amount, metadata);
+}
+
+export async function getXpAsync(apiKeyId: string): Promise<UserLevelRow | null> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return getXp(apiKeyId);
+  return createPostgresGamificationRepository(database).getXp(apiKeyId);
+}
+
+export async function updateLevelAsync(apiKeyId: string, level: number): Promise<void> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return updateLevel(apiKeyId, level);
+  return createPostgresGamificationRepository(database).updateLevel(apiKeyId, level);
+}
+
+export async function unlockBadgeAsync(apiKeyId: string, badgeId: string): Promise<boolean> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return unlockBadge(apiKeyId, badgeId);
+  return createPostgresGamificationRepository(database).unlockBadge(apiKeyId, badgeId);
+}
+
+export async function hasBadgeAsync(apiKeyId: string, badgeId: string): Promise<boolean> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return hasBadge(apiKeyId, badgeId);
+  return createPostgresGamificationRepository(database).hasBadge(apiKeyId, badgeId);
+}
+
+export async function hasXpActionTodayAsync(apiKeyId: string, action: string): Promise<boolean> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return hasXpActionToday(apiKeyId, action);
+  return createPostgresGamificationRepository(database).hasXpActionToday(apiKeyId, action);
+}
+
+export async function getBadgesAsync(apiKeyId: string): Promise<UserBadge[]> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return getBadges(apiKeyId);
+  return createPostgresGamificationRepository(database).getBadges(apiKeyId);
+}
+
+export async function getBadgeDefinitionsAsync(category?: string): Promise<BadgeDefinition[]> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return getBadgeDefinitions(category);
+  return createPostgresGamificationRepository(database).getBadgeDefinitions(category);
+}
+
+export async function getAggregateXpAsync(): Promise<UserLevelRow> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return getAggregateXp();
+  return createPostgresGamificationRepository(database).getAggregateXp();
+}
+
+export async function getAllEarnedBadgesAsync(): Promise<UserBadge[]> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return getAllEarnedBadges();
+  return createPostgresGamificationRepository(database).getAllEarnedBadges();
+}
+
+export async function transferTokensAsync(
+  fromId: string,
+  toId: string,
+  amount: number,
+  reason: string,
+  idempotencyKey: string
+): Promise<{ success: boolean; error?: string }> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return transferTokens(fromId, toId, amount, reason, idempotencyKey);
+  return createPostgresGamificationRepository(database).transferTokens(
+    fromId,
+    toId,
+    amount,
+    reason,
+    idempotencyKey
+  );
+}
+
+export async function getBalanceAsync(apiKeyId: string): Promise<number> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return getBalance(apiKeyId);
+  return createPostgresGamificationRepository(database).getBalance(apiKeyId);
+}
+
+export async function getHistoryAsync(
+  apiKeyId: string,
+  limit: number
+): Promise<TokenLedgerEntry[]> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return getHistory(apiKeyId, limit);
+  return createPostgresGamificationRepository(database).getHistory(apiKeyId, limit);
+}
+
+export async function createInviteTokenAsync(
+  id: string,
+  code: string,
+  tokenHash: string,
+  createdBy: string,
+  serverUrl?: string,
+  maxUses?: number
+): Promise<void> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return createInviteToken(id, code, tokenHash, createdBy, serverUrl, maxUses);
+  return createPostgresGamificationRepository(database).createInviteToken(
+    id,
+    code,
+    tokenHash,
+    createdBy,
+    serverUrl,
+    maxUses
+  );
+}
+
+export async function getInviteByCodeAsync(code: string): Promise<InviteToken | null> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return getInviteByCode(code);
+  return createPostgresGamificationRepository(database).getInviteByCode(code);
+}
+
+export async function redeemInviteAsync(code: string, usedBy: string): Promise<boolean> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return redeemInvite(code, usedBy);
+  return createPostgresGamificationRepository(database).redeemInvite(code, usedBy);
+}
+
+export async function revokeInviteAsync(id: string): Promise<void> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return revokeInvite(id);
+  return createPostgresGamificationRepository(database).revokeInvite(id);
+}
+
+export async function getConnectedServerByKeyHashAsync(
+  apiKeyHash: string
+): Promise<{ id: string } | undefined> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return getConnectedServerByKeyHash(apiKeyHash);
+  return createPostgresGamificationRepository(database).getConnectedServerByKeyHash(apiKeyHash);
+}
+
+export async function connectServerAsync(
+  id: string,
+  name: string,
+  url: string,
+  apiKeyHash: string
+): Promise<void> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return connectServer(id, name, url, apiKeyHash);
+  return createPostgresGamificationRepository(database).connectServer(id, name, url, apiKeyHash);
+}
+
+export async function disconnectServerAsync(id: string): Promise<void> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return disconnectServer(id);
+  return createPostgresGamificationRepository(database).disconnectServer(id);
+}
+
+export async function listServersAsync(): Promise<Omit<CommunityServer, "apiKeyHash">[]> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return listServers();
+  return createPostgresGamificationRepository(database).listServers();
+}
+
+export async function getLeaderboardNeighborsAsync(
+  apiKeyId: string,
+  scope: string,
+  radius: number = 5
+): Promise<{
+  above: Array<{ apiKeyId: string; score: number }>;
+  below: Array<{ apiKeyId: string; score: number }>;
+}> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return getLeaderboardNeighbors(apiKeyId, scope, radius);
+  return createPostgresGamificationRepository(database).getLeaderboardNeighbors(
+    apiKeyId,
+    scope,
+    radius
+  );
+}
+
+export async function rotateLeaderboardScopeAsync(scope: "weekly" | "monthly"): Promise<void> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return rotateLeaderboardScope(scope);
+  return createPostgresGamificationRepository(database).rotateLeaderboardScope(scope);
 }

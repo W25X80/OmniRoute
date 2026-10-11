@@ -1,3 +1,5 @@
+import { getSelectedPostgresDatabase } from "./controlPlaneContext";
+import { createPostgresCompressionTelemetryRepository } from "./postgres/compressionTelemetryRepository";
 import { getDbInstance } from "./core";
 
 export interface CompressionRunTelemetryInput {
@@ -122,4 +124,23 @@ export function getCompressionRunTelemetrySummary(): CompressionRunTelemetrySumm
     }
   }
   return summary;
+}
+
+export async function insertCompressionRunTelemetryRowAsync(
+  row: CompressionRunTelemetryInput
+): Promise<void> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return insertCompressionRunTelemetryRow(row);
+  try {
+    await createPostgresCompressionTelemetryRepository(database).insertRun(row);
+  } catch {
+    /* Optional telemetry. */
+  }
+}
+
+export async function getCompressionRunTelemetrySummaryAsync(): Promise<CompressionRunTelemetrySummary> {
+  const database = getSelectedPostgresDatabase();
+  return database
+    ? createPostgresCompressionTelemetryRepository(database).runSummary()
+    : getCompressionRunTelemetrySummary();
 }

@@ -111,6 +111,10 @@ function main() {
     { stdio: "inherit" }
   );
 
+  const codeGraphWorkerDest = join(STANDALONE, "src/lib/copilot/codegraphQueryWorker.cjs");
+  bundleCodeGraphWorker(codeGraphWorkerDest);
+  colocateCodeGraphDependencies(join(ROOT, "node_modules"), join(STANDALONE, "node_modules"));
+
   const callLogWorkerDest = join(STANDALONE, CALL_LOG_WORKER_REL);
   mkdirSync(dirname(callLogWorkerDest), { recursive: true });
   // Never spawn `node_modules/.bin/esbuild` directly: that extensionless path is
@@ -130,6 +134,29 @@ function main() {
     { stdio: "inherit" }
   );
   console.log("[colocate-standalone] ✅ call-log artifact worker bundled");
+
+  const codexWorkerDirs = [];
+  for (const relative of [
+    "open-sse/vendor/codex-chatgpt-web/responses/stateWorker",
+    "open-sse/executors/chatgpt-web-codex/tunnelZipWorker",
+  ]) {
+    const destination = join(STANDALONE, `${relative}.js`);
+    mkdirSync(dirname(destination), { recursive: true });
+    runBuildTool(
+      "esbuild",
+      "esbuild",
+      [
+        join(ROOT, `${relative}.ts`),
+        "--bundle",
+        "--platform=node",
+        "--packages=external",
+        "--format=esm",
+        `--outfile=${destination}`,
+      ],
+      { stdio: "inherit" }
+    );
+    codexWorkerDirs.push(dirname(destination));
+  }
 
   const compressionWorkerDest = join(STANDALONE, COMPRESSION_WORKER_REL);
   mkdirSync(dirname(compressionWorkerDest), { recursive: true });
@@ -154,6 +181,7 @@ function main() {
     dirname(healthWorkerDest),
     dirname(callLogWorkerDest),
     dirname(compressionWorkerDest),
+    ...codexWorkerDirs,
   ];
 
   const workerDest = join(STANDALONE, WORKER_REL);
@@ -190,6 +218,42 @@ function main() {
 
   // 3) Give each esbuild'd ESM worker its own "type":"module" scope (see helper doc).
   writeEsmWorkerScopes(workerDirs);
+}
+
+/** Bundle the readonly child as CJS without changing the standalone server's package type. */
+export function bundleCodeGraphWorker(workerDest, build = runBuildTool) {
+  mkdirSync(dirname(workerDest), { recursive: true });
+  build(
+    "esbuild",
+    "esbuild",
+    [
+      join(ROOT, "src/lib/copilot/codegraphQueryWorker.ts"),
+      "--bundle",
+      "--platform=node",
+      "--packages=external",
+      "--format=cjs",
+      `--outfile=${workerDest}`,
+    ],
+    { stdio: "inherit" }
+  );
+}
+
+/** The independent child's literal driver names are not guaranteed by Next's main bundle trace. */
+export function colocateCodeGraphDependencies(sourceNodeModules, destinationNodeModules) {
+  const packages = ["better-sqlite3", "bindings", "file-uri-to-path"];
+  for (const name of packages) {
+    const source = join(sourceNodeModules, name);
+    if (!existsSync(source)) continue; // source query's unavailable-addon contract remains explicit
+    const destination = join(destinationNodeModules, name);
+    mkdirSync(dirname(destination), { recursive: true });
+    // Fill partial traced packages without replacing already-traced files or native binaries.
+    cpSync(source, destination, {
+      recursive: true,
+      dereference: true,
+      force: false,
+      errorOnExist: false,
+    });
+  }
 }
 
 /**

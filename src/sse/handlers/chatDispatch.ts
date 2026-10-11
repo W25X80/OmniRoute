@@ -4,13 +4,13 @@
  *
  * Its only job beyond forwarding the call is the #6219 follow-up: when a combo
  * per-model timeout abandons the account this session is pinned to, drop the
- * pin. See `evictSessionAffinityOnComboTimeout` for why the existing #6219
+ * pin. See `evictSessionAffinityOnComboTimeoutAsync` for why the existing #6219
  * eviction never covers this path.
  */
 
 import { executeChatWithBreaker } from "./chatHelpers";
 import { resolveDispatchClientRawRequest } from "./chat/clientRawRequest.ts";
-import { evictSessionAffinityOnComboTimeout } from "../services/sessionAffinityPin";
+import { evictSessionAffinityOnComboTimeoutAsync } from "../services/sessionAffinityPin";
 
 /** The dispatch arguments chat.ts already assembles, plus what the eviction reads. */
 type DispatchArgs = {
@@ -42,7 +42,7 @@ export async function dispatchChatWithAffinityEviction(
   runtimeOptions: DispatchRuntimeOptions
 ): Promise<Awaited<ReturnType<typeof executeChatWithBreaker>>> {
   const evict = () =>
-    evictSessionAffinityOnComboTimeout({
+    evictSessionAffinityOnComboTimeoutAsync({
       sessionKey: runtimeOptions.sessionAffinityKey,
       provider: args.provider,
       connectionId: args.credentials?.connectionId,
@@ -59,7 +59,7 @@ export async function dispatchChatWithAffinityEviction(
       ),
     });
   } catch (dispatchErr) {
-    evict();
+    await evict();
     throw dispatchErr;
   }
 
@@ -67,6 +67,6 @@ export async function dispatchChatWithAffinityEviction(
   // combo per-model timeout — never treat it as one.
   if ("localResourcePressureResult" in dispatched) return dispatched;
 
-  if (!dispatched.result?.success) evict();
+  if (!dispatched.result?.success) await evict();
   return dispatched;
 }

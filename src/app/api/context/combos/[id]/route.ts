@@ -1,10 +1,11 @@
+import type { CompressionCombo } from "@/lib/db/compressionCombos";
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import {
-  deleteCompressionCombo,
-  getCompressionCombo,
-  setDefaultCompressionCombo,
-  updateCompressionCombo,
+  deleteCompressionComboAsync,
+  getCompressionComboAsync,
+  setDefaultCompressionComboAsync,
+  updateCompressionComboAsync,
 } from "@/lib/db/compressionCombos";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
@@ -31,7 +32,7 @@ export async function GET(request: Request, { params }) {
   const authError = await requireManagementAuth(request);
   if (authError) return authError;
   const { id } = await params;
-  const combo = getCompressionCombo(id);
+  const combo = await getCompressionComboAsync(id);
   if (!combo) return NextResponse.json({ error: "Compression combo not found" }, { status: 404 });
   return NextResponse.json(combo);
 }
@@ -54,12 +55,12 @@ export async function PUT(request: Request, { params }) {
   }
 
   if (validation.data.isDefault === true) {
-    const changed = setDefaultCompressionCombo(id);
+    const changed = await setDefaultCompressionComboAsync(id);
     if (!changed)
       return NextResponse.json({ error: "Compression combo not found" }, { status: 404 });
   }
 
-  const combo = updateCompressionCombo(id, validation.data);
+  const combo = await updateCompressionComboAsync(id, validation.data as Partial<CompressionCombo>);
   if (!combo) return NextResponse.json({ error: "Compression combo not found" }, { status: 404 });
   return NextResponse.json(combo);
 }
@@ -68,7 +69,7 @@ export async function DELETE(request: Request, { params }) {
   const authError = await requireManagementAuth(request);
   if (authError) return authError;
   const { id } = await params;
-  const deleted = deleteCompressionCombo(id);
+  const deleted = await deleteCompressionComboAsync(id);
   if (!deleted) {
     return NextResponse.json(
       { error: "Compression combo not found or cannot delete default combo" },

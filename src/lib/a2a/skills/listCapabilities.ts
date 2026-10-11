@@ -6,7 +6,8 @@
  */
 
 import type { A2ATask, TaskArtifact } from "../taskManager";
-import { getCatalog, computeCoverage } from "@/lib/agentSkills/catalog";
+import { parseDatabaseBackend } from "@/lib/db/backendSelection";
+import { getCatalog, computeCoverage, computeCoverageAsync } from "@/lib/agentSkills/catalog";
 import type { AgentSkill } from "@/lib/agentSkills/types";
 
 export interface ListCapabilitiesResult {
@@ -41,7 +42,8 @@ function buildMarkdownTable(skills: AgentSkill[]): string {
 
 export async function executeListCapabilities(_task: A2ATask): Promise<ListCapabilitiesResult> {
   const catalog = getCatalog();
-  const coverage = computeCoverage();
+  const coverage =
+    parseDatabaseBackend() === "postgres" ? await computeCoverageAsync() : computeCoverage();
 
   const table = buildMarkdownTable(catalog);
 

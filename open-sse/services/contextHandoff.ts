@@ -1,9 +1,13 @@
+import { runPersistenceBackgroundWork } from "../../src/lib/db/persistenceRuntime.ts";
 import {
   cleanupExpiredHandoffs,
+  cleanupExpiredHandoffsAsync,
   getHandoff,
+  getHandoffAsync,
   hasActiveHandoff,
+  hasActiveHandoffAsync,
   type HandoffPayload,
-  upsertHandoff,
+  upsertHandoffAsync,
 } from "../../src/lib/db/contextHandoffs.ts";
 import { estimateTokens } from "./contextManager.ts";
 import { stripMarkdownCodeFence } from "../utils/aiSdkCompat.ts";
@@ -397,7 +401,7 @@ async function generateHandoffAsync(options: {
   config?: ContextRelayConfig | null;
   handleSingleModel: (body: Record<string, unknown>, modelStr: string) => Promise<Response>;
 }): Promise<void> {
-  cleanupExpiredHandoffs();
+  await cleanupExpiredHandoffsAsync();
 
   const relayConfig = resolveContextRelayConfig(options.config as Record<string, unknown>);
   const summaryModel = relayConfig.handoffModel || options.model;
@@ -455,7 +459,7 @@ async function generateHandoffAsync(options: {
     return;
   }
 
-  upsertHandoff({
+  await upsertHandoffAsync({
     sessionId: options.sessionId,
     comboName: options.comboName,
     fromAccount: options.connectionId,
@@ -833,7 +837,7 @@ async function generateUniversalHandoffAsync(options: {
     return "unparseable";
   }
 
-  upsertHandoff({
+  await upsertHandoffAsync({
     sessionId: options.sessionId,
     comboName: options.comboName,
     fromAccount: `universal:${options.prevModel}`,
@@ -962,4 +966,125 @@ export function injectUniversalHandoffBody(
     ...body,
     messages: [handoffMessage, ...messages],
   };
+}
+
+export async function shouldGenerateUniversalHandoffAsync(options: {
+  sessionId: string | null;
+  comboName: string;
+  previousModel: string | null;
+  currentModel: string;
+  universalConfig: UniversalHandoffConfig;
+}): Promise<"generate" | "inject" | "skip"> {
+  if (!options.universalConfig.enabled) return "skip";
+  if (!options.previousModel) return "skip";
+  if (options.previousModel === options.currentModel) return "skip";
+
+  // Check if handoff already exists for this session/combo
+  if (options.sessionId) {
+    const existing = await getHandoffAsync(options.sessionId, options.comboName);
+    if (existing && existing.summary) return "inject";
+  }
+
+  return "generate";
+}
+
+export async function maybeGenerateHandoffAsync(options: {
+  sessionId: string | null;
+  comboName: string;
+  connectionId: string | null;
+  percentUsed: number;
+  messages: MessageLike[];
+  model: string;
+  expiresAt: string | null;
+  config?: ContextRelayConfig | null;
+  handleSingleModel: (body: Record<string, unknown>, modelStr: string) => Promise<Response>;
+}): Promise<void> {
+  if (!options.sessionId || !options.connectionId) return;
+
+  const relayConfig = resolveContextRelayConfig(options.config as Record<string, unknown>);
+  if (relayConfig.handoffProviders.length === 0) return;
+  if (options.percentUsed < relayConfig.handoffThreshold) return;
+  if (options.percentUsed >= HANDOFF_EXHAUSTION_THRESHOLD) return;
+
+  await cleanupExpiredHandoffsAsync();
+  if (await hasActiveHandoffAsync(options.sessionId, options.comboName)) return;
+  const inflightKey = getInflightKey(options.sessionId, options.comboName);
+  if (inflightHandoffGenerations.has(inflightKey)) return;
+  inflightHandoffGenerations.add(inflightKey);
+
+  void runPersistenceBackgroundWork(() =>
+    generateHandoffAsync({
+      ...options,
+      sessionId: options.sessionId as string,
+      connectionId: options.connectionId as string,
+      config: relayConfig,
+    })
+  )
+    .catch((err) => {
+      if (process.env.NODE_ENV !== "test") {
+        console.warn("[context-relay] Handoff generation failed:", err?.message || err);
+      }
+    })
+    .finally(() => {
+      inflightHandoffGenerations.delete(inflightKey);
+    });
+}
+
+export async function maybeGenerateUniversalHandoffAsync(options: {
+  sessionId: string | null;
+  comboName: string;
+  messages: MessageLike[];
+  prevModel: string | null;
+  currModel: string;
+  universalConfig: UniversalHandoffConfig;
+  handleSingleModel: (body: Record<string, unknown>, modelStr: string) => Promise<Response>;
+}): Promise<void> {
+  const decision = await shouldGenerateUniversalHandoffAsync({
+    sessionId: options.sessionId,
+    comboName: options.comboName,
+    previousModel: options.prevModel,
+    currentModel: options.currModel,
+    universalConfig: options.universalConfig,
+  });
+
+  if (decision !== "generate") return;
+  if (!options.sessionId) return;
+
+  const inflightKey = getInflightKey(options.sessionId, options.comboName);
+  // #11552: the previous attempt for this session/combo answered with something
+  // that is not a usable handoff. Re-asking on every model switch just burns an
+  // upstream call whose response is discarded — wait out the backoff instead.
+  if (isUniversalHandoffCoolingDown(inflightKey)) return;
+  if (inflightHandoffGenerations.has(inflightKey)) return;
+  inflightHandoffGenerations.add(inflightKey);
+
+  const ttlMs = (options.universalConfig.ttlMinutes || 300) * 60 * 1000;
+
+  void runPersistenceBackgroundWork(() =>
+    generateUniversalHandoffAsync({
+      sessionId: options.sessionId as string,
+      comboName: options.comboName,
+      messages: options.messages,
+      prevModel: options.prevModel || "unknown",
+      currModel: options.currModel,
+      handoffModel: options.universalConfig.handoffModel || options.currModel,
+      ttlMs,
+      maxMessages: options.universalConfig.maxMessagesForSummary,
+      relayMode: options.universalConfig.relayMode,
+      providerAllowlist: options.universalConfig.providerAllowlist,
+      handleSingleModel: options.handleSingleModel,
+    })
+  )
+    .then((outcome) => {
+      if (outcome === "unparseable") recordUniversalHandoffUnparseable(inflightKey);
+      else if (outcome === "generated") universalHandoffCooldowns.delete(inflightKey);
+    })
+    .catch((err) => {
+      if (process.env.NODE_ENV !== "test") {
+        console.warn("[universal-handoff] Generation failed:", err?.message || err);
+      }
+    })
+    .finally(() => {
+      inflightHandoffGenerations.delete(inflightKey);
+    });
 }

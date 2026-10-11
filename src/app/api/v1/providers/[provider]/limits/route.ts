@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 import { isAuthenticated } from "@/shared/utils/apiAuth";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
-import { setProviderKeyLimit, getProviderKeyLimit } from "@/lib/db/registeredKeys";
+import { setProviderKeyLimitAsync, getProviderKeyLimitAsync } from "@/lib/db/registeredKeys";
 
 const limitsSchema = z.object({
   maxActiveKeys: z.number().int().positive().nullable().optional(),
@@ -20,7 +20,7 @@ export async function GET(request: Request, { params }: { params: Promise<{ prov
   }
 
   const { provider } = await params;
-  const limits = getProviderKeyLimit(provider);
+  const limits = await getProviderKeyLimitAsync(provider);
   return NextResponse.json({ provider, limits: limits ?? null });
 }
 
@@ -46,7 +46,7 @@ export async function PUT(request: Request, { params }: { params: Promise<{ prov
   }
 
   const { provider } = await params;
-  setProviderKeyLimit(provider, validation.data);
-  const updated = getProviderKeyLimit(provider);
+  await setProviderKeyLimitAsync(provider, validation.data);
+  const updated = await getProviderKeyLimitAsync(provider);
   return NextResponse.json({ provider, limits: updated });
 }

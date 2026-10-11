@@ -30,8 +30,8 @@ export async function excludeConnectionForCooldown(params: {
   });
   if (!(params.skipCooldownForProbe && (await shouldIsolateProbeFailures()))) {
     try {
-      const { setConnectionRateLimitUntil } = await import("@/lib/db/providers");
-      setConnectionRateLimitUntil(connectionId, Date.now() + cooldownMs);
+      const { setConnectionRateLimitUntilAsync } = await import("@/lib/db/providers");
+      await setConnectionRateLimitUntilAsync(connectionId, Date.now() + cooldownMs);
     } catch {
       // DB write failure must never break the fallback loop
     }

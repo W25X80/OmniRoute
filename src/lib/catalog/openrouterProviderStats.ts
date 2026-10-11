@@ -22,6 +22,10 @@
 import fs from "fs";
 import path from "path";
 import { z } from "zod";
+import { parseDatabaseBackend } from "@/lib/db/backendSelection";
+import { getSelectedPersistenceIdentity } from "@/lib/db/controlPlaneContext";
+import { runPersistenceBackgroundWork } from "@/lib/db/persistenceRuntime";
+import { createPersistencePoller, type PersistencePoller } from "@/lib/config/persistencePoller";
 
 const ALL_PROVIDERS_URL = "https://openrouter.ai/api/frontend/v1/all-providers";
 const CATALOG_MODELS_URL = "https://openrouter.ai/api/frontend/v1/catalog/models";
@@ -169,7 +173,11 @@ export function computeProviderPopularity(
     const key = `${row.permaslug}::${row.endpoint.variant ?? "standard"}`;
     const usage = usageByKey.get(key);
     const slug = row.endpoint.provider_slug;
-    const agg = bySlug.get(slug) ?? { modelCount: 0, totalTokens: 0, totalRequests: 0 };
+    const agg = bySlug.get(slug) ?? {
+      modelCount: 0,
+      totalTokens: 0,
+      totalRequests: 0,
+    };
     agg.modelCount += 1;
     if (usage) {
       agg.totalTokens += usage.tokens;
@@ -242,6 +250,63 @@ function writeCache(data: ProviderPopularityEntry[]): void {
   }
 }
 
+interface NativeFileIO {
+  tail: Promise<void>;
+}
+const NATIVE_FILE_IO = Symbol.for("omniroute.openrouterProviderStats.nativeFileIO");
+const fileIOGlobals = globalThis as typeof globalThis & {
+  [NATIVE_FILE_IO]?: NativeFileIO;
+};
+
+/** Serialize file sections across duplicate server bundles; no cached data values. */
+function runNativeFileIO<T>(body: () => Promise<T>): Promise<T> {
+  const state = (fileIOGlobals[NATIVE_FILE_IO] ??= { tail: Promise.resolve() });
+  const operation = state.tail.then(body);
+  state.tail = operation.then(
+    (): void => undefined,
+    (): void => undefined
+  );
+  return operation;
+}
+
+function getNativeCacheFilePath(): string {
+  const dataDir = process.env.DATA_DIR || path.join(process.cwd(), "data");
+  return path.join(dataDir, "cache", "openrouter-provider-stats.json");
+}
+
+async function ensureNativeCacheDirectory(filePath: string): Promise<void> {
+  const cacheDir = path.dirname(filePath);
+  try {
+    await fs.promises.access(cacheDir);
+  } catch {
+    await fs.promises.mkdir(cacheDir, { recursive: true });
+  }
+}
+
+function readCacheAsync(filePath: string): Promise<CacheFile | null> {
+  return runNativeFileIO(async () => {
+    // Directory creation preserves the source failure boundary outside read recovery.
+    await ensureNativeCacheDirectory(filePath);
+    try {
+      return JSON.parse(await fs.promises.readFile(filePath, "utf8")) as CacheFile;
+    } catch {
+      return null;
+    }
+  });
+}
+
+function writeCacheAsync(filePath: string, data: ProviderPopularityEntry[]): Promise<void> {
+  return runNativeFileIO(async () => {
+    await ensureNativeCacheDirectory(filePath);
+    const cache: CacheFile = { fetchedAt: new Date().toISOString(), data };
+    try {
+      await fs.promises.writeFile(filePath, JSON.stringify(cache, null, 2), "utf8");
+    } catch (err) {
+      console.warn("[OpenRouterProviderStats] Failed to write cache:", err);
+    }
+  });
+}
+
 /** Get provider popularity/enrichment stats, honoring the on-disk TTL cache. */
 export async function getOpenRouterProviderStats(): Promise<{
   data: ProviderPopularityEntry[];
@@ -249,25 +314,38 @@ export async function getOpenRouterProviderStats(): Promise<{
   cachedAt: string | null;
   fromCache: boolean;
 }> {
+  const native = parseDatabaseBackend() === "postgres";
+  const filePath = native ? getNativeCacheFilePath() : "";
   const ttl = getTTL();
-  const cache = readCache();
+  const cache = native ? await readCacheAsync(filePath) : readCache();
   const now = Date.now();
 
   if (cache && cache.fetchedAt) {
     const age = now - new Date(cache.fetchedAt).getTime();
     if (age < ttl) {
-      return { data: cache.data, stale: false, cachedAt: cache.fetchedAt, fromCache: true };
+      return {
+        data: cache.data,
+        stale: false,
+        cachedAt: cache.fetchedAt,
+        fromCache: true,
+      };
     }
   }
 
   try {
     const data = await fetchFromAPI();
-    writeCache(data);
+    if (native) await writeCacheAsync(filePath, data);
+    else writeCache(data);
     return { data, stale: false, cachedAt: null, fromCache: false };
   } catch (err) {
     console.warn("[OpenRouterProviderStats] Fetch failed, using stale cache:", err);
     if (cache) {
-      return { data: cache.data, stale: true, cachedAt: cache.fetchedAt, fromCache: true };
+      return {
+        data: cache.data,
+        stale: true,
+        cachedAt: cache.fetchedAt,
+        fromCache: true,
+      };
     }
     return { data: [], stale: true, cachedAt: null, fromCache: false };
   }
@@ -280,8 +358,11 @@ export async function refreshOpenRouterProviderStats(): Promise<{
   error?: string;
 }> {
   try {
+    const native = parseDatabaseBackend() === "postgres";
+    const filePath = native ? getNativeCacheFilePath() : "";
     const data = await fetchFromAPI();
-    writeCache(data);
+    if (native) await writeCacheAsync(filePath, data);
+    else writeCache(data);
     return { data, ok: true };
   } catch (err) {
     const error = err instanceof Error ? err.message : String(err);
@@ -297,7 +378,55 @@ function getEffectiveOpenRouterProviderStatsEnabled(): boolean {
   return process.env.OPENROUTER_PROVIDER_STATS_ENABLED !== "false";
 }
 
+interface NativeSchedulerOwner {
+  readonly identity: object;
+  readonly poller: PersistencePoller;
+  stopping?: Promise<void>;
+}
+const NATIVE_SCHEDULER = Symbol.for("omniroute.openrouterProviderStats.postgresScheduler");
+const nativeGlobals = globalThis as typeof globalThis & {
+  [NATIVE_SCHEDULER]?: NativeSchedulerOwner;
+};
+
+function stopNativePoller(): Promise<void> {
+  const owner = nativeGlobals[NATIVE_SCHEDULER];
+  if (!owner) return Promise.resolve();
+
+  owner.stopping ??= owner.poller.stop().finally(() => {
+    if (nativeGlobals[NATIVE_SCHEDULER] === owner) nativeGlobals[NATIVE_SCHEDULER] = undefined;
+  });
+  return owner.stopping;
+}
+
 function startPeriodicSync(intervalMs?: number): void {
+  if (parseDatabaseBackend() === "postgres") {
+    const identity = getSelectedPersistenceIdentity();
+    if (!identity) throw new Error("Native scheduler requires selected PostgreSQL persistence");
+    const existing = nativeGlobals[NATIVE_SCHEDULER];
+    if (existing) {
+      if (existing.identity !== identity || existing.stopping)
+        throw new Error("Native scheduler authority changed or is draining");
+      return;
+    }
+    const poller = createPersistencePoller({
+      intervalMs: intervalMs ?? getTTL(),
+      initialDelayMs: 0,
+      check: async () => {
+        await runPersistenceBackgroundWork(async () => {
+          if (getSelectedPersistenceIdentity() !== identity)
+            throw new Error("Native scheduler persistence identity changed");
+          const result = await refreshOpenRouterProviderStats();
+          if (!result.ok) console.warn("[OpenRouterProviderStats] Sync failed:", result.error);
+        });
+      },
+      onFailure: () => {
+        console.warn("[OpenRouterProviderStats] Native periodic sync failed");
+      },
+    });
+    nativeGlobals[NATIVE_SCHEDULER] = { identity, poller };
+    poller.start();
+    return;
+  }
   if (syncTimer) return; // Already running
 
   const interval = intervalMs ?? getTTL();
@@ -342,4 +471,14 @@ export function initOpenRouterProviderStatsSync(): boolean {
   }
   startPeriodicSync();
   return true;
+}
+
+/** Stop periodic provider-stat refresh and drain accepted native work. */
+export async function stopOpenRouterProviderStatsSync(): Promise<void> {
+  if (parseDatabaseBackend() !== "postgres") {
+    if (syncTimer) clearInterval(syncTimer);
+    syncTimer = null;
+    return;
+  }
+  await stopNativePoller();
 }

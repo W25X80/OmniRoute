@@ -1,3 +1,4 @@
+import { getSelectedPostgresDatabase } from "./controlPlaneContext";
 /**
  * Discovery results CRUD — stores discovered provider access methods.
  *
@@ -102,4 +103,67 @@ function rowToResult(row: Record<string, unknown>): DiscoveryResult {
     discoveredAt: row.discovered_at as string,
     verifiedAt: row.verified_at as string | undefined,
   };
+}
+
+export async function insertDiscoveryResultAsync(
+  ...args: Parameters<typeof insertDiscoveryResult>
+): Promise<ReturnType<typeof insertDiscoveryResult>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceOperations");
+    return postgres.transaction((transaction) =>
+      native.insertDiscoveryResult(transaction, ...args)
+    );
+  }
+  return insertDiscoveryResult(...args);
+}
+
+export async function listDiscoveryResultsAsync(
+  ...args: Parameters<typeof listDiscoveryResults>
+): Promise<ReturnType<typeof listDiscoveryResults>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceOperations");
+    return postgres.transaction((transaction) => native.listDiscoveryResults(transaction, ...args));
+  }
+  return listDiscoveryResults(...args);
+}
+
+export async function getDiscoveryResultByIdAsync(
+  ...args: Parameters<typeof getDiscoveryResultById>
+): Promise<ReturnType<typeof getDiscoveryResultById>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceOperations");
+    return postgres.transaction((transaction) =>
+      native.getDiscoveryResultById(transaction, ...args)
+    );
+  }
+  return getDiscoveryResultById(...args);
+}
+
+export async function updateDiscoveryStatusAsync(
+  ...args: Parameters<typeof updateDiscoveryStatus>
+): Promise<ReturnType<typeof updateDiscoveryStatus>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceOperations");
+    return postgres.transaction((transaction) =>
+      native.updateDiscoveryStatus(transaction, ...args)
+    );
+  }
+  return updateDiscoveryStatus(...args);
+}
+
+export async function deleteDiscoveryResultAsync(
+  ...args: Parameters<typeof deleteDiscoveryResult>
+): Promise<ReturnType<typeof deleteDiscoveryResult>> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const native = await import("./postgres/serviceOperations");
+    return postgres.transaction((transaction) =>
+      native.deleteDiscoveryResult(transaction, ...args)
+    );
+  }
+  return deleteDiscoveryResult(...args);
 }

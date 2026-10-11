@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
-import { createAccessToken, listAccessTokens } from "@/lib/db/accessTokens";
+import { createAccessTokenAsync, listAccessTokensAsync } from "@/lib/db/accessTokens";
 import { ACCESS_SCOPES } from "@/lib/accessTokens/scopes";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
 
@@ -14,7 +14,7 @@ import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
 export async function GET(request: Request) {
   const authError = await requireManagementAuth(request);
   if (authError) return authError;
-  return NextResponse.json({ tokens: listAccessTokens() });
+  return NextResponse.json({ tokens: await listAccessTokensAsync() });
 }
 
 const createSchema = z.object({
@@ -44,7 +44,11 @@ export async function POST(request: Request) {
       ? new Date(Date.now() + expiresInDays * 86_400_000).toISOString()
       : null;
 
-  const { record, secret } = createAccessToken({ name, scope: scope ?? "read", expiresAt });
+  const { record, secret } = await createAccessTokenAsync({
+    name,
+    scope: scope ?? "read",
+    expiresAt,
+  });
 
   // `token` (the plaintext secret) is returned ONCE here and never again.
   return NextResponse.json({

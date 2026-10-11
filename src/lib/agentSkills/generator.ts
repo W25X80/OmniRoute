@@ -16,6 +16,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import { parseDatabaseBackend } from "@/lib/db/backendSelection";
 import { getCatalog, refreshCatalog } from "./catalog";
 import { parseOpenapi } from "./openapiParser";
 import { parseCliRegistry } from "./cliRegistryParser";
@@ -295,7 +296,10 @@ export function buildSkillMarkdown(
 /**
  * Assembles the full file content string from frontmatter + body.
  */
-function assembleFileContent(fm: { name: string; description: string }, body: string): string {
+export function assembleFileContent(
+  fm: { name: string; description: string },
+  body: string
+): string {
   return serializeFrontmatter(fm) + body;
 }
 
@@ -319,6 +323,9 @@ function readReferenceFile(skillDir: string, referencePath: string): string | un
  *   - dryRun=false + prune=true: deletes orphan directories.
  */
 export async function generateAgentSkills(opts: GeneratorOptions): Promise<GeneratorReport> {
+  if (parseDatabaseBackend() === "postgres") {
+    return (await import("./generatorAsync")).generateAgentSkillsWithAsyncFiles(opts);
+  }
   const { dryRun = true, prune = false, outputDir = "skills", onlyIds } = opts;
 
   // Anchor the base path with a literal so Turbopack's static analyzer can resolve

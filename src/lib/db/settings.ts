@@ -3,6 +3,19 @@
  */
 
 import { getDbInstance } from "./core";
+import { getSelectedPostgresDatabase, getSelectedControlPlane } from "./controlPlaneContext";
+import { resolvePostgresProxyForConnection } from "./postgres/proxyResolution";
+import {
+  getPostgresProxyConfig,
+  setPostgresProxyForLevel,
+  setPostgresProxyConfig,
+} from "./postgres/proxyConfigRepository";
+import { readPostgresSettingsSnapshot } from "./postgres/settingsSnapshot";
+import {
+  hasPostgresCatalogSnapshot,
+  refreshPostgresCatalogSnapshot,
+} from "./postgres/catalogSnapshot";
+import { PostgresSettingsEffectsError } from "./postgres/settingsRepository";
 import { backupDbFile } from "./backup";
 import { PROVIDER_ID_TO_ALIAS } from "@omniroute/open-sse/config/providerModels.ts";
 import {
@@ -17,11 +30,21 @@ import { encrypt, decrypt } from "./encryption";
 import { getProxyRegistryGeneration, resolveProxyForScopeFromRegistry } from "./proxies";
 import { isEgressBucketedLockScope } from "@omniroute/open-sse/config/providerErrorRules.ts";
 import { getComboModelProvider as getComboEntryProvider } from "@/lib/combos/steps";
-import { requestBodyLimitMbFromEnv } from "@/shared/constants/bodySize";
-import { DEFAULT_RESPONSES_PREVIOUS_RESPONSE_ID_MODE } from "@/shared/constants/responsesPreviousResponseId";
 import { decodeUserinfo } from "@/shared/utils/decodeUserinfo";
 import { type JsonRecord, toRecord } from "./settings/shared";
 import { resolveNoAuthSharedProviderProxy } from "./settings/noAuthProxyFallback";
+import {
+  interpretSettingsRows,
+  needsHeadlessOnboarding,
+  parseSettingsRevision,
+  SETTINGS_REVISION_KEY,
+  SettingsRevisionConflictError,
+} from "./settings/persistenceSemantics";
+
+export {
+  SETTINGS_REVISION_KEY,
+  SettingsRevisionConflictError,
+} from "./settings/persistenceSemantics";
 
 type ProxyValue = JsonRecord | string | null;
 type ProxyResolutionResult = {
@@ -40,10 +63,6 @@ type ProxyResolutionStamp = {
 type ProxyResolutionCacheEntry = ProxyResolutionStamp & { result: ProxyResolutionResult };
 
 const PROXY_RESOLUTION_CACHE_MAX_ENTRIES = 100;
-
-function isTruthyEnvFlag(value: string | undefined): boolean {
-  return typeof value === "string" && /^(1|true|yes|on)$/i.test(value.trim());
-}
 
 let proxyConfigGeneration = 0;
 const proxyResolutionCache = new Map<string, ProxyResolutionCacheEntry>();
@@ -101,208 +120,37 @@ function withFamilyDefault(value: ProxyValue): ProxyValue {
 
 // ──────────────── Settings ────────────────
 
-/** Internal key_value row — not exposed as a user-facing settings field. */
-export const SETTINGS_REVISION_KEY = "_settingsRevision";
-
-export class SettingsRevisionConflictError extends Error {
-  readonly code = "SETTINGS_REVISION_CONFLICT" as const;
-
-  constructor(public readonly currentRevision: number) {
-    super("Settings revision mismatch");
-    this.name = "SettingsRevisionConflictError";
-  }
-}
-
 function readSettingsRevision(db: ReturnType<typeof getDbInstance>): number {
   const row = db
     .prepare("SELECT value FROM key_value WHERE namespace = 'settings' AND key = ?")
     .get(SETTINGS_REVISION_KEY) as { value?: string } | undefined;
-  if (!row?.value) return 0;
-  try {
-    const parsed = JSON.parse(row.value) as unknown;
-    return typeof parsed === "number" && Number.isInteger(parsed) && parsed >= 0 ? parsed : 0;
-  } catch {
-    return 0;
-  }
+  return parseSettingsRevision(row?.value);
 }
 
 export async function getSettingsRevision(): Promise<number> {
+  const selected = getSelectedControlPlane();
+  if (selected) return selected.settings.getRevision();
   return readSettingsRevision(getDbInstance());
 }
 
-/**
- * #7274: read-fallback for the codexSessionAffinityTtlMs -> sessionAffinityTtlMs
- * rename. Migration 124 already backfills the new key from any pre-existing
- * old-key row for the common case, but this covers callers reading settings
- * before that migration has had a chance to run (or any drift between the
- * two). Only applies when the generic key was never explicitly persisted —
- * an operator-set `sessionAffinityTtlMs` (including an explicit 0) always wins.
- * Extracted to a leaf helper so `getSettings()` stays under the max-lines-per-
- * function ratchet.
- */
-function applySessionAffinityLegacyFallback(settings: Record<string, unknown>): void {
-  if (settings.sessionAffinityTtlMs === undefined) {
-    settings.sessionAffinityTtlMs =
-      typeof settings.codexSessionAffinityTtlMs === "number"
-        ? settings.codexSessionAffinityTtlMs
-        : 0;
-  }
-}
-
 export async function getSettings() {
+  const selected = getSelectedControlPlane();
+  if (selected) {
+    const snapshot = readPostgresSettingsSnapshot();
+    if (snapshot !== undefined) return snapshot;
+    const result = await selected.settings.get();
+    if (selected.database && hasPostgresCatalogSnapshot(selected.database)) {
+      await refreshPostgresCatalogSnapshot(selected.database);
+    }
+    return result;
+  }
   const db = getDbInstance();
   const rows = db.prepare("SELECT key, value FROM key_value WHERE namespace = 'settings'").all();
-  const settings: Record<string, unknown> = {
-    cloudEnabled: false,
-    tailscaleEnabled: false,
-    tailscaleUrl: "",
-    stickyRoundRobinLimit: 3,
-    disableSessionStickiness: false,
-    // Global connection-aware expansion fallback for group-B combo strategies is opt-in.
-    connectionAwareExpansion: false,
-    promptCacheAffinityEnabled: true,
-    comboStrategy: "fallback",
-    comboStickyRoundRobinLimit: null, // null = inherit stickyRoundRobinLimit (a literal default here shadows the documented batched-rotation default of 3 — #6678 regression caught by the v3.8.47 release CI)
-    providerStrategies: {},
-    // Per-operator quota row visibility (dashboard usage tab). Keyed by
-    // provider id → { hidden: [<quota visibility key>] }. Independent of the
-    // model catalog's isHidden flag (collectHiddenQuotaModelIds in
-    // ProviderLimits/utils.tsx) — this is a personal view preference, not an
-    // admin model-catalog edit. Ported from upstream decolua/9router#2371.
-    quotaVisibility: {},
-    requestRetry: 3,
-    maxRetryIntervalSec: 30,
-    antigravitySignatureCacheMode: "enabled",
-    requireLogin: true,
-    oidcEnabled: false,
-    oidcDisablePasswordLogin: false,
-    oidcIssuer: "",
-    oidcClientId: "",
-    oidcClientSecret: "",
-    oidcScopes: ["openid", "profile", "email"],
-    oidcRedirectPath: "/api/auth/oidc/callback",
-    oidcAllowedSubjects: [], // optional sub or email whitelist
-    mcpEnabled: false,
-    a2aEnabled: false,
-    hiddenSidebarItems: [],
-    hiddenSidebarGroupLabels: [],
-    sidebarSectionOrder: [],
-    sidebarItemOrder: {},
-    sidebarActivePreset: null,
-    hideEndpointCloudflaredTunnel: false,
-    hideEndpointTailscaleFunnel: false,
-    hideEndpointNgrokTunnel: false,
-    preferClaudeCodeForUnprefixedClaudeModels: isTruthyEnvFlag(
-      process.env.OMNIROUTE_PREFER_CLAUDE_CODE_FOR_UNPREFIXED_CLAUDE_MODELS
-    ),
-    // Opt-in (default "off"): short-circuits Claude Code's `--permission-mode auto`
-    // internal security-classifier request with a synthetic `<block>no</block>` ALLOW
-    // response, without calling the upstream provider. See
-    // open-sse/handlers/chatCore/claudeClassifierCompat.ts for the detector + builder.
-    claudeClassifierCompat: "off",
-    autoRefreshProviderQuota: false,
-    credentialRedactionEnabled: false,
-    autoRefreshProviderQuotaInterval: 180,
-    comboConfigMode: "guided",
-    comboAutoPromoteEnabled: false,
-    codexServiceTier: { enabled: false },
-    claudeFastMode: {
-      enabled: false,
-      supportedModels: [
-        "claude-fable-5",
-        "claude-opus-5-5",
-        "claude-opus-5",
-        "claude-opus-4-8",
-        "claude-opus-4-7",
-        "claude-opus-4-6",
-      ],
-    },
-    // #7274: renamed from codexSessionAffinityTtlMs — session affinity now
-    // applies to any provider, not just Codex. No default here on purpose:
-    // the read-fallback below only kicks in while `sessionAffinityTtlMs` has
-    // never been explicitly persisted, so it can tell "never configured"
-    // apart from "operator explicitly set 0" on the new key.
-    responsesPreviousResponseIdMode: DEFAULT_RESPONSES_PREVIOUS_RESPONSE_ID_MODE,
-    alwaysPreserveClientCache: "auto",
-    idempotencyWindowMs: 5000,
-    wsAuth: false,
-    maxBodySizeMb: requestBodyLimitMbFromEnv(process.env.MAX_BODY_SIZE_BYTES),
-    // #10312: opt-in only — a fresh install (or one missing the persisted key)
-    // must not run in debug mode; installs that persisted `true` keep it.
-    debugMode: false,
-    // Opt-in diagnostic: when true, the chat handler emits a `log.debug("TOOLS", …)`
-    // line per request summarizing tool count + MCP/hosted/client source breakdown.
-    logToolSources: false,
-    // LOCAL_ONLY manage-scope bypass policy defaults (T-011 / spec §Data Model).
-    // Preserves PR #2473 behaviour on migration — the bypass starts ENABLED
-    // for `/api/mcp/` so existing manage-scope Bearer clients keep working.
-    // Operators flip the kill-switch to false (or drop the prefix) via the
-    // Settings UI; the change hot-reloads through `applyRuntimeSettings` →
-    // `applyAuthzBypassSection` → `getAuthzBypassSnapshot()`.
-    localOnlyManageScopeBypassEnabled: true,
-    localOnlyManageScopeBypassPrefixes: ["/api/mcp/"],
-    customBannedSignals: [],
-    autoDisableBannedScope: "all",
-    proxyEnabled: true,
-    perKeyProxyEnabled: false,
-    customSystemPromptEnabled: false,
-    customSystemPrompt: "",
-    // #6316: Opt-in filter that hides paid-only models from the /v1/models catalog.
-    // Uses isFreeModel() from src/shared/utils/freeModels.ts to detect free entries
-    // (`:free` suffix, zero-price pricing, or FREE_MODEL_BUDGETS membership). Default
-    // false preserves prior behaviour; opt-in only.
-    hidePaidModels: false,
-    // Opt-in, default off: same shape as hidePaidModels above, but requires a
-    // live hard-stop-guaranteed quota check for non-keyless free candidates.
-    // See open-sse/services/autoCombo/strictZeroCostFilter.ts.
-    freeAccessPolicy: "off",
-    // #15059: ON by default — providers whose curated verdict is `tos: "avoid"` (e.g. Antigravity)
-    // must not receive `auto` traffic on a fresh install. Opt out with PATCH /api/settings.
-    excludeTosAvoid: true,
-    // #9418: Opt-in filter that hides auto/* virtual combos from the /v1/models catalog.
-    // User-defined combos are unaffected; routing still works for hidden ids sent explicitly.
-    hideAutoCombos: false,
-    // #9418: Opt-in filter that hides no-think/* gateway variants from the /v1/models catalog.
-    // Routing still works for hidden ids sent explicitly.
-    hideNoThinkVariants: false,
-    // #11481: Opt-in explicit model exposure allow/deny list, mirrored into the
-    // auto/* combo candidate pool (open-sse/services/autoCombo/modelExposureFilter.ts)
-    // so a denied model can't sneak back in via combo routing — the same trap
-    // #6512 already fixed once for hidePaidModels. See
-    // src/shared/utils/modelExposureList.ts for the matching predicate. Empty
-    // arrays preserve prior behaviour; opt-in only.
-    modelVisibilityAllowlist: [],
-    modelVisibilityDenylist: [],
-    // #6977: Opt-in per-connection auto-ping that warms a Codex OAuth connection's
-    // quota window right after it resets, so the first real request doesn't land in
-    // a cold window. `connections` maps connection id -> enabled. Default empty map
-    // (nobody opted in) — the scheduler is a no-op until an operator flips a
-    // connection on, since pinging burns a small amount of real quota (Hard Rule #20
-    // spirit: never mutate/consume on the operator's behalf by default).
-    codexAutoPing: { connections: {} },
-    // #8848: opt-in per-connection Claude proactive warmup (empty = off for everyone).
-    claudeWarmup: { connections: {} },
-  };
-  for (const row of rows) {
-    const record = toRecord(row);
-    const key = typeof record.key === "string" ? record.key : null;
-    const rawValue = typeof record.value === "string" ? record.value : null;
-    if (!key || rawValue === null || key.startsWith("_")) continue;
-    try {
-      settings[key] = JSON.parse(rawValue);
-    } catch {
-      settings[key] = rawValue;
-    }
-  }
-
-  if (typeof settings.oidcClientSecret === "string") {
-    settings.oidcClientSecret = decrypt(settings.oidcClientSecret) ?? "";
-  }
-  applySessionAffinityLegacyFallback(settings);
+  const settings = interpretSettingsRows(rows, process.env, decrypt);
 
   // Auto-complete onboarding for pre-configured deployments (Docker/VM)
   // If INITIAL_PASSWORD is set via env, this is a headless deploy — skip the wizard
-  if (!settings.setupComplete && process.env.INITIAL_PASSWORD) {
+  if (needsHeadlessOnboarding(settings, process.env)) {
     settings.setupComplete = true;
     settings.requireLogin = true;
     db.prepare(
@@ -320,6 +168,18 @@ export async function updateSettings(
   updates: Record<string, unknown>,
   options?: { expectedRevision?: number }
 ) {
+  const selected = getSelectedControlPlane();
+  if (selected) {
+    const result = await selected.settings.update(updates, options);
+    if (selected.database && hasPostgresCatalogSnapshot(selected.database)) {
+      try {
+        await refreshPostgresCatalogSnapshot(selected.database);
+      } catch {
+        throw new PostgresSettingsEffectsError(["catalog_snapshot"]);
+      }
+    }
+    return result;
+  }
   // Detect first-time setup completion before we overwrite settings.
   let setupJustCompleted = false;
   if (updates.setupComplete === true) {
@@ -441,6 +301,8 @@ function migrateProxyEntry(value: unknown): JsonRecord | null {
 }
 
 export async function getProxyConfig() {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) return getPostgresProxyConfig(postgres, migrateProxyEntry);
   const db = getDbInstance();
   const rows = db.prepare("SELECT key, value FROM key_value WHERE namespace = 'proxyConfig'").all();
 
@@ -486,6 +348,19 @@ export async function getProxyForLevel(level: string, id?: string | null) {
 }
 
 export async function setProxyForLevel(level: string, id: string | null, proxy: ProxyValue) {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const result = await setPostgresProxyForLevel(
+      postgres,
+      level,
+      id,
+      proxy,
+      migrateProxyEntry,
+      toProxyMap
+    );
+    bumpProxyConfigGeneration();
+    return result;
+  }
   const db = getDbInstance();
   const config = await getProxyConfig();
 
@@ -571,6 +446,10 @@ export async function resolveProxyForConnection(
   apiKeyId?: string,
   providerId?: string
 ) {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    return resolvePostgresProxyForConnection(postgres, connectionId, apiKeyId, providerId);
+  }
   const cacheKey = providerId
     ? `${connectionId}:${apiKeyId || ""}:${providerId}`
     : apiKeyId
@@ -854,6 +733,18 @@ export async function setProxyConfig(config: Record<string, unknown>) {
     return setProxyForLevel(level, id, proxy);
   }
 
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) {
+    const result = await setPostgresProxyConfig(
+      postgres,
+      config,
+      migrateProxyEntry,
+      toProxyMap,
+      toProxyValue
+    );
+    bumpProxyConfigGeneration();
+    return result;
+  }
   const db = getDbInstance();
   const current = await getProxyConfig();
   const insert = db.prepare(

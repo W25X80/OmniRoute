@@ -1,4 +1,4 @@
-import { verifyAccessToken } from "@/lib/db/accessTokens";
+import { verifyAccessToken, verifyAccessTokenAsync } from "@/lib/db/accessTokens";
 import { scopeSatisfies, type AccessScope } from "@/lib/accessTokens/scopes";
 import { inferRequiredScope } from "@/server/authz/accessScopes";
 
@@ -41,9 +41,31 @@ function safePathname(url: string): string {
 
 /**
  * Evaluate the request's access-token credential and required scope.
- * Pure w.r.t. the request (only side effect is `verifyAccessToken` stamping
+ * Pure w.r.t. the request (only side effect is `verifyAccessTokenAsync` stamping
  * `last_used_at`). Never throws — DB failures surface as `{ kind: "error" }`.
  */
+export async function evaluateAccessTokenAuthAsync(request: Request): Promise<AccessTokenVerdict> {
+  const bearer = extractBearer(request);
+  if (!bearer || !bearer.startsWith(ACCESS_TOKEN_PREFIX)) {
+    return { kind: "absent" };
+  }
+
+  let verified: Awaited<ReturnType<typeof verifyAccessTokenAsync>>;
+  try {
+    verified = await verifyAccessTokenAsync(bearer);
+  } catch {
+    return { kind: "error" };
+  }
+  if (!verified) return { kind: "invalid" };
+
+  const need = inferRequiredScope(request.method, safePathname(request.url));
+  if (!scopeSatisfies(verified.scope, need)) {
+    return { kind: "insufficient", have: verified.scope, need };
+  }
+
+  return { kind: "ok", scope: verified.scope, id: verified.id, name: verified.name };
+}
+
 export function evaluateAccessTokenAuth(request: Request): AccessTokenVerdict {
   const bearer = extractBearer(request);
   if (!bearer || !bearer.startsWith(ACCESS_TOKEN_PREFIX)) {

@@ -1,3 +1,5 @@
+import type { BailoutConfig } from "./stackedStepCore.ts";
+import type { RiskGateConfig } from "./riskGate/riskGate.ts";
 import type { CompressionConfig, CompressionMode, CompressionResult } from "./types.ts";
 import type { StackedCompressionStep } from "./strategySelector.ts";
 import type {
@@ -16,6 +18,8 @@ export interface CompressionWorkerOptions {
   targetFormat?: CompressionWireFormat;
   compressionStage?: CompressionStage;
   config?: CompressionConfig;
+  bailout?: BailoutConfig;
+  riskGate?: RiskGateConfig;
 }
 export interface CompressionWorkerJob {
   id: number;

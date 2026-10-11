@@ -4,11 +4,13 @@
  * Wire format for the real-time dashboard WebSocket.
  */
 
+import type { DashboardChannel } from "../../lib/events/types.ts";
+
 // ── Client → Server ───────────────────────────────────────────────────────
 
 export interface WsSubscribeMessage {
   type: "subscribe";
-  channels: Array<"requests" | "combo" | "credentials" | "compression" | "agents">;
+  channels: DashboardChannel[];
 }
 
 export interface WsPingMessage {
@@ -21,7 +23,7 @@ export type WsClientMessage = WsSubscribeMessage | WsPingMessage;
 
 export interface WsEventMessage {
   type: "event";
-  channel: "requests" | "combo" | "credentials" | "compression" | "agents";
+  channel: DashboardChannel;
   event: string;
   data: unknown;
 }
@@ -35,7 +37,7 @@ export interface WsWelcomeMessage {
   version: string;
   sessionId: string;
   serverTime: number;
-  channels: Array<"requests" | "combo" | "credentials" | "compression" | "agents">;
+  channels: DashboardChannel[];
   /** Number of buffered events since last reconnect */
   backlog: number;
 }

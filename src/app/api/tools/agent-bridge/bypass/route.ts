@@ -6,16 +6,16 @@
  */
 import { AgentBridgeBypassUpsertSchema } from "@/shared/schemas/agentBridge";
 import {
-  getAllBypassPatterns,
-  replaceUserBypassPatterns,
-  getUserBypassPatterns,
+  getAllBypassPatternsAsync,
+  replaceUserBypassPatternsAsync,
+  getUserBypassPatternsAsync,
 } from "@/lib/db/agentBridgeBypass";
 import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
 import { createErrorResponse } from "@/lib/api/errorResponse";
 
 export async function GET(): Promise<Response> {
   try {
-    const patterns = getAllBypassPatterns();
+    const patterns = await getAllBypassPatternsAsync();
     return Response.json({ patterns });
   } catch (err) {
     const msg = sanitizeErrorMessage(err instanceof Error ? err.message : String(err));
@@ -41,8 +41,8 @@ export async function POST(request: Request): Promise<Response> {
   }
 
   try {
-    replaceUserBypassPatterns(parsed.data.patterns);
-    const patterns = getAllBypassPatterns();
+    await replaceUserBypassPatternsAsync(parsed.data.patterns);
+    const patterns = await getAllBypassPatternsAsync();
     return Response.json({ ok: true, patterns });
   } catch (err) {
     const msg = sanitizeErrorMessage(err instanceof Error ? err.message : String(err));
@@ -59,10 +59,10 @@ export async function DELETE(request: Request): Promise<Response> {
   }
 
   try {
-    const existing = getUserBypassPatterns();
+    const existing = await getUserBypassPatternsAsync();
     const updated = existing.filter((p) => p !== pattern);
-    replaceUserBypassPatterns(updated);
-    const patterns = getAllBypassPatterns();
+    await replaceUserBypassPatternsAsync(updated);
+    const patterns = await getAllBypassPatternsAsync();
     return Response.json({ ok: true, patterns });
   } catch (err) {
     const msg = sanitizeErrorMessage(err instanceof Error ? err.message : String(err));

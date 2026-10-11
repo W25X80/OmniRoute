@@ -1,9 +1,12 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
+import fsp from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import { parse as parseToml } from "smol-toml";
 import { z } from "zod";
+import { parseDatabaseBackend } from "../../../../../src/lib/db/backendSelection";
+
 import { isReDoSProne, type RtkFilterDefinition } from "./filterSchema.ts";
 import { applyLineFilter } from "./lineFilter.ts";
 
@@ -130,7 +133,10 @@ function regexFields(filter: ParsedFilter): Array<{ field: string; pattern: stri
       field: "keep_lines_matching",
       pattern,
     })),
-    ...(filter.replace ?? []).map(({ pattern }) => ({ field: "replace.pattern", pattern })),
+    ...(filter.replace ?? []).map(({ pattern }) => ({
+      field: "replace.pattern",
+      pattern,
+    })),
     ...(filter.match_output ?? []).flatMap(({ pattern, unless }) => [
       { field: "match_output.pattern", pattern },
       ...(unless ? [{ field: "match_output.unless", pattern: unless }] : []),
@@ -287,7 +293,10 @@ export function getGlobalRtkTomlPath(): string {
 export function installGlobalRtkTomlV1(
   content: string,
   options: { overwrite?: boolean } = {}
-): RtkTomlCompatibilityResult & { installedPath: string; backupCreated: boolean } {
+): RtkTomlCompatibilityResult & {
+  installedPath: string;
+  backupCreated: boolean;
+} {
   const result = parseRtkTomlV1(content);
   if (!result.passed) {
     throw compatibilityError("one or more inline tests failed");
@@ -317,7 +326,11 @@ export function installGlobalRtkTomlV1(
   }
   const temporary = `${target}.${process.pid}.${crypto.randomUUID()}.tmp`;
   try {
-    fs.writeFileSync(temporary, content, { encoding: "utf8", mode: 0o600, flag: "wx" });
+    fs.writeFileSync(temporary, content, {
+      encoding: "utf8",
+      mode: 0o600,
+      flag: "wx",
+    });
     fs.renameSync(temporary, target);
     try {
       fs.chmodSync(target, 0o600);
@@ -332,3 +345,70 @@ export function installGlobalRtkTomlV1(
 }
 
 export const RTK_TOML_MAX_BYTES = MAX_TOML_BYTES;
+
+const NATIVE_INSTALLS = Symbol.for("omniroute.nativeRtkTomlInstalls");
+const installGlobals = globalThis as typeof globalThis & {
+  [NATIVE_INSTALLS]?: Map<string, Promise<unknown>>;
+};
+
+/** Serialize check/backup/replace for one native application's configured filter file. */
+export async function installGlobalRtkTomlV1Async(
+  content: string,
+  options: { overwrite?: boolean } = {}
+): Promise<RtkTomlCompatibilityResult & { installedPath: string; backupCreated: boolean }> {
+  if (parseDatabaseBackend() !== "postgres") return installGlobalRtkTomlV1(content, options);
+  const result = parseRtkTomlV1(content);
+  if (!result.passed) throw compatibilityError("one or more inline tests failed");
+  const target = getGlobalRtkTomlPath();
+  const installs = (installGlobals[NATIVE_INSTALLS] ??= new Map());
+  const previous = installs.get(target);
+  const installing = (async () => {
+    await previous?.catch(() => {});
+    const directory = path.dirname(target);
+    await fsp.mkdir(directory, { recursive: true, mode: 0o700 });
+    try {
+      await fsp.chmod(directory, 0o700);
+    } catch {
+      /* Preserve best-effort permissions. */
+    }
+    const exists = await fsp.access(target).then(
+      () => true,
+      () => false
+    );
+    if (exists && !options.overwrite)
+      throw compatibilityError("filters.toml already exists; confirm overwrite to replace it");
+    let backupCreated = false;
+    if (exists) {
+      await fsp.copyFile(target, `${target}.bak`);
+      try {
+        await fsp.chmod(`${target}.bak`, 0o600);
+      } catch {
+        /* Best effort, as before. */
+      }
+      backupCreated = true;
+    }
+    const temporary = `${target}.${process.pid}.${crypto.randomUUID()}.tmp`;
+    try {
+      await fsp.writeFile(temporary, content, {
+        encoding: "utf8",
+        mode: 0o600,
+        flag: "wx",
+      });
+      await fsp.rename(temporary, target);
+      try {
+        await fsp.chmod(target, 0o600);
+      } catch {
+        /* Best effort, as before. */
+      }
+    } finally {
+      await fsp.rm(temporary, { force: true });
+    }
+    return { ...result, installedPath: "rtk/filters.toml", backupCreated };
+  })();
+  installs.set(target, installing);
+  try {
+    return await installing;
+  } finally {
+    if (installs.get(target) === installing) installs.delete(target);
+  }
+}

@@ -8,7 +8,7 @@
  * `latencyMs` (Date.now() - startTime) and fires the fire-and-forget saveRequestUsage(...).catch().
  */
 
-import { buildErrorBody } from "../../utils/error.ts";
+import { buildErrorBody, sanitizeErrorMessage } from "../../utils/error.ts";
 
 export { readCpaAuthIndex } from "./cpaTraceAuthIndex.ts";
 
@@ -66,6 +66,7 @@ export function buildFailureUsageRecord(opts: {
   statusCode: number;
   errorCode: string | null | undefined;
   latencyMs: number;
+  timestamp?: string;
   endpoint?: string | null | undefined;
   cpaAuthIndex?: string | null | undefined;
   aggregate?: FailureUsageAggregate | null;
@@ -85,7 +86,7 @@ export function buildFailureUsageRecord(opts: {
     latencyMs: opts.latencyMs,
     timeToFirstTokenMs: 0,
     errorCode: opts.errorCode || String(opts.statusCode),
-    timestamp: new Date().toISOString(),
+    timestamp: opts.timestamp ?? new Date().toISOString(),
     connectionId: opts.connectionId || undefined,
     apiKeyId: opts.apiKeyInfo?.id || undefined,
     apiKeyName: opts.apiKeyInfo?.name || undefined,
@@ -94,4 +95,18 @@ export function buildFailureUsageRecord(opts: {
     endpoint: opts.endpoint || undefined,
     cpaAuthIndex: opts.cpaAuthIndex || undefined,
   };
+}
+
+/** Optional native failure usage settles safely; settlement is not a durable-write receipt. */
+export function observeFailureUsagePersistence(operation: Promise<void>): Promise<void> {
+  return operation.catch((error) => {
+    try {
+      console.warn(
+        "[USAGE] Failed to persist failed-request usage:",
+        sanitizeErrorMessage(error) || "Usage persistence failed"
+      );
+    } catch {
+      // Failure of optional accounting or its logger must not replace the provider response.
+    }
+  });
 }

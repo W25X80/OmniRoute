@@ -1,5 +1,6 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomUUID, webcrypto } from "node:crypto";
+import { chmod, mkdir, open, readFile, rm, stat } from "node:fs/promises";
 import {
   chmodSync,
   closeSync,
@@ -14,7 +15,14 @@ import { basename, join } from "node:path";
 
 import { unzipSync } from "fflate";
 
-import { atomicWriteFile, getConfigDir } from "../../vendor/codex-chatgpt-web/config.ts";
+import { parseDatabaseBackend } from "../../../src/lib/db/backendSelection";
+import { closeTunnelZipWorkers, extractTunnelBinaryAsync } from "./tunnelZipClient";
+
+import {
+  atomicWriteFile,
+  atomicWriteFileAsync,
+  getConfigDir,
+} from "../../vendor/codex-chatgpt-web/config.ts";
 
 export const CHATGPT_WEB_CODEX_TUNNEL_VERSION = "0.0.13";
 const MIGRATABLE_TUNNEL_VERSIONS = new Set(["0.0.10", "0.0.12"]);
@@ -260,6 +268,7 @@ function restoreTunnelInstallation(
 }
 
 export async function ensureTunnelClientInstalled(): Promise<string> {
+  if (nativeTunnelFiles()) return ensureNativeTunnelClientInstalled();
   const paths = tunnelClientPaths();
   const existing = inspectExistingTunnelInstallation(paths);
   if (existing?.action === "reuse") return paths.binary;
@@ -325,15 +334,17 @@ function validateRuntimeConfig(config: TunnelRuntimeConfig) {
 
 export async function startTunnelRuntime(config: TunnelRuntimeConfig): Promise<ChildProcess> {
   validateRuntimeConfig(config);
-  acquireTunnelSupervisorLease();
+  if (nativeTunnelFiles()) await acquireTunnelSupervisorLeaseAsync();
+  else acquireTunnelSupervisorLease();
   const binary = await ensureTunnelClientInstalled();
   const paths = tunnelClientPaths();
   const runtimeKeyFile = join(
     paths.root,
     `runtime-key-${createHash("sha256").update(config.tunnelId).digest("hex").slice(0, 16)}`
   );
-  atomicWriteFile(runtimeKeyFile, config.runtimeKey.trim());
-  runtimeKeyFiles.add(runtimeKeyFile);
+  if (nativeTunnelFiles()) await atomicWriteFileAsync(runtimeKeyFile, config.runtimeKey.trim());
+  else atomicWriteFile(runtimeKeyFile, config.runtimeKey.trim());
+  tunnelKeyFiles().add(runtimeKeyFile);
   const alias = config.alias ?? "omniroute-chatgpt-web-codex";
   const profile = config.profile ?? "omniroute";
   const mcpCommand = [
@@ -428,6 +439,10 @@ export async function getTunnelRuntimeStatus(
 ): Promise<TunnelRuntimeStatus> {
   const binary = await ensureTunnelClientInstalled();
   const alias = config.alias ?? "omniroute-chatgpt-web-codex";
+  if (nativeTunnelFiles()) {
+    const result = await runTunnelCommandAsync(binary, buildTunnelRuntimeStatusArgs(alias), 5_000);
+    return parseTunnelRuntimeStatus(result.stdout || result.stderr, result.status);
+  }
   const result = spawnSync(binary, buildTunnelRuntimeStatusArgs(alias), {
     encoding: "utf8",
     timeout: 5_000,
@@ -456,7 +471,8 @@ export function ensureTunnelRuntimeReady(
   timeoutMs = 30_000
 ): Promise<void> {
   const identity = runtimeIdentity(config);
-  const existing = connectedRuntimes.get(identity);
+  const runtimes = tunnelRuntimes();
+  const existing = runtimes.get(identity);
   if (existing) return existing;
   const connecting = (async () => {
     const child = await startTunnelRuntime(config);
@@ -490,12 +506,13 @@ export function ensureTunnelRuntimeReady(
     }
     if (!status.ok) throw new Error(`Tunnel runtime is not ready: ${status.detail}`);
   })();
-  connectedRuntimes.set(identity, connecting);
-  void connecting.catch(() => connectedRuntimes.delete(identity));
+  runtimes.set(identity, connecting);
+  void connecting.catch(() => runtimes.delete(identity));
   return connecting;
 }
 
 export async function stopChatGptWebCodexTunnelRuntime(): Promise<void> {
+  if (nativeTunnelFiles()) return stopNativeTunnelRuntime();
   const paths = tunnelClientPaths();
   if (ownsSupervisorLease && existsSync(paths.binary)) {
     spawnSync(paths.binary, buildTunnelRuntimeStopArgs("omniroute-chatgpt-web-codex"), {
@@ -507,4 +524,314 @@ export async function stopChatGptWebCodexTunnelRuntime(): Promise<void> {
   for (const runtimeKeyFile of runtimeKeyFiles) rmSync(runtimeKeyFile, { force: true });
   runtimeKeyFiles.clear();
   releaseTunnelSupervisorLease();
+}
+
+const NATIVE_TUNNEL = Symbol.for("omniroute.codex.native-tunnel.v1");
+type NativeTunnel = {
+  home: string;
+  ownsLease: boolean;
+  installing?: Promise<string>;
+  acquiringLease?: Promise<void>;
+  runtimes: Map<string, Promise<void>>;
+  keyFiles: Set<string>;
+  closing: boolean;
+};
+const nativeTunnelHolders = globalThis as typeof globalThis & {
+  [NATIVE_TUNNEL]?: NativeTunnel;
+};
+function nativeTunnelFiles(): boolean {
+  return parseDatabaseBackend() === "postgres";
+}
+function nativeTunnel(): NativeTunnel {
+  const home = getConfigDir();
+  const state = nativeTunnelHolders[NATIVE_TUNNEL];
+  if (state && state.home !== home) throw new Error("Tunnel runtime home changed while active");
+  return (
+    state ??
+    (nativeTunnelHolders[NATIVE_TUNNEL] = {
+      home,
+      ownsLease: false,
+      runtimes: new Map(),
+      keyFiles: new Set(),
+      closing: false,
+    })
+  );
+}
+function tunnelRuntimes() {
+  return nativeTunnelFiles() ? nativeTunnel().runtimes : connectedRuntimes;
+}
+function tunnelKeyFiles() {
+  return nativeTunnelFiles() ? nativeTunnel().keyFiles : runtimeKeyFiles;
+}
+async function fileExistsAsync(path: string): Promise<boolean> {
+  try {
+    await stat(path);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+}
+async function sha256Async(bytes: Uint8Array): Promise<string> {
+  const digest = await webcrypto.subtle.digest("SHA-256", bytes as Uint8Array<ArrayBuffer>);
+  return Buffer.from(digest).toString("hex");
+}
+
+export function runTunnelCommandAsync(
+  binary: string,
+  args: string[],
+  timeoutMs: number
+): Promise<{ stdout: string; stderr: string; status: number }> {
+  return new Promise((resolveCommand) => {
+    let stdout = "";
+    let stderr = "";
+    let bytes = 0;
+    let ended = false;
+    let failed = false;
+    let hardKill: ReturnType<typeof setTimeout> | undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const child = spawn(binary, args, { stdio: ["ignore", "pipe", "pipe"] });
+    const settle = (status = 1) => {
+      if (ended) return;
+      ended = true;
+      if (timer) clearTimeout(timer);
+      if (hardKill) clearTimeout(hardKill);
+      resolveCommand({ stdout, stderr, status: failed ? 1 : status });
+    };
+    const stop = () => {
+      if (failed) return;
+      failed = true;
+      child.kill("SIGTERM");
+      hardKill = setTimeout(() => child.kill("SIGKILL"), 100);
+    };
+    child.stdout?.setEncoding("utf8");
+    child.stderr?.setEncoding("utf8");
+    const collect = (kind: "stdout" | "stderr", chunk: string) => {
+      bytes += Buffer.byteLength(chunk);
+      if (bytes > 1024 * 1024) {
+        stop();
+        return;
+      }
+      if (kind === "stdout") stdout += String(chunk);
+      else stderr += String(chunk);
+    };
+    child.stdout?.on("data", (chunk: string) => collect("stdout", chunk));
+    child.stderr?.on("data", (chunk: string) => collect("stderr", chunk));
+    child.once("error", () => {
+      failed = true;
+      settle();
+    });
+    child.once("close", (code, signal) => settle(signal ? 1 : (code ?? 1)));
+    timer = setTimeout(stop, timeoutMs);
+  });
+}
+
+export async function tunnelSupervisorLeaseStatusAsync(): Promise<{
+  ownedByCurrentProcess: boolean;
+  conflict: boolean;
+  ownerPid?: number;
+}> {
+  const path = tunnelClientPaths().supervisorLease;
+  try {
+    const lease = JSON.parse(await readFile(path, "utf8")) as Partial<SupervisorLease>;
+    const ownerPid = Number(lease.pid) || undefined;
+    return {
+      ownedByCurrentProcess: ownerPid === process.pid,
+      conflict: Boolean(ownerPid && ownerPid !== process.pid && processIsAlive(ownerPid)),
+      ...(ownerPid ? { ownerPid } : {}),
+    };
+  } catch {
+    return { ownedByCurrentProcess: false, conflict: false };
+  }
+}
+
+export async function acquireTunnelSupervisorLeaseAsync(): Promise<void> {
+  const state = nativeTunnel();
+  if (state.closing) throw new Error("Tunnel runtime is closing");
+  if (state.ownsLease) return;
+  if (state.acquiringLease) return state.acquiringLease;
+  const acquiring = (async () => {
+    const paths = tunnelClientPaths();
+    await mkdir(paths.root, { recursive: true, mode: 0o700 });
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        const fd = await open(paths.supervisorLease, "wx", 0o600);
+        try {
+          await fd.writeFile(
+            `${JSON.stringify({ version: 1, pid: process.pid, startedAt: new Date().toISOString() })}\n`
+          );
+        } finally {
+          await fd.close();
+        }
+        state.ownsLease = true;
+        return;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        let ownerPid = 0;
+        try {
+          ownerPid =
+            Number(
+              (
+                JSON.parse(
+                  await readFile(paths.supervisorLease, "utf8")
+                ) as Partial<SupervisorLease>
+              ).pid
+            ) || 0;
+        } catch {
+          ownerPid = 0;
+        }
+        if (ownerPid === process.pid) {
+          state.ownsLease = true;
+          return;
+        }
+        if (processIsAlive(ownerPid))
+          throw new Error(`ChatGPT Web (Codex) supervisor is already owned by process ${ownerPid}`);
+        await rm(paths.supervisorLease, { force: true });
+      }
+    }
+    throw new Error("ChatGPT Web (Codex) supervisor lease could not be acquired");
+  })();
+  state.acquiringLease = acquiring;
+  try {
+    await acquiring;
+  } finally {
+    if (state.acquiringLease === acquiring) state.acquiringLease = undefined;
+  }
+}
+
+async function requireReportedTunnelVersionAsync(
+  binary: string,
+  expectedVersion: string,
+  errorMessage: string
+): Promise<void> {
+  const result = await runTunnelCommandAsync(binary, ["--version"], 5_000);
+  if (result.status !== 0 || !`${result.stdout}\n${result.stderr}`.includes(expectedVersion))
+    throw new Error(errorMessage);
+}
+
+async function inspectExistingTunnelInstallationAsync(
+  paths: TunnelClientPaths
+): Promise<
+  { action: "reuse" | "upgrade"; previousInstallation: PreviousInstallation } | undefined
+> {
+  if (!(await fileExistsAsync(paths.binary)) || !(await fileExistsAsync(paths.manifest)))
+    return undefined;
+  const manifestText = await readFile(paths.manifest, "utf8");
+  const manifest = JSON.parse(manifestText) as Partial<InstallManifest>;
+  const installedBinary = new Uint8Array(await readFile(paths.binary));
+  if (
+    manifest.version !== 1 ||
+    typeof manifest.tunnelClientVersion !== "string" ||
+    manifest.binarySha256 !== (await sha256Async(installedBinary))
+  )
+    throw new Error("Existing tunnel-client failed integrity validation");
+  await requireReportedTunnelVersionAsync(
+    paths.binary,
+    manifest.tunnelClientVersion,
+    `Existing tunnel-client did not report version ${manifest.tunnelClientVersion}`
+  );
+  return {
+    action: tunnelClientInstallAction(manifest.tunnelClientVersion),
+    previousInstallation: { binary: installedBinary, manifestText },
+  };
+}
+
+async function restoreTunnelInstallationAsync(
+  paths: TunnelClientPaths,
+  previousInstallation: PreviousInstallation | undefined
+): Promise<void> {
+  if (!previousInstallation) return;
+  await atomicWriteFileAsync(paths.binary, previousInstallation.binary);
+  if (process.platform !== "win32") await chmod(paths.binary, 0o700);
+  await atomicWriteFileAsync(paths.manifest, previousInstallation.manifestText);
+}
+
+async function installNativeTunnelClient(): Promise<string> {
+  const paths = tunnelClientPaths();
+  const existing = await inspectExistingTunnelInstallationAsync(paths);
+  if (existing?.action === "reuse") return paths.binary;
+  const asset = tunnelPlatformAsset();
+  const [archive, checksumFile] = await Promise.all([
+    download(`${RELEASE_BASE}/${asset}`),
+    download(`${RELEASE_BASE}/SHA256SUMS.txt`),
+  ]);
+  const expected = parseTunnelChecksum(new TextDecoder().decode(checksumFile), asset);
+  const archiveSha256 = await sha256Async(archive);
+  if (archiveSha256 !== expected) throw new Error(`Checksum mismatch for ${asset}`);
+  const executableName = process.platform === "win32" ? "tunnel-client.exe" : "tunnel-client";
+  const binary = await extractTunnelBinaryAsync(archive, executableName);
+  const stagedBinary = `${paths.binary}.install-${process.pid}-${randomUUID()}`;
+  await atomicWriteFileAsync(stagedBinary, binary);
+  try {
+    if (process.platform !== "win32") await chmod(stagedBinary, 0o700);
+    await requireReportedTunnelVersionAsync(
+      stagedBinary,
+      CHATGPT_WEB_CODEX_TUNNEL_VERSION,
+      "Installed tunnel-client did not report the pinned version"
+    );
+  } finally {
+    await rm(stagedBinary, { force: true });
+  }
+  const manifest: InstallManifest = {
+    version: 1,
+    tunnelClientVersion: CHATGPT_WEB_CODEX_TUNNEL_VERSION,
+    asset,
+    archiveSha256,
+    binarySha256: await sha256Async(binary),
+  };
+  try {
+    await atomicWriteFileAsync(paths.binary, binary);
+    if (process.platform !== "win32") await chmod(paths.binary, 0o700);
+    await atomicWriteFileAsync(paths.manifest, `${JSON.stringify(manifest, null, 2)}\n`);
+  } catch (error) {
+    await restoreTunnelInstallationAsync(paths, existing?.previousInstallation);
+    throw error;
+  }
+  return paths.binary;
+}
+
+function ensureNativeTunnelClientInstalled(): Promise<string> {
+  const state = nativeTunnel();
+  if (state.closing) return Promise.reject(new Error("Tunnel runtime is closing"));
+  if (state.installing) return state.installing;
+  const installing = installNativeTunnelClient();
+  state.installing = installing;
+  void installing.then(
+    () => {
+      if (state.installing === installing) state.installing = undefined;
+    },
+    () => {
+      if (state.installing === installing) state.installing = undefined;
+    }
+  );
+  return installing;
+}
+
+async function stopNativeTunnelRuntime(): Promise<void> {
+  const state = nativeTunnel();
+  state.closing = true;
+  const paths = tunnelClientPaths();
+  await Promise.allSettled([
+    ...state.runtimes.values(),
+    ...(state.installing ? [state.installing] : []),
+    ...(state.acquiringLease ? [state.acquiringLease] : []),
+  ]);
+  try {
+    if (state.ownsLease && (await fileExistsAsync(paths.binary)))
+      await runTunnelCommandAsync(
+        paths.binary,
+        buildTunnelRuntimeStopArgs("omniroute-chatgpt-web-codex"),
+        10_000
+      );
+  } finally {
+    state.runtimes.clear();
+    for (const path of state.keyFiles) await rm(path, { force: true });
+    state.keyFiles.clear();
+    const lease = await tunnelSupervisorLeaseStatusAsync();
+    if (state.ownsLease && lease.ownedByCurrentProcess)
+      await rm(paths.supervisorLease, { force: true });
+    state.ownsLease = false;
+    await closeTunnelZipWorkers();
+    if (nativeTunnelHolders[NATIVE_TUNNEL] === state) delete nativeTunnelHolders[NATIVE_TUNNEL];
+  }
 }

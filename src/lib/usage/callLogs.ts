@@ -1,3 +1,10 @@
+import { getSelectedCallLogRepository } from "../db/postgres/callLogRepository";
+import { getSelectedPersistenceIdentity } from "../db/controlPlaneContext";
+import {
+  isApplicationPersistenceIdentity,
+  runPersistenceBackgroundWork,
+} from "../db/persistenceRuntime";
+import { isNoLog, isNoLogAsync } from "../compliance/noLog";
 /**
  * Structured call log management.
  *
@@ -10,11 +17,16 @@ import path from "node:path";
 import type { RequestPipelinePayloads } from "@omniroute/open-sse/utils/requestLogger.ts";
 import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/errorSanitization.ts";
 import { getDbInstance } from "../db/core";
-import { getRequestDetailLogByCallLogId } from "../db/detailedLogs";
+import { getRequestDetailLogByCallLogIdAsync } from "../db/detailedLogs";
 import { shouldPersistToDisk } from "./migrations";
 import { updateRequestTokensById } from "./usageHistory";
-import { getCallLogApiKeyContext } from "./callLogApiKeyContext";
-import { serializeResilienceActions, resetResilienceActions } from "./resilienceActionsContext";
+import { getCallLogApiKeyContext, type CallLogApiKeyContext } from "./callLogApiKeyContext";
+import {
+  serializeResilienceActions,
+  resetResilienceActions,
+  captureResilienceActions,
+  type CapturedResilienceActions,
+} from "./resilienceActionsContext";
 import { parseResilienceActions } from "./resilienceActionsParse";
 import {
   seedPendingContinuationState,
@@ -34,7 +46,7 @@ import {
   isNonTextRequest,
   resolveUsageProvenance,
 } from "./callContentProvenance";
-import { isNoLog } from "../compliance/noLog";
+
 import {
   parseStoredPayload,
   protectErrorPayloadForLog,
@@ -44,6 +56,8 @@ import { pickDisplayValue } from "@/shared/utils/maskEmail";
 import {
   CALL_LOGS_DIR,
   readCallArtifact,
+  readCallArtifactAsync,
+  deleteCallArtifactAsync,
   type CallLogArtifact,
   type CallLogDetailState,
 } from "./callLogArtifacts";
@@ -61,13 +75,14 @@ import {
   toStoredErrorType,
 } from "./callLogs/format";
 import {
-  clearArtifactReference,
+  clearArtifactReferenceAsync,
   cleanupOrphanCallLogFiles,
   cleanupOverflowCallLogFiles,
   deleteCallLogsBefore,
   trimCallLogsToMaxRows,
   rotateCallLogs,
   scheduleCallLogRotation,
+  scheduleCallLogRotationAsync,
 } from "./callLogRotation";
 
 // Re-exported for existing importers (usageDb.ts, compliance/index.ts, purge-logs route,
@@ -144,11 +159,6 @@ type LegacyInlineRow = {
   request_body: string | null;
   response_body: string | null;
   error: string | null;
-};
-
-type DeleteResult = {
-  deletedRows: number;
-  deletedArtifacts: number;
 };
 
 const CALL_LOG_ID_RETRY_LIMIT = 3;
@@ -379,6 +389,7 @@ function hasTable(tableName: string): boolean {
 }
 
 function hasCallLogsColumn(columnName: string): boolean {
+  if (getSelectedCallLogRepository()) return true;
   // One PRAGMA per INSERT is wasteful; the cached answer is invalidated only
   // when a write fails with "no such column" (concurrent migration race).
   const cached = (hasCallLogsColumn as { cache?: Map<string, boolean> }).cache;
@@ -523,18 +534,6 @@ function mapSummaryRow(row: CallLogSummaryRow) {
   };
 }
 
-function buildLegacyPipelinePayloads(id: string) {
-  const detailed = getRequestDetailLogByCallLogId(id);
-  if (!detailed) return null;
-
-  return {
-    clientRequest: detailed.client_request ?? null,
-    providerRequest: detailed.translated_request ?? null,
-    providerResponse: detailed.provider_response ?? null,
-    clientResponse: detailed.client_response ?? null,
-  };
-}
-
 function getLegacyInlineDetail(id: string) {
   if (!hasTable("call_logs_v1_legacy")) return null;
 
@@ -551,21 +550,36 @@ function getLegacyInlineDetail(id: string) {
   };
 }
 
-async function saveCallLogOperation(entry: any): Promise<void> {
+interface NativeCallLogContext {
+  readonly apiKeyContext: CallLogApiKeyContext | null;
+  readonly resilience: CapturedResilienceActions;
+}
+
+function reportCallLogSaveFailure(error: unknown): void {
+  console.error(
+    "[callLogs] Failed to save call log:",
+    sanitizeErrorMessage(error) || "Call log persistence failed"
+  );
+}
+
+async function saveCallLogOperation(entry: any, captured?: NativeCallLogContext): Promise<void> {
   try {
     // Bind the DB instance up front, before any await (resolveAccountName,
     // writeCallArtifactAsync). If the singleton is reset/closed while this
     // operation awaits, the insert must target the instance this request
     // started against — a closed handle fails into the catch below instead of
     // silently writing into whatever database opened afterwards (#12780).
-    const db = getDbInstance();
-    const apiKeyContext = getCallLogApiKeyContext();
+    const postgres = getSelectedCallLogRepository();
+    const db = postgres ? undefined : getDbInstance();
+    const apiKeyContext = captured ? captured.apiKeyContext : getCallLogApiKeyContext();
     // `||` (not `??`): an empty-string apiKeyId/apiKeyName is "unattributed",
     // same as before this fallback existed — it must not be persisted verbatim
     // nor block the request-scoped context.
     const apiKeyId = entry.apiKeyId || apiKeyContext?.apiKeyId || null;
     const apiKeyName = entry.apiKeyName || apiKeyContext?.apiKeyName || null;
-    const noLogEnabled = Boolean(entry.noLog) || (apiKeyId ? isNoLog(apiKeyId) : false);
+    const noLogEnabled =
+      Boolean(entry.noLog) ||
+      (apiKeyId ? (postgres ? await isNoLogAsync(apiKeyId) : isNoLog(apiKeyId)) : false);
 
     const protectedRequestBody = noLogEnabled ? null : protectPayloadForLog(entry.requestBody);
     const responseStatus = Number(entry.status);
@@ -586,11 +600,10 @@ async function saveCallLogOperation(entry: any): Promise<void> {
     // Bridges the window before this row's own artifact write (queued below,
     // async) lands with detail_state = 'ready': a client that fires its next
     // turn immediately -- normal in a tight tool-calling loop -- can reach
-    // resolvePreviousResponseState before that write exists at all. Seeded
-    // synchronously, before any await, from the same protected pipeline
-    // payload the artifact will eventually hold (and the same
-    // videoContentRemoved/fail-closed rules), so it is available the instant
-    // this function is called. See responsesContinuationStore.ts.
+    // resolvePreviousResponseState before that write exists at all. SQLite seeds
+    // before its first await; PostgreSQL first awaits authoritative privacy.
+    // Both use the same protected pipeline payload and videoContentRemoved /
+    // fail-closed rules. See responsesContinuationStore.ts.
     if (typeof entry.responseId === "string" && entry.responseId.length > 0) {
       seedPendingContinuationState(
         entry.responseId,
@@ -603,11 +616,11 @@ async function saveCallLogOperation(entry: any): Promise<void> {
       );
     }
 
-    // resilience resilience summary for this attempt (implicit ALS store opened
-    // around the attempt; null outside a store or when nothing was noted).
-    // Read BEFORE any await: the ALS context is synchronous and later awaits
-    // (resolveAccountName, artifact write) may cross async boundaries.
-    const resilienceActions = serializeResilienceActions();
+    // Native application saves captured this attempt before enqueueing. Direct
+    // saves retain the source read/reset path in their explicit caller scope.
+    const resilienceActions = captured
+      ? captured.resilience.serialized
+      : serializeResilienceActions();
     const hasResilienceColumn = hasCallLogsColumn("resilience_actions");
 
     const account = await resolveAccountName(entry.connectionId || null);
@@ -791,8 +804,10 @@ async function saveCallLogOperation(entry: any): Promise<void> {
     // Optional column (migration 191) — only fixed identifiers are spliced in.
     const resilienceCol = hasResilienceColumn ? ", resilience_actions" : "";
     const resilienceParam = hasResilienceColumn ? ", @resilienceActions" : "";
-    const insertStmt = db.prepare(
-      `
+    const insertStmt = postgres
+      ? undefined
+      : db!.prepare(
+          `
       INSERT INTO call_logs (
         id, timestamp, method, path, status, model, requested_model, provider,
         account, connection_id, duration, ttft_ms, tokens_in, tokens_out,
@@ -824,7 +839,7 @@ async function saveCallLogOperation(entry: any): Promise<void> {
         @addedWaitMs, @addedWaitCause${resilienceParam}
       )
     `
-    );
+        );
     const insertParams = {
       ...logEntry,
       errorSummary: toStoredErrorSummary(protectedError),
@@ -842,7 +857,19 @@ async function saveCallLogOperation(entry: any): Promise<void> {
     // Keep the already-written artifact path; only the SQLite primary key is regenerated.
     for (let attempt = 0; ; attempt++) {
       try {
-        insertStmt.run(insertParams);
+        if (postgres) {
+          const result = await postgres.insert(insertParams);
+          if (!result.inserted) {
+            if (attempt >= CALL_LOG_ID_RETRY_LIMIT)
+              throw new Error("Call log id collision limit exceeded");
+            insertParams.id = generateLogId();
+            continue;
+          }
+          if (!result.payloadAccepted && artifactRelPath) {
+            await deleteCallArtifactAsync(artifactRelPath);
+            detailState = "none";
+          }
+        } else insertStmt!.run(insertParams);
         break;
       } catch (error) {
         if (!isCallLogIdCollision(error) || attempt >= CALL_LOG_ID_RETRY_LIMIT) throw error;
@@ -852,7 +879,8 @@ async function saveCallLogOperation(entry: any): Promise<void> {
     // sink note: the sink is the unique consumer — reset only after a successful
     // INSERT, so a failed write (or a second persistence of the same
     // attempt) keeps the summary instead of silently writing NULL.
-    resetResilienceActions();
+    if (captured) captured.resilience.consume();
+    else resetResilienceActions();
 
     if (detailState === "ready" && typeof logEntry.responseId === "string") {
       // The durable row is now authoritative; drop the bridge entry instead
@@ -860,15 +888,12 @@ async function saveCallLogOperation(entry: any): Promise<void> {
       clearPendingContinuationState(logEntry.responseId);
     }
 
-    scheduleCallLogRotation();
+    scheduleCallLogRotationAsync();
   } catch (error) {
     if (String((error as Error)?.message ?? error).includes("no such column")) {
       invalidateCallLogsColumnCache();
     }
-    console.error(
-      "[callLogs] Failed to save call log:",
-      sanitizeErrorMessage(error) || "Call log persistence failed"
-    );
+    reportCallLogSaveFailure(error);
   }
 }
 
@@ -887,7 +912,37 @@ export function saveCallLog(entry: any): Promise<void> {
   }
   if (!shouldPersistToDisk || callLogSavesClosing) return Promise.resolve();
 
-  const operation = saveCallLogOperation(entry);
+  let operation: Promise<void>;
+  try {
+    const identity = getSelectedPersistenceIdentity();
+    if (isApplicationPersistenceIdentity(identity)) {
+      const apiKeyContext = getCallLogApiKeyContext();
+      const captured: NativeCallLogContext = {
+        apiKeyContext: apiKeyContext ? { ...apiKeyContext } : null,
+        resilience: captureResilienceActions(),
+      };
+      const capturedEntry = {
+        ...entry,
+        id: typeof entry.id === "string" && entry.id.length > 0 ? entry.id : generateLogId(),
+        timestamp: typeof entry.timestamp === "string" ? entry.timestamp : new Date().toISOString(),
+      };
+      operation = runPersistenceBackgroundWork(() => {
+        if (
+          !isApplicationPersistenceIdentity(identity) ||
+          getSelectedPersistenceIdentity() !== identity
+        ) {
+          throw new Error("Call log persistence authority changed before admission");
+        }
+        return saveCallLogOperation(capturedEntry, captured);
+      }).catch(reportCallLogSaveFailure);
+    } else {
+      // Standalone native planes retain their explicit-await contract; SQLite starts immediately.
+      operation = saveCallLogOperation(entry);
+    }
+  } catch (error) {
+    reportCallLogSaveFailure(error);
+    return Promise.resolve();
+  }
   pendingCallLogSaves.add(operation);
   void operation.then(
     () => pendingCallLogSaves.delete(operation),
@@ -951,6 +1006,9 @@ function pushLikeFilter(
 }
 
 export async function getCallLogs(filter: any = {}) {
+  const postgres = getSelectedCallLogRepository();
+  if (postgres)
+    return (await postgres.list(filter)).map((row) => mapSummaryRow(row as CallLogSummaryRow));
   const db = getDbInstance();
   let sql = `
     SELECT cl.*,
@@ -1043,10 +1101,13 @@ export async function getCallLogs(filter: any = {}) {
 }
 
 export async function getCallLogById(id: string) {
-  const db = getDbInstance();
-  const row = db
-    .prepare(
-      `SELECT cl.*,
+  const postgres = getSelectedCallLogRepository();
+  const db = postgres ? undefined : getDbInstance();
+  const row = postgres
+    ? ((await postgres.byId(id)) as CallLogSummaryRow | undefined)
+    : (db!
+        .prepare(
+          `SELECT cl.*,
         pn.name AS provider_node_name,
         pn.prefix AS provider_node_prefix,
         ${RESOLVED_ACCOUNT_SQL} AS resolved_account
@@ -1054,8 +1115,8 @@ export async function getCallLogById(id: string) {
        LEFT JOIN provider_nodes pn ON pn.id = cl.provider
        LEFT JOIN provider_connections pc ON pc.id = cl.connection_id
        WHERE cl.id = ?`
-    )
-    .get(id) as CallLogSummaryRow | undefined;
+        )
+        .get(id) as CallLogSummaryRow | undefined);
   if (!row) return null;
 
   const entry = mapSummaryRow(row);
@@ -1063,7 +1124,9 @@ export async function getCallLogById(id: string) {
   let artifactRelPath = entry.artifactRelPath;
 
   if (artifactRelPath) {
-    const artifactResult = readCallArtifact(artifactRelPath);
+    const artifactResult = postgres
+      ? await readCallArtifactAsync(artifactRelPath)
+      : readCallArtifact(artifactRelPath);
     if (artifactResult.state === "ready" && artifactResult.artifact) {
       return {
         ...entry,
@@ -1071,7 +1134,8 @@ export async function getCallLogById(id: string) {
         requestBody: artifactResult.artifact.requestBody ?? null,
         responseBody: artifactResult.artifact.responseBody ?? null,
         error: artifactResult.artifact.error ?? entry.error,
-        pipelinePayloads: artifactResult.artifact.pipeline ?? buildLegacyPipelinePayloads(id),
+        pipelinePayloads:
+          artifactResult.artifact.pipeline ?? (await buildLegacyPipelinePayloadsAsync(id)),
         hasPipelineDetails: Boolean(artifactResult.artifact.pipeline) || entry.hasPipelineDetails,
         active: false,
       };
@@ -1079,17 +1143,18 @@ export async function getCallLogById(id: string) {
 
     detailState = artifactResult.state;
     if (artifactResult.state === "missing") {
-      clearArtifactReference(artifactRelPath, "missing");
+      await clearArtifactReferenceAsync(artifactRelPath, "missing");
       artifactRelPath = null;
     } else {
-      db.prepare("UPDATE call_logs SET detail_state = ? WHERE id = ?").run("corrupt", id);
+      if (postgres) await postgres.setDetailState(id, "corrupt");
+      else db!.prepare("UPDATE call_logs SET detail_state = ? WHERE id = ?").run("corrupt", id);
     }
   }
 
   if (detailState === "legacy-inline") {
-    const legacyInline = getLegacyInlineDetail(id);
+    const legacyInline = await getLegacyInlineDetailAsync(id);
     if (legacyInline) {
-      const legacyPipeline = buildLegacyPipelinePayloads(id);
+      const legacyPipeline = await buildLegacyPipelinePayloadsAsync(id);
       return {
         ...entry,
         detailState,
@@ -1102,9 +1167,9 @@ export async function getCallLogById(id: string) {
     }
   }
 
-  const legacyDisk = readLegacyLogFromDisk(entry);
+  const legacyDisk = postgres ? null : readLegacyLogFromDisk(entry);
   if (legacyDisk) {
-    const legacyPipeline = buildLegacyPipelinePayloads(id);
+    const legacyPipeline = await buildLegacyPipelinePayloadsAsync(id);
     return {
       ...entry,
       detailState,
@@ -1118,7 +1183,7 @@ export async function getCallLogById(id: string) {
     };
   }
 
-  const legacyPipeline = buildLegacyPipelinePayloads(id);
+  const legacyPipeline = await buildLegacyPipelinePayloadsAsync(id);
   return {
     ...entry,
     detailState,
@@ -1133,11 +1198,14 @@ export async function getCallLogById(id: string) {
 }
 
 export async function exportCallLogsSince(since: string) {
-  const db = getDbInstance();
-  const ids = db
-    .prepare("SELECT id FROM call_logs WHERE timestamp >= ? ORDER BY timestamp DESC")
-    .all(since)
-    .map((row) => String((row as { id: string }).id));
+  const postgres = getSelectedCallLogRepository();
+  const db = postgres ? undefined : getDbInstance();
+  const ids = postgres
+    ? await postgres.idsSince(since, Number.MAX_SAFE_INTEGER)
+    : db!
+        .prepare("SELECT id FROM call_logs WHERE timestamp >= ? ORDER BY timestamp DESC")
+        .all(since)
+        .map((row) => String((row as { id: string }).id));
 
   const logs: unknown[] = [];
   for (const id of ids) {
@@ -1174,14 +1242,44 @@ export async function* iterateCallLogsSince(
   since: string,
   limit: number
 ): AsyncGenerator<unknown, void, void> {
-  const db = getDbInstance();
-  const ids = db
-    .prepare("SELECT id FROM call_logs WHERE timestamp >= ? ORDER BY timestamp DESC LIMIT ?")
-    .all(since, limit)
-    .map((row) => String((row as { id: string }).id));
+  const postgres = getSelectedCallLogRepository();
+  const db = postgres ? undefined : getDbInstance();
+  const ids = postgres
+    ? await postgres.idsSince(since, limit)
+    : db!
+        .prepare("SELECT id FROM call_logs WHERE timestamp >= ? ORDER BY timestamp DESC LIMIT ?")
+        .all(since, limit)
+        .map((row) => String((row as { id: string }).id));
 
   for (const id of ids) {
     const log = await getCallLogById(id);
     if (log) yield log;
   }
+}
+
+async function buildLegacyPipelinePayloadsAsync(id: string) {
+  const detailed = await getRequestDetailLogByCallLogIdAsync(id);
+  if (!detailed) return null;
+  return {
+    clientRequest: detailed.client_request ?? null,
+    providerRequest: detailed.translated_request ?? null,
+    providerResponse: detailed.provider_response ?? null,
+    clientResponse: detailed.client_response ?? null,
+  };
+}
+async function getLegacyInlineDetailAsync(id: string) {
+  const postgres = getSelectedCallLogRepository();
+  if (!postgres) return getLegacyInlineDetail(id);
+  const row = await postgres.legacyById(id);
+  return row
+    ? {
+        requestBody: parseStoredPayload(row.request_body),
+        responseBody: parseStoredPayload(row.response_body),
+        error: parseInlineError(row.error),
+      }
+    : null;
+}
+export async function countCallLogsSinceAsync(since: string): Promise<number> {
+  const postgres = getSelectedCallLogRepository();
+  return postgres ? postgres.countSince(since) : countCallLogsSince(since);
 }

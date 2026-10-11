@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
-import { retrieveBlock } from "@omniroute/open-sse/services/compression/engines/ccr/index";
+import { retrieveBlockAsync } from "@omniroute/open-sse/services/compression/engines/ccr/index";
 import { queryBlock } from "@omniroute/open-sse/services/compression/engines/ccr/ccrQuery";
 import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
 
@@ -34,7 +34,7 @@ export async function POST(req: Request) {
     );
   }
   try {
-    const block = retrieveBlock(parsed.data.hash); // string | null; no principalId → management scope
+    const block = await retrieveBlockAsync(parsed.data.hash); // string | null; no principalId → management scope
     if (block == null) return NextResponse.json({ found: false });
     if (!parsed.data.mode || parsed.data.mode === "full") {
       return NextResponse.json({ found: true, block });

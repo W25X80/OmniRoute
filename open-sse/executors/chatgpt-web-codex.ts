@@ -1,4 +1,10 @@
 import { existsSync } from "node:fs";
+import { parseDatabaseBackend } from "../../src/lib/db/backendSelection.ts";
+import {
+  chromeExecutableCandidates,
+  detectChromeExecutableAsync,
+} from "./chatgpt-web-codex/chromeExecutable.ts";
+export { detectChromeExecutableAsync } from "./chatgpt-web-codex/chromeExecutable.ts";
 
 import {
   CHATGPT_WEB_CODEX_CONNECTOR_NAME,
@@ -12,6 +18,7 @@ import { createChatGptWebAdapter } from "../vendor/codex-chatgpt-web/adapters/ch
 import { ChatGptBrowserWorker } from "../vendor/codex-chatgpt-web/adapters/chatgpt-web/browser-worker.ts";
 import {
   browserLoginStateExists,
+  browserLoginStateExistsAsync,
   inspectBrowserLoginCapabilities,
 } from "../vendor/codex-chatgpt-web/browser-login.ts";
 import { extractChatGptTurnIdentity } from "../vendor/codex-chatgpt-web/adapters/chatgpt-web/environment.ts";
@@ -20,7 +27,9 @@ import { AsyncEventQueue } from "../vendor/codex-chatgpt-web/event-queue.ts";
 import { parseRequest } from "../vendor/codex-chatgpt-web/responses/parser.ts";
 import {
   expandPreviousResponseInput,
+  expandPreviousResponseInputAsync,
   rememberResponseState,
+  rememberResponseStateAsync,
 } from "../vendor/codex-chatgpt-web/responses/state.ts";
 import type {
   AdapterEvent,
@@ -32,7 +41,9 @@ import { reasoningEffortOf, requireChatGptWebCodexRoute } from "./chatgpt-web-co
 import {
   connectionRuntimePaths,
   ensureConnectionStorageStateFromCredential,
+  ensureConnectionStorageStateFromCredentialAsync,
   readConnectionStorageState,
+  readConnectionStorageStateAsync,
 } from "./chatgpt-web-codex/storageState.ts";
 import {
   decodeChatGptWebCodexSecrets,
@@ -98,16 +109,7 @@ function configuredString(data: Record<string, unknown>, ...keys: string[]): str
 }
 
 export function detectChromeExecutable(explicit?: string): string | undefined {
-  const candidates = [
-    explicit,
-    process.env.CHATGPT_WEB_CODEX_CHROME_PATH,
-    process.env.CHROME_PATH,
-    "/usr/bin/google-chrome",
-    "/usr/bin/google-chrome-stable",
-    "/usr/bin/chromium",
-    "/usr/bin/chromium-browser",
-    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-  ];
+  const candidates = chromeExecutableCandidates(explicit);
   return candidates.find((candidate): candidate is string =>
     Boolean(candidate && existsSync(candidate))
   );
@@ -161,6 +163,20 @@ export function resolveChatGptWebCodexPreviousResponse(
   return { body: next, ok: true };
 }
 
+export async function resolveChatGptWebCodexPreviousResponseAsync(
+  body: Record<string, unknown>,
+  namespace: string
+): Promise<{ body: Record<string, unknown>; ok: boolean }> {
+  if (typeof body.previous_response_id !== "string" || !body.previous_response_id.trim())
+    return { body, ok: true };
+  const expanded = await expandPreviousResponseInputAsync(body, namespace);
+  if (expanded !== body) return { body: record(expanded), ok: true };
+  if (!inputHasSelfContainedCodexContinuation(body)) return { body, ok: false };
+  const next = { ...body };
+  delete next.previous_response_id;
+  return { body: next, ok: true };
+}
+
 function toolModeRequired(parsed: CodexParsedRequest): boolean {
   if (parsed.options.toolChoice === "none") return false;
   return (parsed.context.tools?.length ?? 0) > 0;
@@ -170,16 +186,17 @@ function buildProviderConfig(
   input: ExecuteInput,
   parsed: CodexParsedRequest,
   storageStatePath: string,
-  connectionId: string
+  connectionId: string,
+  qualifiedBrowser?: { chromeExecutablePath?: string }
 ): CodexProviderConfig {
   const data = record(input.credentials.providerSpecificData);
   const route = requireChatGptWebCodexRoute(input.model);
   const paths = connectionRuntimePaths(connectionId);
   const cdpEndpoint =
     configuredString(data, "browserCdpEndpoint") ?? process.env.CHATGPT_WEB_CODEX_CDP_URL;
-  const chromeExecutablePath = detectChromeExecutable(
-    configuredString(data, "chromeExecutablePath")
-  );
+  const chromeExecutablePath = qualifiedBrowser
+    ? qualifiedBrowser.chromeExecutablePath
+    : detectChromeExecutable(configuredString(data, "chromeExecutablePath"));
   if (!chromeExecutablePath && !cdpEndpoint) {
     throw new Error("No supported Chrome or Chromium executable was found");
   }
@@ -290,7 +307,10 @@ export class ChatGptWebCodexExecutor extends BaseExecutor {
       const initialBody = nativeBody(input.body);
       const initialParsed = parseRequest(initialBody);
       const namespace = responseStateNamespace(connectionId, initialParsed);
-      const resolvedPrevious = resolveChatGptWebCodexPreviousResponse(initialBody, namespace);
+      const resolvedPrevious =
+        parseDatabaseBackend() === "postgres"
+          ? await resolveChatGptWebCodexPreviousResponseAsync(initialBody, namespace)
+          : resolveChatGptWebCodexPreviousResponse(initialBody, namespace);
       if (!resolvedPrevious.ok) {
         return wrapped(
           errorResponse(
@@ -319,14 +339,18 @@ export class ChatGptWebCodexExecutor extends BaseExecutor {
         );
       }
 
-      const storageStatePath = ensureConnectionStorageStateFromCredential(connectionId, secrets);
+      const nativeControlFiles = parseDatabaseBackend() === "postgres";
+      const storageStatePath = nativeControlFiles
+        ? await ensureConnectionStorageStateFromCredentialAsync(connectionId, secrets)
+        : ensureConnectionStorageStateFromCredential(connectionId, secrets);
       const providerData = record(input.credentials.providerSpecificData);
       const cdpEndpoint =
         configuredString(providerData, "browserCdpEndpoint") ??
         process.env.CHATGPT_WEB_CODEX_CDP_URL;
-      const chromeExecutablePath = detectChromeExecutable(
-        configuredString(providerData, "chromeExecutablePath")
-      );
+      const explicitChrome = configuredString(providerData, "chromeExecutablePath");
+      const chromeExecutablePath = nativeControlFiles
+        ? await detectChromeExecutableAsync(explicitChrome)
+        : detectChromeExecutable(explicitChrome);
       if (!chromeExecutablePath && !cdpEndpoint) {
         throw new Error("No supported Chrome or Chromium executable was found");
       }
@@ -344,7 +368,11 @@ export class ChatGptWebCodexExecutor extends BaseExecutor {
         proAvailable: providerData.proAvailable === true,
         autoApproveToolCalls: false,
       };
-      if (!browserLoginStateExists(loginConfig)) {
+      if (
+        !(nativeControlFiles
+          ? await browserLoginStateExistsAsync(loginConfig)
+          : browserLoginStateExists(loginConfig))
+      ) {
         const capabilities = await inspectBrowserLoginCapabilities(loginConfig);
         providerData.solAvailable = capabilities.solAvailable;
         providerData.proAvailable = capabilities.proAvailable;
@@ -384,7 +412,8 @@ export class ChatGptWebCodexExecutor extends BaseExecutor {
         },
         parsed,
         storageStatePath,
-        connectionId
+        connectionId,
+        nativeControlFiles ? { chromeExecutablePath } : undefined
       );
       const adapter = createChatGptWebAdapter(provider);
       const worker = ChatGptBrowserWorker.forProvider(provider);
@@ -408,7 +437,9 @@ export class ChatGptWebCodexExecutor extends BaseExecutor {
           });
         } finally {
           try {
-            const storageState = readConnectionStorageState(storageStatePath);
+            const storageState = nativeControlFiles
+              ? await readConnectionStorageStateAsync(storageStatePath)
+              : readConnectionStorageState(storageStatePath);
             await input.onCredentialsRefreshed?.({
               apiKey: encodeChatGptWebCodexSecrets({
                 storageState,
@@ -438,7 +469,9 @@ export class ChatGptWebCodexExecutor extends BaseExecutor {
           toolSearchToolNames: maps.toolSearch,
           compaction: parsed._compactionRequest,
         });
-        rememberResponseState(expandedBody, response, { force: true, namespace });
+        if (parseDatabaseBackend() === "postgres")
+          await rememberResponseStateAsync(expandedBody, response, { force: true, namespace });
+        else rememberResponseState(expandedBody, response, { force: true, namespace });
         return wrapped(
           new Response(JSON.stringify(response), { status: 200, headers: JSON_HEADERS }),
           expandedBody
@@ -457,8 +490,15 @@ export class ChatGptWebCodexExecutor extends BaseExecutor {
         {
           hideThinkingSummary: parsed.options.hideThinkingSummary,
           compaction: parsed._compactionRequest,
-          onCompletedResponse: (response) =>
-            rememberResponseState(expandedBody, response, { force: true, namespace }),
+          ...(parseDatabaseBackend() === "postgres"
+            ? {
+                onCompletedResponseAsync: (response: Record<string, unknown>) =>
+                  rememberResponseStateAsync(expandedBody, response, { force: true, namespace }),
+              }
+            : {
+                onCompletedResponse: (response: Record<string, unknown>) =>
+                  rememberResponseState(expandedBody, response, { force: true, namespace }),
+              }),
         }
       );
       return wrapped(new Response(stream, { status: 200, headers: SSE_HEADERS }), expandedBody);

@@ -1,3 +1,4 @@
+import fsPromises from "node:fs/promises";
 /**
  * Optional runtime pack resolution (Stage 7 of the Electron efficiency roadmap,
  * issue #10321).
@@ -82,6 +83,37 @@ export function packMemberInstalled(memberRelPath: string, dataDirOverride?: str
 
   for (const nodeModulesDir of installedPackNodePaths(dataDirOverride)) {
     if (fs.existsSync(path.join(nodeModulesDir, ...segments))) return true;
+  }
+  return false;
+}
+
+export async function installedPackNodePathsAsync(dataDirOverride?: string): Promise<string[]> {
+  const directories = OPTIONAL_PACK_NAMES.map((name) => packNodeModulesDir(name, dataDirOverride));
+  const entries: string[] = [];
+  for (const dir of directories) {
+    try {
+      if ((await fsPromises.stat(dir)).isDirectory()) entries.push(dir);
+    } catch {
+      // Same absent/unreadable pack behavior and deterministic manifest order.
+    }
+  }
+  return entries;
+}
+
+export async function packMemberInstalledAsync(
+  memberRelPath: string,
+  dataDirOverride?: string
+): Promise<boolean> {
+  const segments = memberRelPath.split(/[\\/]/).filter(Boolean);
+  if (segments[0] === "node_modules") segments.shift();
+  if (segments.length === 0) return false;
+  for (const directory of await installedPackNodePathsAsync(dataDirOverride)) {
+    try {
+      await fsPromises.access(path.join(directory, ...segments));
+      return true;
+    } catch {
+      // Same absent/unreadable member behavior.
+    }
   }
   return false;
 }

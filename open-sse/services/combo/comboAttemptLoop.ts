@@ -21,7 +21,7 @@ import {
 } from "../../utils/error.ts";
 import { estimateSizeFast } from "../../utils/estimateSize.ts";
 import { jsonLength } from "../../utils/jsonSize.ts";
-import { COMBO_FAILURE_THRESHOLD, recordComboFailure } from "./failureTracker.ts";
+import { COMBO_FAILURE_THRESHOLD, recordComboFailureAsync } from "./failureTracker.ts";
 import {
   buildAllTargetsCoolingDownResponse,
   buildNoUpstreamResponseDiagnostics,
@@ -592,7 +592,7 @@ export async function dispatchWithCooldownRetry(opts: {
           latencyMs,
           fallbackCount: state.fallbackCount,
         });
-        recordComboFailure(deps.effectiveSessionId, deps.combo.name);
+        await recordComboFailureAsync(deps.effectiveSessionId, deps.combo.name);
         const inactiveRateLimitedUntil = await computeEarliestSkippedRateLimitedUntil(
           state.orderedTargets
         );
@@ -705,7 +705,10 @@ export async function dispatchWithCooldownRetry(opts: {
       // model: auto" instead of an opaque 5xx. We pass the upstream retry-after seconds to
       // the hint so the client can render a precise "wait Ns and retry" message.
       deps.log.warn("COMBO", `All models failed | ${msg}`);
-      const { pinClearedNow } = recordComboFailure(deps.effectiveSessionId, deps.combo.name);
+      const { pinClearedNow } = await recordComboFailureAsync(
+        deps.effectiveSessionId,
+        deps.combo.name
+      );
       if (pinClearedNow) {
         deps.log.info(
           "COMBO",
@@ -738,7 +741,7 @@ export async function dispatchWithCooldownRetry(opts: {
     // Final fallback — when the dispatch returned without crystallizing a status (rare).
     // Surface the recovery hint with a generic retry recommendation so the client at least
     // gets a non-opaque message instead of "Combo routing completed without an upstream response".
-    recordComboFailure(deps.effectiveSessionId, deps.combo.name);
+    await recordComboFailureAsync(deps.effectiveSessionId, deps.combo.name);
     return errorResponseWithComboDiagnostics(
       503,
       "Combo routing completed without an upstream response",

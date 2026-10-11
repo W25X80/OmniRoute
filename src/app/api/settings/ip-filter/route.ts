@@ -1,13 +1,7 @@
 import { NextResponse } from "next/server";
 import {
-  configureIPFilter,
+  applyIPFilterUpdateAsync,
   getIPFilterConfig,
-  addToBlacklist,
-  removeFromBlacklist,
-  addToWhitelist,
-  removeFromWhitelist,
-  tempBanIP,
-  removeTempBan,
 } from "@omniroute/open-sse/services/ipFilter.ts";
 import { updateIpFilterSchema } from "@/shared/validation/schemas";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
@@ -49,26 +43,7 @@ export async function PUT(request: Request) {
     }
     const body = validation.data;
 
-    // Configure entire filter
-    if (body.enabled !== undefined || body.mode || body.blacklist || body.whitelist) {
-      configureIPFilter(body);
-    }
-
-    // Add/remove individual IPs
-    if (body.addBlacklist) addToBlacklist(body.addBlacklist);
-    if (body.removeBlacklist) removeFromBlacklist(body.removeBlacklist);
-    if (body.addWhitelist) addToWhitelist(body.addWhitelist);
-    if (body.removeWhitelist) removeFromWhitelist(body.removeWhitelist);
-
-    // Temp bans
-    if (body.tempBan) {
-      tempBanIP(
-        body.tempBan.ip,
-        body.tempBan.durationMs || 3600000,
-        body.tempBan.reason || "Manual ban"
-      );
-    }
-    if (body.removeBan) removeTempBan(body.removeBan);
+    await applyIPFilterUpdateAsync(body);
 
     return NextResponse.json(getIPFilterConfig());
   } catch (error) {

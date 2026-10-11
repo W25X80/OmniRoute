@@ -14,10 +14,10 @@ export async function POST(_request: Request, { params }: { params: Promise<{ id
   try {
     const { id } = await params;
     const registry = getJobRegistry();
-    if (!registry.listJobs().some((j) => j.id === id)) {
+    if (!(await registry.listJobsAsync()).some((j) => j.id === id)) {
       return NextResponse.json(buildErrorBody(404, "Job not found"), { status: 404 });
     }
-    registry.setEnabled(id, false);
+    await registry.setEnabledAsync(id, false);
     return NextResponse.json({ data: { id, enabled: false } });
   } catch (err) {
     console.error("[API] POST /api/jobs/:id/disable error:", err);

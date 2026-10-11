@@ -1,3 +1,9 @@
+import { getSelectedCallLogRepository } from "../db/postgres/callLogRepository";
+import {
+  isApplicationPersistenceIdentity,
+  runPersistenceBackgroundWork,
+} from "../db/persistenceRuntime";
+import { getSelectedPersistenceIdentity } from "../db/controlPlaneContext";
 /**
  * Bounded call-log rotation and pruning.
  *
@@ -17,6 +23,7 @@ import {
 import {
   CALL_LOGS_DIR,
   deleteCallArtifact,
+  deleteCallArtifactAsync,
   type CallLogDetailState,
 } from "./callLogArtifacts";
 import { getCallLogMaxEntries, getCallLogRetentionDays, getCallLogsTableMaxRows } from "../logEnv";
@@ -381,4 +388,156 @@ export function scheduleCallLogRotation() {
     runScheduledCallLogRotation();
   }, CALL_LOG_ROTATE_THROTTLE_MS - elapsed);
   timer.unref?.();
+}
+
+export async function clearArtifactReferenceAsync(
+  relativePath: string,
+  nextState: CallLogDetailState
+): Promise<void> {
+  const postgres = getSelectedCallLogRepository();
+  if (!postgres) {
+    clearArtifactReference(relativePath, nextState);
+    return;
+  }
+  await postgres.clearReference(relativePath, nextState);
+}
+async function deleteOwnedArtifacts(paths: string[]): Promise<number> {
+  let count = 0;
+  for (const path of paths) if (await deleteCallArtifactAsync(path)) count++;
+  return count;
+}
+export async function deleteCallLogsBeforeAsync(
+  cutoff: string,
+  maxDeletes = Number.POSITIVE_INFINITY
+): Promise<DeleteResult> {
+  const postgres = getSelectedCallLogRepository();
+  if (!postgres) return deleteCallLogsBefore(cutoff, maxDeletes);
+  let deletedRows = 0,
+    deletedArtifacts = 0;
+  while (deletedRows < maxDeletes) {
+    const result = await postgres.deleteBefore(cutoff, Math.min(500, maxDeletes - deletedRows));
+    deletedRows += result.deletedRows;
+    deletedArtifacts += await deleteOwnedArtifacts(result.paths);
+    if (result.deletedRows === 0) break;
+  }
+  return { deletedRows, deletedArtifacts };
+}
+export async function trimCallLogsToMaxRowsAsync(
+  maxRows = getCallLogsTableMaxRows(),
+  maxDeletes = Number.POSITIVE_INFINITY
+): Promise<DeleteResult> {
+  const postgres = getSelectedCallLogRepository();
+  if (!postgres) return trimCallLogsToMaxRows(maxRows, maxDeletes);
+  if (!Number.isSafeInteger(maxRows) || maxRows < 1 || maxDeletes <= 0)
+    return { deletedRows: 0, deletedArtifacts: 0 };
+  let deletedRows = 0,
+    deletedArtifacts = 0;
+  while (deletedRows < maxDeletes) {
+    const result = await postgres.trim(maxRows, Math.min(500, maxDeletes - deletedRows));
+    deletedRows += result.deletedRows;
+    deletedArtifacts += await deleteOwnedArtifacts(result.paths);
+    if (result.deletedRows === 0) break;
+  }
+  return { deletedRows, deletedArtifacts };
+}
+interface PostgresRotationState {
+  inFlight?: Promise<void>;
+  scheduled?: Promise<void>;
+  scheduledAt?: number;
+}
+
+const POSTGRES_ROTATIONS = Symbol.for("omniroute.callLogRotation.postgres");
+const rotationRoot = globalThis as typeof globalThis & {
+  [key: symbol]: WeakMap<object, PostgresRotationState> | undefined;
+};
+
+function getPostgresRotationState(identity: object): PostgresRotationState {
+  const states = (rotationRoot[POSTGRES_ROTATIONS] ??= new WeakMap<
+    object,
+    PostgresRotationState
+  >());
+  let state = states.get(identity);
+  if (!state) {
+    state = {};
+    states.set(identity, state);
+  }
+  return state;
+}
+
+function assertRotationIdentity(identity: object): void {
+  if (getSelectedPersistenceIdentity() !== identity) {
+    throw new Error("Call log rotation persistence authority changed");
+  }
+}
+
+export async function rotateCallLogsAsync(): Promise<void> {
+  const postgres = getSelectedCallLogRepository();
+  if (!postgres) {
+    rotateCallLogs();
+    return;
+  }
+  const identity = getSelectedPersistenceIdentity();
+  if (!identity) throw new Error("Call log rotation requires selected persistence");
+  const state = getPostgresRotationState(identity);
+  if (state.inFlight) return state.inFlight;
+  const cutoff = new Date(
+    Date.now() - getCallLogRetentionDays() * 24 * 60 * 60 * 1000
+  ).toISOString();
+  const work = Promise.resolve().then(async () => {
+    assertRotationIdentity(identity);
+    await deleteCallLogsBeforeAsync(cutoff, CALL_LOG_ROTATE_BATCH_SIZE);
+    assertRotationIdentity(identity);
+    await trimCallLogsToMaxRowsAsync(getCallLogsTableMaxRows(), CALL_LOG_ROTATE_BATCH_SIZE);
+  });
+  state.inFlight = work;
+  try {
+    await work;
+  } finally {
+    if (state.inFlight === work) state.inFlight = undefined;
+  }
+}
+
+export function scheduleCallLogRotationAsync(): void {
+  if (!getSelectedCallLogRepository()) {
+    scheduleCallLogRotation();
+    return;
+  }
+  const identity = getSelectedPersistenceIdentity();
+  // Standalone planes keep explicit awaited rotation; they cannot enqueue application maintenance.
+  if (!identity || !isApplicationPersistenceIdentity(identity)) return;
+  const state = getPostgresRotationState(identity);
+  const now = Date.now();
+  if (
+    state.scheduled ||
+    (state.scheduledAt !== undefined && now - state.scheduledAt < CALL_LOG_ROTATE_THROTTLE_MS)
+  )
+    return;
+  state.scheduledAt = now;
+  const work = runPersistenceBackgroundWork(async () => {
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    if (
+      !isApplicationPersistenceIdentity(identity) ||
+      getSelectedPersistenceIdentity() !== identity
+    ) {
+      throw new Error("Call log rotation persistence authority changed before admission");
+    }
+    await rotateCallLogsAsync();
+  });
+  state.scheduled = work;
+  void work.then(
+    () => {
+      if (state.scheduled === work) state.scheduled = undefined;
+    },
+    (error) => {
+      if (state.scheduled === work) state.scheduled = undefined;
+      console.warn("[callLogs] Rotation failed:", error instanceof Error ? error.name : "Error");
+    }
+  );
+}
+
+export async function closeCallLogRotationAsync(): Promise<void> {
+  const identity = getSelectedPersistenceIdentity();
+  if (!identity) return;
+  const state = rotationRoot[POSTGRES_ROTATIONS]?.get(identity);
+  await Promise.all([state?.scheduled, state?.inFlight]);
 }

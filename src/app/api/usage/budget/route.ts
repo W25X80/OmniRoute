@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { getCostSummary, setBudget, checkBudget } from "@/domain/costRules";
+import { getCostSummaryAsync, setBudgetAsync, checkBudgetAsync } from "@/domain/costRules";
 import { setBudgetSchema } from "@/shared/validation/schemas";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
@@ -14,8 +14,8 @@ export async function GET(request) {
     if (!apiKeyId) {
       return NextResponse.json({ error: "apiKeyId query param is required" }, { status: 400 });
     }
-    const summary = getCostSummary(apiKeyId);
-    const budgetCheck = checkBudget(apiKeyId);
+    const summary = await getCostSummaryAsync(apiKeyId);
+    const budgetCheck = await checkBudgetAsync(apiKeyId);
     return NextResponse.json({
       ...summary,
       budgetCheck,
@@ -74,7 +74,7 @@ export async function POST(request) {
       resetTime,
     } = validation.data;
 
-    const budget = setBudget(apiKeyId, {
+    const budget = await setBudgetAsync(apiKeyId, {
       dailyLimitUsd,
       weeklyLimitUsd,
       monthlyLimitUsd,

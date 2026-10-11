@@ -1,3 +1,15 @@
+import { assertSqliteBackendAllowed } from "./controlPlaneContext";
+import { getSelectedPostgresDatabase } from "./controlPlaneContext";
+import {
+  catalogEnvironmentValue,
+  catalogNamespaceRows,
+  catalogValue,
+  requirePostgresCatalogSnapshot,
+  isPostgresCatalogMutation,
+  mutatePostgresCatalog,
+  putCatalogValue,
+  deleteCatalogValue,
+} from "./postgres/catalogSnapshot";
 /**
  * db/ccDiscoveryAliases.ts — Claude Code discovery-alias gate.
  *
@@ -60,55 +72,86 @@ export function resolveCcAliasEnabled(opts: {
 }
 
 export function getCcAliasProviderSetting(providerId: string): CcAliasSetting {
-  const db = getDbInstance();
-  const row = db
-    .prepare("SELECT value FROM key_value WHERE namespace = ? AND key = ?")
-    .get(NAMESPACE, providerKey(providerId)) as { value: string } | undefined;
+  requirePostgresCatalogSnapshot();
+
+  const db = getSelectedPostgresDatabase() ? undefined : getDbInstance();
+  const row = (
+    getSelectedPostgresDatabase()
+      ? catalogValue(NAMESPACE, providerKey(providerId))
+      : db
+          .prepare("SELECT value FROM key_value WHERE namespace = ? AND key = ?")
+          .get(NAMESPACE, providerKey(providerId))
+  ) as { value: string } | undefined;
   return parseSetting(row?.value);
 }
 
-export function setCcAliasProviderSetting(providerId: string, v: CcAliasSetting): void {
-  const db = getDbInstance();
-  const key = providerKey(providerId);
-  if (v === null) {
-    db.prepare("DELETE FROM key_value WHERE namespace = ? AND key = ?").run(NAMESPACE, key);
+export async function setCcAliasProviderSettingAsync(
+  providerId: string,
+  v: CcAliasSetting
+): Promise<void> {
+  const catalogDatabase = getSelectedPostgresDatabase();
+  const execute = async () => {
+    const db = getSelectedPostgresDatabase() ? undefined : getDbInstance();
+    const key = providerKey(providerId);
+    if (v === null) {
+      getSelectedPostgresDatabase()
+        ? await deleteCatalogValue(NAMESPACE, key)
+        : db!.prepare("DELETE FROM key_value WHERE namespace = ? AND key = ?").run(NAMESPACE, key);
+      finishModelCatalogWriteWithoutBackup();
+      return;
+    }
+    getSelectedPostgresDatabase()
+      ? await putCatalogValue(NAMESPACE, key, v)
+      : db!
+          .prepare("INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES (?, ?, ?)")
+          .run(NAMESPACE, key, v);
     finishModelCatalogWriteWithoutBackup();
-    return;
-  }
-  db.prepare("INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES (?, ?, ?)").run(
-    NAMESPACE,
-    key,
-    v,
-  );
-  finishModelCatalogWriteWithoutBackup();
+  };
+  if (catalogDatabase && !isPostgresCatalogMutation(catalogDatabase))
+    return mutatePostgresCatalog(catalogDatabase, execute);
+  return execute();
 }
 
 export function getCcAliasModelSetting(providerId: string, modelId: string): CcAliasSetting {
-  const db = getDbInstance();
-  const row = db
-    .prepare("SELECT value FROM key_value WHERE namespace = ? AND key = ?")
-    .get(NAMESPACE, modelKey(providerId, modelId)) as { value: string } | undefined;
+  requirePostgresCatalogSnapshot();
+
+  const db = getSelectedPostgresDatabase() ? undefined : getDbInstance();
+  const row = (
+    getSelectedPostgresDatabase()
+      ? catalogValue(NAMESPACE, modelKey(providerId, modelId))
+      : db
+          .prepare("SELECT value FROM key_value WHERE namespace = ? AND key = ?")
+          .get(NAMESPACE, modelKey(providerId, modelId))
+  ) as { value: string } | undefined;
   return parseSetting(row?.value);
 }
 
-export function setCcAliasModelSetting(
+export async function setCcAliasModelSettingAsync(
   providerId: string,
   modelId: string,
-  v: CcAliasSetting,
-): void {
-  const db = getDbInstance();
-  const key = modelKey(providerId, modelId);
-  if (v === null) {
-    db.prepare("DELETE FROM key_value WHERE namespace = ? AND key = ?").run(NAMESPACE, key);
+  v: CcAliasSetting
+): Promise<void> {
+  const catalogDatabase = getSelectedPostgresDatabase();
+  const execute = async () => {
+    const db = getSelectedPostgresDatabase() ? undefined : getDbInstance();
+    const key = modelKey(providerId, modelId);
+    if (v === null) {
+      getSelectedPostgresDatabase()
+        ? await deleteCatalogValue(NAMESPACE, key)
+        : db!.prepare("DELETE FROM key_value WHERE namespace = ? AND key = ?").run(NAMESPACE, key);
+      finishModelCatalogWriteWithoutBackup();
+      return;
+    }
+    getSelectedPostgresDatabase()
+      ? await putCatalogValue(NAMESPACE, key, v)
+      : db!
+          .prepare("INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES (?, ?, ?)")
+          .run(NAMESPACE, key, v);
     finishModelCatalogWriteWithoutBackup();
-    return;
-  }
-  db.prepare("INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES (?, ?, ?)").run(
-    NAMESPACE,
-    key,
-    v,
-  );
-  finishModelCatalogWriteWithoutBackup();
+  };
+  if (catalogDatabase && !isPostgresCatalogMutation(catalogDatabase))
+    return mutatePostgresCatalog(catalogDatabase, execute);
+  return execute();
 }
 
 /**
@@ -119,10 +162,14 @@ export function getCcAliasSettingsBulk(): {
   providers: Map<string, "on" | "off">;
   models: Map<string, "on" | "off">;
 } {
-  const db = getDbInstance();
-  const rows = db
-    .prepare("SELECT key, value FROM key_value WHERE namespace = ?")
-    .all(NAMESPACE) as Array<{ key: string; value: string }>;
+  requirePostgresCatalogSnapshot();
+
+  const db = getSelectedPostgresDatabase() ? undefined : getDbInstance();
+  const rows = (
+    getSelectedPostgresDatabase()
+      ? catalogNamespaceRows(NAMESPACE)
+      : db.prepare("SELECT key, value FROM key_value WHERE namespace = ?").all(NAMESPACE)
+  ) as Array<{ key: string; value: string }>;
 
   const providers = new Map<string, "on" | "off">();
   const models = new Map<string, "on" | "off">();
@@ -141,7 +188,7 @@ export function getCcAliasSettingsBulk(): {
 }
 
 function envForcesGlobalOn(): boolean {
-  const raw = process.env[FLAG_KEY];
+  const raw = catalogEnvironmentValue(FLAG_KEY);
   return raw === "1" || raw === "true";
 }
 
@@ -164,4 +211,42 @@ export function getCcAliasGlobalState(): { enabled: boolean; source: "env" | "db
 
 export function isCcAliasGlobalEnabled(): boolean {
   return getCcAliasGlobalState().enabled;
+}
+
+export function setCcAliasProviderSetting(providerId: string, v: CcAliasSetting): void {
+  assertSqliteBackendAllowed();
+  const db = getDbInstance();
+  const key = providerKey(providerId);
+  if (v === null) {
+    db.prepare("DELETE FROM key_value WHERE namespace = ? AND key = ?").run(NAMESPACE, key);
+    finishModelCatalogWriteWithoutBackup();
+    return;
+  }
+  db.prepare("INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES (?, ?, ?)").run(
+    NAMESPACE,
+    key,
+    v
+  );
+  finishModelCatalogWriteWithoutBackup();
+}
+
+export function setCcAliasModelSetting(
+  providerId: string,
+  modelId: string,
+  v: CcAliasSetting
+): void {
+  assertSqliteBackendAllowed();
+  const db = getDbInstance();
+  const key = modelKey(providerId, modelId);
+  if (v === null) {
+    db.prepare("DELETE FROM key_value WHERE namespace = ? AND key = ?").run(NAMESPACE, key);
+    finishModelCatalogWriteWithoutBackup();
+    return;
+  }
+  db.prepare("INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES (?, ?, ?)").run(
+    NAMESPACE,
+    key,
+    v
+  );
+  finishModelCatalogWriteWithoutBackup();
 }

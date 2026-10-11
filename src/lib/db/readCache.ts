@@ -12,6 +12,8 @@
  *   const settings = await dbCache.getSettings();
  */
 
+import { getSelectedControlPlane } from "./controlPlaneContext";
+
 type CacheEntry<T> = {
   value: T;
   expiresAt: number;
@@ -98,6 +100,8 @@ const connectionsCache = new TTLCache<unknown[]>(CONNECTIONS_TTL_MS, 500);
  * Invalidated on every updateSettings() call.
  */
 export async function getCachedSettings(): Promise<Record<string, unknown>> {
+  const selected = getSelectedControlPlane();
+  if (selected) return (await import("./settings")).getSettings();
   return settingsCache.load("settings", async () => {
     const { getSettings } = await import("@/lib/db/settings");
     return getSettings();
@@ -109,6 +113,7 @@ export async function getCachedSettings(): Promise<Record<string, unknown>> {
  * Longer TTL since pricing rarely changes mid-session.
  */
 export async function getCachedPricing(): Promise<Record<string, unknown>> {
+  if (getSelectedControlPlane()) return (await import("./settings/pricing")).getPricing();
   return pricingCache.load("pricing", async () => {
     const { getPricing } = await import("@/lib/db/settings");
     return getPricing();
@@ -122,6 +127,8 @@ export async function getCachedPricing(): Promise<Record<string, unknown>> {
 export async function getCachedProviderConnections(
   filter?: Record<string, unknown>
 ): Promise<unknown[]> {
+  const selected = getSelectedControlPlane();
+  if (selected) return selected.providers.list(filter);
   const cacheKey = filter && Object.keys(filter).length > 0 ? JSON.stringify(filter) : "all";
 
   return connectionsCache.load(cacheKey, async () => {
@@ -142,6 +149,8 @@ const rawConnectionsCache = new TTLCache<unknown[]>(CONNECTIONS_TTL_MS, 500);
 export async function getCachedRawProviderConnections(
   filter?: Record<string, unknown>
 ): Promise<unknown[]> {
+  const selected = getSelectedControlPlane();
+  if (selected) return selected.providers.listRaw(filter);
   const key = JSON.stringify(filter ?? {});
   return rawConnectionsCache.load(key, async () => {
     const { getRawProviderConnections } = await import("./providers");
@@ -163,6 +172,8 @@ const nodesCache = new TTLCache<(Record<string, unknown> | null)[]>(CONNECTIONS_
 export async function getCachedProviderConnectionById(
   id: string
 ): Promise<Record<string, unknown> | null> {
+  const selected = getSelectedControlPlane();
+  if (selected) return selected.providers.findById(id);
   if (!id) return null;
   return connectionByIdCache.load(id, async () => {
     const { getProviderConnectionById } = await import("@/lib/db/providers");
@@ -178,6 +189,8 @@ export async function getCachedProviderConnectionById(
 export async function getCachedProviderNodes(
   filter?: Record<string, unknown>
 ): Promise<(Record<string, unknown> | null)[]> {
+  const selected = getSelectedControlPlane();
+  if (selected) return selected.nodes.list(filter);
   const cacheKey = filter ? JSON.stringify(filter) : "all";
   return nodesCache.load(cacheKey, async () => {
     const { getProviderNodes } = await import("@/lib/db/providers");
@@ -198,6 +211,9 @@ export async function getCachedLKGP(
   comboName: string,
   modelId: string
 ): Promise<LKGPRecordCache | null> {
+  if (getSelectedControlPlane()) {
+    return (await import("./settings/lkgp")).getLKGP(comboName, modelId);
+  }
   const cacheKey = `lkgp:${comboName}:${modelId}`;
   return lkgpCache.load(cacheKey, async () => {
     const { getLKGP } = await import("@/lib/db/settings");
@@ -211,7 +227,7 @@ export async function setCachedLKGP(
   providerId: string,
   connectionId?: string
 ): Promise<void> {
-  const { setLKGP } = await import("@/lib/db/settings");
+  const { setLKGP } = await import("./settings/lkgp");
   await setLKGP(comboName, modelId, providerId, connectionId);
   lkgpCache.invalidate(`lkgp:${comboName}:${modelId}`);
 }

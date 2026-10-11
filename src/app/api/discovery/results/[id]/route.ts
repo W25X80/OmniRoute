@@ -1,3 +1,4 @@
+import { deleteDiscoveryResultAsync } from "@/lib/db/discoveryResults";
 /**
  * Discovery result by id — GET / DELETE /api/discovery/results/:id
  *
@@ -6,7 +7,7 @@
 
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 import { createErrorResponse, createErrorResponseFromUnknown } from "@/lib/api/errorResponse";
-import { getDiscoveryResultById, deleteDiscoveryResult } from "@/lib/db/discoveryResults";
+import { getDiscoveryResultById } from "@/lib/db/discoveryResults";
 
 function parseId(raw: string): number | null {
   const id = Number(raw);
@@ -51,7 +52,7 @@ export async function DELETE(
   }
 
   try {
-    const removed = deleteDiscoveryResult(id);
+    const removed = await deleteDiscoveryResultAsync(id);
     if (!removed) {
       return createErrorResponse({ status: 404, message: "Discovery result not found" });
     }

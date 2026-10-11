@@ -7,7 +7,7 @@ import {
   type LeaderboardScope,
 } from "@/lib/gamification/leaderboard";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
-import { getApiKeyDisplayNames } from "@/lib/db/apiKeys/displayNames";
+import { getApiKeyDisplayNamesAsync } from "@/lib/db/apiKeys/displayNames";
 
 export async function OPTIONS() {
   return handleCorsOptions();
@@ -21,11 +21,14 @@ export async function OPTIONS() {
  * the name is added — the lookup reads no key material, and a leaderboard row
  * whose key was deleted keeps `name: null` so the UI can fall back to the id.
  */
-function withApiKeyNames<T extends { apiKeyId: string }>(
+async function withApiKeyNames<T extends { apiKeyId: string }>(
   entries: T[]
-): Array<T & { name: string | null }> {
-  const names = getApiKeyDisplayNames(entries.map((entry) => entry.apiKeyId));
-  return entries.map((entry) => ({ ...entry, name: names.get(entry.apiKeyId) ?? null }));
+): Promise<Array<T & { name: string | null }>> {
+  const names = await getApiKeyDisplayNamesAsync(entries.map((entry) => entry.apiKeyId));
+  return entries.map((entry) => ({
+    ...entry,
+    name: names.get(entry.apiKeyId) ?? null,
+  }));
 }
 
 export async function GET(request: NextRequest) {
@@ -45,9 +48,9 @@ export async function GET(request: NextRequest) {
     );
   }
 
-  const entries = withApiKeyNames(await getTopN(scope, limit));
+  const entries = await withApiKeyNames(await getTopN(scope, limit));
   let myRank: number | null = null;
-  let neighbors = null;
+  let neighbors: Awaited<ReturnType<typeof getNeighbors>> | null = null;
 
   if (apiKeyId) {
     myRank = await getRank(apiKeyId, scope);

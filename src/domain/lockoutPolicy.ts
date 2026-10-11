@@ -15,6 +15,11 @@ import {
   deleteLockoutState,
   loadAllLockedIdentifiers,
 } from "../lib/db/domainState";
+import { getSelectedPostgresDatabase } from "@/lib/db/controlPlaneContext";
+import {
+  PostgresDomainStateRepository,
+  updatePostgresLockout,
+} from "@/lib/db/postgres/domainStateRepository";
 
 /**
  * @typedef {Object} LockoutConfig
@@ -205,4 +210,49 @@ export function getLockedIdentifiers() {
   }
 
   return locked;
+}
+
+interface LockoutVerdict {
+  locked: boolean;
+  remainingMs?: number;
+  attempts?: number;
+}
+
+export async function checkLockoutAsync(
+  id: string,
+  config = DEFAULT_CONFIG
+): Promise<LockoutVerdict> {
+  return getSelectedPostgresDatabase()
+    ? updatePostgresLockout(getSelectedPostgresDatabase()!, id, config, false)
+    : checkLockout(id, config);
+}
+
+export async function recordFailedAttemptAsync(
+  id: string,
+  config = DEFAULT_CONFIG
+): Promise<LockoutVerdict> {
+  return getSelectedPostgresDatabase()
+    ? updatePostgresLockout(getSelectedPostgresDatabase()!, id, config, true)
+    : recordFailedAttempt(id, config);
+}
+
+export async function recordSuccessAsync(id: string): Promise<void> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return recordSuccess(id);
+  await new PostgresDomainStateRepository(database).deleteLockoutState(id);
+}
+
+export async function forceUnlockAsync(id: string): Promise<void> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return forceUnlock(id);
+  await new PostgresDomainStateRepository(database).deleteLockoutState(id);
+}
+
+export async function getLockedIdentifiersAsync() {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return getLockedIdentifiers();
+  const now = Date.now();
+  return (await new PostgresDomainStateRepository(database).loadAllLockedIdentifiers()).map(
+    (e) => ({ ...e, remainingMs: e.lockedUntil - now })
+  );
 }

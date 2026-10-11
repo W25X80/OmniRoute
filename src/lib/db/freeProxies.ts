@@ -1,8 +1,9 @@
 import { randomUUID } from "crypto";
+import type { FreeProxyItem, FreeProxySourceId } from "@/lib/freeProxyProviders/types";
+import { createPostgresFreeProxyRepository } from "./postgres/freeProxyRepository";
+import { getSelectedPostgresDatabase } from "./controlPlaneContext";
 import { getDbInstance } from "./core";
 import { backupDbFile } from "./backup";
-import type { FreeProxyItem, FreeProxySourceId } from "@/lib/freeProxyProviders/types";
-
 export interface FreeProxyRecord {
   id: string;
   source: FreeProxySourceId;
@@ -56,6 +57,9 @@ function mapRow(row: unknown): FreeProxyRecord {
 export async function upsertFreeProxy(
   item: FreeProxyItem
 ): Promise<{ id: string; action: "created" | "updated" }> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) return createPostgresFreeProxyRepository(postgres).upsert(item);
+
   const db = getDbInstance();
   const now = new Date().toISOString();
 
@@ -117,6 +121,9 @@ export async function listFreeProxies(options?: {
   limit?: number;
   offset?: number;
 }): Promise<FreeProxyRecord[]> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) return createPostgresFreeProxyRepository(postgres).list(options);
+
   const db = getDbInstance();
   const params: unknown[] = [];
   let sql = "SELECT * FROM free_proxies WHERE 1=1";
@@ -178,6 +185,9 @@ export async function countFreeProxies(options?: {
   onlyNotInPool?: boolean;
   search?: string;
 }): Promise<number> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) return createPostgresFreeProxyRepository(postgres).count(options);
+
   const db = getDbInstance();
   const params: unknown[] = [];
   let sql = "SELECT COUNT(*) AS count FROM free_proxies WHERE 1=1";
@@ -244,12 +254,18 @@ export async function listFreeProxiesBySource(
 }
 
 export async function getFreeProxyById(id: string): Promise<FreeProxyRecord | null> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) return createPostgresFreeProxyRepository(postgres).get(id);
+
   const db = getDbInstance();
   const row = db.prepare("SELECT * FROM free_proxies WHERE id = ?").get(id);
   return row ? mapRow(row) : null;
 }
 
 export async function markFreeProxyInPool(id: string, poolProxyId: string): Promise<void> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) return createPostgresFreeProxyRepository(postgres).markInPool(id, poolProxyId);
+
   const db = getDbInstance();
   const now = new Date().toISOString();
   db.prepare(
@@ -278,6 +294,10 @@ export async function promoteFreeProxyToPool(
     source: string;
   }
 ): Promise<string | null> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres)
+    return createPostgresFreeProxyRepository(postgres).promote(freeProxyId, registryPayload);
+
   const db = getDbInstance();
   const now = new Date().toISOString();
   const newRegistryId = randomUUID();
@@ -315,6 +335,9 @@ export async function promoteFreeProxyToPool(
 }
 
 export async function deleteFreeProxy(id: string): Promise<boolean> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) return createPostgresFreeProxyRepository(postgres).delete(id);
+
   const db = getDbInstance();
   const result = db.prepare("DELETE FROM free_proxies WHERE id = ?").run(id);
   backupDbFile("pre-write");
@@ -322,6 +345,9 @@ export async function deleteFreeProxy(id: string): Promise<boolean> {
 }
 
 export async function clearFreeProxiesBySource(source: FreeProxySourceId): Promise<number> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) return createPostgresFreeProxyRepository(postgres).clearSource(source);
+
   const db = getDbInstance();
   const result = db
     .prepare("DELETE FROM free_proxies WHERE source = ? AND in_pool = 0")
@@ -341,6 +367,9 @@ export async function pruneStaleFreeProxies(
   source: FreeProxySourceId,
   activeKeys: ReadonlySet<string>
 ): Promise<number> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) return createPostgresFreeProxyRepository(postgres).prune(source, activeKeys);
+
   const db = getDbInstance();
   const rows = db
     .prepare("SELECT id, host, port FROM free_proxies WHERE source = ? AND in_pool = 0")
@@ -371,6 +400,9 @@ const FREE_PROXY_SYNC_KEY = "last_sync_at";
  * so the route can echo it back. `at` is overridable for deterministic tests.
  */
 export async function recordFreeProxySync(at?: string): Promise<string> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) return createPostgresFreeProxyRepository(postgres).recordSync(at);
+
   const db = getDbInstance();
   const ts = at ?? new Date().toISOString();
   db.prepare("INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES (?, ?, ?)").run(
@@ -390,6 +422,9 @@ function getRecordedFreeProxySync(db: ReturnType<typeof getDbInstance>): string 
 }
 
 export async function getFreeProxyStats(): Promise<FreeProxyStats> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) return createPostgresFreeProxyRepository(postgres).stats();
+
   const db = getDbInstance();
   const totals = db
     .prepare(
@@ -416,7 +451,10 @@ export async function getFreeProxyStats(): Promise<FreeProxyStats> {
     total: Number(totals.total) || 0,
     inPool: Number(totals.in_pool_count) || 0,
     avgQuality: totals.avg_quality != null ? Math.round(Number(totals.avg_quality)) : null,
-    bySource: bySource.map((r) => ({ source: String(r.source), count: Number(r.count) })),
+    bySource: bySource.map((r) => ({
+      source: String(r.source),
+      count: Number(r.count),
+    })),
     lastSyncAt: recordedSyncAt ?? derivedSyncAt,
   };
 }
@@ -429,6 +467,9 @@ export async function recordFreeProxySyncErrors(
   source: FreeProxySourceId,
   errors: string[]
 ): Promise<void> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) return createPostgresFreeProxyRepository(postgres).recordErrors(source, errors);
+
   const db = getDbInstance();
   const at = new Date().toISOString();
   db.prepare(
@@ -439,6 +480,9 @@ export async function recordFreeProxySyncErrors(
 
 /** Clear a source's stored sync error (called on a successful sync). */
 export async function clearFreeProxySyncErrors(source: FreeProxySourceId): Promise<void> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) return createPostgresFreeProxyRepository(postgres).clearErrors(source);
+
   const db = getDbInstance();
   db.prepare("DELETE FROM free_proxy_sync_errors WHERE source = ?").run(source);
   backupDbFile("pre-write");
@@ -450,6 +494,9 @@ export async function clearFreeProxySyncErrors(source: FreeProxySourceId): Promi
  * state.
  */
 export async function getFreeProxySyncErrors(): Promise<FreeProxySyncErrors> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) return createPostgresFreeProxyRepository(postgres).errors();
+
   const db = getDbInstance();
   const rows = db.prepare("SELECT source, errors FROM free_proxy_sync_errors").all() as Array<{
     source: string;

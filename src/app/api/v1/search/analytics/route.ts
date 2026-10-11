@@ -8,7 +8,10 @@
 import { NextResponse } from "next/server";
 import { SEARCH_PROVIDERS } from "@omniroute/open-sse/config/searchRegistry.ts";
 import { enforceApiKeyPolicy } from "@/shared/utils/apiKeyPolicy";
-import { getSearchAggregateStats, getSearchProviderCounts } from "@/lib/db/callLogStats";
+import {
+  getSearchAggregateStatsAsync as getSearchAggregateStats,
+  getSearchProviderCountsAsync as getSearchProviderCounts,
+} from "@/lib/db/callLogStats";
 
 export async function GET(req: Request) {
   const policy = await enforceApiKeyPolicy(req, "analytics");
@@ -20,7 +23,7 @@ export async function GET(req: Request) {
     todayStart.setUTCHours(0, 0, 0, 0);
     const todayIso = todayStart.toISOString();
 
-    const statsRow = getSearchAggregateStats(todayIso);
+    const statsRow = await getSearchAggregateStats(todayIso);
 
     const total = statsRow?.total ?? 0;
     const today = statsRow?.today ?? 0;
@@ -29,7 +32,7 @@ export async function GET(req: Request) {
     const cached = statsRow?.cached ?? 0;
 
     // Per-provider breakdown
-    const provRows = getSearchProviderCounts();
+    const provRows = await getSearchProviderCounts();
 
     const byProvider: Record<string, { count: number; costUsd: number }> = {};
     let totalCostUsd = 0;

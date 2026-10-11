@@ -16,8 +16,12 @@
  * with the sweep disabled nothing is ever deleted, so the new columns are pure telemetry.
  */
 
+import { parseDatabaseBackend } from "@/lib/db/backendSelection";
+import { getSelectedPersistenceIdentity } from "@/lib/db/controlPlaneContext";
+import { runPersistenceBackgroundWork } from "@/lib/db/persistenceRuntime";
+import { createPersistencePoller, type PersistencePoller } from "@/lib/config/persistencePoller";
 import { MemoryType, type Memory } from "./types";
-import { listMemoriesForDecay, deleteMemory } from "./store";
+import { listMemoriesForDecayAsync, deleteMemory } from "./store";
 import { logger } from "../../../open-sse/utils/logger.ts";
 
 const log = logger("MEMORY_TYPED_DECAY");
@@ -155,10 +159,16 @@ export async function sweepDecayedMemories(
   const dryRun = options.dryRun === true;
 
   if (!config.enabled && !dryRun) {
-    return { scanned: 0, decayed: 0, deletedIds: [], skippedDisabled: true, capped: false };
+    return {
+      scanned: 0,
+      decayed: 0,
+      deletedIds: [],
+      skippedDisabled: true,
+      capped: false,
+    };
   }
 
-  const candidates = await listMemoriesForDecay({
+  const candidates = await listMemoriesForDecayAsync({
     apiKeyId: options.apiKeyId,
     limit: SWEEP_SCAN_CAP + 1,
   });
@@ -219,7 +229,56 @@ function resolveSweepIntervalMs(env: NodeJS.ProcessEnv = process.env): number {
  * `MEMORY_TYPED_DECAY_SWEEP_INTERVAL>0` are set. Idempotent and best-effort: a sweep
  * error is swallowed (the next tick retries). Never deletes by default.
  */
+interface NativeSchedulerOwner {
+  readonly identity: object;
+  readonly poller: PersistencePoller;
+  stopping?: Promise<void>;
+}
+const NATIVE_SCHEDULER = Symbol.for("omniroute.typedMemoryDecay.postgresScheduler");
+const nativeGlobals = globalThis as typeof globalThis & {
+  [NATIVE_SCHEDULER]?: NativeSchedulerOwner;
+};
+
+function stopNativePoller(): Promise<void> {
+  const owner = nativeGlobals[NATIVE_SCHEDULER];
+  if (!owner) return Promise.resolve();
+
+  owner.stopping ??= owner.poller.stop().finally(() => {
+    if (nativeGlobals[NATIVE_SCHEDULER] === owner) nativeGlobals[NATIVE_SCHEDULER] = undefined;
+  });
+  return owner.stopping;
+}
+
 export function startMemoryDecaySweep(intervalMs?: number): void {
+  if (parseDatabaseBackend() === "postgres") {
+    const identity = getSelectedPersistenceIdentity();
+    if (!identity) throw new Error("Native scheduler requires selected PostgreSQL persistence");
+    const existing = nativeGlobals[NATIVE_SCHEDULER];
+    if (existing) {
+      if (existing.identity !== identity || existing.stopping)
+        throw new Error("Native scheduler authority changed or is draining");
+      return;
+    }
+    const config = resolveTypedDecayConfig();
+    if (!config.enabled) return;
+    const interval = intervalMs ?? resolveSweepIntervalMs();
+    if (!interval || interval <= 0) return;
+    const poller = createPersistencePoller({
+      intervalMs: interval,
+      initialDelayMs: 0,
+      check: async () => {
+        await runPersistenceBackgroundWork(async () => {
+          if (getSelectedPersistenceIdentity() !== identity)
+            throw new Error("Native scheduler persistence identity changed");
+          await sweepDecayedMemories({ config });
+        });
+      },
+      onFailure: () => {},
+    });
+    nativeGlobals[NATIVE_SCHEDULER] = { identity, poller };
+    poller.start();
+    return;
+  }
   if (sweepTimer) return;
   const config = resolveTypedDecayConfig();
   if (!config.enabled) return; // master switch off → never run the destructive sweep
@@ -238,8 +297,18 @@ export function startMemoryDecaySweep(intervalMs?: number): void {
 }
 
 export function stopMemoryDecaySweep(): void {
+  if (parseDatabaseBackend() === "postgres") {
+    void stopNativePoller().catch(() => {});
+    return;
+  }
   if (sweepTimer) {
     clearInterval(sweepTimer);
     sweepTimer = null;
   }
+}
+
+/** Stop admission and wait for every accepted native tick. */
+export async function stopMemoryDecaySweepAsync(): Promise<void> {
+  if (parseDatabaseBackend() !== "postgres") return stopMemoryDecaySweep();
+  await stopNativePoller();
 }

@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { parseDatabaseBackend } from "@/lib/db/backendSelection";
 import { getAuditRequestContext, logAuditEvent } from "@/lib/compliance/index";
 import {
   getProviderAuditTarget,
@@ -188,6 +189,7 @@ export async function PUT(request: Request, { params }: { params: Promise<{ id: 
         try {
           const {
             finalizeValidatedChatGptWebCodexSecrets,
+            finalizeValidatedChatGptWebCodexSecretsAsync,
             decodeChatGptWebCodexSecrets,
             encodeChatGptWebCodexSecrets,
           } = await import("@omniroute/open-sse/services/chatgptWebCodexAdmin.ts");
@@ -197,9 +199,10 @@ export async function PUT(request: Request, { params }: { params: Promise<{ id: 
             cookie: incomingSecrets.cookie,
             runtimeKey: incomingSecrets.runtimeKey || existingSecrets.runtimeKey,
           });
-          updateData.apiKey = finalizeValidatedChatGptWebCodexSecrets(
-            encoded,
-            validationId
+          updateData.apiKey = (
+            parseDatabaseBackend() === "postgres"
+              ? await finalizeValidatedChatGptWebCodexSecretsAsync(encoded, validationId)
+              : finalizeValidatedChatGptWebCodexSecrets(encoded, validationId)
           ).encodedCredential;
         } catch (error) {
           return NextResponse.json(

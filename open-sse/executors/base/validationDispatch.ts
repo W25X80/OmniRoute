@@ -27,7 +27,7 @@ export type StrictValidationDispatch = {
     url: string;
     headers: HeadersInit | undefined;
     body: BodyInit | null | undefined;
-  }): void;
+  }): void | Promise<void>;
   reject(): never;
 };
 
@@ -43,19 +43,18 @@ export function assertValidationCredentials(
   if (!Array.isArray(extraKeys) || extraKeys.length > 0) observer.reject();
 }
 
-function prepareValidationFetch(
+async function prepareValidationFetch(
   observer: StrictValidationDispatch | undefined,
   details: Pick<
     Parameters<StrictValidationDispatch["beforeFetch"]>[0],
     "provider" | "model" | "credentials" | "url"
   >,
   options: RequestInit
-): RequestInit {
+): Promise<RequestInit> {
   if (!observer) return options;
   options.signal?.throwIfAborted();
-  observer.beforeFetch({ ...details, headers: options.headers, body: options.body });
-  // The observer is synchronous; no awaited work may separate this final
-  // cancellation/identity fence from the physical transport in BaseExecutor.
+  await observer.beforeFetch({ ...details, headers: options.headers, body: options.body });
+  // After the awaited native freshness read, cancellation is checked again before transport.
   options.signal?.throwIfAborted();
   // Automatic redirects would perform an unobserved second HTTP dispatch,
   // possibly to a different provider or credential scope.
@@ -77,9 +76,9 @@ export function validationFetch(
   credentials: ProviderCredentials,
   transport: FetchTransport = (url, options) => fetch(url, options)
 ): FetchTransport {
-  return (url, options) =>
+  return async (url, options) =>
     transport(
       url,
-      prepareValidationFetch(observer, { provider, model, credentials, url }, options)
+      await prepareValidationFetch(observer, { provider, model, credentials, url }, options)
     );
 }

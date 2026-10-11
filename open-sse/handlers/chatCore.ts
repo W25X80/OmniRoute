@@ -1,3 +1,8 @@
+import { prepareResponsesContinuationBeforeTerminal } from "@/lib/usage/prepareResponsesContinuation";
+import {
+  getSelectedPostgresDatabase,
+  getSelectedPersistenceIdentity,
+} from "@/lib/db/controlPlaneContext";
 import {
   extractRequestToolMetadata,
   resolveResponseToolNameMap,
@@ -13,6 +18,7 @@ import {
 } from "./chatCore/openAICompatibleTools.ts";
 import {
   buildFailureUsageRecord,
+  observeFailureUsagePersistence,
   readCpaAuthIndex,
   type FailureUsageAggregate,
 } from "./chatCore/failureUsage.ts";
@@ -104,7 +110,7 @@ import {
   injectSystemPromptPreTranslation,
 } from "../services/systemPrompt.ts";
 import { applyProviderSystemTransforms } from "../services/systemTransforms.ts";
-import { translateRequest } from "../translator/index.ts";
+import { translateRequestAsync } from "../translator/index.ts";
 import { applyReasoningRuleDirective } from "@/lib/reasoningRouting/policy";
 import { withReasoningRuleContext } from "../utils/reasoningRuleContext.ts";
 import { FORMATS } from "../translator/formats.ts";
@@ -134,7 +140,10 @@ import { getUnsupportedParams, REGISTRY } from "../config/providerRegistry.ts";
 
 import { checkToolCallingRequiredButUnsupported } from "./chatCore/toolCallingRequiredCheck.ts";
 import { buildExecutorClientHeaders } from "./chatCore/executorClientHeaders.ts";
-import { executeProviderRequest as executeProviderRequestLeaf } from "./chatCore/executeProviderRequest.ts";
+import {
+  executeProviderRequest as executeProviderRequestLeaf,
+  createNativeStreamingPersistence,
+} from "./chatCore/executeProviderRequest.ts";
 import { runNonStreamingResponse } from "./chatCore/nonStreamingResponse.ts";
 import {
   supportsMaxTokens,
@@ -165,7 +174,7 @@ import {
   detectMalformedNonStream,
   describeMalformedNonStream,
 } from "../utils/diagnostics.ts";
-import { checkTokenLimits } from "@omniroute/open-sse/services/tokenLimitCounter.ts";
+import { checkTokenLimitsAsync } from "@omniroute/open-sse/services/tokenLimitCounter.ts";
 import {
   COOLDOWN_MS,
   HTTP_STATUS,
@@ -218,7 +227,7 @@ import {
   initialPendingBody,
   updatePendingScope,
 } from "@/lib/usage/pendingRequestScope";
-import { recordChatCallCost, buildCostCtx } from "@/domain/costRules";
+import { recordChatCallCost, recordChatCallCostAsync, buildCostCtx } from "@/domain/costRules";
 import { calculateCost } from "@/lib/usage/costCalculator";
 import { buildClaudePassthroughToolNameMap } from "./chatCore/passthroughToolNames.ts";
 import {
@@ -245,10 +254,10 @@ import { scheduleQuotaShareConsumption } from "./chatCore/quotaShareConsumption.
 import { emitRequestGamificationEvent } from "./chatCore/gamificationEvent.ts";
 import { runPluginOnResponseHook } from "./chatCore/pluginOnResponse.ts";
 import { isJsonRecord } from "./chatCore/nonStreamingResponseParse.ts";
-import { recordNonStreamingUsageStats } from "./chatCore/nonStreamingUsageStats.ts";
+import { recordNonStreamingUsageStatsAsync as recordNonStreamingUsageStats } from "./chatCore/nonStreamingUsageStats.ts";
 import { getModelNormalizeToolCallId, getModelPreserveOpenAIDeveloperRole } from "@/lib/db/models";
 import { extractSessionAffinityKey } from "@/sse/services/auth";
-import { assertExclusiveConnectionLeaseFence } from "@/lib/db/exclusiveConnectionLeases";
+import { assertExclusiveConnectionLeaseFenceAsync } from "@/lib/db/exclusiveConnectionLeases";
 
 import { getCacheControlSettings } from "@/lib/cacheControlSettings";
 import { guardrailRegistry } from "@/lib/guardrails";
@@ -322,7 +331,7 @@ import {
 import { setGeminiThoughtSignatureMode } from "../services/geminiThoughtSignatureStore.ts";
 import { classifyModelScope429, isModelScopeProvider } from "../services/modelscopePolicy.ts";
 import { incrementTokenUsage, isTpmExhausted } from "../services/geminiRateLimitTracker.ts";
-import { getProactiveCompressionRatio } from "@/lib/db/compression";
+import { getProactiveCompressionRatioAsync } from "@/lib/db/compression";
 
 /**
  * #12150 P1b: shape of handleChatCore's optional `videoBridgeLog` param — see
@@ -477,7 +486,7 @@ async function handleChatCoreInner({
         : null;
     return credentialConnectionId || connectionId || null;
   };
-  const assertManagedLeaseFence = (attemptConnectionId: string | null | undefined) => {
+  const assertManagedLeaseFence = async (attemptConnectionId: string | null | undefined) => {
     if (!managedLease) return;
     if (!attemptConnectionId) {
       throw Object.assign(new Error("Managed lease connection is unavailable"), {
@@ -485,7 +494,7 @@ async function handleChatCoreInner({
         status: 409,
       });
     }
-    const fence = assertExclusiveConnectionLeaseFence({
+    const fence = await assertExclusiveConnectionLeaseFenceAsync({
       leaseOwnerId: managedLease.context.leaseOwnerId,
       generation: managedLease.context.generation,
       apiKeyId: managedLease.apiKeyId,
@@ -591,9 +600,10 @@ async function handleChatCoreInner({
   const persistFailureUsage = (
     statusCode: number,
     errorCode?: string | null,
-    aggregate?: FailureUsageAggregate | null
+    aggregate?: FailureUsageAggregate | null,
+    completionClock?: import("./chatCore/streamingCompletion.ts").StreamCompletionClock
   ) => {
-    saveRequestUsage(
+    const persisted = saveRequestUsage(
       buildFailureUsageRecord({
         provider,
         model,
@@ -604,12 +614,15 @@ async function handleChatCoreInner({
         comboStrategy,
         statusCode,
         errorCode,
-        latencyMs: Date.now() - startTime,
+        latencyMs: completionClock?.latencyMs ?? Date.now() - startTime,
+        timestamp: completionClock?.timestamp,
         endpoint: endpointPath,
         cpaAuthIndex: readCpaAuthIndex(providerResponse),
         aggregate: aggregate ?? undefined,
       })
-    ).catch(() => {});
+    );
+    if (getSelectedPostgresDatabase()) return observeFailureUsagePersistence(persisted);
+    void persisted.catch(() => {});
   };
   // Key-health updater extracted to chatCore/keyHealth.ts (#3501); bind the per-request log once
   // and delegate so the existing call sites stay byte-identical.
@@ -1020,6 +1033,22 @@ async function handleChatCoreInner({
       // transcript was redacted. false for every non-video request.
       videoContentRemoved: videoBridgeObserved,
     });
+
+  const prepareStreamContinuation =
+    detailedLoggingEnabled && !videoBridgeObserved
+      ? (clientResponse: unknown, signal: AbortSignal) =>
+          prepareResponsesContinuationBeforeTerminal(
+            clientResponse,
+            {
+              apiKeyId: apiKeyInfo?.id ?? null,
+              noLog: noLogEnabled,
+              detailedLoggingEnabled,
+              videoContentRemoved: videoBridgeObserved,
+              getPipelinePayloads: () => reqLogger?.getPipelinePayloads?.(),
+            },
+            signal
+          )
+      : undefined;
 
   // Primary path: merge client model id + alias target so config on either key applies; resolved
   // id wins on same header name. T5 family fallback uses only (nextModel, resolveModelAlias(next))
@@ -1487,12 +1516,12 @@ async function handleChatCoreInner({
             comboName?.startsWith("combo/") ? comboName.substring(6) : null,
           ].filter((id): id is string => typeof id === "string" && id.length > 0);
           if (routingComboIds.length > 0) {
-            const { getCompressionComboForRoutingCombo } =
+            const { getCompressionComboForRoutingComboAsync } =
               await import("../../src/lib/db/compressionCombos.ts");
             const assignedCompressionCombo =
-              routingComboIds
-                .map((id) => getCompressionComboForRoutingCombo(id))
-                .find((combo) => combo !== null) ?? null;
+              (await Promise.all(
+                routingComboIds.map((id) => getCompressionComboForRoutingComboAsync(id))
+              )).find((combo) => combo !== null) ?? null;
             if (
               applyCompressionComboConfig(
                 assignedCompressionCombo as RuntimeCompressionCombo | null,
@@ -1512,8 +1541,8 @@ async function handleChatCoreInner({
       }
       let namedCombos: Record<string, CompressionPipelineStep[]> = {};
       try {
-        const { listCompressionCombos } = await import("../../src/lib/db/compressionCombos.ts");
-        namedCombos = buildNamedComboLookup(listCompressionCombos());
+        const { listCompressionCombosAsync } = await import("../../src/lib/db/compressionCombos.ts");
+        namedCombos = buildNamedComboLookup(await listCompressionCombosAsync());
       } catch (err) {
         log?.debug?.(
           "COMPRESSION",
@@ -1551,10 +1580,10 @@ async function handleChatCoreInner({
         !activeComboResolves(config, namedCombos)
       ) {
         try {
-          const { getDefaultCompressionCombo } =
+          const { getDefaultCompressionComboAsync } =
             await import("../../src/lib/db/compressionCombos.ts");
           const defaultCompressionCombo = defaultComboForRequest(
-            getDefaultCompressionCombo() as RuntimeCompressionCombo | null,
+            (await getDefaultCompressionComboAsync()) as RuntimeCompressionCombo | null,
             { config, header: compressionHeader, combos: namedCombos }
           );
           if (applyCompressionComboConfig(defaultCompressionCombo)) {
@@ -2002,7 +2031,7 @@ async function handleChatCoreInner({
       }
     }
 
-    const COMPRESSION_THRESHOLD = getProactiveCompressionRatio();
+    const COMPRESSION_THRESHOLD = await getProactiveCompressionRatioAsync();
     let reservedTokens = 0;
     if (Array.isArray(body.tools)) {
       reservedTokens = estimateTokens(body.tools);
@@ -2312,7 +2341,7 @@ async function handleChatCoreInner({
           model || "",
           sourceFormat
         );
-        normalizedForCc = translateRequest(
+        normalizedForCc = await translateRequestAsync(
           sourceFormat,
           FORMATS.OPENAI,
           model,
@@ -2529,7 +2558,7 @@ async function handleChatCoreInner({
       // relocation paths carry the global prompt (baseline coverage of the
       // removed pre-translation pass). The gate writes ONE carrier only.
       translatedBody = injectSystemPromptPreTranslation(translatedBody, { targetFormat });
-      translatedBody = translateRequest(
+      translatedBody = await translateRequestAsync(
         sourceFormat,
         targetFormat,
         model,
@@ -3016,8 +3045,12 @@ async function handleChatCoreInner({
     ? computeRequestHash(dedupRequestBody, apiKeyInfo?.id, trustedEffortContext)
     : null;
 
+  const nativeStreamingPersistence = stream ? createNativeStreamingPersistence() : undefined;
   const executeProviderRequestDeps = {
     agentGoalPolicy,
+    ...(nativeStreamingPersistence
+      ? { runNativeStreamingPersistence: nativeStreamingPersistence.run }
+      : {}),
     assertManagedLeaseFence,
     buildUpstreamHeadersForExecute,
     clientRawRequest,
@@ -3111,7 +3144,7 @@ async function handleChatCoreInner({
   // ── Tier 2: Authoritative per-model/provider token-limit check (provider now resolved) ──
   if (apiKeyInfo?.id) {
     try {
-      const tokenBreach = checkTokenLimits(
+      const tokenBreach = await checkTokenLimitsAsync(
         apiKeyInfo.id,
         provider || undefined,
         model || undefined
@@ -3798,7 +3831,7 @@ async function handleChatCoreInner({
       providerResponse,
       reasoningCacheScope,
       reasoningReplayHistory,
-      recordChatCallCost,
+      recordChatCallCost: getSelectedPersistenceIdentity() ? recordChatCallCostAsync : recordChatCallCost,
       recordContextEditingTelemetryHook,
       recordCoreOwnedAntigravityQuotaState,
       recordNonStreamingUsageStats,
@@ -3824,7 +3857,7 @@ async function handleChatCoreInner({
       traceEnabled,
       traceId,
       trackPendingRequest,
-      translateRequest,
+      translateRequest: translateRequestAsync,
       translatedBody,
       triedModels,
       updateFromHeaders,
@@ -3852,6 +3885,9 @@ async function handleChatCoreInner({
 
   const streamingTailOutcome = await runStreamingTail({
     agentGoalPolicy,
+    ...(nativeStreamingPersistence
+      ? { adoptNativeStreamingPersistence: nativeStreamingPersistence.adopt }
+      : {}),
     modelInfo,
     forcedConnectionId,
     apiKeyInfo,
@@ -3895,6 +3931,7 @@ async function handleChatCoreInner({
     pendingRequestId,
     persistAttemptLogs,
     persistFailureUsage,
+    prepareStreamContinuation,
     pipelineSessionId,
     provider,
     providerHeaders,

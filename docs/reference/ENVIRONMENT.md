@@ -1,7 +1,7 @@
 ---
 title: "Environment Variables Reference"
 version: 3.8.52
-lastUpdated: 2026-10-05
+lastUpdated: 2026-10-11
 ---
 
 # Environment Variables Reference
@@ -51,7 +51,7 @@ lastUpdated: 2026-10-05
 
 ## 1. Required Secrets
 
-Unset secrets marked **Yes** are auto-generated on the first run (`JWT_SECRET`, `API_KEY_SECRET`) and persisted to `server.env` in the data directory — set them explicitly when that directory is ephemeral. The exception is `OMNIROUTE_WS_BRIDGE_SECRET`: it is not persisted to `server.env` — the server entrypoints mint an ephemeral per-boot value only the in-process bridge can use, so external bridge clients need it set explicitly.
+For the default SQLite startup, unset secrets marked **Yes** are auto-generated on the first run (`JWT_SECRET`, `API_KEY_SECRET`) and persisted to `server.env` in the data directory — set them explicitly when that directory is ephemeral. The PostgreSQL runtime uses encrypted durable secrets when explicit nonempty values are absent; preserve the original values during migration. The exception is `OMNIROUTE_WS_BRIDGE_SECRET`: it is not persisted to `server.env` — the server entrypoints mint an ephemeral per-boot value only the in-process bridge can use, so external bridge clients need it set explicitly.
 
 | Variable                     | Required             | Default           | Source File                                        | Description                                                                                                                                                                                                                                                                                                                                                        |
 | ---------------------------- | -------------------- | ----------------- | -------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
@@ -82,7 +82,10 @@ echo "OMNIROUTE_WS_BRIDGE_SECRET=$(openssl rand -base64 32)"
 
 ## 2. Storage & Database
 
-OmniRoute uses **SQLite** (via `better-sqlite3`) for all persistence. These variables control data location, encryption, and lifecycle.
+SQLite remains the default embedded backend. The optional PostgreSQL server is selected at startup
+through `OMNIROUTE_DATABASE_BACKEND`; see [its configuration](#optional-postgresql-server-and-offline-tools).
+These variables control data location, credential/secret encryption and lifecycle. PostgreSQL still
+requires writable local scratch; its durable authority is not the local SQLite file.
 
 | Variable                               | Default              | Source File                                           | Description                                                                                                                                                                                                                                     |
 | -------------------------------------- | -------------------- | ----------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -96,7 +99,7 @@ OmniRoute uses **SQLite** (via `better-sqlite3`) for all persistence. These vari
 | `OMNIROUTE_SKIP_NATIVE_DEP_CHECK`       | `0`                  | `scripts/check/check-native-deps.mjs`                 | Set to `1` to skip the optional native-dependency prebuild check for exotic vendored trees. This does not make a missing dependency buildable; use only when native dependencies are supplied out of band.                                                                                                                                     |
 | `OMNIROUTE_DATA_DIR`                   | _(unset)_            | `open-sse/executors/promptql/threadSticky.ts`         | **Fallback alias** for `DATA_DIR`, checked only when `DATA_DIR` is unset. Used to locate the PromptQL executor's on-disk thread-sticky session cache (`<dir>/promptql-thread-sessions.json`); if neither var is set, the cache stays in-memory only (not persisted across restarts).                                                                                                                                             |
 | `OMNIROUTE_PLUGINS_DIR`                | _(unset)_            | `src/lib/plugins/scanner.ts`                          | Directory the **runtime plugin scanner** reads — and the root the plugin manager installs into — overriding the home-derived default (#11827). Point it at the bind-mounted plugin tree in Docker/K8s instead of moving HOME just to relocate the scan path (HOME governs every other home-relative behaviour too). Unset = `~/.omniroute/plugins`, or `/tmp/.omniroute/plugins` when the process exports no home at all — the silent non-discovery this variable removes. The resolved directory is logged once at startup as `scanner.dir_resolved` with the input that won. Server-side only: CLI command plugins keep their own `OMNIROUTE_PLUGIN_PATH` (section 9). |
-| `STORAGE_ENCRYPTION_KEY`               | _(empty = disabled)_ | `src/lib/db/encryption.ts`                            | AES key for full SQLite database encryption at rest. Generate with `openssl rand -hex 32`.                                                                                                                                                      |
+| `STORAGE_ENCRYPTION_KEY`               | _(empty = disabled)_ | `src/lib/db/encryption.ts`                            | AES-256-GCM credential/secret field encryption, not whole-file SQLite encryption. PostgreSQL requires a stable explicit process value. Generate with `openssl rand -hex 32`.                                                                                                                                                      |
 | `STORAGE_ENCRYPTION_KEY_VERSION`       | `v1`                 | `scripts/build/bootstrap-env.mjs`, `electron/main.js` | Version label for the encryption key. Increment when performing key rotation to support decryption of old backups.                                                                                                                              |
 | `DISABLE_SQLITE_AUTO_BACKUP`           | `false`              | `src/lib/db/backup.ts`                                | When `true`, skips routine/pre-write SQLite file backups (models.dev pricing save/clear, settings writes). Manual and pre-restore backups still run. It does **not** disable the migration runner's mandatory durable safety snapshot or mass-migration guard for an existing persistent DB. Non-manual backups are throttled to at most once per 60 minutes. Dashboard **Settings → Storage** can disable routine auto-backup independently. |
 | `OMNIROUTE_CRYPT_KEY`                  | _(unset)_            | `src/lib/db/encryption.ts`                            | **Legacy alias** for `STORAGE_ENCRYPTION_KEY`. Accepted as a fallback when the primary variable is absent.                                                                                                                                      |
@@ -1064,6 +1067,7 @@ Embedding layer, vector store and reranking knobs for the persistent memory subs
 | `MEMORY_STATIC_CACHE_DIR`       | `<DATA_DIR>/embeddings`    | Directory used to cache the static potion model files. Defaults under `DATA_DIR` when unset.               |
 | `HF_HUB_ENDPOINT`               | `https://huggingface.co`   | Override Hugging Face Hub base URL used by `staticPotion.ts` (e.g. mirror endpoint for air-gapped setups). |
 | `MEMORY_VEC_TOP_K`              | `20`                       | Default top-K used by the `sqlite-vec` brute-force vector search inside `src/lib/memory/vectorStore.ts`.   |
+| `MEMORY_VEC_QUANTIZATION` | `none` | `src/lib/memory/vectorStore.ts`: exact `int8` requests SQLite vec0 int8 storage; unset/`none` and other values use float32. Resolved signature changes recreate vectors and mark memories for lazy reindex; existing table I/O follows its stored signature. PostgreSQL vector readiness declines `int8`; this does not select Qdrant quantization. |
 | `MEMORY_RRF_K`                  | `60`                       | Reciprocal Rank Fusion constant `k` for hybrid FTS5 + vector retrieval (sqlite-vec recipe).                |
 | `VECTOR_STORE_DISABLE_VEC`      | `false`                    | Test/diagnostic seam in `getVectorStore()` (`src/lib/memory/vectorStore.ts`): when `true`, forces the vector store to `null` (simulates a cloud/WASM environment without `sqlite-vec`), degrading memory retrieval to FTS5 keyword search. Leave unset in production. |
 | `NOTION_API_KEY`                | _(unset)_                  | API key for Notion backend (used by `genericBackend.ts` known backend preset).                                |
@@ -1845,3 +1849,57 @@ Used by `open-sse/services/combo.ts` and `src/lib/quota/quotaScheduler.ts` for p
 | `OMNIROUTE_QUOTA_AWARE_ROUTING`   | `0`      | `open-sse/services/combo.ts`      | When `1`, skip connections whose per-window token budget (`rateLimitOverrides.tpm`, table `provider_quota_state`) cannot afford the estimated request cost before dispatch. Fail-open when no budget configured. |
 | `OMNIROUTE_ESTIMATOR_CALIBRATION` | _(on)_ | `open-sse/services/estimatorCalibration.ts` | Feedback calibration of the context-guard token estimator (#14931): per (provider, model, tools present) EMA of `usage.prompt_tokens` / estimate, clamped to 0.15–2.0, in memory only. `off`, `0` or `false` disables recording and application. |
 | `GROK_SUBSCRIPTION_IMAGES_ENABLED` | `false` | `open-sse/config/imageRegistry.ts` | Registers the `xai-oauth` (`xao`) and `grok-cli` image routes. Dashboard feature flag of the same name; a DB override wins over this value. |
+
+### Optional PostgreSQL server and offline tools
+
+`OMNIROUTE_DATABASE_BACKEND` selects the durable authority once at process startup. Unset means
+SQLite; `postgres` requires native initialization. Change the backend only through offline migration
+and restart. PostgreSQL configuration/startup failures do not select SQLite. See the
+[PostgreSQL runbook](../ops/POSTGRESQL.md) for source-checkout maintenance commands, stable
+secrets, private S3 configuration and pending exact-artifact qualification.
+
+The server and `scripts/ops/postgres-migrate-storage.ts` read
+`src/lib/db/postgres/environment.ts`; the older `scripts/ops/postgres-import-routing.ts` remains a
+routing-slice utility. Separate connection fields
+are required; no database URL is read. Values below are the environment/server profile, not the
+lower-level explicit factory's 4-connection/no-queue defaults.
+
+| Variable                                         | Default                                        | Description                                                                                                                                           |
+| ------------------------------------------------ | ---------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `OMNIROUTE_DATABASE_BACKEND`                     | `sqlite` when unset                            | Accepted values: `sqlite`, `postgres`. Startup selection; a restart is required to change authority.                                                  |
+| `OMNIROUTE_POSTGRES_HOST`                        | _(empty; required for PostgreSQL)_             | Target hostname. Use the certificate's hostname for verify-full TLS.                                                                                  |
+| `OMNIROUTE_POSTGRES_PORT`                        | `5432`                                         | Target TCP port.                                                                                                                                      |
+| `OMNIROUTE_POSTGRES_DATABASE`                    | _(empty; required for PostgreSQL)_             | Dedicated target database.                                                                                                                            |
+| `OMNIROUTE_POSTGRES_USER`                        | _(empty; required for PostgreSQL)_             | Database user; startup/import needs migration privileges for the dedicated `omniroute` schema.                                                        |
+| `OMNIROUTE_POSTGRES_PASSWORD`                    | _(empty; required for PostgreSQL)_             | Password supplied through process configuration; no credentials in CLI arguments.                                                                     |
+| `OMNIROUTE_POSTGRES_TLS`                         | `verify-full`                                  | Verify certificate chain and hostname. `disable-local` accepts plaintext only for literal `127.0.0.1` or `::1`.                                       |
+| `OMNIROUTE_POSTGRES_CA_FILE`                     | _(unset)_                                      | Readable PEM CA bundle; otherwise Node's trusted certificates. May be set only with verify-full.                                                      |
+| `OMNIROUTE_POSTGRES_MAX_CONNECTIONS`             | `16`                                           | Local admitted SQL-operation slots, including acquisition; range 1-100. Not a global RDS or HTTP concurrency guarantee.                               |
+| `OMNIROUTE_POSTGRES_MAX_QUEUED_OPERATIONS`       | `256`                                          | Bounded local FIFO waiters; range 0-1024. Full/expired admission returns overloaded; 0 disables waiting.                                              |
+| `OMNIROUTE_POSTGRES_CONNECTION_TIMEOUT_MS`       | `3000`                                         | Driver connection/acquisition deadline.                                                                                                               |
+| `OMNIROUTE_POSTGRES_ADMISSION_WAIT_TIMEOUT_MS`   | connection timeout; normally `3000`            | Deadline for a queued local operation before connection acquisition.                                                                                  |
+| `OMNIROUTE_POSTGRES_LOCK_TIMEOUT_MS`             | `1000`                                         | Server lock wait limit.                                                                                                                               |
+| `OMNIROUTE_POSTGRES_STATEMENT_TIMEOUT_MS`        | `5000`                                         | Server statement limit.                                                                                                                               |
+| `OMNIROUTE_POSTGRES_QUERY_TIMEOUT_MS`            | `6000`                                         | Driver response deadline; uncertain connections are destroyed.                                                                                        |
+| `OMNIROUTE_POSTGRES_TRANSACTION_TIMEOUT_MS`      | `15000`                                        | Server transaction limit and client callback deadline; requires PostgreSQL 17+. Offline storage CLI uses its explicit 300-second transaction profile. |
+| `OMNIROUTE_POSTGRES_IDLE_TRANSACTION_TIMEOUT_MS` | `5000`                                         | Server idle-transaction limit.                                                                                                                        |
+| `OMNIROUTE_ARTIFACT_S3_BUCKET`                   | _(unset; required by PostgreSQL server)_       | Private call-artifact bucket; configured in `src/lib/artifacts/s3ArtifactConfiguration.ts`.                                                           |
+| `OMNIROUTE_ARTIFACT_S3_PREFIX`                   | _(unset; required by PostgreSQL server)_       | Object prefix ending in `/`, with segments restricted to letters, digits, `_` and `-`.                                                                |
+| `OMNIROUTE_ARTIFACT_S3_EXPECTED_BUCKET_OWNER`    | _(unset; required by PostgreSQL server)_       | 12-digit expected bucket owner, sent on object PUT/GET/DELETE.                                                                                        |
+| `OMNIROUTE_ARTIFACT_S3_KMS_KEY_ID`               | _(unset)_                                      | Optional KMS key UUID/ARN. Configures aws:kms encryption; otherwise PUT requests AES256 encryption.                                                   |
+| `AWS_REGION`                                     | _(unset; required by PostgreSQL object store)_ | S3 region; this reader does not fall back to AWS_DEFAULT_REGION. Other AWS consumers retain their own region rules.                                   |
+
+Timeouts must be safe integers from 1 to 300000 ms and satisfy lock < statement < query <
+transaction, with idle <= transaction. The server profile is 16 admitted SQL operations plus 256
+FIFO waiters with a normally 3-second admission wait. These are per-process bounds, not availability,
+latency, HA or server-side cancellation guarantees. SQL callback replay is not automatic:
+commit_unknown needs domain reconciliation; committed post-commit-effect failures need effect recovery.
+
+Preserve a stable explicit `STORAGE_ENCRYPTION_KEY` for PostgreSQL and any explicit `JWT_SECRET` /
+`API_KEY_SECRET`. Otherwise the selected backend supplies encrypted durable authentication secrets.
+Writable scratch remains needed; use `APP_LOG_TO_FILE=false` when collecting task stdout/stderr.
+The S3 SDK is lazy and uses its credential chain. Configuration validation is not live bucket/IAM/KMS
+proof; no endpoint override or filesystem fallback is provided. Call artifacts retain an 8 MiB limit,
+separate from native application file bytea. Shutdown closes producer admission and drains owned work;
+forced termination or deadline expiry is not proof that an external write failed. Further operational
+qualification and the actual stop budget are described in the runbook.

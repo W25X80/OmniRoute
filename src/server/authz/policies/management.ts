@@ -10,15 +10,15 @@ import {
   hasMcpConnectOrManageScope,
   MCP_CONNECT_SCOPE,
 } from "../../../shared/constants/managementScopes";
-import { evaluateAccessTokenAuth } from "../accessTokenAuth";
-import { isInternalServiceRequest } from "../../../lib/api/internalServiceAuth";
+import { evaluateAccessTokenAuthAsync } from "../accessTokenAuth";
+import { isInternalServiceRequestAsync } from "../../../lib/api/internalServiceAuth";
 import {
   VIDEO_BRIDGE_BROKER_PATH,
   VIDEO_BRIDGE_DRILLDOWN_PATH,
   isVideoBridgeBrokerTokenRequest,
 } from "../../../lib/guardrails/videoBridgeBrokerAuth";
 import {
-  hasValidLoopbackCliToken,
+  hasValidLoopbackCliTokenAsync,
   isLoopbackRequest,
   isPrivateLanRequest,
   LOCAL_CLI_SUBJECT,
@@ -205,7 +205,10 @@ export const managementPolicy: RoutePolicy = {
       });
     }
 
-    if (isLoopbackRequest(ctx) && isInternalServiceRequest(ctx.request as unknown as Request)) {
+    if (
+      isLoopbackRequest(ctx) &&
+      (await isInternalServiceRequestAsync(ctx.request as unknown as Request))
+    ) {
       return allow({
         kind: "management_key",
         id: "internal-service",
@@ -213,7 +216,7 @@ export const managementPolicy: RoutePolicy = {
       });
     }
 
-    if (hasValidLoopbackCliToken(ctx)) {
+    if (await hasValidLoopbackCliTokenAsync(ctx)) {
       return allow({ ...LOCAL_CLI_SUBJECT });
     }
 
@@ -284,7 +287,7 @@ export const managementPolicy: RoutePolicy = {
     // because `oma_` tokens are management credentials, not inference API keys.
     // Shared with `requireManagementAuth` (no drift). Scope enforced per the
     // method+admin-allowlist policy (inferRequiredScope).
-    const accessVerdict = evaluateAccessTokenAuth(ctx.request as unknown as Request);
+    const accessVerdict = await evaluateAccessTokenAuthAsync(ctx.request as unknown as Request);
     switch (accessVerdict.kind) {
       case "ok":
         return allow({

@@ -1,5 +1,7 @@
+import { createValidationSnapshotAsync } from "../db/validatedModels";
+import { commitValidatedModelAsync } from "../db/validatedModels";
 import { randomUUID } from "node:crypto";
-import { createValidationSnapshot, commitValidatedModel } from "../db/validatedModels";
+
 import { ModelValidationError, type ValidationInput } from "./http";
 import { proofFailed, deadline, abortable, type ProofMessage } from "./proofs";
 import { createProofRunner, type ProofRunner } from "./runner";
@@ -91,16 +93,18 @@ export async function validateAndAddModel(input: ValidationInput, clientSignal: 
   try {
     signal.throwIfAborted();
     const pluginFence = createValidationPluginFence();
-    pluginFence.assertIdle();
-    const snapshot = createValidationSnapshot(input);
+    await pluginFence.assertIdleAsync();
+    const snapshot = await createValidationSnapshotAsync(input);
     await abortable(
-      withPluginExecutionGuard(pluginFence, async () =>
-        runProofs(await abortable(createProofRunner(input, snapshot, signal), signal))
+      withPluginExecutionGuard(
+        pluginFence,
+        async () =>
+          await runProofs(await abortable(createProofRunner(input, snapshot, signal), signal))
       ),
       signal
     );
     signal.throwIfAborted();
-    pluginFence.assertIdle();
+    await pluginFence.assertIdleAsync();
     const validation = {
       id: randomUUID(),
       status: "passed",
@@ -110,7 +114,7 @@ export async function validateAndAddModel(input: ValidationInput, clientSignal: 
       validatedAt: new Date().toISOString(),
       stages: { generation: "passed", toolCall: "passed", continuation: "passed" },
     };
-    const model = commitValidatedModel(snapshot, input, validation);
+    const model = await commitValidatedModelAsync(snapshot, input, validation);
     return { schemaVersion: 1, model, persistenceVerified: true, validation };
   } catch (error) {
     if (

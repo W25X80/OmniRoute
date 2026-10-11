@@ -1,3 +1,7 @@
+import {
+  requireSqliteMaintenance,
+  persistenceCapabilityResponse,
+} from "@/lib/db/persistenceCapabilities";
 import { NextResponse } from "next/server";
 import path from "path";
 import fs from "fs";
@@ -29,9 +33,7 @@ const MAX_UPLOAD_MB_CEILING = 4096;
  * via `OMNIROUTE_DB_IMPORT_MAX_MB`. Invalid / out-of-range values fall back to the 100 MB
  * default and are clamped to a 4 GB ceiling.
  */
-export function resolveMaxUploadSizeBytes(
-  env: NodeJS.ProcessEnv = process.env
-): number {
+export function resolveMaxUploadSizeBytes(env: NodeJS.ProcessEnv = process.env): number {
   const raw = env.OMNIROUTE_DB_IMPORT_MAX_MB;
   const parsed = raw === undefined ? NaN : Number(raw);
   const mb =
@@ -61,6 +63,7 @@ export async function POST(request: Request) {
   let tmpPath: string | null = null;
 
   try {
+    requireSqliteMaintenance("sqlite-file-import");
     let fileBuffer: Buffer | null = null;
     let fileName = "";
     const contentType = request.headers.get("content-type") || "";
@@ -211,6 +214,8 @@ export async function POST(request: Request) {
       apiKeyCount: keyCount,
     });
   } catch (error) {
+    const unavailable = persistenceCapabilityResponse(error);
+    if (unavailable) return NextResponse.json(unavailable, { status: 501 });
     console.error("[API] Error importing database:", error);
     return NextResponse.json({ error: sanitizeErrorMessage(error) }, { status: 500 });
   } finally {

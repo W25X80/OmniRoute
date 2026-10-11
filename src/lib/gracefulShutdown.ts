@@ -12,6 +12,8 @@
  * @module lib/gracefulShutdown
  */
 
+import { parseDatabaseBackend } from "@/lib/db/backendSelection";
+import { beginPersistenceAdmissionClose } from "@/lib/db/persistenceRuntime";
 import { markServerStopping } from "@/lib/serverLifecycle";
 
 /** Grace period before forced exit (default 30s, configurable) */
@@ -32,7 +34,11 @@ declare global {
 
 function getShutdownState() {
   if (!globalThis.__omnirouteShutdown) {
-    globalThis.__omnirouteShutdown = { init: false, shuttingDown: false, activeRequests: 0 };
+    globalThis.__omnirouteShutdown = {
+      init: false,
+      shuttingDown: false,
+      activeRequests: 0,
+    };
   }
   return globalThis.__omnirouteShutdown;
 }
@@ -104,6 +110,40 @@ async function waitForDrain(): Promise<void> {
  * Perform cleanup: close DB connections, flush logs.
  */
 async function cleanup(): Promise<void> {
+  if (parseDatabaseBackend() === "postgres") {
+    let persistenceFailure: unknown;
+    try {
+      await (await import("@/lib/startup/postgresShutdown")).shutdownPostgresApplication();
+    } catch (error) {
+      persistenceFailure = error;
+    } finally {
+      try {
+        const { stopAllSessions, listSessions } = await import("@/lib/vncSession/service");
+        if (listSessions().length > 0) await stopAllSessions();
+      } catch {
+        /* unused optional local session service */
+      }
+      try {
+        await (
+          await import("@omniroute/open-sse/executors/chatgpt-web-codex/runtime.ts")
+        ).stopChatGptWebCodexRuntime();
+      } catch {
+        /* unused optional local provider runtime */
+      }
+      try {
+        await (await import("@/shared/utils/loggerResource")).closeSharedLoggerResource();
+      } catch (error) {
+        persistenceFailure ??= error;
+      }
+      try {
+        (await import("@/lib/logRotation")).closeLogRotation();
+      } catch (error) {
+        persistenceFailure ??= error;
+      }
+    }
+    if (persistenceFailure) throw persistenceFailure;
+    return;
+  }
   try {
     const [
       { closeAuditDb },
@@ -171,6 +211,7 @@ async function cleanup(): Promise<void> {
  * Start the process-wide shutdown sequence, or join the sequence already in progress.
  */
 export function requestGracefulShutdown(signal: string): Promise<void> {
+  if (parseDatabaseBackend() === "postgres") beginPersistenceAdmissionClose();
   const state = getShutdownState();
   if (state.shutdownPromise) return state.shutdownPromise;
 
@@ -204,6 +245,16 @@ export function initGracefulShutdown(): void {
   }
 
   const shutdown = (signal: string) => {
+    if (parseDatabaseBackend() === "postgres") {
+      void globalThis.__omnirouteRequestShutdown?.(signal).then(
+        () => setTimeout(() => process.exit(0), 0),
+        () => {
+          console.error("[Shutdown] PostgreSQL cleanup failed; exiting with an error.");
+          setTimeout(() => process.exit(1), 0);
+        }
+      );
+      return;
+    }
     void globalThis.__omnirouteRequestShutdown?.(signal).then(() => {
       // #13306: on Windows, sql.js's Emscripten WASM build leaves pending libuv
       // async-handle teardown work in flight after a statement has run. Calling

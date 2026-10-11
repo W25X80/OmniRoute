@@ -67,10 +67,11 @@ export async function getXaiOauthUsage(
   }
 
   try {
-    const { getMonthlyProviderTokensForConnection } = await import("@/lib/usage/usageStats");
+    const { getMonthlyProviderTokensForConnectionAsync: getMonthlyProviderTokensForConnection } =
+      await import("@/lib/usage/usageStats");
     const used =
-      getMonthlyProviderTokensForConnection("xai-oauth", connectionId) ||
-      getMonthlyProviderTokensForConnection("xao", connectionId) ||
+      (await getMonthlyProviderTokensForConnection("xai-oauth", connectionId)) ||
+      (await getMonthlyProviderTokensForConnection("xao", connectionId)) ||
       0;
     return {
       plan: "xAI OAuth (Grok) · OmniRoute-tracked",

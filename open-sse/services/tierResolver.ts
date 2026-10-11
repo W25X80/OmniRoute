@@ -6,11 +6,32 @@ import { mergeTierConfig, DEFAULT_TIER_CONFIG } from "./tierConfig";
 import { createRequire } from "node:module";
 import { PROVIDER_ID_TO_ALIAS } from "../config/providerModels.ts";
 import { getDefaultPricing } from "@/shared/constants/pricing";
+import { getSelectedPostgresDatabase } from "@/lib/db/controlPlaneContext";
+import {
+  catalogSnapshotReadIdentity,
+  hasPostgresCatalogSnapshot,
+} from "@/lib/db/postgres/catalogSnapshot";
+import { readPreparedPostgresTierPricing } from "@/lib/db/postgres/pricingSnapshot";
 
 const lazyRequire = createRequire(import.meta.url);
 
 const tierCache = new Map<string, TierAssignment>();
 let currentConfig: TierConfig = DEFAULT_TIER_CONFIG;
+const nativeTierCaches = new WeakMap<
+  object,
+  { config: TierConfig; assignments: Map<string, TierAssignment> }
+>();
+
+function assignmentCache(): Map<string, TierAssignment> {
+  if (!getSelectedPostgresDatabase()) return tierCache;
+  const identity = catalogSnapshotReadIdentity();
+  let cached = nativeTierCaches.get(identity);
+  if (!cached || cached.config !== currentConfig) {
+    cached = { config: currentConfig, assignments: new Map() };
+    nativeTierCaches.set(identity, cached);
+  }
+  return cached.assignments;
+}
 
 type DbPrice = { input: number; output: number };
 const tierPricingSnapshot = new Map<string, DbPrice>();
@@ -22,6 +43,7 @@ function snapshotKey(provider: string, model: string): string {
 }
 
 function refreshTierPricingSnapshot(): void {
+  if (getSelectedPostgresDatabase()) return;
   // An injected snapshot (see setTierPricingSnapshot) is authoritative
   // until released: never let a refresh clobber it.
   if (snapshotPinned) return;
@@ -82,7 +104,11 @@ function refreshTierPricingSnapshot(): void {
   snapshotWarmed = true;
 }
 
-function lookupSnapshot(provider: string, model: string): DbPrice | null {
+function lookupSnapshot(
+  provider: string,
+  model: string,
+  prices: ReadonlyMap<string, DbPrice> = tierPricingSnapshot
+): DbPrice | null {
   // Pure memory. Candidate-key order mirrors getPricingForModel
   // (src/lib/db/settings/pricing.ts): direct, alias, reverse alias,
   // "-cn" strip, hyphen/dot variant. No I/O on the routing hot path.
@@ -93,7 +119,7 @@ function lookupSnapshot(provider: string, model: string): DbPrice | null {
   if (hyphenModel !== mLower) modelKeys.push(hyphenModel);
   for (const p of providerKeysFor(pLower)) {
     for (const m of modelKeys) {
-      const hit = tierPricingSnapshot.get(`${p}::${m}`);
+      const hit = prices.get(`${p}::${m}`);
       if (hit) return hit;
     }
   }
@@ -162,10 +188,12 @@ function matchGlob(pattern: string, text: string): boolean {
 }
 
 export function classifyTier(provider: string, model: string): TierAssignment {
+  const native = getSelectedPostgresDatabase();
+  const assignments = assignmentCache();
   const key = cacheKey(provider, model);
 
-  if (tierCache.has(key)) {
-    return tierCache.get(key)!;
+  if (assignments.has(key)) {
+    return assignments.get(key)!;
   }
 
   if (isExplicitlyFree(provider, currentConfig)) {
@@ -178,7 +206,7 @@ export function classifyTier(provider: string, model: string): TierAssignment {
       costPer1MOutput: 0,
       hasFreeTier: true,
     };
-    tierCache.set(key, assignment);
+    assignments.set(key, assignment);
     return assignment;
   }
 
@@ -197,7 +225,7 @@ export function classifyTier(provider: string, model: string): TierAssignment {
       hasFreeTier: pricing.isFree,
       freeQuotaLimit: pricing.freeQuotaLimit,
     };
-    tierCache.set(key, assignment);
+    assignments.set(key, assignment);
     return assignment;
   }
 
@@ -216,7 +244,7 @@ export function classifyTier(provider: string, model: string): TierAssignment {
       hasFreeTier: pricing.isFree,
       freeQuotaLimit: pricing.freeQuotaLimit,
     };
-    tierCache.set(key, assignment);
+    assignments.set(key, assignment);
     return assignment;
   }
 
@@ -224,8 +252,10 @@ export function classifyTier(provider: string, model: string): TierAssignment {
   // so a fresher stored price reclassifies without a restart. Warmed once
   // per process on First use, so a fresh boot serves stored prices without
   // waiting for the First pricing write.
-  if (!snapshotWarmed && !snapshotPinned) refreshTierPricingSnapshot();
-  const dbPrice = lookupSnapshot(provider, model);
+  if (!native && !snapshotWarmed && !snapshotPinned) refreshTierPricingSnapshot();
+  const dbPrice = native
+    ? lookupSnapshot(provider, model, readPreparedPostgresTierPricing()!)
+    : lookupSnapshot(provider, model);
   const fallbackPricing = getModelPricing(provider, model);
   const pricing = dbPrice
     ? {
@@ -263,7 +293,7 @@ export function classifyTier(provider: string, model: string): TierAssignment {
     freeQuotaLimit: pricing.freeQuotaLimit,
   };
 
-  tierCache.set(key, assignment);
+  assignments.set(key, assignment);
   return assignment;
 }
 
@@ -286,6 +316,10 @@ export function getTierConfig(): TierConfig {
 }
 
 export function clearTierCache(): void {
+  if (getSelectedPostgresDatabase()) {
+    assignmentCache().clear();
+    return;
+  }
   tierCache.clear();
   // setTierConfig below clears the assignment cache on config edits without
   // touching pricing: only this entry point refreshes the pricing snapshot.
@@ -300,7 +334,7 @@ export function classifyTiers(
 
 export function getTierStats(): Record<ProviderTier, number> {
   const stats: Record<ProviderTier, number> = { free: 0, cheap: 0, premium: 0 };
-  for (const assignment of tierCache.values()) {
+  for (const assignment of assignmentCache().values()) {
     stats[assignment.tier]++;
   }
   return stats;
@@ -349,7 +383,11 @@ export async function classifyTierAsync(provider: string, model: string): Promis
         hasFreeTier: input === 0,
         freeQuotaLimit: sync.freeQuotaLimit,
       };
-      tierCache.set(cacheKey(provider, model), assignment);
+      const native = getSelectedPostgresDatabase();
+      if (!native) tierCache.set(cacheKey(provider, model), assignment);
+      else if (hasPostgresCatalogSnapshot(native)) {
+        assignmentCache().set(cacheKey(provider, model), assignment);
+      }
       return assignment;
     }
   } catch {

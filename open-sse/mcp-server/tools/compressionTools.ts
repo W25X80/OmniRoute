@@ -12,9 +12,9 @@ import {
   getCompressionSettings,
   updateCompressionSettings,
 } from "../../../src/lib/db/compression.ts";
-import { getCompressionAnalyticsSummary } from "../../../src/lib/db/compressionAnalytics.ts";
-import { getCacheStatsSummary } from "../../../src/lib/db/compressionCacheStats.ts";
-import { listCompressionCombos } from "../../../src/lib/db/compressionCombos.ts";
+import { getCompressionAnalyticsSummaryAsync } from "../../../src/lib/db/compressionAnalytics.ts";
+import { getCacheStatsSummaryAsync } from "../../../src/lib/db/compressionCacheStats.ts";
+import { listCompressionCombosAsync } from "../../../src/lib/db/compressionCombos.ts";
 import type { McpToolExtraLike } from "../scopeEnforcement.ts";
 import {
   getMcpDescriptionCompressionStats,
@@ -26,7 +26,7 @@ import {
  */
 export async function handleCompressionStatus(
   args: Record<string, never>,
-  extra?: McpToolExtraLike
+  _extra?: McpToolExtraLike
 ): Promise<{
   enabled: boolean;
   strategy: string;
@@ -80,9 +80,9 @@ export async function handleCompressionStatus(
   try {
     const settings = await getCompressionSettings();
     await snapshotMcpDescriptionCompressionStats();
-    const analyticsSummary = getCompressionAnalyticsSummary();
+    const analyticsSummary = await getCompressionAnalyticsSummaryAsync();
     const mcpDescriptionStats = getMcpDescriptionCompressionStats();
-    const cacheStats = getCacheStatsSummary();
+    const cacheStats = await getCacheStatsSummaryAsync();
 
     const result = {
       enabled: settings.enabled,
@@ -163,7 +163,7 @@ export async function handleCompressionConfigure(
     preserveSystemPrompt?: boolean;
     mcpDescriptionCompressionEnabled?: boolean;
   },
-  extra?: McpToolExtraLike
+  _extra?: McpToolExtraLike
 ): Promise<{
   success: boolean;
   updated: Record<string, unknown>;
@@ -252,16 +252,16 @@ import {
 import {
   MAX_CCR_MCP_FULL_BYTES,
   buildCcrReference,
-  deleteCcrBlock,
+  deleteCcrBlockAsync,
   getCcrStoreStats,
-  handleCcrRetrieve,
-  inspectCcrBlock,
+  handleCcrRetrieveAsync,
+  inspectCcrBlockAsync,
   isCcrStoreRejection,
   listCcrBlocks,
   tryStoreBlock,
 } from "../../services/compression/engines/ccr/index.ts";
 import {
-  listRtkCommandSamples,
+  listRtkCommandSamplesAsync as listRtkCommandSamples,
   discoverRepeatedNoise,
   suggestFilter,
   commandToId,
@@ -326,7 +326,7 @@ export async function handleCcrRetrieveTool(
 ) {
   const start = Date.now();
   const principal = await resolveCcrPrincipal(extra, ["read:compression"]);
-  const metadata = inspectCcrBlock(args.hash, principal);
+  const metadata = await inspectCcrBlockAsync(args.hash, principal);
   if (!metadata) {
     const output = { found: false as const, error: "CCR block not found or expired" };
     await logToolCall(
@@ -349,8 +349,8 @@ export async function handleCcrRetrieveTool(
     await logToolCall("omniroute_ccr_retrieve", args, output, Date.now() - start, true);
     return output;
   }
-  const queried = handleCcrRetrieve(args, principal);
-  const refreshedMetadata = inspectCcrBlock(args.hash, principal) ?? metadata;
+  const queried = await handleCcrRetrieveAsync(args, principal);
+  const refreshedMetadata = (await inspectCcrBlockAsync(args.hash, principal)) ?? metadata;
   const output =
     "content" in queried
       ? { found: true as const, metadata: refreshedMetadata, content: queried.content }
@@ -377,7 +377,7 @@ export async function handleCcrInspectTool(
 ) {
   const start = Date.now();
   const principal = await resolveCcrPrincipal(extra, ["read:compression"]);
-  const metadata = inspectCcrBlock(args.hash, principal);
+  const metadata = await inspectCcrBlockAsync(args.hash, principal);
   const output = metadata
     ? { found: true as const, reference: buildCcrReference(args.hash, metadata.chars), metadata }
     : { found: false as const };
@@ -409,7 +409,7 @@ export async function handleCcrDeleteTool(
 ) {
   const start = Date.now();
   const principal = await resolveCcrPrincipal(extra, ["write:compression"]);
-  const output = { deleted: deleteCcrBlock(args.hash, principal) };
+  const output = { deleted: await deleteCcrBlockAsync(args.hash, principal) };
   await logToolCall("omniroute_ccr_delete", args, output, Date.now() - start, true);
   return output;
 }
@@ -472,15 +472,17 @@ export async function handleSetCompressionEngine(
 }
 
 export async function handleListCompressionCombos(): Promise<{
-  combos: ReturnType<typeof listCompressionCombos>;
+  combos: Awaited<ReturnType<typeof listCompressionCombosAsync>>;
 }> {
-  return { combos: listCompressionCombos() };
+  return { combos: await listCompressionCombosAsync() };
 }
 
 export async function handleCompressionComboStats(
   args: z.infer<typeof compressionComboStatsInput>
 ): Promise<Record<string, unknown>> {
-  const summary = getCompressionAnalyticsSummary(args.since === "all" ? undefined : args.since);
+  const summary = await getCompressionAnalyticsSummaryAsync(
+    args.since === "all" ? undefined : args.since
+  );
   if (!args.comboId) return summary as unknown as Record<string, unknown>;
   return {
     comboId: args.comboId,
@@ -521,7 +523,7 @@ export async function handleRtkDiscover(
   args: z.infer<typeof rtkDiscoverInput>
 ): Promise<{ sampleCount: number; candidates: ReturnType<typeof discoverRepeatedNoise> }> {
   const start = Date.now();
-  const samples = listRtkCommandSamples({ limit: resolveSampleLimit(args.limit) });
+  const samples = await listRtkCommandSamples({ limit: resolveSampleLimit(args.limit) });
   const candidates = discoverRepeatedNoise(samples);
   const result = { sampleCount: samples.length, candidates };
   await logToolCall("omniroute_rtk_discover", args, result, Date.now() - start, true);
@@ -534,7 +536,7 @@ export async function handleRtkLearn(
   const start = Date.now();
   const command = args.command.trim();
   const targetId = commandToId(command);
-  const matching = listRtkCommandSamples({ limit: resolveSampleLimit(args.limit) }).filter(
+  const matching = (await listRtkCommandSamples({ limit: resolveSampleLimit(args.limit) })).filter(
     (sample) => commandToId(sample.command) === targetId
   );
   const filter = suggestFilter(command, matching);

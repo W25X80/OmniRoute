@@ -1,3 +1,5 @@
+import { getSelectedPostgresDatabase } from "./controlPlaneContext";
+import { PersistenceCapabilityError } from "./persistenceCapabilities";
 /**
  * Post-cleanup space reclamation (#12821).
  *
@@ -138,6 +140,7 @@ function checkpointQuietly(db: SqliteAdapter, mode: "PASSIVE"): void {
 export async function reclaimFreedPages(
   options: ReclaimFreedPagesOptions = {}
 ): Promise<ReclaimFreedPagesResult> {
+  if (getSelectedPostgresDatabase()) throw new PersistenceCapabilityError("sqlite-optimization");
   const maxBatches = Math.max(1, Math.floor(options.maxBatches ?? INCREMENTAL_VACUUM_MAX_BATCHES));
   const timeBudgetMs = options.timeBudgetMs ?? INCREMENTAL_VACUUM_TIME_BUDGET_MS;
   const pause = options.pause ?? pauseBetweenBatches;

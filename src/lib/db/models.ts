@@ -1,3 +1,31 @@
+import { runPersistenceBackgroundWork } from "./persistenceRuntime";
+import { assertSqliteBackendAllowed } from "./controlPlaneContext";
+import { persistCanonicalSyncedAvailableModelsAsync } from "./models/syncedAvailableModelPersistence";
+import { writeCompatListAsync } from "./models/compat";
+import { removeModelCompatOverrideAsync } from "./models/compat";
+import { mergeModelCompatOverrideAsync } from "./models/compat";
+
+import { invalidateConnectionUpdate } from "./readCache";
+import { getSelectedPostgresDatabase } from "./controlPlaneContext";
+import {
+  writePostgresCatalog,
+  readPostgresCatalog,
+  catalogTableRows,
+  compareCatalogText,
+  catalogNamespaceRows,
+  catalogValue,
+  catalogKeyMatches,
+  hasPostgresCatalogSnapshot,
+  requirePostgresCatalogSnapshot,
+  withPostgresCatalogSnapshot,
+  isPostgresCatalogMutation,
+  mutatePostgresCatalog,
+  putCatalogValue,
+  deleteCatalogValue,
+  updateCatalogValue,
+  deleteCatalogMatchingKeys,
+  afterPostgresCatalogCommit,
+} from "./postgres/catalogSnapshot";
 /**
  * db/models.ts — Custom models, synced available models, and model-flag queries.
  * Compat overrides, model aliases, and MITM aliases have moved to sub-modules under
@@ -7,7 +35,7 @@
 import { isRetiredGitHubCopilotModelId } from "@omniroute/open-sse/config/providers/registry/github/retiredModels.ts";
 
 import { getDbInstance } from "./core";
-import { getProviderConnectionsCount, touchConnectionSyncedModelsAt } from "./providers";
+import { getProviderConnectionsCountAsync, touchConnectionSyncedModelsAt } from "./providers";
 import { type JsonRecord, getKeyValue } from "./models/shared";
 import {
   normalizeSyncedAvailableModels,
@@ -17,7 +45,6 @@ import {
 import {
   deleteSyncedAvailableModelsForProvider as deleteSyncedAvailableModelsForProviderInternal,
   finishSyncedAvailableModelsWrite,
-  persistCanonicalSyncedAvailableModels,
 } from "./models/syncedAvailableModelPersistence";
 import { finishModelCatalogWriteWithBackup } from "./models/modelCatalogWriteSignals";
 import {
@@ -27,7 +54,6 @@ import {
   compatByProtocolHasEntries,
   isCompatProtocolKey,
   sanitizeUpstreamHeadersMap,
-  removeModelCompatOverride,
   mergeModelCompatOverride,
   isOverrideHiddenForModality,
   type CompatByProtocolMap,
@@ -46,6 +72,8 @@ export {
   type ModelCompatPerProtocol,
   type ModelCompatOverride,
   type ModelCompatPatch,
+  mergeModelCompatOverrideAsync,
+  removeModelCompatOverrideAsync,
 } from "./models/compat";
 export {
   getModelAliases,
@@ -76,49 +104,73 @@ export {
 // ──────────────── Custom Models ────────────────
 
 function notifyQuotaCombosForProvider(providerId: string): void {
-  void (async () => {
+  if (getSelectedPostgresDatabase()) {
+    afterPostgresCatalogCommit(() => notifyQuotaCombosAfterCommit(providerId));
+    return;
+  }
+  notifyQuotaCombosAfterCommit(providerId);
+}
+
+function notifyQuotaCombosAfterCommit(providerId: string): void {
+  const work = async () => {
     try {
       const { syncQuotaCombosForProvider } = await import("./quotaPools");
       await syncQuotaCombosForProvider(providerId);
     } catch {
       // Non-fatal: quota combo sync errors should not break model operations
     }
-  })();
+  };
+  if (getSelectedPostgresDatabase()) void runPersistenceBackgroundWork(work).catch(() => {});
+  else void work();
 }
 
 export async function getCustomModels(providerId?: string) {
-  const db = getDbInstance();
-  if (providerId) {
-    const row = db
-      .prepare("SELECT value FROM key_value WHERE namespace = 'customModels' AND key = ?")
-      .get(providerId);
-    const value = getKeyValue(row).value;
-    return value ? JSON.parse(value) : [];
-  }
-  const rows = db
-    .prepare("SELECT key, value FROM key_value WHERE namespace = 'customModels'")
-    .all();
-  const result: Record<string, unknown> = {};
-  for (const row of rows) {
-    const { key, value } = getKeyValue(row);
-    if (!key || value === null) continue;
-    result[key] = JSON.parse(value);
-  }
-  return result;
+  const catalogDatabase = getSelectedPostgresDatabase();
+  const execute = async () => {
+    const db = getSelectedPostgresDatabase() ? undefined : getDbInstance();
+    if (providerId) {
+      const row = getSelectedPostgresDatabase()
+        ? catalogValue("customModels", providerId)
+        : db!
+            .prepare("SELECT value FROM key_value WHERE namespace = 'customModels' AND key = ?")
+            .get(providerId);
+      const value = getKeyValue(row).value;
+      return value ? JSON.parse(value) : [];
+    }
+    const rows = getSelectedPostgresDatabase()
+      ? catalogNamespaceRows("customModels")
+      : db!.prepare("SELECT key, value FROM key_value WHERE namespace = 'customModels'").all();
+    const result: Record<string, unknown> = {};
+    for (const row of rows) {
+      const { key, value } = getKeyValue(row);
+      if (!key || value === null) continue;
+      result[key] = JSON.parse(value);
+    }
+    return result;
+  };
+  if (catalogDatabase && !hasPostgresCatalogSnapshot(catalogDatabase))
+    return withPostgresCatalogSnapshot(catalogDatabase, execute);
+  return execute();
 }
 
 export async function getAllCustomModels() {
-  const db = getDbInstance();
-  const rows = db
-    .prepare("SELECT key, value FROM key_value WHERE namespace = 'customModels'")
-    .all();
-  const result: Record<string, unknown> = {};
-  for (const row of rows) {
-    const { key, value } = getKeyValue(row);
-    if (!key || value === null) continue;
-    result[key] = JSON.parse(value);
-  }
-  return result;
+  const catalogDatabase = getSelectedPostgresDatabase();
+  const execute = async () => {
+    const db = getSelectedPostgresDatabase() ? undefined : getDbInstance();
+    const rows = getSelectedPostgresDatabase()
+      ? catalogNamespaceRows("customModels")
+      : db!.prepare("SELECT key, value FROM key_value WHERE namespace = 'customModels'").all();
+    const result: Record<string, unknown> = {};
+    for (const row of rows) {
+      const { key, value } = getKeyValue(row);
+      if (!key || value === null) continue;
+      result[key] = JSON.parse(value);
+    }
+    return result;
+  };
+  if (catalogDatabase && !hasPostgresCatalogSnapshot(catalogDatabase))
+    return withPostgresCatalogSnapshot(catalogDatabase, execute);
+  return execute();
 }
 
 export async function addCustomModel(
@@ -157,47 +209,59 @@ export async function addCustomModel(
     modelType?: "chat" | "embedding" | "image" | "rerank";
   }
 ) {
-  const db = getDbInstance();
-  const row = db
-    .prepare("SELECT value FROM key_value WHERE namespace = 'customModels' AND key = ?")
-    .get(providerId);
-  const value = getKeyValue(row).value;
-  const models = value ? JSON.parse(value) : [];
+  const catalogDatabase = getSelectedPostgresDatabase();
+  const execute = async () => {
+    const db = getSelectedPostgresDatabase() ? undefined : getDbInstance();
+    const row = getSelectedPostgresDatabase()
+      ? catalogValue("customModels", providerId)
+      : db!
+          .prepare("SELECT value FROM key_value WHERE namespace = 'customModels' AND key = ?")
+          .get(providerId);
+    const value = getKeyValue(row).value;
+    const models = value ? JSON.parse(value) : [];
 
-  const exists = models.find((m: JsonRecord) => m.id === modelId);
-  if (exists) return exists;
+    const exists = models.find((m: JsonRecord) => m.id === modelId);
+    if (exists) return exists;
 
-  const model = {
-    id: modelId,
-    name: modelName || modelId,
-    source,
-    apiFormat,
-    supportedEndpoints,
-    ...(targetFormat ? { targetFormat } : {}),
-    ...(tokenLimits.inputTokenLimit != null
-      ? { inputTokenLimit: tokenLimits.inputTokenLimit }
-      : {}),
-    ...(tokenLimits.outputTokenLimit != null
-      ? { outputTokenLimit: tokenLimits.outputTokenLimit }
-      : {}),
-    ...(typeof supportsVision === "boolean" ? { supportsVision } : {}),
-    ...(typeof isFree === "boolean" ? { isFree } : {}),
-    ...(generationConfig && generationConfig.preset ? { generationConfig } : {}),
-    ...(typeof extraMeta?.dimensions === "number" && extraMeta.dimensions > 0
-      ? { dimensions: extraMeta.dimensions }
-      : {}),
-    ...(Array.isArray(extraMeta?.supportedInputTypes)
-      ? { supportedInputTypes: extraMeta.supportedInputTypes }
-      : {}),
-    ...(typeof extraMeta?.modelType === "string" ? { modelType: extraMeta.modelType } : {}),
+    const model = {
+      id: modelId,
+      name: modelName || modelId,
+      source,
+      apiFormat,
+      supportedEndpoints,
+      ...(targetFormat ? { targetFormat } : {}),
+      ...(tokenLimits.inputTokenLimit != null
+        ? { inputTokenLimit: tokenLimits.inputTokenLimit }
+        : {}),
+      ...(tokenLimits.outputTokenLimit != null
+        ? { outputTokenLimit: tokenLimits.outputTokenLimit }
+        : {}),
+      ...(typeof supportsVision === "boolean" ? { supportsVision } : {}),
+      ...(typeof isFree === "boolean" ? { isFree } : {}),
+      ...(generationConfig && generationConfig.preset ? { generationConfig } : {}),
+      ...(typeof extraMeta?.dimensions === "number" && extraMeta.dimensions > 0
+        ? { dimensions: extraMeta.dimensions }
+        : {}),
+      ...(Array.isArray(extraMeta?.supportedInputTypes)
+        ? { supportedInputTypes: extraMeta.supportedInputTypes }
+        : {}),
+      ...(typeof extraMeta?.modelType === "string" ? { modelType: extraMeta.modelType } : {}),
+    };
+    models.push(model);
+    getSelectedPostgresDatabase()
+      ? await putCatalogValue("customModels", providerId, JSON.stringify(models))
+      : db!
+          .prepare(
+            "INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES ('customModels', ?, ?)"
+          )
+          .run(providerId, JSON.stringify(models));
+    finishModelCatalogWriteWithBackup();
+    notifyQuotaCombosForProvider(providerId);
+    return model;
   };
-  models.push(model);
-  db.prepare(
-    "INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES ('customModels', ?, ?)"
-  ).run(providerId, JSON.stringify(models));
-  finishModelCatalogWriteWithBackup();
-  notifyQuotaCombosForProvider(providerId);
-  return model;
+  if (catalogDatabase && !isPostgresCatalogMutation(catalogDatabase))
+    return mutatePostgresCatalog(catalogDatabase, execute);
+  return execute();
 }
 
 /**
@@ -222,103 +286,115 @@ export async function replaceCustomModels(
   }>,
   { allowEmpty = false }: { allowEmpty?: boolean } = {}
 ) {
-  // Guard: skip destructive clear when the caller hasn't explicitly opted in.
-  // This prevents callers from wiping manually added models when the
-  // upstream /models endpoint fails, times out, or returns an empty list.
-  if (models.length === 0 && !allowEmpty) {
-    const existing = await getCustomModels(providerId);
-    return Array.isArray(existing) ? existing : [];
-  }
-
-  const db = getDbInstance();
-  const existing = await getCustomModels(providerId);
-  const existingMap = new Map<string, JsonRecord>();
-  if (Array.isArray(existing)) {
-    for (const m of existing) {
-      if (m && typeof m === "object" && m.id) existingMap.set(m.id, m);
+  const catalogDatabase = getSelectedPostgresDatabase();
+  const execute = async () => {
+    // Guard: skip destructive clear when the caller hasn't explicitly opted in.
+    // This prevents callers from wiping manually added models when the
+    // upstream /models endpoint fails, times out, or returns an empty list.
+    if (models.length === 0 && !allowEmpty) {
+      const existing = await getCustomModels(providerId);
+      return Array.isArray(existing) ? existing : [];
     }
-  }
 
-  // Merge: keep existing per-model compat flags if model still exists
-  const merged = models.map((m) => {
-    const prev = existingMap.get(m.id);
-    // `customModels` is also the user-owned metadata overlay for a same-id
-    // synced model. Preserve every defined field instead of maintaining a
-    // lossy allowlist here (for example supportsVision and future capabilities).
-    const definedModelMetadata = Object.fromEntries(
-      Object.entries(m).filter(([, value]) => value !== undefined)
-    );
-    return {
-      ...(prev || {}),
-      ...definedModelMetadata,
-      id: m.id,
-      name: m.name || m.id,
-      source: m.source || "auto-sync",
-      apiFormat: m.apiFormat || (prev as any)?.apiFormat || "chat-completions",
-      supportedEndpoints: m.supportedEndpoints || (prev as any)?.supportedEndpoints || ["chat"],
-      // #2905: preserve a per-model targetFormat override (new value wins, else prev).
-      ...(m.targetFormat
-        ? { targetFormat: m.targetFormat }
-        : (prev as any)?.targetFormat
-          ? { targetFormat: (prev as any).targetFormat }
-          : {}),
-      // #9820: preserve a video job preset across auto-sync (new value wins,
-      // else prev — so sync overwrites don't drop a job-config model).
-      ...(m.generationConfig?.preset
-        ? { generationConfig: { preset: m.generationConfig.preset } }
-        : (prev as any)?.generationConfig?.preset
-          ? { generationConfig: { preset: (prev as any).generationConfig.preset } }
-          : {}),
-      // Preserve metadata from provider API (or previous sync)
-      ...(m.inputTokenLimit != null
-        ? { inputTokenLimit: m.inputTokenLimit }
-        : (prev as any)?.inputTokenLimit != null
-          ? { inputTokenLimit: (prev as any).inputTokenLimit }
-          : {}),
-      ...(m.outputTokenLimit != null
-        ? { outputTokenLimit: m.outputTokenLimit }
-        : (prev as any)?.outputTokenLimit != null
-          ? { outputTokenLimit: (prev as any).outputTokenLimit }
-          : {}),
-      ...(m.description != null
-        ? { description: m.description }
-        : (prev as any)?.description != null
-          ? { description: (prev as any).description }
-          : {}),
-      ...(m.supportsThinking != null
-        ? { supportsThinking: m.supportsThinking }
-        : (prev as any)?.supportsThinking != null
-          ? { supportsThinking: (prev as any).supportsThinking }
-          : {}),
-      // Preserve existing compat flags
-      ...(prev && (prev as any).normalizeToolCallId !== undefined
-        ? { normalizeToolCallId: (prev as any).normalizeToolCallId }
-        : {}),
-      ...(prev && (prev as any).preserveOpenAIDeveloperRole !== undefined
-        ? { preserveOpenAIDeveloperRole: (prev as any).preserveOpenAIDeveloperRole }
-        : {}),
-      ...(prev && (prev as any).compatByProtocol
-        ? { compatByProtocol: (prev as any).compatByProtocol }
-        : {}),
-      ...(prev && (prev as any).upstreamHeaders
-        ? { upstreamHeaders: (prev as any).upstreamHeaders }
-        : {}),
-    };
-  });
+    const db = getSelectedPostgresDatabase() ? undefined : getDbInstance();
+    const existing = await getCustomModels(providerId);
+    const existingMap = new Map<string, JsonRecord>();
+    if (Array.isArray(existing)) {
+      for (const m of existing) {
+        if (m && typeof m === "object" && m.id) existingMap.set(m.id, m);
+      }
+    }
 
-  if (merged.length === 0) {
-    db.prepare("DELETE FROM key_value WHERE namespace = 'customModels' AND key = ?").run(
-      providerId
-    );
-  } else {
-    db.prepare(
-      "INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES ('customModels', ?, ?)"
-    ).run(providerId, JSON.stringify(merged));
-  }
+    // Merge: keep existing per-model compat flags if model still exists
+    const merged = models.map((m) => {
+      const prev = existingMap.get(m.id);
+      // `customModels` is also the user-owned metadata overlay for a same-id
+      // synced model. Preserve every defined field instead of maintaining a
+      // lossy allowlist here (for example supportsVision and future capabilities).
+      const definedModelMetadata = Object.fromEntries(
+        Object.entries(m).filter(([, value]) => value !== undefined)
+      );
+      return {
+        ...(prev || {}),
+        ...definedModelMetadata,
+        id: m.id,
+        name: m.name || m.id,
+        source: m.source || "auto-sync",
+        apiFormat: m.apiFormat || (prev as any)?.apiFormat || "chat-completions",
+        supportedEndpoints: m.supportedEndpoints || (prev as any)?.supportedEndpoints || ["chat"],
+        // #2905: preserve a per-model targetFormat override (new value wins, else prev).
+        ...(m.targetFormat
+          ? { targetFormat: m.targetFormat }
+          : (prev as any)?.targetFormat
+            ? { targetFormat: (prev as any).targetFormat }
+            : {}),
+        // #9820: preserve a video job preset across auto-sync (new value wins,
+        // else prev — so sync overwrites don't drop a job-config model).
+        ...(m.generationConfig?.preset
+          ? { generationConfig: { preset: m.generationConfig.preset } }
+          : (prev as any)?.generationConfig?.preset
+            ? { generationConfig: { preset: (prev as any).generationConfig.preset } }
+            : {}),
+        // Preserve metadata from provider API (or previous sync)
+        ...(m.inputTokenLimit != null
+          ? { inputTokenLimit: m.inputTokenLimit }
+          : (prev as any)?.inputTokenLimit != null
+            ? { inputTokenLimit: (prev as any).inputTokenLimit }
+            : {}),
+        ...(m.outputTokenLimit != null
+          ? { outputTokenLimit: m.outputTokenLimit }
+          : (prev as any)?.outputTokenLimit != null
+            ? { outputTokenLimit: (prev as any).outputTokenLimit }
+            : {}),
+        ...(m.description != null
+          ? { description: m.description }
+          : (prev as any)?.description != null
+            ? { description: (prev as any).description }
+            : {}),
+        ...(m.supportsThinking != null
+          ? { supportsThinking: m.supportsThinking }
+          : (prev as any)?.supportsThinking != null
+            ? { supportsThinking: (prev as any).supportsThinking }
+            : {}),
+        // Preserve existing compat flags
+        ...(prev && (prev as any).normalizeToolCallId !== undefined
+          ? { normalizeToolCallId: (prev as any).normalizeToolCallId }
+          : {}),
+        ...(prev && (prev as any).preserveOpenAIDeveloperRole !== undefined
+          ? { preserveOpenAIDeveloperRole: (prev as any).preserveOpenAIDeveloperRole }
+          : {}),
+        ...(prev && (prev as any).compatByProtocol
+          ? { compatByProtocol: (prev as any).compatByProtocol }
+          : {}),
+        ...(prev && (prev as any).upstreamHeaders
+          ? { upstreamHeaders: (prev as any).upstreamHeaders }
+          : {}),
+      };
+    });
 
-  finishModelCatalogWriteWithBackup();
-  notifyQuotaCombosForProvider(providerId);
-  return merged;
+    if (merged.length === 0) {
+      getSelectedPostgresDatabase()
+        ? await deleteCatalogValue("customModels", providerId)
+        : db!
+            .prepare("DELETE FROM key_value WHERE namespace = 'customModels' AND key = ?")
+            .run(providerId);
+    } else {
+      getSelectedPostgresDatabase()
+        ? await putCatalogValue("customModels", providerId, JSON.stringify(merged))
+        : db!
+            .prepare(
+              "INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES ('customModels', ?, ?)"
+            )
+            .run(providerId, JSON.stringify(merged));
+    }
+
+    finishModelCatalogWriteWithBackup();
+    notifyQuotaCombosForProvider(providerId);
+    return merged;
+  };
+  if (catalogDatabase && !isPostgresCatalogMutation(catalogDatabase))
+    return mutatePostgresCatalog(catalogDatabase, execute);
+  return execute();
 }
 
 /**
@@ -326,75 +402,98 @@ export async function replaceCustomModels(
  * models the user added manually. Returns the removed model IDs.
  */
 export async function deleteImportedCustomModels(providerId: string): Promise<string[]> {
-  const db = getDbInstance();
-  const row = db
-    .prepare("SELECT value FROM key_value WHERE namespace = 'customModels' AND key = ?")
-    .get(providerId);
-  const value = getKeyValue(row).value;
-  if (!value) return [];
+  const catalogDatabase = getSelectedPostgresDatabase();
+  const execute = async () => {
+    const db = getSelectedPostgresDatabase() ? undefined : getDbInstance();
+    const row = getSelectedPostgresDatabase()
+      ? catalogValue("customModels", providerId)
+      : db!
+          .prepare("SELECT value FROM key_value WHERE namespace = 'customModels' AND key = ?")
+          .get(providerId);
+    const value = getKeyValue(row).value;
+    if (!value) return [];
 
-  const parsed = JSON.parse(value);
-  if (!Array.isArray(parsed)) return [];
+    const parsed = JSON.parse(value);
+    if (!Array.isArray(parsed)) return [];
 
-  const removed: JsonRecord[] = [];
-  const retained = parsed.filter((model: JsonRecord) => {
-    const source = typeof model?.source === "string" ? model.source.trim().toLowerCase() : "manual";
-    const imported = source === "imported" || source === "api-sync" || source === "auto-sync";
-    if (imported) removed.push(model);
-    return !imported;
-  });
-  if (removed.length === 0) return [];
+    const removed: JsonRecord[] = [];
+    const retained = parsed.filter((model: JsonRecord) => {
+      const source =
+        typeof model?.source === "string" ? model.source.trim().toLowerCase() : "manual";
+      const imported = source === "imported" || source === "api-sync" || source === "auto-sync";
+      if (imported) removed.push(model);
+      return !imported;
+    });
+    if (removed.length === 0) return [];
 
-  if (retained.length === 0) {
-    db.prepare("DELETE FROM key_value WHERE namespace = 'customModels' AND key = ?").run(
-      providerId
+    if (retained.length === 0) {
+      getSelectedPostgresDatabase()
+        ? await deleteCatalogValue("customModels", providerId)
+        : db!
+            .prepare("DELETE FROM key_value WHERE namespace = 'customModels' AND key = ?")
+            .run(providerId);
+    } else {
+      getSelectedPostgresDatabase()
+        ? await updateCatalogValue("customModels", providerId, JSON.stringify(retained))
+        : db!
+            .prepare("UPDATE key_value SET value = ? WHERE namespace = 'customModels' AND key = ?")
+            .run(JSON.stringify(retained), providerId);
+    }
+
+    const removedIds = removed.flatMap((model) =>
+      typeof model.id === "string" && model.id ? [model.id] : []
     );
-  } else {
-    db.prepare("UPDATE key_value SET value = ? WHERE namespace = 'customModels' AND key = ?").run(
-      JSON.stringify(retained),
-      providerId
-    );
-  }
-
-  const removedIds = removed.flatMap((model) =>
-    typeof model.id === "string" && model.id ? [model.id] : []
-  );
-  for (const modelId of removedIds) removeModelCompatOverride(providerId, modelId);
-  finishModelCatalogWriteWithBackup();
-  notifyQuotaCombosForProvider(providerId);
-  return removedIds;
+    for (const modelId of removedIds) await removeModelCompatOverrideAsync(providerId, modelId);
+    finishModelCatalogWriteWithBackup();
+    notifyQuotaCombosForProvider(providerId);
+    return removedIds;
+  };
+  if (catalogDatabase && !isPostgresCatalogMutation(catalogDatabase))
+    return mutatePostgresCatalog(catalogDatabase, execute);
+  return execute();
 }
 
 export async function removeCustomModel(providerId: string, modelId: string) {
-  const db = getDbInstance();
-  const row = db
-    .prepare("SELECT value FROM key_value WHERE namespace = 'customModels' AND key = ?")
-    .get(providerId);
-  if (!row) return false;
+  const catalogDatabase = getSelectedPostgresDatabase();
+  const execute = async () => {
+    const db = getSelectedPostgresDatabase() ? undefined : getDbInstance();
+    const row = getSelectedPostgresDatabase()
+      ? catalogValue("customModels", providerId)
+      : db!
+          .prepare("SELECT value FROM key_value WHERE namespace = 'customModels' AND key = ?")
+          .get(providerId);
+    if (!row) return false;
 
-  const value = getKeyValue(row).value;
-  if (!value) return false;
-  const models = JSON.parse(value);
-  const before = models.length;
-  const filtered = models.filter((m: JsonRecord) => m.id !== modelId);
+    const value = getKeyValue(row).value;
+    if (!value) return false;
+    const models = JSON.parse(value);
+    const before = models.length;
+    const filtered = models.filter((m: JsonRecord) => m.id !== modelId);
 
-  if (filtered.length === before) return false;
+    if (filtered.length === before) return false;
 
-  if (filtered.length === 0) {
-    db.prepare("DELETE FROM key_value WHERE namespace = 'customModels' AND key = ?").run(
-      providerId
-    );
-  } else {
-    db.prepare("UPDATE key_value SET value = ? WHERE namespace = 'customModels' AND key = ?").run(
-      JSON.stringify(filtered),
-      providerId
-    );
-  }
+    if (filtered.length === 0) {
+      getSelectedPostgresDatabase()
+        ? await deleteCatalogValue("customModels", providerId)
+        : db!
+            .prepare("DELETE FROM key_value WHERE namespace = 'customModels' AND key = ?")
+            .run(providerId);
+    } else {
+      getSelectedPostgresDatabase()
+        ? await updateCatalogValue("customModels", providerId, JSON.stringify(filtered))
+        : db!
+            .prepare("UPDATE key_value SET value = ? WHERE namespace = 'customModels' AND key = ?")
+            .run(JSON.stringify(filtered), providerId);
+    }
 
-  removeModelCompatOverride(providerId, modelId);
-  finishModelCatalogWriteWithBackup();
-  notifyQuotaCombosForProvider(providerId);
-  return true;
+    await removeModelCompatOverrideAsync(providerId, modelId);
+    finishModelCatalogWriteWithBackup();
+    notifyQuotaCombosForProvider(providerId);
+    return true;
+  };
+  if (catalogDatabase && !isPostgresCatalogMutation(catalogDatabase))
+    return mutatePostgresCatalog(catalogDatabase, execute);
+  return execute();
 }
 
 // ──────────────── Synced Available Models ────────────────
@@ -409,19 +508,29 @@ export async function getSyncedAvailableModelsForConnection(
   providerId: string,
   connectionId: string
 ): Promise<SyncedAvailableModel[]> {
-  const db = getDbInstance();
-  const key = `${providerId}:${connectionId}`;
-  const row = db
-    .prepare("SELECT value FROM key_value WHERE namespace = 'syncedAvailableModels' AND key = ?")
-    .get(key);
-  const value = getKeyValue(row).value;
-  if (!value) return [];
-  try {
-    const models = JSON.parse(value);
-    return normalizeSyncedAvailableModels(models, providerId);
-  } catch {
-    return [];
-  }
+  const catalogDatabase = getSelectedPostgresDatabase();
+  const execute = async () => {
+    const db = getSelectedPostgresDatabase() ? undefined : getDbInstance();
+    const key = `${providerId}:${connectionId}`;
+    const row = getSelectedPostgresDatabase()
+      ? catalogValue("syncedAvailableModels", key)
+      : db!
+          .prepare(
+            "SELECT value FROM key_value WHERE namespace = 'syncedAvailableModels' AND key = ?"
+          )
+          .get(key);
+    const value = getKeyValue(row).value;
+    if (!value) return [];
+    try {
+      const models = JSON.parse(value);
+      return normalizeSyncedAvailableModels(models, providerId);
+    } catch {
+      return [];
+    }
+  };
+  if (catalogDatabase && !hasPostgresCatalogSnapshot(catalogDatabase))
+    return withPostgresCatalogSnapshot(catalogDatabase, execute);
+  return execute();
 }
 
 /**
@@ -430,22 +539,32 @@ export async function getSyncedAvailableModelsForConnection(
 export async function getSyncedAvailableModels(
   providerId: string
 ): Promise<SyncedAvailableModel[]> {
-  const db = getDbInstance();
-  const rows = db
-    .prepare(
-      "SELECT key, value FROM key_value WHERE namespace = 'syncedAvailableModels' AND key LIKE ?"
-    )
-    .all(`${providerId}:%`);
-  const map = new Map<string, SyncedAvailableModel>();
-  for (const row of rows) {
-    const { key, value } = getKeyValue(row);
-    if (!key || value === null) continue;
-    const models = normalizeSyncedAvailableModels(JSON.parse(value), providerId);
-    for (const m of models) {
-      if (m.id) map.set(m.id, m);
+  const catalogDatabase = getSelectedPostgresDatabase();
+  const execute = async () => {
+    const db = getSelectedPostgresDatabase() ? undefined : getDbInstance();
+    const rows = getSelectedPostgresDatabase()
+      ? catalogNamespaceRows("syncedAvailableModels").filter((row) =>
+          catalogKeyMatches(row.key, `${providerId}:%`)
+        )
+      : db!
+          .prepare(
+            "SELECT key, value FROM key_value WHERE namespace = 'syncedAvailableModels' AND key LIKE ?"
+          )
+          .all(`${providerId}:%`);
+    const map = new Map<string, SyncedAvailableModel>();
+    for (const row of rows) {
+      const { key, value } = getKeyValue(row);
+      if (!key || value === null) continue;
+      const models = normalizeSyncedAvailableModels(JSON.parse(value), providerId);
+      for (const m of models) {
+        if (m.id) map.set(m.id, m);
+      }
     }
-  }
-  return Array.from(map.values());
+    return Array.from(map.values());
+  };
+  if (catalogDatabase && !hasPostgresCatalogSnapshot(catalogDatabase))
+    return withPostgresCatalogSnapshot(catalogDatabase, execute);
+  return execute();
 }
 
 export const SYNCED_AVAILABLE_MODELS_MALFORMED = Symbol("syncedAvailableModelsMalformed");
@@ -461,28 +580,38 @@ export type SyncedAvailableModelsByConnection = Record<string, SyncedAvailableMo
 export async function getSyncedAvailableModelsByConnection(
   providerId: string
 ): Promise<SyncedAvailableModelsByConnection> {
-  const db = getDbInstance();
-  const prefix = `${providerId}:`;
-  const rows = db
-    .prepare(
-      "SELECT key, value FROM key_value WHERE namespace = 'syncedAvailableModels' AND key LIKE ?"
-    )
-    .all(`${prefix}%`);
-  const result: SyncedAvailableModelsByConnection = {};
-  for (const row of rows) {
-    const { key, value } = getKeyValue(row);
-    if (!key || value === null || !key.startsWith(prefix)) continue;
-    try {
-      const connectionId = key.slice(prefix.length);
-      result[connectionId] = normalizeSyncedAvailableModels(JSON.parse(value), providerId);
-    } catch {
-      Object.defineProperty(result, SYNCED_AVAILABLE_MODELS_MALFORMED, {
-        value: true,
-        enumerable: false,
-      });
+  const catalogDatabase = getSelectedPostgresDatabase();
+  const execute = async () => {
+    const db = getSelectedPostgresDatabase() ? undefined : getDbInstance();
+    const prefix = `${providerId}:`;
+    const rows = getSelectedPostgresDatabase()
+      ? catalogNamespaceRows("syncedAvailableModels").filter((row) =>
+          catalogKeyMatches(row.key, `${prefix}%`)
+        )
+      : db!
+          .prepare(
+            "SELECT key, value FROM key_value WHERE namespace = 'syncedAvailableModels' AND key LIKE ?"
+          )
+          .all(`${prefix}%`);
+    const result: SyncedAvailableModelsByConnection = {};
+    for (const row of rows) {
+      const { key, value } = getKeyValue(row);
+      if (!key || value === null || !key.startsWith(prefix)) continue;
+      try {
+        const connectionId = key.slice(prefix.length);
+        result[connectionId] = normalizeSyncedAvailableModels(JSON.parse(value), providerId);
+      } catch {
+        Object.defineProperty(result, SYNCED_AVAILABLE_MODELS_MALFORMED, {
+          value: true,
+          enumerable: false,
+        });
+      }
     }
-  }
-  return result;
+    return result;
+  };
+  if (catalogDatabase && !hasPostgresCatalogSnapshot(catalogDatabase))
+    return withPostgresCatalogSnapshot(catalogDatabase, execute);
+  return execute();
 }
 
 /**
@@ -491,28 +620,36 @@ export async function getSyncedAvailableModelsByConnection(
 export async function getAllSyncedAvailableModels(): Promise<
   Record<string, SyncedAvailableModel[]>
 > {
-  const db = getDbInstance();
-  const rows = db
-    .prepare("SELECT key, value FROM key_value WHERE namespace = 'syncedAvailableModels'")
-    .all();
-  // Group by providerId (before the colon)
-  const byProvider = new Map<string, Map<string, SyncedAvailableModel>>();
-  for (const row of rows) {
-    const { key, value } = getKeyValue(row);
-    if (!key || value === null) continue;
-    const providerId = key.split(":")[0];
-    if (!byProvider.has(providerId)) byProvider.set(providerId, new Map());
-    const models = normalizeSyncedAvailableModels(JSON.parse(value), providerId);
-    const map = byProvider.get(providerId)!;
-    for (const m of models) {
-      if (m.id) map.set(m.id, m);
+  const catalogDatabase = getSelectedPostgresDatabase();
+  const execute = async () => {
+    const db = getSelectedPostgresDatabase() ? undefined : getDbInstance();
+    const rows = getSelectedPostgresDatabase()
+      ? catalogNamespaceRows("syncedAvailableModels")
+      : db!
+          .prepare("SELECT key, value FROM key_value WHERE namespace = 'syncedAvailableModels'")
+          .all();
+    // Group by providerId (before the colon)
+    const byProvider = new Map<string, Map<string, SyncedAvailableModel>>();
+    for (const row of rows) {
+      const { key, value } = getKeyValue(row);
+      if (!key || value === null) continue;
+      const providerId = key.split(":")[0];
+      if (!byProvider.has(providerId)) byProvider.set(providerId, new Map());
+      const models = normalizeSyncedAvailableModels(JSON.parse(value), providerId);
+      const map = byProvider.get(providerId)!;
+      for (const m of models) {
+        if (m.id) map.set(m.id, m);
+      }
     }
-  }
-  const result: Record<string, SyncedAvailableModel[]> = {};
-  for (const [providerId, map] of byProvider) {
-    result[providerId] = Array.from(map.values());
-  }
-  return result;
+    const result: Record<string, SyncedAvailableModel[]> = {};
+    for (const [providerId, map] of byProvider) {
+      result[providerId] = Array.from(map.values());
+    }
+    return result;
+  };
+  if (catalogDatabase && !hasPostgresCatalogSnapshot(catalogDatabase))
+    return withPostgresCatalogSnapshot(catalogDatabase, execute);
+  return execute();
 }
 
 /**
@@ -523,12 +660,53 @@ export async function getAllSyncedAvailableModels(): Promise<
  * into application memory for each request.
  */
 export async function getActiveProvidersWithSyncedModel(modelId: string): Promise<string[]> {
-  if (!modelId) return [];
+  const catalogDatabase = getSelectedPostgresDatabase();
+  const execute = async () => {
+    if (!modelId) return [];
 
-  const db = getDbInstance();
-  const rows = db
-    .prepare(
-      `SELECT DISTINCT pc.provider AS provider
+    const db = getSelectedPostgresDatabase() ? undefined : getDbInstance();
+    const rows = (
+      getSelectedPostgresDatabase()
+        ? catalogTableRows<{ provider: string; id: string; is_active: number }>(
+            "provider_connections"
+          )
+            .filter((connection) => connection.is_active === 1)
+            .filter((connection) =>
+              [
+                catalogValue("syncedAvailableModels", connection.provider + ":" + connection.id),
+                catalogValue("customModels", connection.provider),
+              ].some((row) => {
+                let value: unknown;
+                try {
+                  value = row ? JSON.parse(row.value) : [];
+                } catch {
+                  return false;
+                }
+                const models = Array.isArray(value)
+                  ? value
+                  : value && typeof value === "object"
+                    ? Object.values(value)
+                    : [value];
+                return models.some((candidate) => {
+                  const model: unknown =
+                    typeof candidate === "string" ? JSON.parse(candidate) : candidate;
+                  return (
+                    model &&
+                    typeof model === "object" &&
+                    ((model as JsonRecord).id ??
+                      (model as JsonRecord).name ??
+                      (model as JsonRecord).model) === modelId
+                  );
+                });
+              })
+            )
+            .map((connection) => connection.provider)
+            .filter((provider, index, providers) => providers.indexOf(provider) === index)
+            .sort(compareCatalogText)
+            .map((provider) => ({ provider }))
+        : db!
+            .prepare(
+              `SELECT DISTINCT pc.provider AS provider
        FROM provider_connections pc
        JOIN key_value kv
          ON kv.namespace = 'syncedAvailableModels'
@@ -553,13 +731,18 @@ export async function getActiveProvidersWithSyncedModel(modelId: string): Promis
            json_extract(custom_model.value, '$.name'),
            json_extract(custom_model.value, '$.model')
          ) = ?`
-    )
-    .all(modelId, modelId) as Array<{ provider?: unknown }>;
+            )
+            .all(modelId, modelId)
+    ) as Array<{ provider?: unknown }>;
 
-  return rows
-    .map((row) => row.provider)
-    .filter((provider): provider is string => typeof provider === "string" && provider.length > 0)
-    .filter((provider) => !isRetiredGitHubCopilotModelId(provider, modelId));
+    return rows
+      .map((row) => row.provider)
+      .filter((provider): provider is string => typeof provider === "string" && provider.length > 0)
+      .filter((provider) => !isRetiredGitHubCopilotModelId(provider, modelId));
+  };
+  if (catalogDatabase && !hasPostgresCatalogSnapshot(catalogDatabase))
+    return withPostgresCatalogSnapshot(catalogDatabase, execute);
+  return execute();
 }
 
 /**
@@ -571,16 +754,36 @@ export async function replaceSyncedAvailableModelsForConnection(
   connectionId: string,
   models: SyncedAvailableModelInput[]
 ): Promise<SyncedAvailableModel[]> {
-  const key = `${providerId}:${connectionId}`;
-  const normalizedModels = normalizeSyncedAvailableModels(models, providerId);
-  persistCanonicalSyncedAvailableModels(key, normalizedModels, normalizeSyncedAvailableModels);
-  notifyQuotaCombosForProvider(providerId);
-  // #12849: stamp the sync time on every successful sync — even a re-sync that
-  // returns an unchanged list proves the catalog is still current, so staleness
-  // gating in getActiveSyncedCatalog must not treat it as aging regardless.
-  if (connectionId) await touchConnectionSyncedModelsAt(connectionId);
-  // Return the full unioned list for the provider
-  return getSyncedAvailableModels(providerId);
+  const catalogDatabase = getSelectedPostgresDatabase();
+  const execute = async () => {
+    const key = `${providerId}:${connectionId}`;
+    const normalizedModels = normalizeSyncedAvailableModels(models, providerId);
+    await persistCanonicalSyncedAvailableModelsAsync(
+      key,
+      normalizedModels,
+      normalizeSyncedAvailableModels
+    );
+    notifyQuotaCombosForProvider(providerId);
+    // #12849: stamp the sync time on every successful sync — even a re-sync that
+    // returns an unchanged list proves the catalog is still current, so staleness
+    // gating in getActiveSyncedCatalog must not treat it as aging regardless.
+    if (connectionId) {
+      if (catalogDatabase)
+        await writePostgresCatalog(
+          "UPDATE omniroute.provider_connections SET synced_models_at=$2,updated_at=$2 WHERE id=$1",
+          [connectionId, new Date().toISOString()]
+        );
+      else await touchConnectionSyncedModelsAt(connectionId);
+      if (catalogDatabase)
+        afterPostgresCatalogCommit(() =>
+          invalidateConnectionUpdate(connectionId, { syncedModelsAt: true })
+        );
+    }
+    // Return the full unioned list for the provider
+    return await getSyncedAvailableModels(providerId);
+  };
+  if (catalogDatabase) return mutatePostgresCatalog(catalogDatabase, execute, { providers: true });
+  return execute();
 }
 
 /**
@@ -591,51 +794,89 @@ export async function removeSyncedAvailableModel(
   providerId: string,
   modelId: string
 ): Promise<boolean> {
-  const db = getDbInstance();
-  const prefix = `${providerId}:`;
-  const rows = db
-    .prepare(
-      "SELECT key, value FROM key_value WHERE namespace = 'syncedAvailableModels' AND key LIKE ?"
-    )
-    .all(`${prefix}%`);
-
-  let removedAny = false;
-  const removeModel = db.transaction(() => {
-    for (const row of rows) {
-      const { key, value } = getKeyValue(row);
-      if (!key || value === null) continue;
-
-      let parsedModels: unknown;
-      try {
-        parsedModels = JSON.parse(value);
-      } catch (error) {
-        console.warn(`[DB] Skipping malformed syncedAvailableModels entry for key ${key}:`, error);
-        continue;
-      }
-
-      const models = normalizeSyncedAvailableModels(parsedModels, providerId);
-      const filtered = models.filter((m) => m.id !== modelId);
-      if (filtered.length !== models.length) {
+  const catalogDatabase = getSelectedPostgresDatabase();
+  const execute = async () => {
+    if (catalogDatabase) {
+      let removedAny = false;
+      const prefix = providerId + ":";
+      for (const row of catalogNamespaceRows("syncedAvailableModels").filter((row) =>
+        catalogKeyMatches(row.key, prefix + "%")
+      )) {
+        let parsedModels: unknown;
+        try {
+          parsedModels = JSON.parse(row.value);
+        } catch (error) {
+          console.warn(
+            `[DB] Skipping malformed syncedAvailableModels entry for key ${row.key}:`,
+            error
+          );
+          continue;
+        }
+        const models = normalizeSyncedAvailableModels(parsedModels, providerId);
+        const filtered = models.filter((model) => model.id !== modelId);
+        if (filtered.length === models.length) continue;
         removedAny = true;
-        if (filtered.length === 0) {
-          db.prepare(
-            "DELETE FROM key_value WHERE namespace = 'syncedAvailableModels' AND key = ?"
-          ).run(key);
-        } else {
-          db.prepare(
-            "UPDATE key_value SET value = ? WHERE namespace = 'syncedAvailableModels' AND key = ?"
-          ).run(JSON.stringify(filtered), key);
+        if (!filtered.length) await deleteCatalogValue("syncedAvailableModels", row.key);
+        else await updateCatalogValue("syncedAvailableModels", row.key, JSON.stringify(filtered));
+      }
+      if (removedAny) {
+        finishSyncedAvailableModelsWrite();
+        notifyQuotaCombosForProvider(providerId);
+      }
+      return removedAny;
+    }
+    const db = getDbInstance();
+    const prefix = `${providerId}:`;
+    const rows = db
+      .prepare(
+        "SELECT key, value FROM key_value WHERE namespace = 'syncedAvailableModels' AND key LIKE ?"
+      )
+      .all(`${prefix}%`);
+
+    let removedAny = false;
+    const removeModel = db.transaction(() => {
+      for (const row of rows) {
+        const { key, value } = getKeyValue(row);
+        if (!key || value === null) continue;
+
+        let parsedModels: unknown;
+        try {
+          parsedModels = JSON.parse(value);
+        } catch (error) {
+          console.warn(
+            `[DB] Skipping malformed syncedAvailableModels entry for key ${key}:`,
+            error
+          );
+          continue;
+        }
+
+        const models = normalizeSyncedAvailableModels(parsedModels, providerId);
+        const filtered = models.filter((m) => m.id !== modelId);
+        if (filtered.length !== models.length) {
+          removedAny = true;
+          if (filtered.length === 0) {
+            db.prepare(
+              "DELETE FROM key_value WHERE namespace = 'syncedAvailableModels' AND key = ?"
+            ).run(key);
+          } else {
+            db.prepare(
+              "UPDATE key_value SET value = ? WHERE namespace = 'syncedAvailableModels' AND key = ?"
+            ).run(JSON.stringify(filtered), key);
+          }
         }
       }
-    }
-  });
+    });
 
-  removeModel();
-  if (removedAny) {
-    finishSyncedAvailableModelsWrite();
-    notifyQuotaCombosForProvider(providerId);
-  }
-  return removedAny;
+    removeModel();
+    if (removedAny) {
+      finishSyncedAvailableModelsWrite();
+      notifyQuotaCombosForProvider(providerId);
+    }
+    return removedAny;
+  };
+  if (catalogDatabase && !isPostgresCatalogMutation(catalogDatabase))
+    return mutatePostgresCatalog(catalogDatabase, execute);
+  return execute();
 }
 
 /**
@@ -646,16 +887,24 @@ export async function deleteSyncedAvailableModelsForConnection(
   providerId: string,
   connectionId: string
 ): Promise<SyncedAvailableModel[]> {
-  const db = getDbInstance();
-  const key = `${providerId}:${connectionId}`;
-  const result = db
-    .prepare("DELETE FROM key_value WHERE namespace = 'syncedAvailableModels' AND key = ?")
-    .run(key);
-  if (result.changes > 0) {
-    finishSyncedAvailableModelsWrite();
-    notifyQuotaCombosForProvider(providerId);
-  }
-  return getSyncedAvailableModels(providerId);
+  const catalogDatabase = getSelectedPostgresDatabase();
+  const execute = async () => {
+    const db = getSelectedPostgresDatabase() ? undefined : getDbInstance();
+    const key = `${providerId}:${connectionId}`;
+    const result = getSelectedPostgresDatabase()
+      ? await deleteCatalogValue("syncedAvailableModels", key)
+      : db!
+          .prepare("DELETE FROM key_value WHERE namespace = 'syncedAvailableModels' AND key = ?")
+          .run(key);
+    if (result.changes > 0) {
+      finishSyncedAvailableModelsWrite();
+      notifyQuotaCombosForProvider(providerId);
+    }
+    return await getSyncedAvailableModels(providerId);
+  };
+  if (catalogDatabase && !isPostgresCatalogMutation(catalogDatabase))
+    return mutatePostgresCatalog(catalogDatabase, execute);
+  return execute();
 }
 
 /**
@@ -670,15 +919,30 @@ export async function cleanupProviderModelsAfterConnectionDelete(
   removedImportedModelIds: string[];
   remainingSyncedModels: SyncedAvailableModel[];
 }> {
-  const remainingSyncedModels = await deleteSyncedAvailableModelsForConnection(
-    providerId,
-    connectionId
-  );
-  const remainingConnections = getProviderConnectionsCount({ provider: providerId });
-  const removedImportedModelIds =
-    remainingConnections === 0 ? await deleteImportedCustomModels(providerId) : [];
+  const catalogDatabase = getSelectedPostgresDatabase();
+  const execute = async () => {
+    const remainingSyncedModels = await deleteSyncedAvailableModelsForConnection(
+      providerId,
+      connectionId
+    );
+    const remainingConnections = catalogDatabase
+      ? Number(
+          (
+            await readPostgresCatalog<{ count: string }>(
+              "SELECT COUNT(*)::text AS count FROM omniroute.provider_connections WHERE provider=$1",
+              [providerId]
+            )
+          ).rows[0]?.count ?? 0
+        )
+      : await getProviderConnectionsCountAsync({ provider: providerId });
+    const removedImportedModelIds =
+      remainingConnections === 0 ? await deleteImportedCustomModels(providerId) : [];
 
-  return { remainingConnections, removedImportedModelIds, remainingSyncedModels };
+    return { remainingConnections, removedImportedModelIds, remainingSyncedModels };
+  };
+  if (catalogDatabase && !isPostgresCatalogMutation(catalogDatabase))
+    return mutatePostgresCatalog(catalogDatabase, execute);
+  return execute();
 }
 
 /**
@@ -686,9 +950,15 @@ export async function cleanupProviderModelsAfterConnectionDelete(
  * Returns the number of connection-scoped synced model lists removed.
  */
 export async function deleteSyncedAvailableModelsForProvider(providerId: string): Promise<number> {
-  const changes = await deleteSyncedAvailableModelsForProviderInternal(providerId);
-  if (changes > 0) notifyQuotaCombosForProvider(providerId);
-  return changes;
+  const catalogDatabase = getSelectedPostgresDatabase();
+  const execute = async () => {
+    const changes = await deleteSyncedAvailableModelsForProviderInternal(providerId);
+    if (changes > 0) notifyQuotaCombosForProvider(providerId);
+    return changes;
+  };
+  if (catalogDatabase && !isPostgresCatalogMutation(catalogDatabase))
+    return mutatePostgresCatalog(catalogDatabase, execute);
+  return execute();
 }
 
 /**
@@ -699,24 +969,35 @@ export async function pruneStaleSyncedAvailableModelsForProvider(
   providerId: string,
   allowedConnectionIds: string[]
 ): Promise<number> {
-  const db = getDbInstance();
-  if (allowedConnectionIds.length === 0) {
-    return deleteSyncedAvailableModelsForProvider(providerId);
-  }
-  const placeholders = allowedConnectionIds.map(() => "?").join(",");
-  const keyPrefix = `${providerId}:`;
-  const allowedKeys = allowedConnectionIds.map((id) => `${providerId}:${id}`);
-  const result = db
-    .prepare(
-      `DELETE FROM key_value WHERE namespace = 'syncedAvailableModels' AND key LIKE ? AND key NOT IN (${placeholders})`
-    )
-    .run(`${keyPrefix}%`, ...allowedKeys);
-  const changes = Number(result.changes || 0);
-  if (changes > 0) {
-    finishSyncedAvailableModelsWrite();
-    notifyQuotaCombosForProvider(providerId);
-  }
-  return changes;
+  const catalogDatabase = getSelectedPostgresDatabase();
+  const execute = async () => {
+    const db = getSelectedPostgresDatabase() ? undefined : getDbInstance();
+    if (allowedConnectionIds.length === 0) {
+      return await deleteSyncedAvailableModelsForProvider(providerId);
+    }
+    const placeholders = allowedConnectionIds.map(() => "?").join(",");
+    const keyPrefix = `${providerId}:`;
+    const allowedKeys = allowedConnectionIds.map((id) => `${providerId}:${id}`);
+    const result = getSelectedPostgresDatabase()
+      ? await deleteCatalogMatchingKeys(
+          "syncedAvailableModels",
+          (key) => catalogKeyMatches(key, `${keyPrefix}%`) && !allowedKeys.includes(key)
+        )
+      : db!
+          .prepare(
+            `DELETE FROM key_value WHERE namespace = 'syncedAvailableModels' AND key LIKE ? AND key NOT IN (${placeholders})`
+          )
+          .run(`${keyPrefix}%`, ...allowedKeys);
+    const changes = Number(result.changes || 0);
+    if (changes > 0) {
+      finishSyncedAvailableModelsWrite();
+      notifyQuotaCombosForProvider(providerId);
+    }
+    return changes;
+  };
+  if (catalogDatabase && !isPostgresCatalogMutation(catalogDatabase))
+    return mutatePostgresCatalog(catalogDatabase, execute);
+  return execute();
 }
 
 /**
@@ -744,121 +1025,138 @@ export async function updateCustomModel(
   updates: Record<string, unknown> = {},
   options: { createIfMissing?: boolean } = {}
 ) {
-  const db = getDbInstance();
-  const row = db
-    .prepare("SELECT value FROM key_value WHERE namespace = 'customModels' AND key = ?")
-    .get(providerId);
+  const catalogDatabase = getSelectedPostgresDatabase();
+  const execute = async () => {
+    const db = getSelectedPostgresDatabase() ? undefined : getDbInstance();
+    const row = getSelectedPostgresDatabase()
+      ? catalogValue("customModels", providerId)
+      : db!
+          .prepare("SELECT value FROM key_value WHERE namespace = 'customModels' AND key = ?")
+          .get(providerId);
 
-  const value = row ? getKeyValue(row).value : null;
-  const models: JsonRecord[] = value ? JSON.parse(value) : [];
-  let index = models.findIndex((m: JsonRecord) => m.id === modelId);
+    const value = row ? getKeyValue(row).value : null;
+    const models: JsonRecord[] = value ? JSON.parse(value) : [];
+    let index = models.findIndex((m: JsonRecord) => m.id === modelId);
 
-  if (index === -1) {
-    if (!options.createIfMissing) return null;
-    // A model discovered via sync/passthrough (syncedAvailableModels) has no
-    // customModels row until an operator explicitly overrides one of its
-    // fields -- PUT /api/provider-models is exactly that "set an override"
-    // action, so upsert here (same default shape as addCustomModel()) instead
-    // of 404ing on the very save it exists to serve. Observed live: a
-    // llama.cpp connection's auto-discovered embedding model had no way to be
-    // marked "supports embeddings" because it had never been explicitly
-    // imported as a custom model first.
-    models.push({
-      id: modelId,
-      name: modelId,
-      source: "manual",
-      apiFormat: "chat-completions",
-      supportedEndpoints: ["chat"],
-    });
-    index = models.length - 1;
-  }
+    if (index === -1) {
+      if (!options.createIfMissing) return null;
+      // A model discovered via sync/passthrough (syncedAvailableModels) has no
+      // customModels row until an operator explicitly overrides one of its
+      // fields -- PUT /api/provider-models is exactly that "set an override"
+      // action, so upsert here (same default shape as addCustomModel()) instead
+      // of 404ing on the very save it exists to serve. Observed live: a
+      // llama.cpp connection's auto-discovered embedding model had no way to be
+      // marked "supports embeddings" because it had never been explicitly
+      // imported as a custom model first.
+      models.push({
+        id: modelId,
+        name: modelId,
+        source: "manual",
+        apiFormat: "chat-completions",
+        supportedEndpoints: ["chat"],
+      });
+      index = models.length - 1;
+    }
 
-  const current = models[index];
-  const currentCompat = (current as JsonRecord).compatByProtocol as CompatByProtocolMap | undefined;
-  let mergedCompat: CompatByProtocolMap | undefined = currentCompat;
-  if (
-    updates.compatByProtocol !== undefined &&
-    typeof updates.compatByProtocol === "object" &&
-    updates.compatByProtocol !== null &&
-    !Array.isArray(updates.compatByProtocol)
-  ) {
-    mergedCompat = deepMergeCompatByProtocol(
-      currentCompat,
-      updates.compatByProtocol as Partial<
-        Record<ModelCompatProtocolKey, Partial<ModelCompatPerProtocol>>
-      >
-    );
-    if (!compatByProtocolHasEntries(mergedCompat)) mergedCompat = undefined;
-  }
+    const current = models[index];
+    const currentCompat = (current as JsonRecord).compatByProtocol as
+      CompatByProtocolMap | undefined;
+    let mergedCompat: CompatByProtocolMap | undefined = currentCompat;
+    if (
+      updates.compatByProtocol !== undefined &&
+      typeof updates.compatByProtocol === "object" &&
+      updates.compatByProtocol !== null &&
+      !Array.isArray(updates.compatByProtocol)
+    ) {
+      mergedCompat = deepMergeCompatByProtocol(
+        currentCompat,
+        updates.compatByProtocol as Partial<
+          Record<ModelCompatProtocolKey, Partial<ModelCompatPerProtocol>>
+        >
+      );
+      if (!compatByProtocolHasEntries(mergedCompat)) mergedCompat = undefined;
+    }
 
-  const next: JsonRecord = {
-    ...current,
-    ...(updates.modelName !== undefined ? { name: updates.modelName || current.name } : {}),
-    ...(updates.apiFormat !== undefined ? { apiFormat: updates.apiFormat } : {}),
-    ...(updates.targetFormat !== undefined ? { targetFormat: updates.targetFormat } : {}),
-    ...(updates.supportedEndpoints !== undefined
-      ? { supportedEndpoints: updates.supportedEndpoints }
-      : {}),
-    ...(updates.normalizeToolCallId !== undefined
-      ? { normalizeToolCallId: Boolean(updates.normalizeToolCallId) }
-      : {}),
-    ...(updates.isHidden !== undefined ? { isHidden: Boolean(updates.isHidden) } : {}),
+    const next: JsonRecord = {
+      ...current,
+      ...(updates.modelName !== undefined ? { name: updates.modelName || current.name } : {}),
+      ...(updates.apiFormat !== undefined ? { apiFormat: updates.apiFormat } : {}),
+      ...(updates.targetFormat !== undefined ? { targetFormat: updates.targetFormat } : {}),
+      ...(updates.supportedEndpoints !== undefined
+        ? { supportedEndpoints: updates.supportedEndpoints }
+        : {}),
+      ...(updates.normalizeToolCallId !== undefined
+        ? { normalizeToolCallId: Boolean(updates.normalizeToolCallId) }
+        : {}),
+      ...(updates.isHidden !== undefined ? { isHidden: Boolean(updates.isHidden) } : {}),
+    };
+    applyTriStateBooleanOverride(next, updates, "preserveOpenAIDeveloperRole");
+    // #1904: manual vision-capability override — `null` clears back to the
+    // id-based heuristic in getCustomVisionCapabilityFields().
+    applyTriStateBooleanOverride(next, updates, "supportsVision");
+    applyTriStateBooleanOverride(next, updates, "isFree");
+    if (updates.compatByProtocol !== undefined) {
+      if (mergedCompat && compatByProtocolHasEntries(mergedCompat)) {
+        next.compatByProtocol = mergedCompat;
+      } else {
+        delete next.compatByProtocol;
+      }
+    }
+
+    if (Object.prototype.hasOwnProperty.call(updates, "upstreamHeaders")) {
+      const uh = updates.upstreamHeaders;
+      if (uh === null || uh === undefined) {
+        delete next.upstreamHeaders;
+      } else if (typeof uh === "object" && !Array.isArray(uh)) {
+        const s = sanitizeUpstreamHeadersMap(uh as Record<string, unknown>);
+        if (Object.keys(s).length === 0) delete next.upstreamHeaders;
+        else next.upstreamHeaders = s;
+      }
+    }
+
+    // #9820: optional video-generation job preset. Mirrors the upstreamHeaders
+    // pattern: `null`/`undefined` clears a previously set preset; a well-formed
+    // object replaces it verbatim.
+    if (Object.prototype.hasOwnProperty.call(updates, "generationConfig")) {
+      const gc = updates.generationConfig;
+      if (gc === null || gc === undefined) {
+        delete next.generationConfig;
+      } else if (typeof gc === "object" && !Array.isArray(gc)) {
+        next.generationConfig = gc;
+      }
+    }
+
+    models[index] = next;
+
+    // INSERT OR REPLACE (not UPDATE): the createIfMissing path above may be
+    // writing this provider's customModels row for the first time, and an
+    // UPDATE...WHERE would silently match zero rows in that case.
+    getSelectedPostgresDatabase()
+      ? await putCatalogValue("customModels", providerId, JSON.stringify(models))
+      : db!
+          .prepare(
+            "INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES ('customModels', ?, ?)"
+          )
+          .run(providerId, JSON.stringify(models));
+
+    finishModelCatalogWriteWithBackup();
+    return next;
   };
-  applyTriStateBooleanOverride(next, updates, "preserveOpenAIDeveloperRole");
-  // #1904: manual vision-capability override — `null` clears back to the
-  // id-based heuristic in getCustomVisionCapabilityFields().
-  applyTriStateBooleanOverride(next, updates, "supportsVision");
-  applyTriStateBooleanOverride(next, updates, "isFree");
-  if (updates.compatByProtocol !== undefined) {
-    if (mergedCompat && compatByProtocolHasEntries(mergedCompat)) {
-      next.compatByProtocol = mergedCompat;
-    } else {
-      delete next.compatByProtocol;
-    }
-  }
-
-  if (Object.prototype.hasOwnProperty.call(updates, "upstreamHeaders")) {
-    const uh = updates.upstreamHeaders;
-    if (uh === null || uh === undefined) {
-      delete next.upstreamHeaders;
-    } else if (typeof uh === "object" && !Array.isArray(uh)) {
-      const s = sanitizeUpstreamHeadersMap(uh as Record<string, unknown>);
-      if (Object.keys(s).length === 0) delete next.upstreamHeaders;
-      else next.upstreamHeaders = s;
-    }
-  }
-
-  // #9820: optional video-generation job preset. Mirrors the upstreamHeaders
-  // pattern: `null`/`undefined` clears a previously set preset; a well-formed
-  // object replaces it verbatim.
-  if (Object.prototype.hasOwnProperty.call(updates, "generationConfig")) {
-    const gc = updates.generationConfig;
-    if (gc === null || gc === undefined) {
-      delete next.generationConfig;
-    } else if (typeof gc === "object" && !Array.isArray(gc)) {
-      next.generationConfig = gc;
-    }
-  }
-
-  models[index] = next;
-
-  // INSERT OR REPLACE (not UPDATE): the createIfMissing path above may be
-  // writing this provider's customModels row for the first time, and an
-  // UPDATE...WHERE would silently match zero rows in that case.
-  db.prepare(
-    "INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES ('customModels', ?, ?)"
-  ).run(providerId, JSON.stringify(models));
-
-  finishModelCatalogWriteWithBackup();
-  return next;
+  if (catalogDatabase && !isPostgresCatalogMutation(catalogDatabase))
+    return mutatePostgresCatalog(catalogDatabase, execute);
+  return execute();
 }
 
 /** Single custom model row from key_value customModels, or null */
 function getCustomModelRow(providerId: string, modelId: string): JsonRecord | null {
-  const db = getDbInstance();
-  const row = db
-    .prepare("SELECT value FROM key_value WHERE namespace = 'customModels' AND key = ?")
-    .get(providerId);
+  requirePostgresCatalogSnapshot();
+
+  const db = getSelectedPostgresDatabase() ? undefined : getDbInstance();
+  const row = getSelectedPostgresDatabase()
+    ? catalogValue("customModels", providerId)
+    : db!
+        .prepare("SELECT value FROM key_value WHERE namespace = 'customModels' AND key = ?")
+        .get(providerId);
   const value = getKeyValue(row).value;
   if (!value) return null;
   try {
@@ -984,13 +1282,19 @@ export function getModelIsHidden(
  * building to skip user-hidden models. Single bulk DB query — not N+1 per model.
  */
 export function getHiddenModelsByProvider(modality: string = "chat"): Map<string, Set<string>> {
-  const db = getDbInstance();
+  requirePostgresCatalogSnapshot();
+
+  const db = getSelectedPostgresDatabase() ? undefined : getDbInstance();
   const visibilityByProvider = new Map<string, Map<string, boolean>>();
-  const rows = db
-    .prepare(
-      "SELECT namespace, key, value FROM key_value WHERE namespace IN ('modelCompatOverrides', 'customModels')"
-    )
-    .all() as Array<{ namespace: string; key: string; value: string | null }>;
+  const rows = (
+    getSelectedPostgresDatabase()
+      ? [...catalogNamespaceRows("modelCompatOverrides"), ...catalogNamespaceRows("customModels")]
+      : db!
+          .prepare(
+            "SELECT namespace, key, value FROM key_value WHERE namespace IN ('modelCompatOverrides', 'customModels')"
+          )
+          .all()
+  ) as Array<{ namespace: string; key: string; value: string | null }>;
 
   for (const namespace of ["modelCompatOverrides", "customModels"]) {
     for (const row of rows) {
@@ -1050,50 +1354,56 @@ export function getHiddenModelsByProvider(modality: string = "chat"): Map<string
  * row when one exists, otherwise on the compat-override list. Setting
  * `hidden = false` is a no-op when the model is already visible.
  */
-export function setModelIsHidden(
+export async function setModelIsHiddenAsync(
   providerId: string,
   modelId: string,
   hidden: boolean,
   modality?: string
-): void {
-  const customRow = getCustomModelRow(providerId, modelId);
-  if (customRow) {
-    if (hidden) {
-      updateCustomModel(providerId, modelId, { isHidden: true });
-    } else if (Object.prototype.hasOwnProperty.call(customRow, "isHidden")) {
-      updateCustomModel(providerId, modelId, { isHidden: false });
+): Promise<void> {
+  const catalogDatabase = getSelectedPostgresDatabase();
+  const execute = async () => {
+    const customRow = getCustomModelRow(providerId, modelId);
+    if (customRow) {
+      if (hidden) {
+        await updateCustomModel(providerId, modelId, { isHidden: true });
+      } else if (Object.prototype.hasOwnProperty.call(customRow, "isHidden")) {
+        await updateCustomModel(providerId, modelId, { isHidden: false });
+      }
+      return;
     }
-    return;
-  }
 
-  // #12172: a modality-scoped write never touches the legacy all-modalities
-  // `isHidden` flag — it only sets/clears that one modality's override, so an
-  // identically-ID'd model in a different modality's registry is unaffected.
-  if (modality) {
-    mergeModelCompatOverride(providerId, modelId, { isHidden: hidden, modality });
-    return;
-  }
+    // #12172: a modality-scoped write never touches the legacy all-modalities
+    // `isHidden` flag — it only sets/clears that one modality's override, so an
+    // identically-ID'd model in a different modality's registry is unaffected.
+    if (modality) {
+      await mergeModelCompatOverrideAsync(providerId, modelId, { isHidden: hidden, modality });
+      return;
+    }
 
-  const list = readCompatList(providerId);
-  const idx = list.findIndex((e) => e.id === modelId);
-  if (hidden) {
-    const prev = idx >= 0 ? list[idx] : { id: modelId };
-    const next: ModelCompatOverride = { ...prev, id: modelId, isHidden: true };
-    if (idx >= 0) list[idx] = next;
-    else list.push(next);
-    writeCompatList(providerId, list);
-    return;
-  }
+    const list = readCompatList(providerId);
+    const idx = list.findIndex((e) => e.id === modelId);
+    if (hidden) {
+      const prev = idx >= 0 ? list[idx] : { id: modelId };
+      const next: ModelCompatOverride = { ...prev, id: modelId, isHidden: true };
+      if (idx >= 0) list[idx] = next;
+      else list.push(next);
+      await writeCompatListAsync(providerId, list);
+      return;
+    }
 
-  if (idx < 0) return;
-  if (Object.keys(list[idx]).length <= 1) {
-    // Only `id` left; drop the entry entirely.
-    const filtered = list.filter((_, i) => i !== idx);
-    writeCompatList(providerId, filtered);
-    return;
-  }
-  delete list[idx].isHidden;
-  writeCompatList(providerId, list);
+    if (idx < 0) return;
+    if (Object.keys(list[idx]).length <= 1) {
+      // Only `id` left; drop the entry entirely.
+      const filtered = list.filter((_, i) => i !== idx);
+      await writeCompatListAsync(providerId, filtered);
+      return;
+    }
+    delete list[idx].isHidden;
+    await writeCompatListAsync(providerId, list);
+  };
+  if (catalogDatabase && !isPostgresCatalogMutation(catalogDatabase))
+    return mutatePostgresCatalog(catalogDatabase, execute);
+  return execute();
 }
 
 function readUpstreamFromJsonRecord(
@@ -1152,4 +1462,51 @@ export function getModelUpstreamExtraHeaders(
     );
   }
   return base;
+}
+
+export function setModelIsHidden(
+  providerId: string,
+  modelId: string,
+  hidden: boolean,
+  modality?: string
+): void {
+  assertSqliteBackendAllowed();
+  const customRow = getCustomModelRow(providerId, modelId);
+  if (customRow) {
+    if (hidden) {
+      updateCustomModel(providerId, modelId, { isHidden: true });
+    } else if (Object.prototype.hasOwnProperty.call(customRow, "isHidden")) {
+      updateCustomModel(providerId, modelId, { isHidden: false });
+    }
+    return;
+  }
+
+  // #12172: a modality-scoped write never touches the legacy all-modalities
+  // `isHidden` flag — it only sets/clears that one modality's override, so an
+  // identically-ID'd model in a different modality's registry is unaffected.
+  if (modality) {
+    mergeModelCompatOverride(providerId, modelId, { isHidden: hidden, modality });
+    return;
+  }
+
+  const list = readCompatList(providerId);
+  const idx = list.findIndex((e) => e.id === modelId);
+  if (hidden) {
+    const prev = idx >= 0 ? list[idx] : { id: modelId };
+    const next: ModelCompatOverride = { ...prev, id: modelId, isHidden: true };
+    if (idx >= 0) list[idx] = next;
+    else list.push(next);
+    writeCompatList(providerId, list);
+    return;
+  }
+
+  if (idx < 0) return;
+  if (Object.keys(list[idx]).length <= 1) {
+    // Only `id` left; drop the entry entirely.
+    const filtered = list.filter((_, i) => i !== idx);
+    writeCompatList(providerId, filtered);
+    return;
+  }
+  delete list[idx].isHidden;
+  writeCompatList(providerId, list);
 }
