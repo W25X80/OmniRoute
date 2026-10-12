@@ -64,6 +64,7 @@ export async function PUT(request: Request, props: { params: Promise<{ id: strin
 
     await updateSkillAsync(id, patch);
 
+    skillRegistry.invalidateCache();
     await skillRegistry.loadFromDatabase();
 
     return NextResponse.json({

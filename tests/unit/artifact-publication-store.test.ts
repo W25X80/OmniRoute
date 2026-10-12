@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { registerHooks } from "node:module";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import {
   fixture,
@@ -24,6 +27,73 @@ const hooks = registerHooks({
 });
 const { createS3ArtifactStore } = await import(source);
 test.after(() => hooks.deregister());
+for (const endpoints of [
+  ["AWS_ENDPOINT_URL_S3"],
+  ["AWS_ENDPOINT_URL"],
+  ["AWS_ENDPOINT_URL_S3", "AWS_ENDPOINT_URL"],
+]) {
+  test(`production factory ignores endpoint overrides from ${endpoints.join(" and ")}`, async () => {
+    fixture.reset();
+    const directory = await mkdtemp(join(tmpdir(), "artifact-endpoint-profile-"));
+    const names = [
+      "AWS_ENDPOINT_URL_S3",
+      "AWS_ENDPOINT_URL",
+      "AWS_IGNORE_CONFIGURED_ENDPOINT_URLS",
+      "AWS_CONFIG_FILE",
+      "AWS_SHARED_CREDENTIALS_FILE",
+      "AWS_PROFILE",
+      "AWS_DEFAULT_PROFILE",
+    ];
+    const previous = new Map(names.map((name) => [name, process.env[name]]));
+    const store = createS3ArtifactStore(configuration);
+    try {
+      const config = join(directory, "config");
+      const credentials = join(directory, "credentials");
+      await writeFile(config, "[default]\nignore_configured_endpoint_urls = false\n");
+      await writeFile(credentials, "");
+      process.env.AWS_CONFIG_FILE = config;
+      process.env.AWS_SHARED_CREDENTIALS_FILE = credentials;
+      process.env.AWS_PROFILE = "default";
+      process.env.AWS_DEFAULT_PROFILE = "default";
+      // Only the production factory may suppress overrides, not the ambient SDK profile.
+      process.env.AWS_IGNORE_CONFIGURED_ENDPOINT_URLS = "false";
+      delete process.env.AWS_ENDPOINT_URL_S3;
+      delete process.env.AWS_ENDPOINT_URL;
+      for (const name of endpoints) process.env[name] = "http://127.0.0.1:1/untrusted";
+      const bytes = Buffer.from("private artifact endpoint control");
+      const stored = await store.put(bytes);
+      assert.deepEqual(await store.get(stored.reference), bytes);
+      assert.equal(await store.delete(stored.reference), true);
+      assert.equal(fixture.clients.length, 2, "the production writer and reader must be created");
+      assert.deepEqual(
+        fixture.requests.map(({ method }) => method),
+        ["PUT", "GET", "DELETE"]
+      );
+      for (const request of fixture.requests) {
+        assert.equal(request.protocol, "https:");
+        assert.equal(
+          request.hostname,
+          `${configuration.bucket}.s3.${configuration.region}.amazonaws.com`
+        );
+        assert.equal(request.path, `/${configuration.prefix}${stored.reference}`);
+        assert.equal(
+          request.headers["x-amz-expected-bucket-owner"],
+          configuration.expectedBucketOwner
+        );
+      }
+    } finally {
+      try {
+        await store.close();
+      } finally {
+        for (const [name, value] of previous) {
+          if (value === undefined) delete process.env[name];
+          else process.env[name] = value;
+        }
+        await rm(directory, { recursive: true, force: true });
+      }
+    }
+  });
+}
 test("production factory routes exactly one SDK PUT attempt and retains read/delete retries and socket bounds", async () => {
   fixture.reset();
   fixture.putMode = "lost";

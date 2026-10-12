@@ -131,6 +131,14 @@ const migrations: readonly Migration[] = [
     name: "artifact_publication_ownership",
     statements: POSTGRES_ARTIFACT_PUBLICATION_SCHEMA_STATEMENTS,
   },
+  {
+    version: 6,
+    name: "fractional_compression_durations",
+    statements: [
+      "ALTER TABLE omniroute.compression_analytics ALTER COLUMN duration_ms TYPE double precision USING duration_ms::double precision",
+      "ALTER TABLE omniroute.compression_engine_breakdown ALTER COLUMN duration_ms TYPE double precision USING duration_ms::double precision",
+    ],
+  },
 ];
 
 function checksum(migration: Migration): string {

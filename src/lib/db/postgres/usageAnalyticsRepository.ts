@@ -264,7 +264,7 @@ export async function getDailyCostRows(
         COALESCE(SUM(stored_cost), 0.0) as "storedCost",
         MAX(is_aggregated) as "isAggregated"
       FROM ${unifiedSource} AS _u
-      GROUP BY to_char(timestamp::timestamptz AT TIME ZONE 'UTC', 'YYYY-MM-DD'), LOWER(provider), LOWER(model), "serviceTier"
+      GROUP BY to_char(timestamp::timestamptz AT TIME ZONE 'UTC', 'YYYY-MM-DD'), LOWER(provider), LOWER(model), "serviceTier", is_aggregated
       ORDER BY date ASC
     `,
     params,
@@ -312,7 +312,12 @@ export async function getModelUsageRows(
         COALESCE(SUM(tokens_cache_creation), 0) as "cacheCreationTokens",
         COALESCE(SUM(tokens_reasoning), 0) as "reasoningTokens",
         COALESCE(SUM(tokens_input + tokens_output), 0) as "totalTokens",
-        COALESCE(AVG(latency_ms), 0) as "avgLatencyMs",
+        -- Splitting cost operands must not change the existing request-weighted
+        -- consumer: retain the original day's latency cohort for both operands.
+        COALESCE(
+          SUM(SUM(latency_ms)) OVER latency_cohort /
+          NULLIF(SUM(COUNT(latency_ms)) OVER latency_cohort, 0), 0
+        ) as "avgLatencyMs",
         COALESCE(SUM(CASE WHEN success = 1 THEN requests ELSE 0 END), 0) as "successfulRequests",
         COALESCE(MAX(timestamp), '') as "lastUsed",
         COALESCE(SUM(stored_cost), 0.0) as "storedCost",
@@ -321,8 +326,14 @@ export async function getModelUsageRows(
       -- Keep cost inputs separated by day. Historical provider rows do not
       -- always use one cache-token convention, and computeCostFromPricing's
       -- non-cached-input clamp is intentionally non-linear across those rows.
-      GROUP BY to_char(timestamp::timestamptz AT TIME ZONE 'UTC', 'YYYY-MM-DD'), LOWER(model), LOWER(provider), "serviceTier"
-      ORDER BY requests DESC
+      -- Raw pricing and exact archive cost are independent operands, even on one day.
+      GROUP BY to_char(timestamp::timestamptz AT TIME ZONE 'UTC', 'YYYY-MM-DD'), LOWER(model), LOWER(provider), "serviceTier", is_aggregated
+      WINDOW latency_cohort AS (
+        PARTITION BY to_char(timestamp::timestamptz AT TIME ZONE 'UTC', 'YYYY-MM-DD'), LOWER(model), LOWER(provider), COALESCE(NULLIF(service_tier, ''), 'standard')
+      )
+      -- Keep the former group rank: the model consumer takes its representative
+      -- provider from the first operand before merging identical model names.
+      ORDER BY SUM(SUM(requests)) OVER latency_cohort DESC, requests DESC
     `,
     params,
     USAGE_NUMERIC_FIELDS
@@ -349,7 +360,7 @@ export async function getProviderCostRows(
         COALESCE(SUM(stored_cost), 0.0) as "storedCost",
         MAX(is_aggregated) as "isAggregated"
       FROM ${unifiedSource} AS _u
-      GROUP BY to_char(timestamp::timestamptz AT TIME ZONE 'UTC', 'YYYY-MM-DD'), LOWER(provider), LOWER(model), "serviceTier"
+      GROUP BY to_char(timestamp::timestamptz AT TIME ZONE 'UTC', 'YYYY-MM-DD'), LOWER(provider), LOWER(model), "serviceTier", is_aggregated
     `,
     params,
     USAGE_NUMERIC_FIELDS
@@ -557,7 +568,7 @@ export async function getServiceTierUsageRows(
         COALESCE(SUM(stored_cost), 0.0) as "storedCost",
         MAX(is_aggregated) as "isAggregated"
       FROM ${unifiedSource} AS _u
-      GROUP BY to_char(timestamp::timestamptz AT TIME ZONE 'UTC', 'YYYY-MM-DD'), "serviceTier", LOWER(provider), LOWER(model)
+      GROUP BY to_char(timestamp::timestamptz AT TIME ZONE 'UTC', 'YYYY-MM-DD'), "serviceTier", LOWER(provider), LOWER(model), is_aggregated
     `,
     params,
     USAGE_NUMERIC_FIELDS
@@ -637,7 +648,7 @@ export async function getPresetCostModelRows(
         COALESCE(SUM(stored_cost), 0.0) as "storedCost",
         MAX(is_aggregated) as "isAggregated"
       FROM ${presetUnifiedSource} AS _pu
-      GROUP BY to_char(timestamp::timestamptz AT TIME ZONE 'UTC', 'YYYY-MM-DD'), LOWER(model), LOWER(provider), "serviceTier"
+      GROUP BY to_char(timestamp::timestamptz AT TIME ZONE 'UTC', 'YYYY-MM-DD'), LOWER(model), LOWER(provider), "serviceTier", is_aggregated
     `,
     params,
     USAGE_NUMERIC_FIELDS

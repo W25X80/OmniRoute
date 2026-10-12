@@ -50,9 +50,16 @@ export async function writeProviderQuotaUsage(
   const window = opts.windowMs ?? 60_000;
   if (!Number.isFinite(window) || window <= 0 || !Number.isFinite(delta))
     throw new TypeError("Invalid quota window or token delta");
-  const now = Date.now(),
-    start = Math.floor(now / window) * window;
   await database.transaction(async (tx) => {
+    // Serialize this counter even before its first row exists. Capture its window only
+    // after the lock acknowledgement, so a queued write cannot publish an older clock.
+    // The namespace is distinct from quota-consumption locks; hash collisions can only
+    // reduce parallelism, while the JSON tuple keeps entity keys unambiguous.
+    await tx.query("SELECT pg_advisory_xact_lock(18767,hashtext($1))", [
+      JSON.stringify([id, model]),
+    ]);
+    const now = Date.now(),
+      start = Math.floor(now / window) * window;
     await tx.query(
       `INSERT INTO omniroute.provider_quota_state
     (connection_id,model,tokens_used,token_limit,window_start,window_reset,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7)

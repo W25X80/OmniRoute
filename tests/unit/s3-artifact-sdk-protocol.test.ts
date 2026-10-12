@@ -168,7 +168,7 @@ test("SDK lost upload acknowledgment retains its identity without a second PUT a
   await store.close();
 });
 
-test("SDK ignores endpoint URL environment overrides in the private artifact profile", async () => {
+test("SDK fixture configuration ignores endpoint URL environment overrides", async () => {
   const originalService = process.env.AWS_ENDPOINT_URL_S3;
   const originalGlobal = process.env.AWS_ENDPOINT_URL;
   process.env.AWS_ENDPOINT_URL_S3 = "http://127.0.0.1:1/untrusted";

@@ -42,6 +42,10 @@ const PROXY_UPDATE_ORDER = `CASE WHEN pg_input_is_valid(updated_at, 'timestamptz
 const PROXY_COLUMNS =
   "id,name,type,host,port,username,password,region,notes,status,source,family,subscription_id,created_at,updated_at";
 const ASSIGNMENT_COLUMNS = "id,proxy_id,scope,scope_id,position,created_at,updated_at";
+interface PreferredMember {
+  preferredId?: string;
+  selectedId?: string;
+}
 
 export async function lockProxyState(tx: PostgresTransaction, shared = false): Promise<void> {
   await tx.query(
@@ -271,7 +275,8 @@ export function createPostgresProxyRepository(database: PostgresDatabase) {
     scope: ProxyScope,
     id: string | null,
     anyId: boolean,
-    notifications: Array<{ scope: string; candidates: JsonRecord[] }>
+    notifications: Array<{ scope: string; candidates: JsonRecord[] }>,
+    preference?: PreferredMember
   ) {
     const candidates = (
       await tx.query<JsonRecord>(
@@ -281,8 +286,23 @@ export function createPostgresProxyRepository(database: PostgresDatabase) {
     ).rows;
     if (!candidates.length) return null;
     notifications.push({ scope, candidates });
-    if (candidates.length === 1)
-      return toRegistryProxyResolution(candidates[0], scope, scope === "global" ? null : id);
+    const selected = (row: JsonRecord) => {
+      if (preference) preference.selectedId = String(row.id);
+      return toRegistryProxyResolution(row, scope, scope === "global" ? null : id);
+    };
+    const preferred = preference?.preferredId
+      ? candidates.find((row) => row.id === preference.preferredId)
+      : undefined;
+    // A stable egress pins identity, never credentials or policy. Every lookup reads
+    // current alive membership; a refused member yields to an eligible alternative.
+    if (
+      preferred &&
+      (!isProxySkipRecentlyFailedEnabled() ||
+        !isProxyAvoided(proxyEgressKey(preferred)) ||
+        candidates.every((row) => isProxyAvoided(proxyEgressKey(row))))
+    )
+      return selected(preferred);
+    if (candidates.length === 1) return selected(candidates[0]);
     const rotationId = normalizeRotationScopeId(scope, id);
     const now = new Date().toISOString();
     await tx.query(
@@ -323,7 +343,7 @@ export function createPostgresProxyRepository(database: PostgresDatabase) {
           }
         }
       }
-      return toRegistryProxyResolution(candidates[index], scope, scope === "global" ? null : id);
+      return selected(candidates[index]);
     }
     let provider: string | null = scope === "provider" ? id : null;
     if (
@@ -425,7 +445,36 @@ export function createPostgresProxyRepository(database: PostgresDatabase) {
           [scope, rotationId, advance, now]
         );
     }
-    return toRegistryProxyResolution(ranked[index], scope, scope === "global" ? null : id);
+    return selected(ranked[index]);
+  }
+
+  async function resolveScope(
+    scope: string,
+    scopeId?: string | null,
+    preference?: PreferredMember
+  ) {
+    const notifications: Array<{ scope: string; candidates: JsonRecord[] }> = [];
+    const selected = await database.transaction(async (tx) => {
+      await lockProxyState(tx, true);
+      const s = normalizeScope(scope);
+      if (s !== "global" && !scopeId) return null;
+      return resolve(
+        tx,
+        s,
+        s === "global" ? null : scopeId!,
+        s === "global",
+        notifications,
+        preference
+      );
+    });
+    for (const notification of notifications)
+      maybeEmitPoolExhausted(
+        notification.scope,
+        notification.candidates,
+        (row) => proxyEgressKey(row),
+        (key) => isProxyAvoided(key)
+      );
+    return selected;
   }
 
   return {
@@ -663,22 +712,15 @@ export function createPostgresProxyRepository(database: PostgresDatabase) {
           ).rows[0]?.strategy
         );
       }),
-    resolveScope: async (scope: string, scopeId?: string | null) => {
-      const notifications: Array<{ scope: string; candidates: JsonRecord[] }> = [];
-      const selected = await database.transaction(async (tx) => {
-        await lockProxyState(tx, true);
-        const s = normalizeScope(scope);
-        if (s !== "global" && !scopeId) return null;
-        return resolve(tx, s, s === "global" ? null : scopeId!, s === "global", notifications);
-      });
-      for (const notification of notifications)
-        maybeEmitPoolExhausted(
-          notification.scope,
-          notification.candidates,
-          (row) => proxyEgressKey(row),
-          (key) => isProxyAvoided(key)
-        );
-      return selected;
+    resolveScope,
+    resolveScopeWithPreference: async (
+      scope: string,
+      scopeId?: string | null,
+      preferredId?: string
+    ) => {
+      const preference: PreferredMember = { preferredId };
+      const resolution = await resolveScope(scope, scopeId, preference);
+      return { resolution, proxyId: preference.selectedId };
     },
     resolveConnection: async (connectionId: string) => {
       const notifications: Array<{ scope: string; candidates: JsonRecord[] }> = [];

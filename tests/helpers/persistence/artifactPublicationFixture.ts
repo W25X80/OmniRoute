@@ -30,7 +30,14 @@ export function barrier() {
   });
   return { promise, resolve };
 }
-type Request = { method: string; path: string; headers: Record<string, string>; body?: unknown };
+type Request = {
+  method: string;
+  protocol: string;
+  hostname: string;
+  path: string;
+  headers: Record<string, string>;
+  body?: unknown;
+};
 type Intent = ArtifactPublicationRow & { nextDue: number };
 export const configuration = {
   bucket: "artifact-publication-test",

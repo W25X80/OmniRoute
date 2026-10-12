@@ -16,6 +16,7 @@ const log = logger("SKILLS");
 export const GLOBAL_SKILL_OWNER_ID = "system";
 const GLOBAL_SKILL_OWNER_IDS = [GLOBAL_SKILL_OWNER_ID, "skillsmp", "skillssh"] as const;
 const GLOBAL_SKILL_OWNER_ID_SET = new Set<string>(GLOBAL_SKILL_OWNER_IDS);
+const MAX_SUPERSEDED_LOADS = 3;
 
 class SkillRegistry {
   private static instances = new WeakMap<object, SkillRegistry>();
@@ -25,15 +26,19 @@ class SkillRegistry {
   private loadedAll: boolean = false;
   private loadedApiKeyIds: Set<string> = new Set();
   private readonly cacheTTL: number = 60_000; // 60 seconds
-  private pendingLoad: Promise<void> | null = null; // dedupes concurrent cache fills
+  private pendingLoad: Promise<boolean> | null = null; // dedupes concurrent cache fills
+  private cacheGeneration: object = {};
+  private readonly authority: object;
 
-  private constructor() {}
+  private constructor(authority: object) {
+    this.authority = authority;
+  }
 
   static getInstance(): SkillRegistry {
     const authority = getSkillStorageAuthority();
     let instance = SkillRegistry.instances.get(authority);
     if (!instance) {
-      instance = new SkillRegistry();
+      instance = new SkillRegistry(authority);
       SkillRegistry.instances.set(authority, instance);
     }
     return instance;
@@ -44,6 +49,7 @@ class SkillRegistry {
   }
 
   invalidateCache(): void {
+    this.cacheGeneration = {};
     this.lastLoaded = 0;
     this.loadedAll = false;
     this.loadedApiKeyIds.clear();
@@ -321,87 +327,104 @@ class SkillRegistry {
   }
 
   async loadFromDatabase(apiKeyId?: string): Promise<void> {
-    if (this.pendingLoad) {
-      await this.pendingLoad;
-      // A concurrent load may cover another principal. Re-check this requested scope below.
-    }
-    const cacheHasScope = apiKeyId
-      ? this.loadedAll || this.loadedApiKeyIds.has(apiKeyId)
-      : this.loadedAll;
-    if (cacheHasScope && !this.isCacheStale()) return;
-
-    this.pendingLoad = (async () => {
-      try {
-        log.debug("skills.registry.loadFromDatabase", { cached: false });
-        const rows = await listSkillRowsAsync(
-          !apiKeyId
-            ? undefined
-            : this.isGlobalOwner(apiKeyId)
-              ? GLOBAL_SKILL_OWNER_IDS
-              : [apiKeyId, ...GLOBAL_SKILL_OWNER_IDS]
-        );
-
-        if (apiKeyId) {
-          this.removeCachedSkills(
-            (skill) => skill.apiKeyId === apiKeyId || this.isGlobalOwner(skill.apiKeyId)
-          );
-        } else {
-          this.registeredSkills.clear();
-          this.versionCache.clear();
-        }
-
-        for (const row of rows as any[]) {
-          const tags = (() => {
-            try {
-              if (typeof row.tags !== "string") return [];
-              const parsed = JSON.parse(row.tags);
-              return Array.isArray(parsed) ? parsed.filter((item) => typeof item === "string") : [];
-            } catch {
-              return [];
-            }
-          })();
-
-          const skill: Skill = {
-            id: row.id,
-            apiKeyId: row.api_key_id,
-            name: row.name,
-            version: row.version,
-            description: row.description || "",
-            schema: JSON.parse(row.schema),
-            handler: row.handler,
-            enabled: row.enabled === 1,
-            mode: row.mode === "off" || row.mode === "auto" ? row.mode : "on",
-            sourceProvider:
-              row.source_provider === "skillsmp" || row.source_provider === "skillssh"
-                ? row.source_provider
-                : row.source_provider
-                  ? "local"
-                  : undefined,
-            tags,
-            installCount: typeof row.install_count === "number" ? row.install_count : 0,
-            createdAt: new Date(row.created_at),
-            updatedAt: new Date(row.updated_at),
-          };
-          this.cacheSkill(skill);
-        }
-        if (apiKeyId) {
-          this.loadedApiKeyIds.add(apiKeyId);
-        } else {
-          this.loadedAll = true;
-          this.loadedApiKeyIds.clear();
-        }
-        this.lastLoaded = Date.now();
-      } catch (err: any) {
-        log.error("loadFromDatabase error:", err);
-        throw err;
-      } finally {
-        this.pendingLoad = null;
+    let superseded = 0;
+    while (superseded < MAX_SUPERSEDED_LOADS) {
+      this.assertStorageAuthority();
+      let load = this.pendingLoad;
+      if (!load) {
+        const cacheHasScope = apiKeyId
+          ? this.loadedAll || this.loadedApiKeyIds.has(apiKeyId)
+          : this.loadedAll;
+        if (cacheHasScope && !this.isCacheStale()) return;
+        load = this.loadSnapshot(apiKeyId, this.cacheGeneration);
+        this.pendingLoad = load;
       }
-    })();
+      try {
+        if (!(await load)) superseded++;
+      } finally {
+        // A waiter must never clear a successor's flight after its own settles.
+        if (this.pendingLoad === load) this.pendingLoad = null;
+      }
+      // Re-check coverage: another tenant's successful load may not cover this caller.
+    }
+    throw new Error("Skill registry changed repeatedly during refresh; retry the request");
+  }
+
+  private assertStorageAuthority(): void {
+    if (getSkillStorageAuthority() !== this.authority)
+      throw new Error("Skill registry persistence authority changed");
+  }
+
+  private async loadSnapshot(apiKeyId: string | undefined, generation: object): Promise<boolean> {
     try {
-      await this.pendingLoad;
-    } finally {
-      this.pendingLoad = null;
+      log.debug("skills.registry.loadFromDatabase", { cached: false });
+      const rows = await listSkillRowsAsync(
+        !apiKeyId
+          ? undefined
+          : this.isGlobalOwner(apiKeyId)
+            ? GLOBAL_SKILL_OWNER_IDS
+            : [apiKeyId, ...GLOBAL_SKILL_OWNER_IDS]
+      );
+
+      this.assertStorageAuthority();
+      // An acknowledged mutation owns the newer cache. Discard this read before
+      // changing any rows, version indexes or freshness; only a read may be retried.
+      if (generation !== this.cacheGeneration) return false;
+
+      if (apiKeyId) {
+        this.removeCachedSkills(
+          (skill) => skill.apiKeyId === apiKeyId || this.isGlobalOwner(skill.apiKeyId)
+        );
+      } else {
+        this.registeredSkills.clear();
+        this.versionCache.clear();
+      }
+
+      for (const row of rows) {
+        const tags = (() => {
+          try {
+            if (typeof row.tags !== "string") return [];
+            const parsed = JSON.parse(row.tags);
+            return Array.isArray(parsed) ? parsed.filter((item) => typeof item === "string") : [];
+          } catch {
+            return [];
+          }
+        })();
+
+        const skill: Skill = {
+          id: row.id,
+          apiKeyId: row.api_key_id,
+          name: row.name,
+          version: row.version,
+          description: row.description || "",
+          schema: JSON.parse(row.schema),
+          handler: row.handler,
+          enabled: row.enabled === 1,
+          mode: row.mode === "off" || row.mode === "auto" ? row.mode : "on",
+          sourceProvider:
+            row.source_provider === "skillsmp" || row.source_provider === "skillssh"
+              ? row.source_provider
+              : row.source_provider
+                ? "local"
+                : undefined,
+          tags,
+          installCount: typeof row.install_count === "number" ? row.install_count : 0,
+          createdAt: new Date(row.created_at),
+          updatedAt: new Date(row.updated_at),
+        };
+        this.cacheSkill(skill);
+      }
+      if (apiKeyId) {
+        this.loadedApiKeyIds.add(apiKeyId);
+      } else {
+        this.loadedAll = true;
+        this.loadedApiKeyIds.clear();
+      }
+      this.lastLoaded = Date.now();
+      return true;
+    } catch (err: unknown) {
+      log.error("loadFromDatabase error:", { error: err });
+      throw err;
     }
   }
 
@@ -411,6 +434,7 @@ class SkillRegistry {
 
     if (updated === 0) return undefined;
 
+    this.invalidateCache();
     const skill = this.getSkill(id, apiKeyId);
     if (skill) {
       const mode: Skill["mode"] = enabled ? "on" : "off";
@@ -419,7 +443,6 @@ class SkillRegistry {
       return updatedSkill;
     }
 
-    this.invalidateCache();
     await this.loadFromDatabase(apiKeyId);
     return this.getSkill(id, apiKeyId);
   }

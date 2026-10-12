@@ -61,7 +61,9 @@ test(
       CREATE TABLE usage_history(id INTEGER PRIMARY KEY AUTOINCREMENT,provider TEXT,model TEXT,timestamp TEXT,tokens_input INTEGER,latency_ms REAL,ttft_ms REAL);
       CREATE TABLE session_model_history(id INTEGER PRIMARY KEY AUTOINCREMENT,session_id TEXT,combo_name TEXT,model_str TEXT,provider TEXT,connection_id TEXT,used_at TEXT);
       CREATE TABLE user_levels(api_key_id TEXT PRIMARY KEY,total_xp REAL,current_level REAL,updated_at TEXT);
-      CREATE TABLE quota_groups(id TEXT PRIMARY KEY,name TEXT,created_at TEXT);`);
+      CREATE TABLE quota_groups(id TEXT PRIMARY KEY,name TEXT,created_at TEXT);
+      CREATE TABLE compression_analytics(id INTEGER PRIMARY KEY,timestamp TEXT NOT NULL,mode TEXT NOT NULL,original_tokens INTEGER NOT NULL,compressed_tokens INTEGER NOT NULL,tokens_saved INTEGER NOT NULL,duration_ms INTEGER);
+      CREATE TABLE compression_engine_breakdown(id INTEGER PRIMARY KEY,timestamp TEXT NOT NULL,engine TEXT NOT NULL,original_tokens INTEGER,compressed_tokens INTEGER,tokens_saved INTEGER,duration_ms INTEGER);`);
       const ciphertext = encrypt("isolated-provider-credential")!;
       source
         .prepare(
@@ -100,6 +102,20 @@ test(
       source
         .prepare("INSERT INTO quota_groups VALUES(?,?,?)")
         .run("group-demo", "Imported Demo", "2026-10-11 03:00:00");
+      source
+        .prepare("INSERT INTO compression_analytics VALUES(?,?,?,?,?,?,?)")
+        .run(21, "2026-10-11T03:00:00Z", "stacked", 100, 70, 30, 1.23);
+      source
+        .prepare("INSERT INTO compression_engine_breakdown VALUES(?,?,?,?,?,?,?)")
+        .run(31, "2026-10-11T03:00:00Z", "lite", 100, 70, 30, 0.45);
+      const sourceDurationType = source
+        .prepare("SELECT typeof(duration_ms) AS type FROM compression_analytics")
+        .get() as { type: string };
+      assert.equal(
+        sourceDurationType.type,
+        "real",
+        "the source INTEGER-affinity column retains the existing fractional producer value"
+      );
       source.pragma("query_only=ON");
       const snapshot = captureSqliteApplicationSnapshot(source),
         sourceDigest = applicationSnapshotDigest(snapshot);
@@ -110,7 +126,18 @@ test(
         async () => {
           const receipt = await importApplicationSnapshot(database, snapshot);
           assert.equal(receipt.sourceDigest, sourceDigest);
-          assert.equal(receipt.rowCount, 9);
+          assert.equal(receipt.rowCount, 11);
+          const durationValues = await database.transaction(async (tx) => ({
+            aggregate: (
+              await tx.query("SELECT duration_ms FROM omniroute.compression_analytics WHERE id=21")
+            ).rows[0].duration_ms,
+            breakdown: (
+              await tx.query(
+                "SELECT duration_ms FROM omniroute.compression_engine_breakdown WHERE id=31"
+              )
+            ).rows[0].duration_ms,
+          }));
+          assert.deepEqual(durationValues, { aggregate: 1.23, breakdown: 0.45 });
           const result = await database.transaction(async (tx) => {
             const provider = (
               await tx.query<{ api_key: string; insertion_order: string }>(

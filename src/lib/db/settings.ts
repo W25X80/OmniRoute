@@ -28,7 +28,11 @@ import { isProxySkipRecentlyFailedEnabled } from "@/shared/utils/featureFlags";
 import { invalidateDbCache } from "./readCache";
 import { encrypt, decrypt } from "./encryption";
 import { getProxyRegistryGeneration, resolveProxyForScopeFromRegistry } from "./proxies";
-import { isEgressBucketedLockScope } from "@omniroute/open-sse/config/providerErrorRules.ts";
+import {
+  advanceProxyConfigGeneration,
+  getProxyConfigGeneration,
+  requiresStableEgress,
+} from "./settings/stableEgressPolicy";
 import { getComboModelProvider as getComboEntryProvider } from "@/lib/combos/steps";
 import { decodeUserinfo } from "@/shared/utils/decodeUserinfo";
 import { type JsonRecord, toRecord } from "./settings/shared";
@@ -64,11 +68,10 @@ type ProxyResolutionCacheEntry = ProxyResolutionStamp & { result: ProxyResolutio
 
 const PROXY_RESOLUTION_CACHE_MAX_ENTRIES = 100;
 
-let proxyConfigGeneration = 0;
 const proxyResolutionCache = new Map<string, ProxyResolutionCacheEntry>();
 
 export function bumpProxyConfigGeneration() {
-  proxyConfigGeneration++;
+  advanceProxyConfigGeneration();
   proxyResolutionCache.clear();
 }
 
@@ -77,7 +80,7 @@ function cacheProxyResolution(
   stamp: ProxyResolutionStamp,
   result: ProxyResolutionResult
 ) {
-  if (stamp.generation !== proxyConfigGeneration) return;
+  if (stamp.generation !== getProxyConfigGeneration()) return;
   if (stamp.registryGeneration !== getProxyRegistryGeneration()) return;
   if (proxyResolutionCache.size >= PROXY_RESOLUTION_CACHE_MAX_ENTRIES) {
     const oldestKey = proxyResolutionCache.keys().next().value;
@@ -406,24 +409,13 @@ function isCachedPoolMemberSetAside(entry: ProxyResolutionCacheEntry): boolean {
   return isProxySkipRecentlyFailedEnabled();
 }
 
-// Providers that need a STABLE egress across requests, never rotated under them by this
-// cache-invalidation path (#13575): opencode's free-tier quota is bucketed by egress IP
-// (EGRESS_BUCKETED_LOCK_PROVIDERS — rotating would fragment one connection's quota across
-// several IPs), and grok-web's cf_clearance cookie is pinned to the IP/User-Agent/TLS
-// fingerprint that earned it (src/shared/providers/webSessionCredentials.ts "grok-web" —
-// rotating the egress would turn every subsequent request into a Cloudflare 403).
-function requiresStableEgress(provider: string | null): boolean {
-  if (!provider) return false;
-  return isEgressBucketedLockScope(provider) || provider.toLowerCase() === "grok-web";
-}
-
 // The chat-path cache (below) exists so a hot connection does not pay the full resolution
 // cascade on every request, but it must not FREEZE a rotating pool's choice: the registry
 // resolver (resolveProxyForScopeFromRegistry, called directly by every #6365 rotation test)
 // re-runs its strategy on every call and rotates correctly, while the cache here returned
 // the same first-resolved member forever (#13575). A cached member is stale whenever it came
 // from a live scope pool (source: "registry") and the connection is not in the two populations
-// above that need a pinned egress instead: the caller then falls through to the full cascade,
+// in the shared stable-egress policy: the caller then falls through to the full cascade,
 // which re-invokes resolveProxyForScopeFromRegistry and applies the pool's own selection
 // strategy (round-robin advances, sticky holds until its window elapses, random reshuffles) —
 // no new strategy is introduced here.
@@ -456,7 +448,7 @@ export async function resolveProxyForConnection(
       ? `${connectionId}:${apiKeyId}`
       : connectionId;
   const stamp: ProxyResolutionStamp = {
-    generation: proxyConfigGeneration,
+    generation: getProxyConfigGeneration(),
     registryGeneration: getProxyRegistryGeneration(),
     refusalSeq: getProxyRefusalSeq(),
   };

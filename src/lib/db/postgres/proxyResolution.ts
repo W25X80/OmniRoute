@@ -4,12 +4,88 @@ import { hasPostgresCatalogSnapshot, withPostgresCatalogSnapshot } from "./catal
 import type { PostgresDatabase } from "./database";
 import { createPostgresProxyRepository } from "./proxyRepository";
 import { resolveNoAuthSharedProviderProxy } from "../settings/noAuthProxyFallback";
+import { getSelectedPersistenceIdentity } from "../controlPlaneContext";
+import { getProxyRegistryGeneration } from "../proxies/registryGeneration";
+import { getProxyConfigGeneration, requiresStableEgress } from "../settings/stableEgressPolicy";
 type Value = Record<string, unknown> | string | null;
 interface Resolution {
   proxy: Value;
   level: string;
   levelId: string | null;
   source?: string;
+}
+interface PinStamp {
+  config: number;
+  registry: number;
+}
+interface StablePins {
+  members: Map<string, PinStamp & { proxyId: string }>;
+  queues: Array<Promise<void>>;
+}
+const PIN_LIMIT = 100;
+const PIN_QUEUE_STRIPES = 64;
+const pinsKey = Symbol.for("omniroute.postgres.stable-proxy-pins.v1");
+const processState = globalThis as typeof globalThis & {
+  [pinsKey]?: WeakMap<object, StablePins>;
+};
+const pinsByAuthority = (processState[pinsKey] ??= new WeakMap<object, StablePins>());
+
+function pinStamp(): PinStamp {
+  return { config: getProxyConfigGeneration(), registry: getProxyRegistryGeneration() };
+}
+function sameStamp(left: PinStamp, right: PinStamp): boolean {
+  return left.config === right.config && left.registry === right.registry;
+}
+
+async function resolveStableScope(
+  database: PostgresDatabase,
+  repository: ReturnType<typeof createPostgresProxyRepository>,
+  owner: readonly (string | undefined)[],
+  stamp: PinStamp,
+  scope: string,
+  scopeId?: string | null
+) {
+  const identity = getSelectedPersistenceIdentity() ?? database;
+  let pins = pinsByAuthority.get(identity);
+  if (!pins) {
+    pins = {
+      members: new Map(),
+      queues: Array.from({ length: PIN_QUEUE_STRIPES }, () => Promise.resolve()),
+    };
+    pinsByAuthority.set(identity, pins);
+  }
+  const key = JSON.stringify([...owner, scope, scopeId ?? null]);
+  let hash = 0;
+  for (let i = 0; i < key.length; i++) hash = (Math.imul(hash, 31) + key.charCodeAt(i)) | 0;
+  const stripe = (hash >>> 0) % PIN_QUEUE_STRIPES;
+  const previous = pins.queues[stripe];
+  let release!: () => void;
+  pins.queues[stripe] = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  // Fixed lock stripes bound coordination state. Collisions only serialize stable
+  // selections; ordinary providers never wait here. Waiters belong to active calls.
+  await previous;
+  try {
+    const existing = pins.members.get(key);
+    const preferred =
+      existing && sameStamp(existing, stamp) && sameStamp(stamp, pinStamp())
+        ? existing.proxyId
+        : undefined;
+    const selected = await repository.resolveScopeWithPreference(scope, scopeId, preferred);
+    // Publish identity only after acknowledged COMMIT and only in the generation
+    // that admitted this selection. A late old receipt cannot replace a newer pin.
+    if (sameStamp(stamp, pinStamp())) {
+      pins.members.delete(key);
+      if (selected.proxyId) {
+        pins.members.set(key, { ...stamp, proxyId: selected.proxyId });
+        if (pins.members.size > PIN_LIMIT) pins.members.delete(pins.members.keys().next().value!);
+      }
+    }
+    return selected.resolution;
+  } finally {
+    release();
+  }
 }
 const ALIAS_TO_PROVIDER_ID: Record<string, string> = {};
 for (const [provider, alias] of Object.entries(PROVIDER_ID_TO_ALIAS)) {
@@ -34,7 +110,7 @@ function parse(value: string | undefined): unknown {
     return undefined;
   }
 }
-/** No process-local cache: database updates from other instances are visible at every lookup. */
+/** Proxy policy is read on every call; stable pins retain only a checked member ID. */
 function perKeyProxyEnabled(value: string | undefined): boolean {
   if (!value) return false;
   try {
@@ -50,6 +126,7 @@ async function resolveProxyForConnection(
   apiKeyId?: string,
   providerId?: string
 ): Promise<Resolution> {
+  const stamp = pinStamp();
   const state = await database.transaction(async (tx) => {
     const rows = (
       await tx.query<{ namespace: string; key: string; value: string }>(
@@ -117,7 +194,19 @@ async function resolveProxyForConnection(
       source: "api_key",
     };
   const repo = createPostgresProxyRepository(database);
-  const account = await repo.resolveScope("account", connectionId);
+  const provider = state.connection?.provider;
+  const resolveScope = (scope: string, scopeId?: string | null) =>
+    requiresStableEgress(provider ?? null)
+      ? resolveStableScope(
+          database,
+          repo,
+          [connectionId, apiKeyId, provider],
+          stamp,
+          scope,
+          scopeId
+        )
+      : repo.resolveScope(scope, scopeId);
+  const account = await resolveScope("account", connectionId);
   if (account?.proxy) return account as Resolution;
   const keys = config.keys as Record<string, Value> | undefined;
   if (connectionId && keys?.[connectionId])
@@ -126,10 +215,9 @@ async function resolveProxyForConnection(
       level: "key",
       levelId: connectionId,
     };
-  const provider = state.connection?.provider;
   const providers = config.providers as Record<string, Value> | undefined;
   if (provider) {
-    const registry = await repo.resolveScope("provider", provider);
+    const registry = await resolveScope("provider", provider);
     if (registry?.proxy) return registry as Resolution;
     for (const row of state.combos) {
       const value = parse(row.data);
@@ -143,7 +231,7 @@ async function resolveProxyForConnection(
         })
       )
         continue;
-      const registryCombo = await repo.resolveScope("combo", row.id);
+      const registryCombo = await resolveScope("combo", row.id);
       if (registryCombo?.proxy) return registryCombo as Resolution;
       const combos = config.combos as Record<string, Value> | undefined;
       if (combos?.[row.id])
@@ -163,7 +251,7 @@ async function resolveProxyForConnection(
     const fallback = await resolveNoAuthSharedProviderProxy(providers, providerId);
     if (fallback) return fallback;
   }
-  const global = await repo.resolveScope("global");
+  const global = await resolveScope("global");
   if (global?.proxy) return global as Resolution;
   if (config.global)
     return {

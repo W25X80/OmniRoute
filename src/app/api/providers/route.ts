@@ -1,5 +1,6 @@
 import { getAllProviderLimitsCacheAsync } from "@/lib/db/providerLimits";
 import { parseDatabaseBackend } from "@/lib/db/backendSelection";
+import { runPersistenceBackgroundWork } from "@/lib/db/persistenceRuntime";
 import { getProviderConnectionsCountAsync } from "@/lib/db/providers";
 import { NextResponse } from "next/server";
 import { getSettings } from "@/lib/db/settings";
@@ -432,10 +433,12 @@ export async function POST(request: Request) {
     // GHSA-jmq6-8j86-8xqj: the local CLI probe spawns on the host — only for local callers.
     // S-01 (#15159): allowLocalSpawn covers the devin cloud-agent validator's CLI
     // fallback, which also spawns. Same gate, same reason.
-    void testSingleConnection(newConnection.id, undefined, {
-      allowLocalRuntimeProbe: getRequestPeerLocality(request) !== "remote",
-      allowLocalSpawn: getRequestPeerLocality(request) !== "remote",
-    }).catch((testError: unknown) => {
+    void runPersistenceBackgroundWork(() =>
+      testSingleConnection(newConnection.id, undefined, {
+        allowLocalRuntimeProbe: getRequestPeerLocality(request) !== "remote",
+        allowLocalSpawn: getRequestPeerLocality(request) !== "remote",
+      })
+    ).catch((testError: unknown) => {
       console.log(
         `[providers] Auto-test failed for ${newConnection.id}:`,
         (testError as { message?: string })?.message || testError

@@ -366,7 +366,7 @@ export async function resolvePromptQlThreadBindingAsync(
     clientThreadId,
     memoryLookup
   );
-  if (result.isFollowUp || missing.size === 0) return result;
+  if (missing.size === 0) return result;
   const path = threadCachePath();
   return withNativeThreadCacheFile(path, async () => {
     const disk = await readNativeThreadCacheFile<ThreadBinding>(path);
