@@ -173,6 +173,9 @@ test(
       const target = join(directory, "core.json"),
         binary = join(directory, "sing-box");
       await asyncFs.writeFile(target, "original", { mode: 0o640 });
+      // Establish the adopted mode independently of the runner's protective umask.
+      await asyncFs.chmod(target, 0o640);
+      assert.equal((await asyncFs.stat(target)).mode & 0o777, 0o640);
       await asyncFs.writeFile(binary, "fixture", { mode: 0o700 });
       await asyncFs.writeFile(`${target}.generated`, "stale");
       const rename = asyncFs.rename;
@@ -213,6 +216,9 @@ test(
       const target = join(directory, "core.json"),
         binary = join(directory, "sing-box");
       await asyncFs.writeFile(target, "original", { mode: 0o640 });
+      // Establish the adopted mode independently of the runner's protective umask.
+      await asyncFs.chmod(target, 0o640);
+      assert.equal((await asyncFs.stat(target)).mode & 0o777, 0o640);
       await asyncFs.writeFile(binary, "fixture", { mode: 0o700 });
       await asyncFs.writeFile(`${target}.generated`, "stale");
       forbidSync(t);
