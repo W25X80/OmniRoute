@@ -7,6 +7,7 @@ import {
   withNativeMitmCancellation,
 } from "./nativeHostIo.ts";
 import { spawn, type ChildProcess } from "child_process";
+import { attachNativeAliasBridge } from "./nativeAliasBridge.ts";
 import path from "path";
 import fs from "fs";
 import { resolveMitmDataDir } from "./dataDir.ts";
@@ -516,7 +517,7 @@ export async function getMitmStatus(agentId?: string): Promise<{
 export async function startMitm(
   apiKey: string,
   sudoPassword: string,
-  options: { port?: number; signal?: AbortSignal } = {}
+  options: { port?: number } = {}
 ): Promise<{ running: true; pid: number | null; certTrusted: boolean }> {
   if (nativeMitmEnabled()) await nativePidCleanup;
   // Check if already running
@@ -531,7 +532,7 @@ export async function startMitm(
   }
 
   try {
-    return await withNativeMitmCancellation(options.signal, () =>
+    return await withNativeMitmCancellation(undefined, () =>
       startMitmInternal(apiKey, sudoPassword, options)
     );
   } finally {
@@ -712,10 +713,11 @@ async function startMitmInternal(
       NODE_ENV: "production",
     },
     detached: false,
-    stdio: ["ignore", "pipe", "pipe"],
+    stdio: nativeMitmEnabled() ? ["ignore", "pipe", "pipe", "ipc"] : ["ignore", "pipe", "pipe"],
   });
 
   const proc = serverProcess;
+  const nativeAliases = nativeMitmEnabled() ? attachNativeAliasBridge(proc) : undefined;
   serverPid = proc.pid ?? null;
 
   let pidWrite: Promise<void> = Promise.resolve();
@@ -752,7 +754,7 @@ async function startMitmInternal(
 
   proc.on("exit", (code) => {
     if (nativeMitmEnabled()) {
-      nativePidCleanup = pidWrite
+      nativePidCleanup = Promise.all([pidWrite, nativeAliases?.close()])
         .then(() => removeNativePidFile(proc.pid))
         .catch(() => {})
         .then(() => {

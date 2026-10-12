@@ -14,9 +14,11 @@
  * seam is injectable so the command sequence is unit-testable without root.
  */
 import fs from "node:fs";
+import { writeFile, unlink } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { execFileWithPassword } from "../systemCommands.ts";
+import { nativeMitmEnabled, existsAsync } from "../nativeHostIo.ts";
 
 /** Dedicated trust-store filename — distinct from the static MITM cert's slot. */
 export const TPROXY_CA_CERT_NAME = "omniroute-tproxy-ca.crt";
@@ -35,30 +37,34 @@ export interface CaTrustDeps {
   /** Run a privileged command (sudo/arg-array; runs direct when root). */
   run: SudoRunner;
   /** Stage the CA PEM to a local file before the privileged copy. */
-  writeFile: (filePath: string, data: string) => void;
+  writeFile: (filePath: string, data: string) => void | Promise<void>;
   /** Remove the staged file (best-effort). */
-  rmFile: (filePath: string) => void;
+  rmFile: (filePath: string) => void | Promise<void>;
   /** Directory to stage the PEM in. */
   tmpDir: () => string;
   /** Resolve the trust-store anchor dir + refresh command for this distro. */
-  certConfig: () => { dir: string; cmd: string };
+  certConfig: () => { dir: string; cmd: string } | Promise<{ dir: string; cmd: string }>;
   /** Host platform (Linux-only gate). */
   platform: () => string;
 }
 
-function detectCertConfig(): { dir: string; cmd: string } {
+async function detectCertConfig(): Promise<{ dir: string; cmd: string }> {
   for (const c of LINUX_CERT_PATHS) {
-    if (fs.existsSync(c.dir)) return c;
+    if (nativeMitmEnabled() ? await existsAsync(c.dir) : fs.existsSync(c.dir)) return c;
   }
   return LINUX_CERT_PATHS[0];
 }
 
 const realDeps: CaTrustDeps = {
   run: execFileWithPassword,
-  writeFile: (filePath, data) => fs.writeFileSync(filePath, data, { mode: 0o644 }),
-  rmFile: (filePath) => {
+  writeFile: (filePath, data) =>
+    nativeMitmEnabled()
+      ? writeFile(filePath, data, { mode: 0o644 })
+      : fs.writeFileSync(filePath, data, { mode: 0o644 }),
+  rmFile: async (filePath) => {
     try {
-      fs.unlinkSync(filePath);
+      if (nativeMitmEnabled()) await unlink(filePath);
+      else fs.unlinkSync(filePath);
     } catch {
       // best-effort cleanup
     }
@@ -86,16 +92,16 @@ export async function installTproxyCa(
   if (d.platform() !== "linux") {
     throw new Error("TPROXY CA trust install is Linux-only.");
   }
-  const cfg = d.certConfig();
+  const cfg = await d.certConfig();
   const staged = path.join(d.tmpDir(), TPROXY_CA_CERT_NAME);
   const dest = `${cfg.dir}/${TPROXY_CA_CERT_NAME}`;
-  d.writeFile(staged, caPem);
   try {
+    await d.writeFile(staged, caPem);
     await d.run("sudo", ["-S", "mkdir", "-p", cfg.dir], sudoPassword);
     await d.run("sudo", ["-S", "cp", staged, dest], sudoPassword);
     await d.run("sudo", ["-S", cfg.cmd], sudoPassword);
   } finally {
-    d.rmFile(staged);
+    await d.rmFile(staged);
   }
 }
 
@@ -113,7 +119,7 @@ export async function uninstallTproxyCa(
   }
   const d = { ...realDeps, ...deps };
   if (d.platform() !== "linux") return;
-  const cfg = d.certConfig();
+  const cfg = await d.certConfig();
   const dest = `${cfg.dir}/${TPROXY_CA_CERT_NAME}`;
   await d.run("sudo", ["-S", "rm", "-f", dest], sudoPassword);
   await d.run("sudo", ["-S", cfg.cmd], sudoPassword);

@@ -76,7 +76,7 @@ export async function POST(request: Request): Promise<Response> {
       if (suppliedPassword) setCachedPassword(suppliedPassword);
       const apiKey = await resolveRouterApiKey(rawApiKey);
       const { startMitm } = await import("@/mitm/manager.runtime");
-      const result = await startMitm(apiKey, sudoPassword, { signal: request.signal });
+      const result = await startMitm(apiKey, sudoPassword);
       return Response.json({ ok: true, ...result });
     }
 
@@ -97,7 +97,7 @@ export async function POST(request: Request): Promise<Response> {
       // stopMitm calls clearCachedPassword() internally, so re-cache after stop
       if (sudoPassword || pwd) setCachedPassword(sudoPassword || pwd);
       const apiKey = await resolveRouterApiKey(rawApiKey);
-      const result = await startMitm(apiKey, sudoPassword || pwd, { signal: request.signal });
+      const result = await startMitm(apiKey, sudoPassword || pwd);
       return Response.json({ ok: true, ...result });
     }
 

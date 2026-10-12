@@ -1,5 +1,5 @@
 import path from "path";
-import fs from "fs";
+import { mitmFileExists } from "./nativeHostIo.ts";
 import { resolveMitmDataDir } from "./dataDir.ts";
 import { removeDNSEntry, removeDNSEntries } from "./dns/dnsConfig.ts";
 import { uninstallCert } from "./cert/install.ts";
@@ -101,7 +101,7 @@ export async function performRepairSteps(sudoPassword: string): Promise<string[]
   if (plan.removeCert) {
     try {
       const certPath = path.join(resolveMitmDataDir(), "mitm", "server.crt");
-      if (fs.existsSync(certPath)) {
+      if (await mitmFileExists(certPath)) {
         await uninstallCert(sudoPassword, certPath);
         repaired.push("cert");
       }

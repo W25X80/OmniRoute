@@ -9,6 +9,7 @@ import path from "path";
 import fs from "fs";
 import { resolveMitmDataDir } from "../dataDir.ts";
 import { generateMitmCa, type CaPair } from "../tproxy/dynamicCert.ts";
+import { withCertificatePair } from "./pairMutex.ts";
 
 // #6684: persisted local root CA for the AgentBridge static server, so it can
 // issue a per-host leaf for every host in `MITM_TOOL_HOSTS` (not just the 4
@@ -54,39 +55,41 @@ export async function loadOrCreateMitmCa(
 ): Promise<MitmCaPair> {
   const { keyPath, certPath } = caPaths(certDir);
 
-  if (
-    nativeMitmEnabled()
-      ? (await existsAsync(keyPath)) && (await existsAsync(certPath))
-      : fs.existsSync(keyPath) && fs.existsSync(certPath)
-  ) {
-    return {
-      key: nativeMitmEnabled() ? await readTextAsync(keyPath) : fs.readFileSync(keyPath, "utf-8"),
-      cert: nativeMitmEnabled()
-        ? await readTextAsync(certPath)
-        : fs.readFileSync(certPath, "utf-8"),
-      keyPath,
-      certPath,
-    };
-  }
+  return withCertificatePair(keyPath, certPath, async () => {
+    if (
+      nativeMitmEnabled()
+        ? (await existsAsync(keyPath)) && (await existsAsync(certPath))
+        : fs.existsSync(keyPath) && fs.existsSync(certPath)
+    ) {
+      return {
+        key: nativeMitmEnabled() ? await readTextAsync(keyPath) : fs.readFileSync(keyPath, "utf-8"),
+        cert: nativeMitmEnabled()
+          ? await readTextAsync(certPath)
+          : fs.readFileSync(certPath, "utf-8"),
+        keyPath,
+        certPath,
+      };
+    }
 
-  const ca = await generateMitmCa();
+    const ca = await generateMitmCa();
 
-  if (nativeMitmEnabled()) await mkdir(certDir, { recursive: true });
-  else if (!fs.existsSync(certDir)) fs.mkdirSync(certDir, { recursive: true });
+    if (nativeMitmEnabled()) await mkdir(certDir, { recursive: true });
+    else if (!fs.existsSync(certDir)) fs.mkdirSync(certDir, { recursive: true });
 
-  if (nativeMitmEnabled()) {
-    nativeMitmSignal()?.throwIfAborted();
-    await writeFile(keyPath, ca.key, { mode: 0o600 });
-    await chmod(keyPath, 0o600);
-    await writeFile(certPath, ca.cert);
-  } else {
-    fs.writeFileSync(keyPath, ca.key);
-    fs.writeFileSync(certPath, ca.cert);
-  }
-  // Owner-only read/write — the CA private key must never be group/world-
-  // readable (it can sign a trusted leaf for any host). No-op on Windows,
-  // which does not honor POSIX chmod bits.
-  if (!nativeMitmEnabled()) fs.chmodSync(keyPath, 0o600);
+    if (nativeMitmEnabled()) {
+      nativeMitmSignal()?.throwIfAborted();
+      await writeFile(keyPath, ca.key, { mode: 0o600 });
+      await chmod(keyPath, 0o600);
+      await writeFile(certPath, ca.cert);
+    } else {
+      fs.writeFileSync(keyPath, ca.key);
+      fs.writeFileSync(certPath, ca.cert);
+    }
+    // Owner-only read/write — the CA private key must never be group/world-
+    // readable (it can sign a trusted leaf for any host). No-op on Windows,
+    // which does not honor POSIX chmod bits.
+    if (!nativeMitmEnabled()) fs.chmodSync(keyPath, 0o600);
 
-  return { key: ca.key, cert: ca.cert, keyPath, certPath };
+    return { key: ca.key, cert: ca.cert, keyPath, certPath };
+  });
 }

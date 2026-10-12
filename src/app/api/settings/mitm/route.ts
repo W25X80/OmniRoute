@@ -2,7 +2,6 @@ import {
   mitmFileExists,
   mkdirMitmDirectory,
   readMitmFile,
-  removeMitmFile,
   writeMitmFile,
 } from "@/mitm/nativeHostIo";
 export const runtime = "nodejs";
@@ -71,10 +70,6 @@ function getStatsPath() {
 
 function getCertPath() {
   return path.join(getMitmDir(), "server.crt");
-}
-
-function getKeyPath() {
-  return path.join(getMitmDir(), "server.key");
 }
 
 function defaultTargets(port = DEFAULT_PORT): MitmTargetRoute[] {
@@ -272,16 +267,8 @@ export async function POST(request: Request) {
       );
     }
 
-    for (const filePath of [getCertPath(), getKeyPath()]) {
-      try {
-        if (await mitmFileExists(filePath)) await removeMitmFile(filePath);
-      } catch {
-        /* ignore */
-      }
-    }
-
     const { generateCert } = await import("@/mitm/cert/generate");
-    await generateCert();
+    await generateCert({ force: true });
 
     return NextResponse.json(await buildMitmResponse());
   } catch (error) {

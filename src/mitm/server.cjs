@@ -6,6 +6,12 @@ const dns = require("dns");
 const { promisify } = require("util");
 const os = require("os");
 
+const databaseBackend = process.env.OMNIROUTE_DATABASE_BACKEND ?? "sqlite";
+if (databaseBackend !== "sqlite" && databaseBackend !== "postgres") {
+  throw new Error("OMNIROUTE_DATABASE_BACKEND must be sqlite or postgres");
+}
+const NATIVE_PERSISTENCE = databaseBackend === "postgres";
+
 // Resolve data directory — mirrors src/lib/dataPaths.ts logic.
 // This file runs as a standalone CommonJS process and cannot import the ES module.
 function getDataDir() {
@@ -142,6 +148,9 @@ const aliasConfigShim = require("./_internal/aliasConfig.cjs");
 const standaloneRoutingShim = require("./_internal/standaloneRouting.cjs");
 const writeBackpressureShim = require("./_internal/writeBackpressure.cjs");
 const peerGuardShim = require("./_internal/peerGuard.cjs");
+const { createNativeAliasClient } = require("./_internal/nativeAliasClient.cjs");
+const { createAsyncStatsWriter } = require("./_internal/asyncStatsWriter.cjs");
+const nativeAliases = NATIVE_PERSISTENCE ? createNativeAliasClient() : null;
 
 // Inspector capture (D4 fallback). The standalone proxy intercepts AgentBridge
 // traffic inline (no MitmHandlerBase / agentBridgeHook), so it posts captured
@@ -220,6 +229,7 @@ if (!API_KEY) {
 // Load SSL certificates
 const certDir = path.join(DATA_DIR, "mitm");
 const STATS_FILE = path.join(certDir, "stats.json");
+const nativeStats = NATIVE_PERSISTENCE ? createAsyncStatsWriter(STATS_FILE) : null;
 const stats = {
   startedAt: null,
   totalRequests: 0,
@@ -230,6 +240,10 @@ const stats = {
 };
 
 function writeStats() {
+  if (nativeStats) {
+    nativeStats.publish(stats);
+    return;
+  }
   try {
     fs.writeFileSync(STATS_FILE, JSON.stringify(stats, null, 2));
   } catch {
@@ -414,7 +428,10 @@ function getSqliteDb() {
  * shape. The route-only namespace is reserved for client-facing OmniRoute model ids;
  * fall back to `mitmAlias` until a route-alias writer is available.
  */
-function getMappedOverride(model, agentId = "antigravity") {
+async function getMappedOverride(model, agentId = "antigravity") {
+  if (nativeAliases) {
+    return nativeAliases.lookup(model, standaloneRoutingShim.getAgentRouteConfig(agentId).aliasKey);
+  }
   return standaloneRoutingShim.resolveMappedOverride(model, agentId, {
     fs,
     dbFile: DB_FILE,
@@ -740,7 +757,19 @@ async function startMitmServer() {
       return passthrough(req, res, bodyBuffer);
     }
 
-    const mappedOverride = getMappedOverride(model, agentId);
+    let mappedOverride;
+    try {
+      mappedOverride = await getMappedOverride(model, agentId);
+    } catch {
+      // Authority/transport failure must not silently bypass the configured router.
+      if (!res.headersSent) res.writeHead(503, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          error: { message: sanitizeErrorMessage("MITM alias lookup is unavailable") },
+        })
+      );
+      return;
+    }
 
     if (!mappedOverride) {
       vlog(1, `[MITM] → PASSTHROUGH (model "${model}" has no MITM alias mapping)`);
@@ -945,12 +974,19 @@ async function startMitmServer() {
     process.exit(1);
   });
 
-  process.on("SIGTERM", () => {
-    server.close(() => process.exit(0));
-  });
-  process.on("SIGINT", () => {
-    server.close(() => process.exit(0));
-  });
+  let closing = false;
+  function closeServer() {
+    if (closing) return;
+    closing = true;
+    server.close(async () => {
+      if (nativeStats) await nativeStats.close(stats);
+      nativeAliases?.close();
+      process.exit(0);
+    });
+  }
+  process.on("SIGTERM", closeServer);
+  process.on("SIGINT", closeServer);
+  if (nativeAliases) process.once("disconnect", closeServer);
 }
 
 startMitmServer().catch((err) => {
