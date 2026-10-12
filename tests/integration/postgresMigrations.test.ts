@@ -48,6 +48,7 @@ test(
         { version: 1, name: "routing_repositories", digest_length: 64 },
         { version: 2, name: "control_plane", digest_length: 64 },
         { version: 3, name: "server_persistence", digest_length: 64 },
+        { version: 4, name: "file_content_chunks", digest_length: 64 },
       ]);
       await first.transaction((tx) =>
         tx.query("UPDATE omniroute.schema_migrations SET checksum = 'modified'")

@@ -190,7 +190,12 @@ test(
         const producer = (async () => {
           if (active.kind === "credits") {
             response.write(
-              `data: ${JSON.stringify({ response: { candidates: [{ content: { role: "model", parts: [{ text: "Preparing tool. " }, { functionCall: { name: "lookup", args: {} } }] }, finishReason: "STOP" }] } })}\n\n`
+              `data: ${JSON.stringify({ response: { candidates: [{ content: { role: "model", parts: [{ text: "Preparing tool. " }] } }] } })}\n\n`
+            );
+            // Advance the same commit-on-next-chunk holdback used by the GLM fixture below.
+            await new Promise<void>((resolve) => setTimeout(resolve, 1100));
+            response.write(
+              `data: ${JSON.stringify({ response: { candidates: [{ content: { role: "model", parts: [{ functionCall: { name: "lookup", args: {} } }] }, finishReason: "STOP" }] } })}\n\n`
             );
             await active.eof.promise;
             response.write(
@@ -329,7 +334,10 @@ test(
       >[0];
       server.removeAllListeners("request");
       // The upstream fixture is outside application routing; public route uses the exact HTTP owner.
-      const wrapped = wrapRequestListenerWithPersistence(rawListener);
+      const wrapped = wrapRequestListenerWithPersistence(rawListener, {
+        basePath: "",
+        experimental: { caseSensitiveRoutes: false },
+      });
       globalThis.__omniroutePersistenceRequest = (run, lifetime) =>
         runtime!.runPersistenceRequest(async () => {
           await run();
