@@ -15,7 +15,7 @@ let closing = false;
 function close(): void {
   if (closing) return;
   closing = true;
-  if (process.connected) process.disconnect();
+  if (process.connected && process.disconnect) process.disconnect();
 }
 process.on("disconnect", close);
 process.on("message", (message: unknown) => {

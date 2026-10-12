@@ -366,7 +366,7 @@ test(
           };
           try {
             sourceFiles.exec(
-              "CREATE TABLE files(id TEXT PRIMARY KEY,bytes INTEGER,created_at INTEGER,filename TEXT,purpose TEXT,deleted_at INTEGER,content BLOB)"
+              "CREATE TABLE key_value(namespace TEXT,key TEXT,value TEXT,PRIMARY KEY(namespace,key)); CREATE TABLE files(id TEXT PRIMARY KEY,bytes INTEGER,created_at INTEGER,filename TEXT,purpose TEXT,deleted_at INTEGER,content BLOB)"
             );
             for (const [id, content] of expected)
               sourceFiles
