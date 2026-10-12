@@ -25,11 +25,11 @@ export function createS3ArtifactStore() {
   const store = createMemoryStore();
   return {
     ...store,
-    async put(bytes: Uint8Array) {
+    async put(bytes: Uint8Array, options?: Parameters<typeof store.put>[1]) {
       continuationNativeFixture.putCalls++;
       entered();
       await wait;
-      const receipt = await store.put(bytes);
+      const receipt = await store.put(bytes, options);
       continuationNativeFixture.references.add(receipt.reference);
       return receipt;
     },

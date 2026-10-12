@@ -47,6 +47,27 @@ export function isApplicationPersistenceIdentity(identity: object | undefined): 
   );
 }
 
+export const PERSISTENCE_STREAM_CAPACITY_CODE = "PERSISTENCE_STREAM_CAPACITY";
+
+// Next can bundle this owner more than once; only locally constructed refusals are branded.
+const admissionErrorKey = Symbol.for("omniroute.persistence.stream-admission-errors.v1");
+const admissionErrorState = globalThis as typeof globalThis & {
+  [admissionErrorKey]?: WeakSet<object>;
+};
+const admissionErrors = (admissionErrorState[admissionErrorKey] ??= new WeakSet<object>());
+
+export class PersistenceStreamCapacityError extends Error {
+  constructor() {
+    super("Persistence stream admission is unavailable");
+    this.name = "PersistenceStreamCapacityError";
+    admissionErrors.add(this);
+  }
+}
+
+export function isPersistenceStreamCapacityError(error: unknown): boolean {
+  return error !== null && typeof error === "object" && admissionErrors.has(error);
+}
+
 const BACKGROUND_LIMIT = 64;
 const TAIL_LIMIT = 64;
 
@@ -229,7 +250,7 @@ export async function acquirePersistenceTail(): Promise<PersistenceTailPermit> {
     (state.phase !== "ready" && !(state.phase === "closing" && descendant)) ||
     state.tails.size >= TAIL_LIMIT
   ) {
-    throw new Error("Persistence stream admission is unavailable");
+    throw new PersistenceStreamCapacityError();
   }
   let entered!: (binding: PostgresControlPlaneBinding) => void;
   let failed!: (error: unknown) => void;

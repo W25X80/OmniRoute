@@ -1,5 +1,15 @@
 import { createHash, randomUUID } from "node:crypto";
-import { readFile, writeFile, mkdir, stat, realpath, rename, link, unlink } from "node:fs/promises";
+import {
+  readFile,
+  writeFile,
+  mkdir,
+  stat,
+  realpath,
+  rename,
+  link,
+  unlink,
+  open,
+} from "node:fs/promises";
 import path from "node:path";
 import { parseArgs } from "node:util";
 import { mkdirSync, writeFileSync } from "node:fs";
@@ -39,6 +49,7 @@ import {
   prepareApplicationArtifacts,
   verifyApplicationArtifacts,
   type OfflineArtifactMapping,
+  type OfflineArtifactCheckpoint,
 } from "../../src/lib/db/postgres/applicationImportArtifacts.ts";
 
 const digest = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("hex");
@@ -62,10 +73,22 @@ type Bundle = z.infer<typeof bundleSchema>;
 
 async function atomicJson(filename: string, value: unknown, replace = false): Promise<void> {
   const temporary = `${filename}.${randomUUID()}.tmp`;
-  await writeFile(temporary, JSON.stringify(value) + "\n", { mode: 0o600, flag: "wx" });
+  const file = await open(temporary, "wx", 0o600);
   try {
+    try {
+      await file.writeFile(JSON.stringify(value) + "\n");
+      await file.sync();
+    } finally {
+      await file.close();
+    }
     if (replace) await rename(temporary, filename);
     else await link(temporary, filename);
+    const directory = await open(path.dirname(path.resolve(filename)), "r");
+    try {
+      await directory.sync();
+    } finally {
+      await directory.close();
+    }
   } finally {
     await unlink(temporary).catch(() => {});
   }
@@ -306,9 +329,11 @@ async function main(): Promise<void> {
     if (action === "verify" || receipt) receipt = await verifyApplicationImport(database, snapshot);
     else {
       const filename = `${values.bundle}.uploads.json`;
-      let prior: OfflineArtifactMapping[] = [];
+      let prior: (OfflineArtifactMapping | OfflineArtifactCheckpoint)[] = [];
       try {
-        prior = JSON.parse(await readFile(filename, "utf8")) as OfflineArtifactMapping[];
+        prior = JSON.parse(await readFile(filename, "utf8")) as (
+          OfflineArtifactMapping | OfflineArtifactCheckpoint
+        )[];
       } catch (error) {
         if ((error as { code?: unknown })?.code !== "ENOENT")
           throw new ApplicationImportError("artifact");

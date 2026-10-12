@@ -53,6 +53,10 @@ import { withResilienceActionsContext } from "./chatCore/resilienceAttemptContex
 import { notePreviousResponseResumed } from "./chatCore/resumedResilienceNotes.ts";
 import { runStreamingResponse } from "./chatCore/streamingResponse.ts";
 import { runStreamingTail } from "./chatCore/streamingTail.ts";
+import {
+  isPersistenceStreamCapacityError,
+  PERSISTENCE_STREAM_CAPACITY_CODE,
+} from "@/lib/db/persistenceRuntime";
 import { sanitizeChatRequestBody } from "./chatCore/sanitization.ts";
 import {
   applyReasoningInputPolicy,
@@ -678,6 +682,7 @@ async function handleChatCoreInner({
   }
   const releaseTurnExecution = turnExecution.release;
   let turnExecutionHandedOffToStream = false;
+  let nativeStreamingPersistence: ReturnType<typeof createNativeStreamingPersistence>;
 
   // Preserve chatCore's canonical formatting while the guarded body remains byte-stable.
   // prettier-ignore
@@ -3046,7 +3051,23 @@ async function handleChatCoreInner({
     ? computeRequestHash(dedupRequestBody, apiKeyInfo?.id, trustedEffortContext)
     : null;
 
-  const nativeStreamingPersistence = stream ? createNativeStreamingPersistence() : undefined;
+  nativeStreamingPersistence = stream ? createNativeStreamingPersistence() : undefined;
+  if (nativeStreamingPersistence) {
+    try {
+      await nativeStreamingPersistence.reserve();
+    } catch (error) {
+      if (!isPersistenceStreamCapacityError(error)) throw error;
+      streamController.abort();
+      trackPendingRequest(model, provider, pendingConnId, false, undefined, pendingRequestId);
+      return createErrorResult(
+        HTTP_STATUS.SERVICE_UNAVAILABLE,
+        "Gateway streaming capacity is unavailable. Please retry later.",
+        null,
+        PERSISTENCE_STREAM_CAPACITY_CODE,
+        "local_queue_capacity"
+      );
+    }
+  }
   const executeProviderRequestDeps = {
     agentGoalPolicy,
     ...(nativeStreamingPersistence
@@ -3883,7 +3904,10 @@ async function handleChatCoreInner({
   const streamingTailOutcome = await runStreamingTail({
     agentGoalPolicy,
     ...(nativeStreamingPersistence
-      ? { adoptNativeStreamingPersistence: nativeStreamingPersistence.adopt }
+      ? {
+          reserveNativeStreamingPersistence: nativeStreamingPersistence.reserve,
+          adoptNativeStreamingPersistence: nativeStreamingPersistence.adopt,
+        }
       : {}),
     modelInfo,
     forcedConnectionId,
@@ -3961,6 +3985,7 @@ async function handleChatCoreInner({
   } finally {
     if (!turnExecutionHandedOffToStream) {
       releaseTurnExecution();
+      if (nativeStreamingPersistence) await nativeStreamingPersistence.release();
     }
   }
 }

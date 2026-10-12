@@ -140,6 +140,8 @@ test(
       const { getSelectedCallLogRepository } =
         await import("../../src/lib/db/postgres/callLogRepository.ts");
       const { saveCallLog } = await import("../../src/lib/usage/callLogs.ts");
+      const { createNativeArtifactPublication } =
+        await import("../../src/lib/usage/nativeArtifactPublication.ts");
       const previews: PendingRequestDetail[] = ids.map((id) => ({
         id,
         provider: "openai",
@@ -183,69 +185,86 @@ test(
             continue;
           }
           let artifact: Awaited<ReturnType<typeof writeCallArtifactAsync>> = null;
-          if (index < 3) {
-            artifact = await writeCallArtifactAsync({
-              schemaVersion: 5,
-              summary: {
-                id,
-                timestamp: new Date().toISOString(),
-                method: "POST",
-                path: "/v1/chat/completions",
-                status: 200,
-                model,
-                requestedModel: null,
-                provider: "openai",
-                account: "fixture",
-                connectionId: id,
-                duration: 1,
-                tokens: {
-                  in: 1,
-                  out: 1,
-                  cacheRead: null,
-                  cacheWrite: null,
-                  reasoning: null,
-                  compressed: null,
-                },
-                requestType: null,
-                sourceFormat: null,
-                targetFormat: null,
-                apiKeyId: null,
-                apiKeyName: null,
-                comboName: null,
-                comboStepId: null,
-                comboExecutionKey: null,
-              },
-              requestBody: null,
-              responseBody:
-                index === 2 ? CALL_LOG_BODY_OMITTED_FOR_SIZE_LIMIT : { side: "fallback" },
-              error: null,
-              ...(index === 0
-                ? {
-                    pipeline: {
-                      providerResponse: { side: "provider" },
-                      clientResponse: { side: "client" },
+          const publication = index < 3 ? createNativeArtifactPublication() : undefined;
+          try {
+            if (index < 3) {
+              artifact = await writeCallArtifactAsync(
+                {
+                  schemaVersion: 5,
+                  summary: {
+                    id,
+                    timestamp: new Date().toISOString(),
+                    method: "POST",
+                    path: "/v1/chat/completions",
+                    status: 200,
+                    model,
+                    requestedModel: null,
+                    provider: "openai",
+                    account: "fixture",
+                    connectionId: id,
+                    duration: 1,
+                    tokens: {
+                      in: 1,
+                      out: 1,
+                      cacheRead: null,
+                      cacheWrite: null,
+                      reasoning: null,
+                      compressed: null,
                     },
-                  }
-                : {}),
+                    requestType: null,
+                    sourceFormat: null,
+                    targetFormat: null,
+                    apiKeyId: null,
+                    apiKeyName: null,
+                    comboName: null,
+                    comboStepId: null,
+                    comboExecutionKey: null,
+                  },
+                  requestBody: null,
+                  responseBody:
+                    index === 2 ? CALL_LOG_BODY_OMITTED_FOR_SIZE_LIMIT : { side: "fallback" },
+                  error: null,
+                  ...(index === 0
+                    ? {
+                        pipeline: {
+                          providerResponse: { side: "provider" },
+                          clientResponse: { side: "client" },
+                        },
+                      }
+                    : {}),
+                },
+                publication!.options
+              );
+              assert.ok(artifact);
+              publication!.acknowledge({
+                reference: artifact.relPath,
+                sizeBytes: artifact.sizeBytes,
+                checksum: artifact.sha256,
+              });
+              references.push(artifact!.relPath);
+            }
+            await repository.insert({
+              id,
+              timestamp: new Date().toISOString(),
+              model,
+              provider: "openai",
+              method: "POST",
+              path: "/v1/chat/completions",
+              status: 200,
+              connectionId: id,
+              videoContentRemoved: 0,
+              detailState: artifact ? "ready" : "none",
+              artifactRelPath: artifact?.relPath ?? null,
+              artifactSizeBytes: artifact?.sizeBytes ?? null,
+              artifactSha256: artifact?.sha256 ?? null,
+              artifactPublicationOwner: publication?.owner,
             });
-            assert.ok(artifact);
-            references.push(artifact!.relPath);
+          } catch (error) {
+            await publication?.fail(error);
+            throw error;
+          } finally {
+            publication?.release();
           }
-          await repository.insert({
-            id,
-            timestamp: new Date().toISOString(),
-            model,
-            provider: "openai",
-            method: "POST",
-            path: "/v1/chat/completions",
-            status: 200,
-            connectionId: id,
-            videoContentRemoved: 0,
-            detailState: artifact ? "ready" : "none",
-            artifactRelPath: artifact?.relPath ?? null,
-            artifactSizeBytes: artifact?.sizeBytes ?? null,
-            artifactSha256: artifact?.sha256 ?? null,
-          });
         }
       });
       await runtime.drainPersistenceAcceptedWork();

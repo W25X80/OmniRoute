@@ -5,6 +5,7 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { Worker } from "node:worker_threads";
 
+import type { ArtifactPutOptions } from "@/domain/persistence/artifactStore";
 import { getSelectedControlPlane } from "../db/controlPlaneContext";
 import { getPersistenceArtifactStore } from "../db/persistenceRuntime";
 import type { CallLogArtifact, CallLogArtifactWriteResult } from "./callLogArtifacts.ts";
@@ -321,12 +322,18 @@ function environmentSnapshot(): CallLogArtifactEnvironment {
   };
 }
 
-function writeNativeArtifact(artifact: CallLogArtifact): Promise<CallLogArtifactWriteResult> {
+function writeNativeArtifact(
+  artifact: CallLogArtifact,
+  options?: ArtifactPutOptions
+): Promise<CallLogArtifactWriteResult> {
   if (closing || queue.length >= MAX_QUEUED_JOBS || nativeWrites.size >= MAX_QUEUED_JOBS) {
     return Promise.reject(new CallLogArtifactSerializationError());
   }
   // Verify native authority before admitting CPU work; never select filesystem storage on error.
   getPersistenceArtifactStore();
+  if (!options?.onPrepared) {
+    return Promise.reject(new Error("Native call-log artifact preparation is required"));
+  }
   const serialized = new Promise<Uint8Array>((resolve, reject) => {
     queue.push({
       id: nextId++,
@@ -340,7 +347,7 @@ function writeNativeArtifact(artifact: CallLogArtifact): Promise<CallLogArtifact
   });
   const operation = serialized.then(async (value) => {
     const { writeCallArtifactToNativeStore } = await import("./callLogArtifacts.ts");
-    return writeCallArtifactToNativeStore(value);
+    return writeCallArtifactToNativeStore(value, options);
   });
   nativeWrites.add(operation);
   void operation
@@ -376,10 +383,11 @@ export function deserializeCallArtifactAsync(
 }
 
 export function writeCallArtifactAsync(
-  artifact: CallLogArtifact
+  artifact: CallLogArtifact,
+  options?: ArtifactPutOptions
 ): Promise<CallLogArtifactWriteResult | null> {
   try {
-    if (getSelectedControlPlane()) return writeNativeArtifact(artifact);
+    if (getSelectedControlPlane()) return writeNativeArtifact(artifact, options);
   } catch (error) {
     return Promise.reject(error);
   }

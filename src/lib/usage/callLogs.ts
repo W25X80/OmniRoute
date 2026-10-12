@@ -57,10 +57,13 @@ import {
   CALL_LOGS_DIR,
   readCallArtifact,
   readCallArtifactAsync,
-  deleteCallArtifactAsync,
   type CallLogArtifact,
   type CallLogDetailState,
 } from "./callLogArtifacts";
+import {
+  createNativeArtifactPublication,
+  deleteNativeCallArtifacts,
+} from "./nativeArtifactPublication";
 import { closeCallLogArtifactWriter, writeCallArtifactAsync } from "./callLogArtifactWriter";
 import {
   toNumber,
@@ -563,6 +566,8 @@ function reportCallLogSaveFailure(error: unknown): void {
 }
 
 async function saveCallLogOperation(entry: any, captured?: NativeCallLogContext): Promise<void> {
+  let nativePublication: ReturnType<typeof createNativeArtifactPublication> | undefined;
+  let nativeArtifactToDelete: string | undefined;
   try {
     // Bind the DB instance up front, before any await (resolveAccountName,
     // writeCallArtifactAsync). If the singleton is reset/closed while this
@@ -790,8 +795,14 @@ async function saveCallLogOperation(entry: any, captured?: NativeCallLogContext)
         protectedError,
         protectedPipelinePayloads
       );
-      const artifactResult = await writeCallArtifactAsync(artifact);
+      if (postgres) nativePublication = createNativeArtifactPublication();
+      const artifactResult = await writeCallArtifactAsync(artifact, nativePublication?.options);
       if (artifactResult) {
+        nativePublication?.acknowledge({
+          reference: artifactResult.relPath,
+          sizeBytes: artifactResult.sizeBytes,
+          checksum: artifactResult.sha256,
+        });
         detailState = "ready";
         artifactRelPath = artifactResult.relPath;
         artifactSizeBytes = artifactResult.sizeBytes;
@@ -847,6 +858,9 @@ async function saveCallLogOperation(entry: any, captured?: NativeCallLogContext)
       artifactRelPath,
       artifactSizeBytes,
       artifactSha256,
+      ...(postgres && artifactRelPath
+        ? { artifactPublicationOwner: nativePublication?.owner }
+        : {}),
       hasRequestBody: protectedRequestBody !== null ? 1 : 0,
       hasResponseBody: protectedResponseBody !== null ? 1 : 0,
       resilienceActions,
@@ -866,8 +880,9 @@ async function saveCallLogOperation(entry: any, captured?: NativeCallLogContext)
             continue;
           }
           if (!result.payloadAccepted && artifactRelPath) {
-            await deleteCallArtifactAsync(artifactRelPath);
+            // The SQL transaction retained deletion ownership; no catch-driven S3 action.
             detailState = "none";
+            nativeArtifactToDelete = artifactRelPath;
           }
         } else insertStmt!.run(insertParams);
         break;
@@ -893,7 +908,24 @@ async function saveCallLogOperation(entry: any, captured?: NativeCallLogContext)
     if (String((error as Error)?.message ?? error).includes("no such column")) {
       invalidateCallLogsColumnCache();
     }
+    if (nativePublication) {
+      try {
+        await nativePublication.fail(error);
+      } catch (reconciliationError) {
+        reportCallLogSaveFailure(reconciliationError);
+      }
+    }
     reportCallLogSaveFailure(error);
+  } finally {
+    nativePublication?.release();
+    // Metadata-only COMMIT is terminal; release the publisher before the claimed delete.
+    if (nativeArtifactToDelete) {
+      try {
+        await deleteNativeCallArtifacts([nativeArtifactToDelete]);
+      } catch (error) {
+        reportCallLogSaveFailure(error);
+      }
+    }
   }
 }
 

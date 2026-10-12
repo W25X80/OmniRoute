@@ -8,6 +8,7 @@ import { buildClientRawRequest, resolveDispatchClientRawRequest } from "./chat/c
 export { buildClientRawRequest, resolveDispatchClientRawRequest };
 import { normalizeReasoningRequest } from "@/shared/reasoning/effortStandardization";
 import { isDetailedLoggingEnabled } from "@/lib/db/detailedLogs";
+import { PERSISTENCE_STREAM_CAPACITY_CODE } from "@/lib/db/persistenceRuntime";
 import { resolvePreviousResponseStateAsync } from "@/lib/db/responsesContinuationStore";
 import { normalizeResponsesPreviousResponseIdMode } from "@omniroute/open-sse/utils/responsesStatePolicy.ts";
 import { FORMATS } from "@omniroute/open-sse/translator/formats.ts";
@@ -2228,6 +2229,11 @@ async function handleSingleModelChat(
         }
         releaseOAuthSession();
         return successResponse;
+      }
+
+      // The process-wide streaming permit cannot be recovered by changing provider/account.
+      if (result.errorCode === PERSISTENCE_STREAM_CAPACITY_CODE) {
+        return withSelectedConnectionHeader(result.response, credentials?.connectionId);
       }
 
       // A hard-lease rejection must not mutate account state or retry.

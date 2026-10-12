@@ -341,6 +341,7 @@ test("findMissingArtifactPaths flags missing root runtime files in the tarball",
     "dist/server-ws.mjs",
     "dist/src/lib/copilot/codegraphQueryWorker.cjs",
     "dist/src/lib/db/healthCheckWorker.js",
+    "dist/src/lib/db/ompHostWorker.cjs",
     "dist/src/lib/usage/callLogArtifactWorker.js",
     "dist/systemd-notify.mjs",
     "dist/tls-options.mjs",
@@ -372,7 +373,11 @@ test("every shipped @omniroute workspace package is covered by an artifact prefi
 });
 
 test("native persistence sidecars survive staging and fail loudly when absent", () => {
-  for (const file of ["persistence-request-boundary.mjs", "webdav-native-handler.mjs"]) {
+  for (const file of [
+    "persistence-request-boundary.mjs",
+    "webdav-native-handler.mjs",
+    "src/lib/db/ompHostWorker.cjs",
+  ]) {
     assert.ok(APP_STAGING_ALLOWED_EXACT_PATHS.includes(file));
     assert.deepEqual(
       findUnexpectedArtifactPaths([file, `${file}.bak`], {

@@ -1,3 +1,4 @@
+import { artifactHasSqlOwner, lockArtifactPublication } from "./artifactPublicationRepository";
 import type { DeleteByPeriodTarget } from "../cleanup/usagePurge";
 import type { PostgresDatabase, PostgresTransaction } from "./database";
 
@@ -67,7 +68,8 @@ export async function queuePostgresArtifactDeletions(
   if (paths.length === 0) return;
   await transaction.query(
     `INSERT INTO omniroute.artifact_deletion_queue(relpath)
-     SELECT DISTINCT unnest($1::text[]) ON CONFLICT(relpath) DO NOTHING`,
+     SELECT DISTINCT unnest($1::text[]) ON CONFLICT(relpath) DO UPDATE
+       SET publication_state='delete_pending',next_attempt_at=statement_timestamp()`,
     [paths]
   );
 }
@@ -80,7 +82,8 @@ async function unreferencedCallLogArtifacts(
   if (paths.length === 0) return [];
   const result = await transaction.query<{ relpath: string }>(
     `SELECT DISTINCT relpath FROM unnest($1::text[]) AS removed(relpath)
-     WHERE NOT EXISTS(SELECT 1 FROM omniroute.call_logs WHERE artifact_relpath=removed.relpath)`,
+     WHERE NOT EXISTS(SELECT 1 FROM omniroute.call_logs WHERE artifact_relpath=removed.relpath
+       UNION ALL SELECT 1 FROM omniroute.call_logs_v1_legacy WHERE artifact_relpath=removed.relpath)`,
     [paths]
   );
   return result.rows.map((row) => row.relpath);
@@ -92,18 +95,25 @@ export function createPostgresCleanupRepository(database: PostgresDatabase) {
       const bounded = Number.isInteger(limit) ? Math.max(1, Math.min(1000, limit)) : 1000;
       return database.transaction(async (transaction) => {
         const result = await transaction.query<{ relpath: string }>(
-          "SELECT relpath FROM omniroute.artifact_deletion_queue ORDER BY created_at, relpath LIMIT $1",
+          `SELECT relpath FROM omniroute.artifact_deletion_queue
+           WHERE publication_state<>'attached' AND next_attempt_at<=statement_timestamp()
+           ORDER BY next_attempt_at,created_at,relpath LIMIT $1`,
           [bounded]
         );
         return result.rows.map((row) => row.relpath);
       });
     },
-    async acknowledgeArtifactDeletion(path: string): Promise<void> {
-      await database.transaction((transaction) =>
-        transaction.query("DELETE FROM omniroute.artifact_deletion_queue WHERE relpath = $1", [
-          path,
-        ])
-      );
+    async acknowledgeArtifactDeletion(path: string): Promise<boolean> {
+      return database.transaction(async (transaction) => {
+        await lockArtifactPublication(transaction);
+        if (await artifactHasSqlOwner(transaction, path)) return false;
+        const result = await transaction.query(
+          `DELETE FROM omniroute.artifact_deletion_queue WHERE relpath=$1
+           AND publication_state='delete_pending' AND upload_state IN ('acknowledged','not_sent')`,
+          [path]
+        );
+        return result.rowCount === 1;
+      });
     },
     exists(table: string) {
       return database.transaction((transaction) => exists(transaction, table));

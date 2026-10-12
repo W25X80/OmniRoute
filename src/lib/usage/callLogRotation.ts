@@ -20,12 +20,8 @@ import {
   selectCallLogIdsBefore,
   selectOverflowArtifactPaths,
 } from "./callLogsBoundedQueries";
-import {
-  CALL_LOGS_DIR,
-  deleteCallArtifact,
-  deleteCallArtifactAsync,
-  type CallLogDetailState,
-} from "./callLogArtifacts";
+import { deleteNativeCallArtifacts } from "./nativeArtifactPublication";
+import { CALL_LOGS_DIR, deleteCallArtifact, type CallLogDetailState } from "./callLogArtifacts";
 import { getCallLogMaxEntries, getCallLogRetentionDays, getCallLogsTableMaxRows } from "../logEnv";
 import { isSqlitePagerCorruptError, notePagerCorruption } from "../db/healthCheck";
 
@@ -402,9 +398,7 @@ export async function clearArtifactReferenceAsync(
   await postgres.clearReference(relativePath, nextState);
 }
 async function deleteOwnedArtifacts(paths: string[]): Promise<number> {
-  let count = 0;
-  for (const path of paths) if (await deleteCallArtifactAsync(path)) count++;
-  return count;
+  return (await deleteNativeCallArtifacts(paths)).deletedArtifacts;
 }
 export async function deleteCallLogsBeforeAsync(
   cutoff: string,

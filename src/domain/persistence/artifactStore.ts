@@ -4,11 +4,26 @@ export interface StoredArtifact {
   checksum: string;
 }
 
+export interface PreparedArtifact extends Readonly<StoredArtifact> {
+  readonly storageScope: string;
+  /** The allocated key receives one atomic PUT attempt and is never replayed. */
+  readonly singleAttempt: true;
+}
+
+export interface ArtifactPutOptions {
+  /** Durable caller ownership must be acknowledged before any external PUT. */
+  onPrepared?(artifact: PreparedArtifact): Promise<void>;
+}
+
 /** Binary object storage only; application serialization remains with its owning domain. */
 export interface NativeArtifactStore {
-  put(bytes: Uint8Array): Promise<StoredArtifact>;
+  put(bytes: Uint8Array, options?: ArtifactPutOptions): Promise<StoredArtifact>;
+  /** Optional on non-native test adapters; native publication fails closed if absent. */
+  readonly storageScope?: string;
+  /** Actual raw PUT/preparation lifetime, independent from the deadline-facing promise. */
+  isPutActive?(reference: string): boolean;
   get(reference: string): Promise<Uint8Array | null>;
-  /** True means deletion was acknowledged; an already absent key may also be acknowledged. */
+  /** True is acknowledged deletion; false is confirmed already-absent. Failures reject. */
   delete(reference: string): Promise<boolean>;
   /** Reject new operations and drain admitted work before successful resource teardown. */
   close(): Promise<void>;
@@ -43,7 +58,9 @@ export class ArtifactStorageError extends Error {
   constructor(
     readonly kind: ArtifactStorageFailure,
     /** Internal reconciliation identity; never include it or the SDK error in HTTP error bodies. */
-    readonly reference?: string
+    readonly reference?: string,
+    /** False proves dispatch never began; absence provides no such guarantee. */
+    readonly putStarted?: boolean
   ) {
     super(MESSAGES[kind]);
     this.name = "ArtifactStorageError";

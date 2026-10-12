@@ -22,6 +22,7 @@ import {
 } from "./applicationSnapshot";
 import {
   verifyApplicationArtifacts,
+  assertApplicationArtifactPublicationScope,
   type OfflineArtifactMapping,
 } from "./applicationImportArtifacts";
 import type { NativeArtifactStore } from "@/domain/persistence/artifactStore";
@@ -451,6 +452,7 @@ function buildPlan(
     });
     planned.push({ name: source.name, columns, rows, order });
   }
+  addArtifactPublicationPlan(planned, schema, artifacts, transformations);
   const sourceDigest = applicationSnapshotDigest(snapshot);
   const planDigest = canonical({
     sourceDigest,
@@ -469,6 +471,94 @@ function buildPlan(
     artifacts,
     transformations,
     restoreAuthority,
+  };
+}
+/** Keep scoped lifecycle ownership in the same atomic import and receipt as its log rows. */
+function addArtifactPublicationPlan(
+  planned: PlannedTable[],
+  schema: TargetSchema,
+  artifacts: OfflineArtifactMapping[],
+  transformations: ApplicationImportReceipt["transformations"]
+): void {
+  const index = planned.findIndex((table) => table.name === "artifact_deletion_queue");
+  if (artifacts.length === 0 && index < 0) return;
+  const target = schema.tables.find((table) => table.name === "artifact_deletion_queue");
+  if (!target) throw new ApplicationImportError("schema", "artifact_deletion_queue");
+  const columns = target.columns.filter((column) => !column.generated);
+  const old = index < 0 ? undefined : planned[index];
+  const entries = (old?.rows ?? []).map((row, rowIndex) => {
+    const values: Record<string, ApplicationImportCell> = Object.fromEntries(
+      old!.columns.map((column, at) => [column.name, row[at]])
+    );
+    values.publication_state ??= "delete_pending";
+    values.upload_state ??= "acknowledged";
+    values.publication_owner ??= null;
+    values.store_scope ??= null;
+    values.expected_size_bytes ??= null;
+    values.expected_sha256 ??= null;
+    values.next_attempt_at ??= values.created_at;
+    const mapped = artifacts.find((entry) => entry.sourceReference === values.relpath);
+    if (
+      mapped &&
+      values.publication_state === "attached" &&
+      values.upload_state === "acknowledged"
+    ) {
+      for (const [name, value] of Object.entries(artifactPublicationValues(mapped))) {
+        if (canonical(values[name] ?? null) !== canonical(value))
+          transformations.push({
+            table: "artifact_deletion_queue",
+            row: rowIndex,
+            column: name,
+            source: values[name] ?? null,
+            target: value,
+          });
+        values[name] = value;
+      }
+    }
+    return values;
+  });
+  for (const mapping of artifacts) {
+    if (!entries.some((entry) => entry.relpath === mapping.targetReference))
+      entries.push(artifactPublicationValues(mapping));
+  }
+  const identities = entries.map((entry) => entry.relpath);
+  if (new Set(identities).size !== identities.length)
+    throw new ApplicationImportError("artifact", "artifact_deletion_queue", "relpath");
+  const table: PlannedTable = {
+    name: target.name,
+    columns,
+    order: columnOrder(target),
+    rows: entries.map((entry) =>
+      columns.map((column) => checkedCell(entry[column.name] ?? null, column, target.name))
+    ),
+  };
+  table.rows.sort((left, right) => {
+    const at = columns.findIndex((column) => column.name === "relpath");
+    return Buffer.compare(Buffer.from(String(left[at])), Buffer.from(String(right[at])));
+  });
+  if (index < 0) planned.push(table);
+  else planned[index] = table;
+}
+function artifactPublicationValues(
+  mapping: OfflineArtifactMapping
+): Record<string, ApplicationImportCell> {
+  if (
+    !mapping.storageScope ||
+    !/^[0-9a-f]{64}$/.test(mapping.storageScope) ||
+    !mapping.preparedAt ||
+    !Number.isFinite(Date.parse(mapping.preparedAt))
+  )
+    throw new ApplicationImportError("artifact", "artifact_deletion_queue");
+  return {
+    relpath: mapping.targetReference,
+    created_at: mapping.preparedAt,
+    publication_state: "attached",
+    upload_state: mapping.singleAttempt ? "acknowledged" : "legacy_unknown",
+    publication_owner: null,
+    store_scope: mapping.storageScope,
+    expected_size_bytes: { kind: "integer", value: String(mapping.sizeBytes) },
+    expected_sha256: mapping.checksum,
+    next_attempt_at: mapping.preparedAt,
   };
 }
 function insertionOrder(plan: ImportPlan, schema: TargetSchema): PlannedTable[] {
@@ -782,7 +872,7 @@ export async function importApplicationSnapshot(
   database: PostgresDatabase,
   input: unknown,
   artifacts: OfflineArtifactMapping[] = [],
-  store?: Pick<NativeArtifactStore, "get">,
+  store?: Pick<NativeArtifactStore, "get" | "storageScope">,
   blobs?: ApplicationBlobImportOptions
 ): Promise<ApplicationImportReceipt> {
   validateApplicationSnapshotCredentials(input);
@@ -798,7 +888,10 @@ export async function importApplicationSnapshot(
       )
   );
   if (hasArtifacts && !store) throw new ApplicationImportError("artifact");
-  if (store) await verifyApplicationArtifacts(artifacts, store);
+  if (store) {
+    assertApplicationArtifactPublicationScope(snapshot, store);
+    await verifyApplicationArtifacts(artifacts, store);
+  }
   const references = blobReferences(snapshot);
   if (
     references.length &&

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { Readable } from "node:stream";
 import test from "node:test";
-import { S3Client } from "@aws-sdk/client-s3";
+import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import {
   createS3ArtifactStore,
   type S3ArtifactTransport,
@@ -31,13 +31,14 @@ function protocolFixture(losePutAcknowledgment = false) {
   const objects = new Map<string, Uint8Array>();
   const requests: FixtureRequest[] = [];
   let closed = false;
-  const client = new S3Client({
+  const options = {
     region: configuration.region,
     credentials: { accessKeyId: "ARTIFACTTESTKEY", secretAccessKey: "artifact-fixture-only-key" },
-    maxAttempts: 3,
+    retryMode: "standard" as const,
+    followRegionRedirects: false,
     ignoreConfiguredEndpointUrls: true,
-    requestChecksumCalculation: "WHEN_REQUIRED",
-    responseChecksumValidation: "WHEN_REQUIRED",
+    requestChecksumCalculation: "WHEN_REQUIRED" as const,
+    responseChecksumValidation: "WHEN_REQUIRED" as const,
     requestHandler: {
       async handle(request: FixtureRequest) {
         requests.push(request);
@@ -108,13 +109,19 @@ function protocolFixture(losePutAcknowledgment = false) {
         closed = true;
       },
     },
-  });
+  };
+  const writer = new S3Client({ ...options, maxAttempts: 1 });
+  const reader = new S3Client({ ...options, maxAttempts: 3 });
   const transport: S3ArtifactTransport = {
     send(command, options) {
-      return client.send(command, options) as ReturnType<S3ArtifactTransport["send"]>;
+      return (command instanceof PutObjectCommand ? writer : reader).send(
+        command,
+        options
+      ) as ReturnType<S3ArtifactTransport["send"]>;
     },
     destroy() {
-      client.destroy();
+      writer.destroy();
+      reader.destroy();
     },
   };
   return { transport, objects, requests, isClosed: () => closed };
@@ -140,7 +147,7 @@ test("SDK wire fixture preserves owner, conditional writes, checksums and privat
   );
 });
 
-test("SDK retry after lost upload acknowledgment retains key and refuses overwrite", async () => {
+test("SDK lost upload acknowledgment retains its identity without a second PUT attempt", async () => {
   const fixture = protocolFixture(true);
   const store = createS3ArtifactStore(configuration, { loadClient: async () => fixture.transport });
   await assert.rejects(
@@ -148,8 +155,7 @@ test("SDK retry after lost upload acknowledgment retains key and refuses overwri
     (error) => error instanceof ArtifactStorageError && error.kind === "put_unknown"
   );
   const puts = fixture.requests.filter((request) => request.method === "PUT");
-  assert.equal(puts.length, 2);
-  assert.equal(puts[0].path, puts[1].path);
+  assert.equal(puts.length, 1);
   assert.equal(
     puts.every((request) => request.headers["if-none-match"] === "*"),
     true

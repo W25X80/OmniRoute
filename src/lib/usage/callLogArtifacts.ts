@@ -1,3 +1,4 @@
+import type { ArtifactPutOptions } from "@/domain/persistence/artifactStore";
 import { isArtifactStorageErrorKind } from "@/domain/persistence/artifactStore";
 import { getSelectedControlPlane } from "../db/controlPlaneContext";
 import { getPersistenceArtifactStore } from "../db/persistenceRuntime";
@@ -26,10 +27,13 @@ export type {
 
 /** The caller supplies worker-serialized bytes; serialization is never repeated on this thread. */
 export async function writeCallArtifactToNativeStore(
-  bytes: Uint8Array
+  bytes: Uint8Array,
+  options?: ArtifactPutOptions
 ): Promise<CallLogArtifactWriteResult> {
   if (!getSelectedControlPlane()) throw new Error("Native call-log persistence is not selected");
-  const stored = await getPersistenceArtifactStore().put(bytes);
+  const store = getPersistenceArtifactStore();
+  if (!options?.onPrepared) throw new Error("Native call-log artifact preparation is required");
+  const stored = await store.put(bytes, options);
   return { relPath: stored.reference, sizeBytes: stored.sizeBytes, sha256: stored.checksum };
 }
 

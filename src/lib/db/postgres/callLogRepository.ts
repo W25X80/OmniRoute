@@ -1,4 +1,8 @@
 import { queuePostgresArtifactDeletions } from "./cleanupRepository";
+import {
+  requireArtifactPublication,
+  finishArtifactPublication,
+} from "./artifactPublicationRepository";
 import { getSelectedPostgresDatabase } from "../controlPlaneContext";
 import type { PostgresDatabase } from "./database";
 import {
@@ -96,6 +100,17 @@ export class PostgresCallLogRepository {
       // Serialized allocation keeps the export cursor in commit order, including concurrent writes.
       await transaction.query("SELECT pg_advisory_xact_lock(18765,8)");
       const stored = { ...parameters };
+      const artifactReference =
+        typeof stored.artifactRelPath === "string" ? stored.artifactRelPath : null;
+      if (artifactReference) {
+        await requireArtifactPublication(
+          transaction,
+          artifactReference,
+          stored.artifactPublicationOwner,
+          stored.artifactSizeBytes,
+          stored.artifactSha256
+        );
+      }
       let payloadAccepted = true;
       if (typeof stored.apiKeyId === "string" && stored.apiKeyId) {
         const row = (
@@ -106,8 +121,6 @@ export class PostgresCallLogRepository {
         ).rows[0];
         payloadAccepted = Boolean(row && row.no_log !== 1);
         if (!payloadAccepted) {
-          if (typeof stored.artifactRelPath === "string")
-            await queuePostgresArtifactDeletions(transaction, [stored.artifactRelPath]);
           Object.assign(stored, {
             detailState: "none",
             artifactRelPath: null,
@@ -127,6 +140,14 @@ export class PostgresCallLogRepository {
         VALUES(${keys.map((_, index) => `$${index + 1}`).join(",")}) ON CONFLICT(id) DO NOTHING RETURNING id`,
         keys.map((key) => stored[key] ?? null)
       );
+      if (inserted.rowCount === 1 && artifactReference) {
+        await finishArtifactPublication(
+          transaction,
+          artifactReference,
+          stored.artifactPublicationOwner as string,
+          payloadAccepted
+        );
+      }
       return { payloadAccepted, inserted: inserted.rowCount === 1 };
     });
   }
@@ -354,7 +375,8 @@ export class PostgresCallLogRepository {
       const unreferenced = (
         await transaction.query<{ relpath: string }>(
           `SELECT DISTINCT relpath FROM unnest($1::text[]) AS removed(relpath)
-        WHERE NOT EXISTS(SELECT 1 FROM omniroute.call_logs WHERE artifact_relpath=removed.relpath)`,
+        WHERE NOT EXISTS(SELECT 1 FROM omniroute.call_logs WHERE artifact_relpath=removed.relpath
+          UNION ALL SELECT 1 FROM omniroute.call_logs_v1_legacy WHERE artifact_relpath=removed.relpath)`,
           [paths]
         )
       ).rows.map((row) => row.relpath);
@@ -386,7 +408,8 @@ export class PostgresCallLogRepository {
       const unreferenced = (
         await transaction.query<{ relpath: string }>(
           `SELECT DISTINCT relpath FROM unnest($1::text[]) AS removed(relpath)
-        WHERE NOT EXISTS(SELECT 1 FROM omniroute.call_logs WHERE artifact_relpath=removed.relpath)`,
+        WHERE NOT EXISTS(SELECT 1 FROM omniroute.call_logs WHERE artifact_relpath=removed.relpath
+          UNION ALL SELECT 1 FROM omniroute.call_logs_v1_legacy WHERE artifact_relpath=removed.relpath)`,
           [paths]
         )
       ).rows.map((row) => row.relpath);

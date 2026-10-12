@@ -5,6 +5,7 @@ import test from "node:test";
 import { createPostgresCleanupRepository } from "../../src/lib/db/postgres/cleanupRepository.ts";
 import { PostgresCallLogRepository } from "../../src/lib/db/postgres/callLogRepository.ts";
 import { migratePostgresSchema } from "../../src/lib/db/postgres/migrations.ts";
+import { prepareArtifactPublication } from "../../src/lib/db/postgres/artifactPublicationRepository.ts";
 import type { PostgresDatabase, PostgresTransaction } from "../../src/lib/db/postgres/database.ts";
 import {
   createTestPostgresDatabase,
@@ -168,7 +169,14 @@ test(
       await t.test(
         "classification waits for a real native insert and sees its committed shared reference",
         async () => {
-          const reference = await object();
+          const publicationOwner = randomUUID();
+          const stored = await store.put(Buffer.from('{"shared":"payload"}'), {
+            onPrepared: (artifact) =>
+              prepareArtifactPublication(database, artifact, publicationOwner),
+          });
+          const reference = stored.reference;
+          references.add(reference);
+          // The fresh intent is durable before this historical/imported row shares its key.
           await seed(`${prefix}-concurrent-old`, "0001-01-01T00:00:00.000Z", reference);
           const entered = barrier(),
             release = barrier();
@@ -205,6 +213,9 @@ test(
             id: `${prefix}-concurrent-new`,
             timestamp: "0003-01-01T00:00:00.000Z",
             artifactRelPath: reference,
+            artifactSizeBytes: stored.sizeBytes,
+            artifactSha256: stored.checksum,
+            artifactPublicationOwner: publicationOwner,
             detailState: "ready",
             videoContentRemoved: 0,
           });
@@ -240,7 +251,25 @@ test(
           const result = await deleting;
           assert.equal(result.deleted, 1);
           assert.deepEqual(result.artifacts, []);
-          assert.equal(await queue(reference), "0");
+          assert.equal(
+            await queue(reference),
+            "1",
+            "attached publication ownership remains durable"
+          );
+          assert.equal((await owner.pendingArtifactDeletions()).includes(reference), false);
+          const publication = await database.transaction((tx) =>
+            tx.query(
+              "SELECT publication_state,upload_state,publication_owner FROM omniroute.artifact_deletion_queue WHERE relpath=$1",
+              [reference]
+            )
+          );
+          assert.deepEqual(publication.rows, [
+            {
+              publication_state: "attached",
+              upload_state: "acknowledged",
+              publication_owner: publicationOwner,
+            },
+          ]);
           assert.deepEqual(await store.get(reference), Buffer.from('{"shared":"payload"}'));
         }
       );

@@ -15,6 +15,7 @@ import {
   UnsupportedPersistenceDomainError,
 } from "@/lib/db/controlPlaneContext";
 import {
+  acquirePersistenceTail,
   isApplicationPersistenceIdentity,
   runPersistenceBackgroundWork,
   type PersistenceTailPermit,
@@ -99,13 +100,18 @@ export type ChatCoreExecutorResult = {
 export function createNativeStreamingPersistence():
   | {
       run: NonNullable<ExecuteInput["runNativeStreamingPersistence"]>;
+      reserve(): Promise<PersistenceTailPermit>;
       adopt(permit: PersistenceTailPermit): PersistenceTailPermit;
+      release(): Promise<void>;
     }
   | undefined {
   const identity = getSelectedPersistenceIdentity();
   if (!identity) return undefined;
   if (!isApplicationPersistenceIdentity(identity)) throw new UnsupportedPersistenceDomainError();
   let permit: PersistenceTailPermit | undefined;
+  let reserved: PersistenceTailPermit | undefined;
+  let reservation: Promise<PersistenceTailPermit> | undefined;
+  let release: Promise<void> | undefined;
   let retired = false;
   const assertIdentity = () => {
     if (
@@ -115,6 +121,19 @@ export function createNativeStreamingPersistence():
       throw new UnsupportedPersistenceDomainError();
   };
   return {
+    reserve() {
+      assertIdentity();
+      if (retired) return Promise.reject(new Error("Persistence stream authority has ended"));
+      reservation ??= acquirePersistenceTail().then(async (next) => {
+        reserved = next;
+        if (retired) {
+          await next.release();
+          throw new Error("Persistence stream authority has ended");
+        }
+        return next;
+      });
+      return reservation;
+    },
     run<T>(
       body: () => Promise<T>,
       observation?: { readonly owner: object; readonly observe: () => void }
@@ -168,7 +187,12 @@ export function createNativeStreamingPersistence():
     },
     adopt(next) {
       assertIdentity();
+      if (retired) throw new Error("Persistence stream authority has ended");
       if (permit) throw new Error("Streaming persistence authority is already adopted");
+      if (reservation && next !== reserved)
+        throw new Error("Streaming persistence reservation does not match");
+      reserved = next;
+      reservation ??= Promise.resolve(next);
       permit = {
         run: (body) => next.run(body),
         release() {
@@ -178,6 +202,14 @@ export function createNativeStreamingPersistence():
         },
       };
       return permit;
+    },
+    release() {
+      retired = true;
+      release ??= (async () => {
+        const next = permit ?? reserved ?? (await reservation?.catch(() => undefined));
+        await next?.release();
+      })();
+      return release;
     },
   };
 }

@@ -1,5 +1,11 @@
-import { randomUUID } from "node:crypto";
+import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import { DeleteObjectCommand, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
 import type { NativeArtifactStore } from "../../../src/domain/persistence/artifactStore.ts";
+import {
+  createS3ArtifactStore as createNativeStore,
+  type S3ArtifactTransport,
+} from "../../../src/lib/artifacts/s3ArtifactStore.ts";
 export {
   readPostgresEnvironment,
   readS3ArtifactConfiguration,
@@ -28,29 +34,70 @@ export const callLogNativeFixture = {
   },
 };
 
-/** Real SQL/runtime; only the independent S3 transport is replaced by a deterministic barrier. */
+/** Real SQL/runtime/store; only the independent S3 transport uses a deterministic barrier. */
 export function createS3ArtifactStore(): NativeArtifactStore {
-  let closed = false;
+  const prefix = "gateway/call-logs/";
+  const transport: S3ArtifactTransport = {
+    async send(command, options) {
+      assert.equal(command.input.Bucket, "native-call-log-fixture");
+      assert.equal(command.input.ExpectedBucketOwner, "123456789012");
+      assert.ok(command.input.Key?.startsWith(prefix + "s3/"));
+      const reference = command.input.Key.slice(prefix.length);
+      if (command instanceof PutObjectCommand) {
+        callLogNativeFixture.puts++;
+        const gate = callLogNativeFixture.gate;
+        callLogNativeFixture.entered?.resolve();
+        await gate?.promise;
+        if (options.abortSignal.aborted)
+          throw Object.assign(new Error("Fixture transport was aborted"), { name: "AbortError" });
+        assert.ok(command.input.Body instanceof Uint8Array);
+        const bytes = Buffer.from(command.input.Body);
+        assert.equal(command.input.ContentLength, bytes.byteLength);
+        assert.equal(
+          command.input.ChecksumSHA256,
+          createHash("sha256").update(bytes).digest("base64")
+        );
+        assert.equal(command.input.IfNoneMatch, "*");
+        assert.equal(callLogNativeFixture.objects.has(reference), false);
+        callLogNativeFixture.objects.set(reference, bytes);
+        return { $metadata: { httpStatusCode: 200 } };
+      }
+      if (command instanceof GetObjectCommand) {
+        const bytes = callLogNativeFixture.objects.get(reference);
+        if (!bytes)
+          throw Object.assign(new Error("Missing fixture object"), {
+            name: "NoSuchKey",
+            $metadata: { httpStatusCode: 404 },
+          });
+        return {
+          Body: bytes,
+          ContentLength: bytes.byteLength,
+          ChecksumSHA256: createHash("sha256").update(bytes).digest("base64"),
+          $metadata: { httpStatusCode: 200 },
+        };
+      }
+      assert.ok(command instanceof DeleteObjectCommand);
+      callLogNativeFixture.objects.delete(reference);
+      return { $metadata: { httpStatusCode: 204 } };
+    },
+    destroy() {},
+  };
+  const store = createNativeStore(
+    {
+      bucket: "native-call-log-fixture",
+      region: "eu-central-1",
+      prefix,
+      expectedBucketOwner: "123456789012",
+    },
+    { loadClient: async () => transport }
+  );
+  let countedClose = false;
   return {
-    async put(bytes) {
-      callLogNativeFixture.puts++;
-      const gate = callLogNativeFixture.gate;
-      callLogNativeFixture.entered?.resolve();
-      await gate?.promise;
-      if (closed) throw new Error("Test artifact store was closed during an accepted write");
-      const reference = `native-call-log-fixture/${randomUUID()}`;
-      callLogNativeFixture.objects.set(reference, bytes);
-      return { reference, sizeBytes: bytes.byteLength, checksum: "fixture-checksum" };
-    },
-    async get(reference) {
-      return callLogNativeFixture.objects.get(reference) ?? null;
-    },
-    async delete(reference) {
-      return callLogNativeFixture.objects.delete(reference);
-    },
+    ...store,
     async close() {
-      if (!closed) {
-        closed = true;
+      await store.close();
+      if (!countedClose) {
+        countedClose = true;
         callLogNativeFixture.closes++;
       }
     },

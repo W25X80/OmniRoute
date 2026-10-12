@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import type { PostgresDatabase, PostgresTransaction } from "../../src/lib/db/postgres/database.ts";
 import {
   createTestPostgresDatabase,
   postgresTestsEnabled,
@@ -49,7 +50,107 @@ test(
         { version: 2, name: "control_plane", digest_length: 64 },
         { version: 3, name: "server_persistence", digest_length: 64 },
         { version: 4, name: "file_content_chunks", digest_length: 64 },
+        { version: 5, name: "artifact_publication_ownership", digest_length: 64 },
       ]);
+      // Commit the genuine migration prefix, stopping only after successful version-4 SQL.
+      await first.transaction((tx) => tx.query("DROP SCHEMA omniroute CASCADE"));
+      const stopAtVersion4 = new Error("Test migration prefix complete");
+      let prefixReached = false;
+      const version4Database = {
+        transaction<T>(body: (tx: PostgresTransaction) => Promise<T>) {
+          return first.transaction(async (tx) => {
+            try {
+              return await body({
+                async query<Row>(sql: string, values?: unknown[]) {
+                  const result = await tx.query<Row>(sql, values);
+                  if (
+                    sql ===
+                      "INSERT INTO omniroute.schema_migrations(version,name,checksum) VALUES($1,$2,$3)" &&
+                    values?.[0] === 4
+                  ) {
+                    prefixReached = true;
+                    throw stopAtVersion4;
+                  }
+                  return result;
+                },
+              });
+            } catch (error) {
+              if (error !== stopAtVersion4) throw error;
+              return undefined as T;
+            }
+          });
+        },
+      } as PostgresDatabase;
+      await migratePostgresSchema(version4Database);
+      assert.equal(prefixReached, true);
+      const history = async () =>
+        (
+          await first.transaction((tx) =>
+            tx.query(
+              "SELECT version,name,checksum,applied_at::text AS applied_at FROM omniroute.schema_migrations ORDER BY version"
+            )
+          )
+        ).rows;
+      const version4History = await history();
+      assert.deepEqual(
+        version4History.map((row) => row.version),
+        [1, 2, 3, 4]
+      );
+      const absent = await first.transaction((tx) =>
+        tx.query(
+          "SELECT column_name FROM information_schema.columns WHERE table_schema='omniroute' AND table_name='artifact_deletion_queue' AND column_name='publication_state'"
+        )
+      );
+      assert.deepEqual(absent.rows, []);
+      const legacyReference = "legacy/migration-v4.json";
+      await first.transaction((tx) =>
+        tx.query(
+          "INSERT INTO omniroute.artifact_deletion_queue(relpath,created_at) VALUES($1,'2026-01-01T00:00:00Z')",
+          [legacyReference]
+        )
+      );
+      const oldQueue = async () =>
+        (
+          await first.transaction((tx) =>
+            tx.query(
+              "SELECT relpath,created_at::text AS created_at FROM omniroute.artifact_deletion_queue WHERE relpath=$1",
+              [legacyReference]
+            )
+          )
+        ).rows;
+      const version4Queue = await oldQueue();
+      await Promise.all([migratePostgresSchema(first), migratePostgresSchema(second)]);
+      const upgradedHistory = await history();
+      assert.deepEqual(upgradedHistory.slice(0, 4), version4History);
+      assert.deepEqual(
+        upgradedHistory.map((row) => row.version),
+        [1, 2, 3, 4, 5]
+      );
+      assert.equal(upgradedHistory[4].name, "artifact_publication_ownership");
+      assert.deepEqual(await oldQueue(), version4Queue);
+      const migratedQueue = await first.transaction((tx) =>
+        tx.query(
+          "SELECT publication_state,upload_state,publication_owner,store_scope,expected_size_bytes,expected_sha256 FROM omniroute.artifact_deletion_queue WHERE relpath=$1",
+          [legacyReference]
+        )
+      );
+      assert.deepEqual(migratedQueue.rows, [
+        {
+          publication_state: "delete_pending",
+          upload_state: "acknowledged",
+          publication_owner: null,
+          store_scope: null,
+          expected_size_bytes: null,
+          expected_sha256: null,
+        },
+      ]);
+      await migratePostgresSchema(first);
+      assert.deepEqual(
+        await history(),
+        upgradedHistory,
+        "repeat upgrade preserves checksum and applied_at for every version"
+      );
+      assert.deepEqual(await oldQueue(), version4Queue);
       await first.transaction((tx) =>
         tx.query("UPDATE omniroute.schema_migrations SET checksum = 'modified'")
       );

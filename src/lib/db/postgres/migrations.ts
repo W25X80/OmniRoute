@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { POSTGRES_ARTIFACT_PUBLICATION_SCHEMA_STATEMENTS } from "./artifactPublicationSchema";
 import type { PostgresDatabase, PostgresTransaction } from "./database";
 import { POSTGRES_PROVIDER_SCHEMA_STATEMENTS } from "./providerSchema";
 import { API_KEY_SCHEMA_STATEMENTS } from "./apiKeySchema";
@@ -124,6 +125,11 @@ const migrations: readonly Migration[] = [
     version: 4,
     name: "file_content_chunks",
     statements: POSTGRES_FILE_CONTENT_SCHEMA_STATEMENTS,
+  },
+  {
+    version: 5,
+    name: "artifact_publication_ownership",
+    statements: POSTGRES_ARTIFACT_PUBLICATION_SCHEMA_STATEMENTS,
   },
 ];
 

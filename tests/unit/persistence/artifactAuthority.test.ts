@@ -12,6 +12,7 @@ import {
 } from "../../../src/lib/db/controlPlaneContext.ts";
 import { fixture } from "../../helpers/persistence/runtimeOwnedWorkFixture.ts";
 import { artifactAuthorityFixture } from "../../helpers/persistence/artifactAuthorityFixture.ts";
+import type { PreparedArtifact } from "../../../src/domain/persistence/artifactStore.ts";
 
 const runtimeUrl = pathToFileURL(
   realpathSync(new URL("../../../src/lib/db/persistenceRuntime.ts", import.meta.url))
@@ -51,11 +52,35 @@ const runtime: typeof import("../../../src/lib/db/persistenceRuntime.ts") = awai
 const owner = await import("../../../src/lib/usage/callLogArtifacts.ts");
 const writer = await import("../../../src/lib/usage/callLogArtifactWriter.ts");
 
+// This lower-layer receipt proves callback propagation, not durable SQL preparation.
+const preparedArtifacts = new Map<string, PreparedArtifact>();
+const preparation = {
+  async onPrepared(artifact: PreparedArtifact) {
+    const store = runtime.getPersistenceArtifactStore();
+    assert.equal(artifact.storageScope, store.storageScope);
+    assert.match(artifact.storageScope, /^[0-9a-f]{64}$/);
+    assert.equal(artifact.singleAttempt, true);
+    assert.equal(Object.isFrozen(artifact), true);
+    assert.equal(artifact.reference.endsWith(`_${artifact.checksum}.json`), true);
+    assert.equal(preparedArtifacts.has(artifact.reference), false);
+    preparedArtifacts.set(artifact.reference, artifact);
+  },
+};
+async function writePreparedArtifact(bytes: Uint8Array) {
+  const result = await owner.writeCallArtifactToNativeStore(bytes, preparation);
+  const prepared = preparedArtifacts.get(result.relPath);
+  assert.ok(prepared);
+  assert.equal(prepared.sizeBytes, result.sizeBytes);
+  assert.equal(prepared.checksum, result.sha256);
+  return result;
+}
+
 async function scenario(body: () => Promise<void>) {
   assert.equal(globalThis.__omniroutePersistenceContext?.application, undefined);
   delete globalThis.__omniroutePersistenceRuntime;
   fixture.reset();
   artifactAuthorityFixture.reset();
+  preparedArtifacts.clear();
   try {
     await body();
   } finally {
@@ -86,6 +111,21 @@ test("unbound artifact lookup does not allocate or start application persistence
     assert.equal(artifactAuthorityFixture.creates, 0);
   }));
 
+test("owned native artifact writes refuse a missing preparation callback without effects", () =>
+  scenario(async () => {
+    await runtime.ensurePersistenceReady();
+    await assert.rejects(
+      owner.writeCallArtifactToNativeStore(Buffer.from("{}")),
+      /preparation is required/
+    );
+    await assert.rejects(
+      writer.writeCallArtifactAsync({} as Parameters<typeof writer.writeCallArtifactAsync>[0]),
+      /preparation is required/
+    );
+    assert.equal(preparedArtifacts.size, 0);
+    assert.deepEqual(artifactAuthorityFixture.effects(), { puts: 0, gets: 0, deletes: 0 });
+  }));
+
 test("the held application and fresh owned scopes select the same artifact store", () =>
   scenario(async () => {
     await runtime.ensurePersistenceReady();
@@ -96,7 +136,7 @@ test("the held application and fresh owned scopes select the same artifact store
     let reference = "";
     await runtime.runPersistenceRequest(async () => {
       assert.equal(runtime.getPersistenceArtifactStore(), store);
-      reference = (await owner.writeCallArtifactToNativeStore(bytes)).relPath;
+      reference = (await writePreparedArtifact(bytes)).relPath;
     });
     await runtime.runPersistenceBackgroundWork(async () => {
       assert.equal(runtime.getPersistenceArtifactStore(), store);
@@ -117,8 +157,9 @@ test("the held application and fresh owned scopes select the same artifact store
 test("foreign and identity-less scopes cannot access the application's artifact transport", () =>
   scenario(async () => {
     await runtime.ensurePersistenceReady();
-    const stored = await owner.writeCallArtifactToNativeStore(Buffer.from('{"keep":true}'));
+    const stored = await writePreparedArtifact(Buffer.from('{"keep":true}'));
     const before = artifactAuthorityFixture.effects();
+    const preparedBefore = preparedArtifacts.size;
     const objects = [...artifactAuthorityFixture.objects];
     const state = globalThis.__omniroutePersistenceRuntime!;
     assert.equal(state.background.size, 0, "free app capacity must not hide an authority leak");
@@ -138,15 +179,19 @@ test("foreign and identity-less scopes cannot access the application's artifact 
           UnsupportedPersistenceDomainError
         );
         await assert.rejects(
-          owner.writeCallArtifactToNativeStore(Buffer.from("never uploaded")),
+          owner.writeCallArtifactToNativeStore(Buffer.from("never uploaded"), preparation),
           UnsupportedPersistenceDomainError
         );
         await assert.rejects(
-          writer.writeCallArtifactAsync({} as Parameters<typeof writer.writeCallArtifactAsync>[0]),
+          writer.writeCallArtifactAsync(
+            {} as Parameters<typeof writer.writeCallArtifactAsync>[0],
+            preparation
+          ),
           UnsupportedPersistenceDomainError
         );
       });
       assert.deepEqual(artifactAuthorityFixture.effects(), before);
+      assert.equal(preparedArtifacts.size, preparedBefore, "foreign denial precedes preparation");
       assert.deepEqual([...artifactAuthorityFixture.objects], objects);
       assert.equal(state.background.size, 0);
     }
@@ -182,7 +227,7 @@ test("accepted shutdown work retains its store until the held authority is relea
     const state = globalThis.__omniroutePersistenceRuntime!;
     state.phase = "closing";
     await runtime.runPersistenceShutdownWork(async () => {
-      const result = await owner.writeCallArtifactToNativeStore(Buffer.from("{}"));
+      const result = await writePreparedArtifact(Buffer.from("{}"));
       assert.equal(await owner.deleteCallArtifactAsync(result.relPath), true);
     });
     await runtime.closePersistenceRuntime();

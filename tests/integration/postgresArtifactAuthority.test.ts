@@ -100,9 +100,28 @@ test(
           ).rows,
         }));
       const store = runtime!.getPersistenceArtifactStore();
-      const object = await owner.writeCallArtifactToNativeStore(
-        Buffer.from('{"keep":"application"}')
-      );
+      const { createNativeArtifactPublication } =
+        await import("../../src/lib/usage/nativeArtifactPublication.ts");
+      const writeUnattachedArtifact = async (bytes: Uint8Array) => {
+        const publication = createNativeArtifactPublication();
+        try {
+          const stored = await owner.writeCallArtifactToNativeStore(bytes, publication.options);
+          publication.acknowledge({
+            reference: stored.relPath,
+            sizeBytes: stored.sizeBytes,
+            checksum: stored.sha256,
+          });
+          // This binary authority fixture has no log row; retain acknowledged deletion ownership.
+          await publication.fail(new Error("Unattached authority fixture output"));
+          return stored;
+        } catch (error) {
+          await publication.fail(error);
+          throw error;
+        } finally {
+          publication.release();
+        }
+      };
+      const object = await writeUnattachedArtifact(Buffer.from('{"keep":"application"}'));
       references.add(object.relPath);
 
       await t.test(
@@ -126,7 +145,11 @@ test(
               UnsupportedPersistenceDomainError
             );
             await assert.rejects(
-              owner.writeCallArtifactToNativeStore(Buffer.from("must not upload")),
+              owner.writeCallArtifactToNativeStore(Buffer.from("must not upload"), {
+                async onPrepared() {
+                  assert.fail("Foreign authority must preempt preparation");
+                },
+              }),
               UnsupportedPersistenceDomainError
             );
             await assert.rejects(
@@ -195,7 +218,7 @@ test(
           });
           await runtime!.runPersistenceBackgroundWork(async () => {
             assert.equal(runtime!.getPersistenceArtifactStore(), store);
-            const temporary = await owner.writeCallArtifactToNativeStore(Buffer.from("{}"));
+            const temporary = await writeUnattachedArtifact(Buffer.from("{}"));
             references.add(temporary.relPath);
             assert.equal(await owner.deleteCallArtifactAsync(temporary.relPath), true);
           });

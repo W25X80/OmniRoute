@@ -1,4 +1,10 @@
-import { createHash, randomUUID } from "node:crypto";
+import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import { DeleteObjectCommand, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
+import {
+  createS3ArtifactStore as createNativeStore,
+  type S3ArtifactTransport,
+} from "../../../src/lib/artifacts/s3ArtifactStore.ts";
 import type { NativeArtifactStore } from "../../../src/domain/persistence/artifactStore.ts";
 import type {
   PostgresControlPlane,
@@ -43,34 +49,70 @@ export async function initializePostgresControlPlane(options: PostgresControlPla
   return plane;
 }
 
-/** SQL/stream qualification excludes AWS/S3. Serialization and artifact readers remain production. */
+/** Real store/serialization; the deterministic owned transport excludes live AWS/S3. */
 export function createS3ArtifactStore(): NativeArtifactStore {
-  const bytesByReference = new Map<string, Uint8Array>();
-  let closed = false;
-  const assertOpen = () => {
-    if (closed) throw new Error("Fixture artifact transport closed");
+  const bytesByKey = new Map<string, Uint8Array>();
+  const prefix = "gateway/call-logs/";
+  const missing = () =>
+    Object.assign(new Error("Missing fixture object"), {
+      name: "NoSuchKey",
+      $metadata: { httpStatusCode: 404 },
+    });
+  const transport: S3ArtifactTransport = {
+    async send(command, options) {
+      assert.equal(command.input.Bucket, "native-streaming-fixture");
+      assert.equal(command.input.ExpectedBucketOwner, "123456789012");
+      assert.ok(command.input.Key?.startsWith(prefix + "s3/"));
+      const key = command.input.Key;
+      if (options.abortSignal.aborted)
+        throw Object.assign(new Error("Fixture transport was aborted"), { name: "AbortError" });
+      if (command instanceof PutObjectCommand) {
+        assert.ok(command.input.Body instanceof Uint8Array);
+        const bytes = Buffer.from(command.input.Body);
+        assert.equal(command.input.ContentLength, bytes.byteLength);
+        assert.equal(
+          command.input.ChecksumSHA256,
+          createHash("sha256").update(bytes).digest("base64")
+        );
+        assert.equal(command.input.IfNoneMatch, "*");
+        assert.equal(bytesByKey.has(key), false);
+        bytesByKey.set(key, bytes);
+        streamingNativeFixture.artifactPuts++;
+        return { $metadata: { httpStatusCode: 200 } };
+      }
+      if (command instanceof GetObjectCommand) {
+        const bytes = bytesByKey.get(key);
+        if (!bytes) throw missing();
+        return {
+          Body: bytes,
+          ContentLength: bytes.byteLength,
+          ChecksumSHA256: createHash("sha256").update(bytes).digest("base64"),
+          $metadata: { httpStatusCode: 200 },
+        };
+      }
+      assert.ok(command instanceof DeleteObjectCommand);
+      if (!bytesByKey.delete(key)) throw missing();
+      return { $metadata: { httpStatusCode: 204 } };
+    },
+    destroy() {},
   };
+  const store = createNativeStore(
+    {
+      bucket: "native-streaming-fixture",
+      region: "eu-central-1",
+      prefix,
+      expectedBucketOwner: "123456789012",
+    },
+    { loadClient: async () => transport }
+  );
+  let closed = false;
   return {
-    async put(bytes) {
-      assertOpen();
-      const checksum = createHash("sha256").update(bytes).digest("hex");
-      const reference = `fixture/${randomUUID()}-${checksum}.json`;
-      bytesByReference.set(reference, Uint8Array.from(bytes));
-      streamingNativeFixture.artifactPuts++;
-      return { reference, sizeBytes: bytes.byteLength, checksum };
-    },
-    async get(reference) {
-      assertOpen();
-      return bytesByReference.get(reference) ?? null;
-    },
-    async delete(reference) {
-      assertOpen();
-      return bytesByReference.delete(reference);
-    },
+    ...store,
     async close() {
+      await store.close();
       if (!closed) {
         closed = true;
-        bytesByReference.clear();
+        bytesByKey.clear();
         streamingNativeFixture.artifactsClosed++;
       }
     },

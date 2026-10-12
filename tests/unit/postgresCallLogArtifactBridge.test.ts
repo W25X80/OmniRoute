@@ -6,7 +6,10 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { DeleteObjectCommand, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
-import { ArtifactStorageError } from "../../src/domain/persistence/artifactStore.ts";
+import {
+  ArtifactStorageError,
+  type PreparedArtifact,
+} from "../../src/domain/persistence/artifactStore.ts";
 import {
   createS3ArtifactStore,
   type S3ArtifactTransport,
@@ -144,7 +147,44 @@ test("PostgreSQL call-log artifacts use worker serialization and native object s
   };
   const writer = await import("../../src/lib/usage/callLogArtifactWriter.ts");
   const owner = await import("../../src/lib/usage/callLogArtifacts.ts");
+  // Controlled callback receipt only: this bridge does not attest durable SQL preparation.
+  const preparedArtifacts = new Map<string, PreparedArtifact>();
+  const preparation = {
+    async onPrepared(prepared: PreparedArtifact) {
+      assert.equal(prepared.storageScope, store.storageScope);
+      assert.match(prepared.storageScope, /^[0-9a-f]{64}$/);
+      assert.equal(prepared.singleAttempt, true);
+      assert.equal(Object.isFrozen(prepared), true);
+      assert.equal(prepared.reference.endsWith(`_${prepared.checksum}.json`), true);
+      assert.equal(preparedArtifacts.has(prepared.reference), false);
+      preparedArtifacts.set(prepared.reference, prepared);
+    },
+  };
+  const writePreparedArtifact = async (
+    input: Parameters<typeof writer.writeCallArtifactAsync>[0]
+  ) => {
+    const result = await writer.writeCallArtifactAsync(input, preparation);
+    assert.ok(result);
+    const prepared = preparedArtifacts.get(result.relPath);
+    assert.ok(prepared);
+    assert.equal(prepared.sizeBytes, result.sizeBytes);
+    assert.equal(prepared.checksum, result.sha256);
+    return result;
+  };
   try {
+    await t.test("missing preparation is refused before serialization or transport", async () => {
+      await assert.rejects(
+        writer.writeCallArtifactAsync(artifact("missing-preparation")),
+        /preparation is required/
+      );
+      await assert.rejects(
+        owner.writeCallArtifactToNativeStore(Buffer.from("{}")),
+        /preparation is required/
+      );
+      assert.equal(putCount, 0);
+      assert.equal(preparedArtifacts.size, 0);
+      assert.equal(fs.existsSync(dataDirectory), false);
+    });
     await t.test(
       "serializer failure is explicit and never writes a fallback artifact",
       async () => {
@@ -159,7 +199,7 @@ test("PostgreSQL call-log artifacts use worker serialization and native object s
         console.warn = (...values: unknown[]) => warnings.push(values);
         try {
           await assert.rejects(
-            writer.writeCallArtifactAsync(artifact("worker-failure")),
+            writePreparedArtifact(artifact("worker-failure")),
             writer.CallLogArtifactSerializationError
           );
         } finally {
@@ -185,7 +225,7 @@ test("PostgreSQL call-log artifacts use worker serialization and native object s
       "small payload bytes, reference and SHA-256 are acknowledged unchanged",
       async () => {
         const input = artifact("native-round-trip");
-        const result = await writer.writeCallArtifactAsync(input);
+        const result = await writePreparedArtifact(input);
         assert(result);
         assert.match(result.relPath, /^s3\/[0-9a-f-]+_[0-9a-f]{64}\.json$/);
         const bytes = objects.get(`gateway/call-logs/${result.relPath}`)!.bytes;
@@ -210,7 +250,7 @@ test("PostgreSQL call-log artifacts use worker serialization and native object s
           providerResponse: { content: "valuable provider output" },
           clientResponse: { content: "answer" },
         };
-        const result = await writer.writeCallArtifactAsync(input);
+        const result = await writePreparedArtifact(input);
         assert(result);
         const stored = await owner.readCallArtifactAsync(result.relPath);
         assert.equal(stored.state, "ready");
@@ -224,7 +264,7 @@ test("PostgreSQL call-log artifacts use worker serialization and native object s
         process.env.CHAT_DEBUG_FILE = "true";
         try {
           const debug = artifact("native-debug");
-          const debugResult = await writer.writeCallArtifactAsync(debug);
+          const debugResult = await writePreparedArtifact(debug);
           assert(debugResult);
           assert.equal(
             objects.get(`gateway/call-logs/${debugResult.relPath}`)!.bytes.toString(),
@@ -275,7 +315,7 @@ test("PostgreSQL call-log artifacts use worker serialization and native object s
         rejectPut = true;
         try {
           await assert.rejects(
-            writer.writeCallArtifactAsync(artifact("unknown-put")),
+            writePreparedArtifact(artifact("unknown-put")),
             (error: unknown) =>
               error instanceof ArtifactStorageError &&
               error.kind === "put_unknown" &&
@@ -292,7 +332,7 @@ test("PostgreSQL call-log artifacts use worker serialization and native object s
       async () => {
         const results = await Promise.allSettled(
           Array.from({ length: 150 }, (_, index) =>
-            writer.writeCallArtifactAsync(artifact(`bounded-${index}`))
+            writePreparedArtifact(artifact(`bounded-${index}`))
           )
         );
         const rejected = results.filter((result) => result.status === "rejected");
@@ -327,7 +367,7 @@ test("PostgreSQL call-log artifacts use worker serialization and native object s
           if (command instanceof PutObjectCommand) entered();
           return originalSend(command, options);
         };
-        const pending = writer.writeCallArtifactAsync(artifact("drain"));
+        const pending = writePreparedArtifact(artifact("drain"));
         await Promise.race([
           started,
           pending.then(() => {
@@ -342,7 +382,7 @@ test("PostgreSQL call-log artifacts use worker serialization and native object s
         holdPut = undefined;
         await writer.closeCallLogArtifactWriter();
         await assert.rejects(
-          writer.writeCallArtifactAsync(artifact("after-close")),
+          writePreparedArtifact(artifact("after-close")),
           writer.CallLogArtifactSerializationError
         );
         assert.equal(fs.existsSync(dataDirectory), false);

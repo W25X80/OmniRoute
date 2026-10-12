@@ -349,7 +349,11 @@ export async function runStreamingTail(deps: StreamingTailDeps) {
   }
 
   let persistenceTail = nativePersistence
-    ? await acquirePersistenceTail().catch(async (error) => {
+    ? await (
+        deps.reserveNativeStreamingPersistence
+          ? deps.reserveNativeStreamingPersistence()
+          : acquirePersistenceTail()
+      ).catch(async (error) => {
         // Admission failed before any client handoff; the ready upstream still needs cancellation.
         try {
           streamController.abort();

@@ -6,7 +6,7 @@ import {
 } from "./cleanupScheduler";
 import { getSelectedPostgresDatabase } from "./controlPlaneContext";
 import { createPostgresCleanupRepository } from "./postgres/cleanupRepository";
-import { deleteCallArtifactAsync } from "@/lib/usage/callLogArtifacts";
+import { deleteNativeCallArtifacts } from "@/lib/usage/nativeArtifactPublication";
 /**
  * Database cleanup functions for removing old data based on retention policies.
  *
@@ -1321,25 +1321,7 @@ async function deletePostgresArtifacts(paths: string[]): Promise<{
   pendingArtifactDeletions: number;
   errors: number;
 }> {
-  const unique = [...new Set(paths)];
-  const result = { deletedArtifacts: 0, pendingArtifactDeletions: unique.length, errors: 0 };
-  const startedAt = Date.now();
-  for (const path of unique) {
-    if (Date.now() - startedAt >= 30_000) break;
-    try {
-      if (await deleteCallArtifactAsync(path)) result.deletedArtifacts++;
-      const database = getSelectedPostgresDatabase();
-      if (database)
-        await createPostgresCleanupRepository(database).acknowledgeArtifactDeletion(path);
-      result.pendingArtifactDeletions--;
-    } catch (error) {
-      console.error("[Cleanup] Call log artifact deletion failed:", error);
-      result.errors++;
-      // Leave durable references queued; one storage outage must not stall the entire pass.
-      break;
-    }
-  }
-  return result;
+  return deleteNativeCallArtifacts(paths);
 }
 
 async function cleanupPostgresTable(

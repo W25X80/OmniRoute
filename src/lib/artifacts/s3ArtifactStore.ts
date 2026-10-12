@@ -12,6 +12,7 @@ import {
   ArtifactStorageError,
   type NativeArtifactStore,
   type StoredArtifact,
+  type ArtifactPutOptions,
 } from "@/domain/persistence/artifactStore";
 import {
   parseS3ArtifactConfiguration,
@@ -43,20 +44,20 @@ export interface S3ArtifactDependencies {
 async function loadDefaultClient(
   configuration: S3ArtifactConfiguration
 ): Promise<S3ArtifactTransport> {
-  const { S3Client } = await import("@aws-sdk/client-s3");
+  const { S3Client, PutObjectCommand } = await import("@aws-sdk/client-s3");
   const agent = new Agent({
     keepAlive: true,
     maxSockets: 8,
     maxTotalSockets: 8,
     maxFreeSockets: 8,
   });
-  const client = new S3Client({
+  const options = {
     region: configuration.region,
-    maxAttempts: 3,
-    retryMode: "standard",
+    followRegionRedirects: false,
+    retryMode: "standard" as const,
     ignoreConfiguredEndpointUrls: true,
-    requestChecksumCalculation: "WHEN_REQUIRED",
-    responseChecksumValidation: "WHEN_REQUIRED",
+    requestChecksumCalculation: "WHEN_REQUIRED" as const,
+    responseChecksumValidation: "WHEN_REQUIRED" as const,
     requestHandler: {
       httpsAgent: agent,
       connectionTimeout: 1000,
@@ -64,13 +65,19 @@ async function loadDefaultClient(
       socketTimeout: 4000,
       throwOnRequestTimeout: true,
     },
-  });
+  };
+  // One writer attempt is required for positive-GET reconciliation to be terminal.
+  // Reads/deletes retain their existing retry policy and share the bounded socket pool.
+  const writer = new S3Client({ ...options, maxAttempts: 1 });
+  const reader = new S3Client({ ...options, maxAttempts: 3 });
   return {
-    send(command, options) {
-      return client.send(command, options) as Promise<ArtifactOutput>;
+    send(command, requestOptions) {
+      const client = command instanceof PutObjectCommand ? writer : reader;
+      return client.send(command, requestOptions) as Promise<ArtifactOutput>;
     },
     destroy() {
-      client.destroy();
+      writer.destroy();
+      reader.destroy();
       agent.destroy();
     },
   };
@@ -187,6 +194,17 @@ export function createS3ArtifactStore(
   dependencies: S3ArtifactDependencies = {}
 ): NativeArtifactStore {
   const configuration = parseS3ArtifactConfiguration(input);
+  const storageScope = createHash("sha256")
+    .update(
+      JSON.stringify({
+        bucket: configuration.bucket,
+        region: configuration.region,
+        prefix: configuration.prefix,
+        expectedBucketOwner: configuration.expectedBucketOwner,
+      })
+    )
+    .digest("hex");
+  const pendingPuts = new Map<string, number>();
   const deadline = dependencies.deadlineMs ?? ARTIFACT_DEADLINE_MS;
   if (!Number.isInteger(deadline) || deadline < 1 || deadline > ARTIFACT_DEADLINE_MS) {
     throw new ArtifactStorageError("configuration");
@@ -227,48 +245,78 @@ export function createS3ArtifactStore(
   }
 
   return {
-    put(bytes: Uint8Array): Promise<StoredArtifact> {
+    storageScope,
+    isPutActive(reference: string): boolean {
+      return (pendingPuts.get(reference) ?? 0) > 0;
+    },
+    put(bytes: Uint8Array, options: ArtifactPutOptions = {}): Promise<StoredArtifact> {
       if (!(bytes instanceof Uint8Array))
         return Promise.reject(new ArtifactStorageError("integrity"));
       if (bytes.byteLength > MAX_ARTIFACT_BYTES)
         return Promise.reject(new ArtifactStorageError("too_large"));
       const referenceId = randomUUID();
       let reference: string | undefined;
-      const deadlineError = new ArtifactStorageError("put_unknown");
+      let putStarted = false;
+      const deadlineError = new ArtifactStorageError("deadline");
       return operation(async (signal) => {
         const immutableBytes = Buffer.from(bytes);
         const checksum = digest(immutableBytes);
         reference = `s3/${referenceId}_${checksum}.json`;
+        pendingPuts.set(reference, (pendingPuts.get(reference) ?? 0) + 1);
         try {
-          const sdk = await import("@aws-sdk/client-s3");
-          const transport = await client();
-          assertActive(signal);
-          const result = await transport.send(
-            new sdk.PutObjectCommand({
-              Bucket: configuration.bucket,
-              Key: configuration.prefix + reference,
-              ExpectedBucketOwner: configuration.expectedBucketOwner,
-              Body: immutableBytes,
-              ContentLength: immutableBytes.byteLength,
-              ContentType: "application/json",
-              ChecksumSHA256: Buffer.from(checksum, "hex").toString("base64"),
-              IfNoneMatch: "*",
-              ServerSideEncryption: configuration.kmsKeyId ? "aws:kms" : "AES256",
-              ...(configuration.kmsKeyId
-                ? { SSEKMSKeyId: configuration.kmsKeyId, BucketKeyEnabled: true }
-                : {}),
-            }),
-            { abortSignal: signal }
+          // Caller SQL/checkpoint errors remain authoritative, not PUT errors.
+          await options.onPrepared?.(
+            Object.freeze({
+              reference,
+              sizeBytes: immutableBytes.byteLength,
+              checksum,
+              storageScope,
+              singleAttempt: true as const,
+            })
           );
           assertActive(signal);
-          assertAcknowledged(result);
-          return { reference, sizeBytes: immutableBytes.byteLength, checksum };
-        } catch {
-          // Even a retry's conditional rejection may follow an earlier acknowledged-lost write.
-          throw new ArtifactStorageError("put_unknown", reference);
+          try {
+            const sdk = await import("@aws-sdk/client-s3");
+            const transport = await client();
+            assertActive(signal);
+            putStarted = true;
+            const result = await transport.send(
+              new sdk.PutObjectCommand({
+                Bucket: configuration.bucket,
+                Key: configuration.prefix + reference,
+                ExpectedBucketOwner: configuration.expectedBucketOwner,
+                Body: immutableBytes,
+                ContentLength: immutableBytes.byteLength,
+                ContentType: "application/json",
+                ChecksumSHA256: Buffer.from(checksum, "hex").toString("base64"),
+                IfNoneMatch: "*",
+                ServerSideEncryption: configuration.kmsKeyId ? "aws:kms" : "AES256",
+                ...(configuration.kmsKeyId
+                  ? { SSEKMSKeyId: configuration.kmsKeyId, BucketKeyEnabled: true }
+                  : {}),
+              }),
+              { abortSignal: signal }
+            );
+            assertActive(signal);
+            assertAcknowledged(result);
+            return { reference, sizeBytes: immutableBytes.byteLength, checksum };
+          } catch {
+            throw new ArtifactStorageError("put_unknown", reference, putStarted);
+          }
+        } finally {
+          // A public deadline must not pretend the opaque transport has settled.
+          const remaining = (pendingPuts.get(reference) ?? 1) - 1;
+          if (remaining === 0) pendingPuts.delete(reference);
+          else pendingPuts.set(reference, remaining);
         }
       }, deadlineError).catch((error) => {
-        if (error === deadlineError) throw new ArtifactStorageError("put_unknown", reference);
+        if (error === deadlineError) {
+          throw new ArtifactStorageError(
+            putStarted ? "put_unknown" : "deadline",
+            reference,
+            putStarted
+          );
+        }
         throw error;
       });
     },
