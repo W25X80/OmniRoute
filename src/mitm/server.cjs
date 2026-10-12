@@ -771,6 +771,9 @@ async function startMitmServer() {
       return;
     }
 
+    // The downstream may have closed while its read-only alias lookup was pending.
+    if (res.closed || res.destroyed || res.writableEnded) return;
+
     if (!mappedOverride) {
       vlog(1, `[MITM] → PASSTHROUGH (model "${model}" has no MITM alias mapping)`);
       return passthrough(req, res, bodyBuffer);

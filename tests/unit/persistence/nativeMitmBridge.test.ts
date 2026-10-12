@@ -55,6 +55,157 @@ function request(port: number): Promise<{ status: number; body: string }> {
   });
 }
 
+for (const mapped of [true, false]) {
+  test(
+    `native MITM disconnect during alias lookup prevents ${mapped ? "mapped" : "absent"} dispatch`,
+    { timeout: 10000 },
+    async () => {
+      const scratch = await fs.mkdtemp(path.join(os.tmpdir(), "mitm-lookup-disconnect-"));
+      const { default: selfsigned } = await import("selfsigned");
+      const pair = await selfsigned.generate([{ name: "commonName", value: "localhost" }], {
+        keySize: 2048,
+      });
+      const received = { router: 0, direct: 0 };
+      const router = http.createServer((_req, res) => {
+        received.router++;
+        res.end("data: [DONE]\n\n");
+      });
+      const upstream = https.createServer({ key: pair.private, cert: pair.cert }, (_req, res) => {
+        received.direct++;
+        res.end("done");
+      });
+      let child: ChildProcess | undefined;
+      let downstream: http.ClientRequest | undefined;
+      const observations: Array<Record<string, unknown>> = [];
+      try {
+        await fs.mkdir(path.join(scratch, "mitm"));
+        await fs.writeFile(path.join(scratch, "mitm/server.key"), pair.private);
+        await fs.writeFile(path.join(scratch, "mitm/server.crt"), pair.cert);
+        let serverPath = path.join(root, "src/mitm/server.cjs");
+        // A frozen baseline copy is supported only by this test; product source is never reverted.
+        if (process.env.OMNIROUTE_TEST_MITM_SERVER_SOURCE) {
+          const owner = path.join(scratch, "owner");
+          await fs.mkdir(owner);
+          serverPath = path.join(owner, "server.cjs");
+          await fs.copyFile(process.env.OMNIROUTE_TEST_MITM_SERVER_SOURCE, serverPath);
+          await fs.symlink(
+            path.join(root, "src/mitm/_internal"),
+            path.join(owner, "_internal"),
+            "dir"
+          );
+        }
+        router.listen(0, "127.0.0.1");
+        upstream.listen(0, "127.0.0.1");
+        await Promise.all([once(router, "listening"), once(upstream, "listening")]);
+        const port = await freePort();
+        child = fork(serverPath, [], {
+          execArgv: [
+            "--require",
+            path.join(root, "tests/helpers/persistence/nativeMitmIoGuard.cjs"),
+          ],
+          env: {
+            ...process.env,
+            DATA_DIR: scratch,
+            OMNIROUTE_DATABASE_BACKEND: "postgres",
+            ROUTER_API_KEY: "fixture",
+            MITM_LOCAL_PORT: String(port),
+            OMNIROUTE_BASE_URL: `http://127.0.0.1:${(router.address() as net.AddressInfo).port}`,
+            MITM_CERT_MODE: "legacy",
+            MITM_DISABLE_TLS_VERIFY: "1",
+            INSPECTOR_INTERNAL_INGEST_TOKEN: "",
+            OMNIROUTE_TEST_MITM_LIFETIME: "1",
+            OMNIROUTE_TEST_MITM_UPSTREAM_PORT: String((upstream.address() as net.AddressInfo).port),
+          },
+          stdio: ["ignore", "pipe", "pipe", "ipc"],
+        });
+        child.on("message", (message) => observations.push(message as Record<string, unknown>));
+        async function observed(predicate: (message: Record<string, unknown>) => boolean) {
+          while (!observations.some(predicate)) await once(child!, "message");
+          return observations.find(predicate)!;
+        }
+        await new Promise<void>((resolve, reject) => {
+          let output = "";
+          child!.stdout!.on("data", (chunk: Buffer) => {
+            output += chunk.toString();
+            if (output.includes("MITM ready")) resolve();
+          });
+          child!.once("error", reject);
+          child!.once("exit", (code) => reject(new Error(`Native MITM exited ${code}`)));
+        });
+        const label = mapped ? "mapped" : "absent";
+        downstream = https.request({
+          host: "127.0.0.1",
+          port,
+          method: "POST",
+          agent: false,
+          path: "/v1beta/models/source:generateContent",
+          rejectUnauthorized: false,
+          headers: {
+            host: "daily-cloudcode-pa.googleapis.com",
+            "Content-Type": "application/json",
+            "x-fixture-request": label,
+          },
+        });
+        downstream.on("error", () => {});
+        downstream.end(
+          JSON.stringify({ model: "source", messages: [{ role: "user", content: "hello" }] })
+        );
+        const lookup = await observed((message) => message.kind === "lookup");
+        downstream.destroy();
+        // This is the actual ServerResponse close, not merely a client-side destroy call.
+        await observed(
+          (message) => message.fixture === "downstream-close" && message.label === label
+        );
+        await new Promise<void>((resolve, reject) =>
+          child!.send(
+            {
+              channel: "omniroute-mitm-alias.v1",
+              kind: "result",
+              id: lookup.id,
+              ok: true,
+              override: mapped ? { model: "provider/selected" } : null,
+            },
+            (error) => (error ? reject(error) : resolve())
+          )
+        );
+        // Completion follows the actual awaited owner callback. IPC ordering also places
+        // any synchronous direct-dispatch witness before this event; no timing sleep is used.
+        await observed(
+          (message) => message.fixture === "handler-complete" && message.label === label
+        );
+        assert.equal(
+          observations.filter((message) => message.fixture === "upstream-dispatch").length,
+          0
+        );
+        assert.deepEqual(received, { router: 0, direct: 0 });
+        assert.equal(
+          observations.filter((message) => message.fixture === "handler-error").length,
+          0
+        );
+        const exit = once(child, "exit");
+        child.kill("SIGTERM");
+        assert.equal((await exit)[0], 0);
+        const stats = JSON.parse(await fs.readFile(path.join(scratch, "mitm/stats.json"), "utf8"));
+        assert.equal(stats.interceptedRequests, 0);
+      } finally {
+        downstream?.destroy();
+        if (child && child.exitCode === null && child.signalCode === null) {
+          const exit = once(child, "exit");
+          child.kill("SIGKILL");
+          await exit;
+        }
+        router.closeAllConnections();
+        upstream.closeAllConnections();
+        await Promise.all([
+          new Promise<void>((resolve) => router.close(() => resolve())),
+          new Promise<void>((resolve) => upstream.close(() => resolve())),
+        ]);
+        await fs.rm(scratch, { recursive: true, force: true });
+      }
+    }
+  );
+}
+
 test(
   "real native CJS bridge reads changed mappings in fresh scopes and fails closed",
   { timeout: 20000 },
