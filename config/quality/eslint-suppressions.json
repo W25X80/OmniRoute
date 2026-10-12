@@ -348,7 +348,7 @@
   },
   "open-sse/services/batchProcessor.ts": {
     "@typescript-eslint/no-explicit-any": {
-      "count": 17
+      "count": 14
     },
     "no-restricted-syntax": {
       "count": 1

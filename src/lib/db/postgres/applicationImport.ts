@@ -335,6 +335,16 @@ function columnOrder(table: TargetTable): string[] {
   if (table.primary.length) return table.primary;
   throw new ApplicationImportError("schema", table.name);
 }
+/** Match buildPlan's byte ordering without applying text collation to numeric keys. */
+function importOrderSql(columns: TargetColumn[], order: string[]): string {
+  return order
+    .map((name) => {
+      const column = columns.find((entry) => entry.name === name);
+      if (!column) throw new ApplicationImportError("schema");
+      return `${importIdentifier(name)}${column.type === "text" ? ' COLLATE "C"' : ""}`;
+    })
+    .join(",");
+}
 function buildPlan(
   snapshot: ApplicationStorageSnapshot,
   schema: TargetSchema,
@@ -708,7 +718,7 @@ async function verifyPlan(transaction: PostgresTransaction, plan: ImportPlan): P
     if (BigInt(count?.count ?? "-1") !== BigInt(table.rows.length))
       throw new ApplicationImportError("verification", table.name);
     const fileContent = table.name === "files";
-    const from = `FROM omniroute.${importIdentifier(table.name)} ORDER BY ${table.order.map(importIdentifier).join(",")}`;
+    const from = `FROM omniroute.${importIdentifier(table.name)} ORDER BY ${importOrderSql(table.columns, table.order)}`;
     const projection = table.columns
       .map((column) =>
         fileContent && column.name === "content"
@@ -1211,7 +1221,7 @@ export async function capturePostgresApplicationSnapshot(
       }
       for (let start = 0; ; start += APPLICATION_SNAPSHOT_LIMITS.chunkRows) {
         const result = await transaction.query<Record<string, unknown>>(
-          `SELECT ${columns.map((column) => (fileContent(column) ? `NULL AS ${importIdentifier(column.name)}` : importIdentifier(column.name))).join(",")} FROM omniroute.${importIdentifier(table.name)} ORDER BY ${order.map(importIdentifier).join(",")} LIMIT $1 OFFSET $2`,
+          `SELECT ${columns.map((column) => (fileContent(column) ? `NULL AS ${importIdentifier(column.name)}` : importIdentifier(column.name))).join(",")} FROM omniroute.${importIdentifier(table.name)} ORDER BY ${importOrderSql(columns, order)} LIMIT $1 OFFSET $2`,
           [APPLICATION_SNAPSHOT_LIMITS.chunkRows, start]
         );
         for (let index = 0; index < result.rows.length; index++) {

@@ -1,3 +1,5 @@
+import { mkdir, writeFile } from "node:fs/promises";
+import { nativeMitmEnabled, existsAsync, nativeMitmSignal } from "../nativeHostIo.ts";
 import path from "path";
 import fs from "fs";
 import { resolveMitmDataDir } from "../dataDir.ts";
@@ -26,14 +28,18 @@ export async function generateCert(options?: {
   // #10467: callers that only need a cert to exist keep the existing one, but the
   // regenerate endpoint has to actually mint a new one — otherwise a cert missing the
   // SANs added in #6494 can never be replaced from the UI.
-  if (!options?.force && fs.existsSync(keyPath) && fs.existsSync(certPath)) {
+  if (
+    !options?.force &&
+    (nativeMitmEnabled()
+      ? (await existsAsync(keyPath)) && (await existsAsync(certPath))
+      : fs.existsSync(keyPath) && fs.existsSync(certPath))
+  ) {
     console.log("✅ SSL certificate already exists");
     return { key: keyPath, cert: certPath };
   }
 
-  if (!fs.existsSync(certDir)) {
-    fs.mkdirSync(certDir, { recursive: true });
-  }
+  if (nativeMitmEnabled()) await mkdir(certDir, { recursive: true });
+  else if (!fs.existsSync(certDir)) fs.mkdirSync(certDir, { recursive: true });
 
   // Dynamic import for optional dependency
   const { default: selfsigned } = await import("selfsigned");
@@ -52,8 +58,15 @@ export async function generateCert(options?: {
     ],
   });
 
-  fs.writeFileSync(keyPath, pems.private);
-  fs.writeFileSync(certPath, pems.cert);
+  if (nativeMitmEnabled()) {
+    nativeMitmSignal()?.throwIfAborted();
+    // Complete the accepted pair before returning; never report a partial pair as successful.
+    await writeFile(keyPath, pems.private);
+    await writeFile(certPath, pems.cert);
+  } else {
+    fs.writeFileSync(keyPath, pems.private);
+    fs.writeFileSync(certPath, pems.cert);
+  }
 
   console.log(`✅ Generated SSL certificate for ${TARGET_HOSTS.join(", ")}`);
   return { key: keyPath, cert: certPath };

@@ -14,7 +14,7 @@ const PHYSICAL_SQL = {
 export interface SqliteVecDefinition {
   name: string;
   type: string;
-  sql: string | null;
+  sql?: string | null;
 }
 interface VersionRow {
   key: unknown;
@@ -33,7 +33,7 @@ export class SqliteVecQualificationError extends Error {
   }
 }
 
-function supportedParent(sql: string | null): boolean {
+function supportedParent(sql?: string | null): boolean {
   const match =
     /^CREATE\s+VIRTUAL\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:vec_memories|"vec_memories"|`vec_memories`|\[vec_memories\])\s+USING\s+vec0\s*\(\s*embedding\s+(?:float|int8)\s*\[\s*([0-9]+)\s*\]\s*\)\s*;?\s*$/i.exec(
       sql ?? ""

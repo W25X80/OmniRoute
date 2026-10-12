@@ -11,7 +11,7 @@
 import { z } from "zod";
 import { repairMitm, getCachedPassword, setCachedPassword } from "@/mitm/manager";
 import {
-  isMitmSudoPasswordRequired,
+  isMitmSudoPasswordRequiredAsync,
   normalizeMitmSudoPasswordInput,
   resolveMitmSudoPassword,
 } from "@/mitm/sudoGate";
@@ -32,7 +32,7 @@ export async function POST(request: Request): Promise<Response> {
     getCachedPassword()
   );
 
-  if (isMitmSudoPasswordRequired(sudoPassword)) {
+  if (await isMitmSudoPasswordRequiredAsync(sudoPassword)) {
     return createErrorResponse({ status: 400, message: "Missing sudoPassword" });
   }
 

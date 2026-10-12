@@ -161,6 +161,59 @@ test(
         }
       );
 
+      await t.test("native catalog counts each admitted Claude Code request once", async () => {
+        const { prepareNativeProviders } = await import("../../open-sse/config/constants.ts");
+        await prepareNativeProviders();
+        const { updateSettings } = await import("../../src/lib/db/settings.ts");
+        const { getUnifiedModelsResponse } = await import("../../src/app/api/v1/models/catalog.ts");
+        const fetch = globalThis.fetch;
+        globalThis.fetch = async () => {
+          throw new Error("Unexpected external catalog request");
+        };
+        try {
+          await runtime!.runPersistenceRequest(() =>
+            updateSettings({
+              requireAuthForModels: false,
+              setupComplete: true,
+              password: "fixture-configured-password",
+            })
+          );
+          const before = await counter();
+          const catalogRequest = (agent: string) =>
+            runtime!.runPersistenceRequest(() =>
+              getUnifiedModelsResponse(
+                new Request("https://catalog.invalid/v1/models", {
+                  headers: { "user-agent": agent },
+                })
+              )
+            );
+          const response = await catalogRequest("claude-cli/fixture");
+          assert.equal(response.status, 200);
+          await response.text();
+          await runtime!.drainPersistenceAcceptedWork();
+          assert.equal(await counter(), before + 1);
+          const ordinary = await catalogRequest("ordinary-client");
+          assert.equal(ordinary.status, 200);
+          await ordinary.text();
+          await runtime!.drainPersistenceAcceptedWork();
+          assert.equal(await counter(), before + 1);
+          await runtime!.runPersistenceRequest(() =>
+            updateSettings({ requireAuthForModels: true })
+          );
+          const denied = await catalogRequest("claude-cli/fixture");
+          assert.equal(denied.status, 401);
+          await denied.text();
+          await runtime!.drainPersistenceAcceptedWork();
+          assert.equal(
+            await counter(),
+            before + 1,
+            "rejected authentication is never a discovery hit"
+          );
+        } finally {
+          globalThis.fetch = fetch;
+        }
+      });
+
       await t.test(
         "a saturated application gate refuses best-effort and performs no increment",
         async () => {

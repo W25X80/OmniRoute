@@ -1,5 +1,6 @@
 import { CORS_HEADERS, handleCorsOptions } from "@/shared/utils/cors";
-import { getBatchAsync, updateBatchAsync } from "@/lib/db/batches";
+import { getBatchAsync, transitionBatchAsync } from "@/lib/db/batches";
+import { isPostgresErrorKind } from "@/lib/db/postgres/database";
 import { NextResponse } from "next/server";
 import {
   getApiKeyRequestScope,
@@ -63,25 +64,35 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
     );
   }
 
-  if (["completed", "failed", "cancelled", "expired"].includes(batch.status)) {
-    return NextResponse.json(
-      {
-        error: { message: `Batch ${id} is already ${batch.status}`, type: "invalid_request_error" },
-      },
-      { status: 400, headers: CORS_HEADERS }
-    );
+  // The initial read authorizes access; only the transaction decides the status winner.
+  try {
+    const result = await transitionBatchAsync(id, ["validating", "in_progress", "finalizing"], {
+      status: "cancelling",
+      cancellingAt: Math.floor(Date.now() / 1000),
+    });
+    if (!result.batch) {
+      return NextResponse.json(buildErrorBody(404, "Batch not found"), {
+        status: 404,
+        headers: CORS_HEADERS,
+      });
+    }
+    if (result.batch.status !== "cancelling") {
+      return NextResponse.json(
+        {
+          error: {
+            message: `Batch ${id} is already ${result.batch.status}`,
+            type: "invalid_request_error",
+          },
+        },
+        { status: 400, headers: CORS_HEADERS }
+      );
+    }
+    return NextResponse.json(formatBatchResponse(result.batch), { headers: CORS_HEADERS });
+  } catch (error) {
+    const status = isPostgresErrorKind(error, "commit_unknown") ? 503 : 500;
+    return NextResponse.json(buildErrorBody(status, "Unable to confirm batch cancellation"), {
+      status,
+      headers: CORS_HEADERS,
+    });
   }
-
-  if (batch.status === "cancelling") {
-    return NextResponse.json(formatBatchResponse(batch), { headers: CORS_HEADERS });
-  }
-
-  await updateBatchAsync(id, {
-    status: "cancelling",
-    cancellingAt: Math.floor(Date.now() / 1000),
-  });
-
-  const updatedBatch = await getBatchAsync(id);
-
-  return NextResponse.json(formatBatchResponse(updatedBatch), { headers: CORS_HEADERS });
 }

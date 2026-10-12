@@ -5,6 +5,8 @@
  */
 
 import crypto from "crypto";
+import { parseDatabaseBackend } from "./db/backendSelection";
+import { runPersistenceBackgroundWork } from "./db/persistenceRuntime";
 import { encrypt, decrypt } from "./db/encryption";
 import { OutboundUrlGuardError } from "@/shared/network/outboundUrlGuard";
 import { fetchWebhookUrl, type WebhookFetchOptions } from "@/shared/network/webhookFetch";
@@ -141,12 +143,19 @@ export async function deliverWebhook(
  * to await delivery (CLI/admin tooling, tests).
  */
 export function notifyWebhookEvent(event: WebhookEvent, data: Record<string, any>): void {
-  // Intentionally not awaited. Promise.allSettled inside dispatchEvent already
-  // absorbs per-delivery errors; this outer catch handles the import/loader
-  // path so a misconfigured webhook table cannot break a request.
-  dispatchEvent(event, data).catch(() => {
-    /* webhook delivery is best-effort */
-  });
+  try {
+    // Native delivery owns its SQL work after the originating HTTP request ends. Admission
+    // happens now, so graceful shutdown joins accepted work through its final bookkeeping.
+    const delivery =
+      parseDatabaseBackend() === "postgres"
+        ? runPersistenceBackgroundWork(() => dispatchEvent(event, data))
+        : dispatchEvent(event, data);
+    void delivery.catch(() => {
+      /* webhook delivery and admission remain best-effort */
+    });
+  } catch {
+    /* notification must never interrupt the caller */
+  }
 }
 
 /**

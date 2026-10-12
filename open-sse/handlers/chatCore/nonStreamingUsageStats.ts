@@ -1,3 +1,4 @@
+import { sanitizeErrorMessage } from "../../utils/error.ts";
 import { getSelectedUsageHistoryRepository } from "@/lib/db/postgres/usageHistoryRepository";
 import { saveRequestUsageWithReceipt, type UsageEntry } from "@/lib/usage/usageHistory";
 import { recordKeyQuotaUsageAsync } from "@/domain/keyQuota";
@@ -129,7 +130,22 @@ export async function recordNonStreamingUsageStatsAsync(
     endpoint: ctx.endpoint || undefined,
     cpaAuthIndex: ctx.cpaAuthIndex || undefined,
   };
-  const receipt = await saveRequestUsageWithReceipt(entry);
+  let receipt: Awaited<ReturnType<typeof saveRequestUsageWithReceipt>>;
+  try {
+    receipt = await saveRequestUsageWithReceipt(entry);
+  } catch (error) {
+    try {
+      console.warn(
+        "[USAGE] Failed to persist completed-request usage:",
+        sanitizeErrorMessage(error) || "Usage persistence failed"
+      );
+    } catch {
+      // Optional diagnostics cannot discard an already successful provider response.
+    }
+    // No acknowledged history identity: do not replay a possibly committed event or
+    // seed its receipt-dependent counters as though the history write had rolled back.
+    return;
+  }
   if (ctx.apiKeyInfo?.id) {
     const billable = computeBillableTokens(usage);
     if (receipt?.inserted) await recordKeyQuotaUsageAsync(ctx.apiKeyInfo.id, billable);

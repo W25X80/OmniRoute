@@ -1,5 +1,6 @@
+import { nativeMitmEnabled, assertNativeMitmNotAborted } from "./nativeHostIo.ts";
 import { createLogger } from "@/shared/utils/logger.ts";
-import { canRunPrivilegedMitmSteps } from "./sudoGate.ts";
+import { canRunPrivilegedMitmSteps, isMitmSudoPasswordRequiredAsync } from "./sudoGate.ts";
 
 const log = createLogger("mitm-manager");
 
@@ -9,7 +10,11 @@ export async function runPrivilegedMitmStep(
   skipLog: string,
   step: () => Promise<void>
 ): Promise<void> {
-  if (!canRunPrivilegedMitmSteps(sudoPassword)) {
+  assertNativeMitmNotAborted();
+  const allowed = nativeMitmEnabled()
+    ? !(await isMitmSudoPasswordRequiredAsync(sudoPassword))
+    : canRunPrivilegedMitmSteps(sudoPassword);
+  if (!allowed) {
     log.info(skipLog);
     return;
   }

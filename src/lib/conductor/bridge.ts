@@ -98,7 +98,7 @@ export function applyConductorEvent(
   tm: A2ATaskManager,
   index: Map<string, string>,
   ev: ConductorEvent
-): void {
+): string | undefined {
   const target = conductorStateFor(ev.type);
   if (!target) return;
   const conductorId = typeof ev.payload.task_id === "string" ? ev.payload.task_id : null;
@@ -118,6 +118,7 @@ export function applyConductorEvent(
     }
   }
   if (target !== "submitted") climb(tm, a2aId, target);
+  return a2aId;
 }
 
 // ============ Incremental SSE parser ============
@@ -219,13 +220,13 @@ export function createConductorBridge(opts: ConductorBridgeOptions): ConductorBr
             continue;
           }
           await runPersistenceBackgroundWork(async () => {
-            applyConductorEvent(opts.tm, index, {
+            const mirroredTaskId = applyConductorEvent(opts.tm, index, {
               id: id,
               type: event,
               payload,
             });
             try {
-              await opts.tm.flushPersistence();
+              if (mirroredTaskId) await opts.tm.flushPersistence(mirroredTaskId);
             } catch (error) {
               running = false;
               log("Task history persistence failed; cursor advancement stopped");

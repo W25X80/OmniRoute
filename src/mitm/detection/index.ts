@@ -1,3 +1,4 @@
+import { nativeMitmEnabled, assertNativeMitmNotAborted } from "../nativeHostIo.ts";
 /**
  * Detection dispatcher.
  *
@@ -10,14 +11,14 @@
  * upstream surface is confirmed (see `targets/trae.ts`).
  */
 import type { AgentId, DetectionResult } from "../types";
-import { detectAntigravity } from "./antigravity";
-import { detectKiro } from "./kiro";
-import { detectCopilot } from "./copilot";
-import { detectCodex } from "./codex";
-import { detectCursor } from "./cursor";
-import { detectZed } from "./zed";
-import { detectClaudeCode } from "./claudeCode";
-import { detectOpenCode } from "./openCode";
+import { detectAntigravity, detectAntigravityAsync } from "./antigravity";
+import { detectKiro, detectKiroAsync } from "./kiro";
+import { detectCopilot, detectCopilotAsync } from "./copilot";
+import { detectCodex, detectCodexAsync } from "./codex";
+import { detectCursor, detectCursorAsync } from "./cursor";
+import { detectZed, detectZedAsync } from "./zed";
+import { detectClaudeCode, detectClaudeCodeAsync } from "./claudeCode";
+import { detectOpenCode, detectOpenCodeAsync } from "./openCode";
 
 export const DETECTORS: Record<AgentId, () => DetectionResult> = {
   antigravity: detectAntigravity,
@@ -53,3 +54,25 @@ export {
   detectClaudeCode,
   detectOpenCode,
 };
+
+const ASYNC_DETECTORS: Record<AgentId, () => Promise<DetectionResult>> = {
+  antigravity: detectAntigravityAsync,
+  kiro: detectKiroAsync,
+  copilot: detectCopilotAsync,
+  "ghe-copilot": detectCopilotAsync,
+  codex: detectCodexAsync,
+  cursor: detectCursorAsync,
+  zed: detectZedAsync,
+  "claude-code": detectClaudeCodeAsync,
+  "open-code": detectOpenCodeAsync,
+  trae: async () => ({ installed: false }),
+};
+export async function detectAgentAsync(id: AgentId): Promise<DetectionResult> {
+  if (!nativeMitmEnabled()) return detectAgent(id);
+  try {
+    return await (ASYNC_DETECTORS[id]?.() ?? { installed: false });
+  } catch {
+    assertNativeMitmNotAborted();
+    return { installed: false };
+  }
+}

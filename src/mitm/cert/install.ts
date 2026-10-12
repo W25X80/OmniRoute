@@ -1,3 +1,11 @@
+import { stat } from "node:fs/promises";
+import {
+  nativeMitmEnabled,
+  existsAsync,
+  readTextAsync,
+  runNativeMitmCommand,
+  assertNativeMitmNotAborted,
+} from "../nativeHostIo.ts";
 import fs from "fs";
 import crypto from "crypto";
 import { exec } from "child_process";
@@ -35,6 +43,14 @@ function getLinuxCertConfig(): LinuxCertConfig {
     if (fs.existsSync(config.dir)) {
       return config;
     }
+  }
+  return LINUX_CERT_PATHS[0];
+}
+
+async function getLinuxCertConfigAsync(): Promise<LinuxCertConfig> {
+  if (!nativeMitmEnabled()) return getLinuxCertConfig();
+  for (const config of LINUX_CERT_PATHS) {
+    if (await existsAsync(config.dir)) return config;
   }
   return LINUX_CERT_PATHS[0];
 }
@@ -85,6 +101,18 @@ async function updateNssDatabases(
     done
   `;
 
+  if (nativeMitmEnabled()) {
+    await runNativeMitmCommand("/bin/bash", ["-c", script], {
+      env: {
+        ...process.env,
+        CERT_NAME: "OmniRoute MITM Root CA",
+        CERT_PATH: certPath || "",
+        ACTION: action,
+      },
+    });
+    assertNativeMitmNotAborted();
+    return;
+  }
   return new Promise((resolve) => {
     exec(
       script,
@@ -104,13 +132,22 @@ async function updateNssDatabases(
 
 // Get SHA1 fingerprint from cert file using Node.js crypto
 function getCertFingerprint(certPath: string): string {
-  const pem = fs.readFileSync(certPath, "utf-8");
+  return fingerprintFromPem(fs.readFileSync(certPath, "utf-8"), certPath);
+}
+
+function fingerprintFromPem(pem: string, certPath: string): string {
   const der = Buffer.from(pem.replace(/-----[^-]+-----/g, "").replace(/\s/g, ""), "base64");
   const pairs = crypto.createHash("sha1").update(der).digest("hex").toUpperCase().match(/.{2}/g);
   if (!pairs) {
     throw new Error(`Unable to compute certificate fingerprint for ${certPath}`);
   }
   return pairs.join(":");
+}
+
+async function getCertFingerprintAsync(certPath: string): Promise<string> {
+  return nativeMitmEnabled()
+    ? fingerprintFromPem(await readTextAsync(certPath), certPath)
+    : getCertFingerprint(certPath);
 }
 
 /**
@@ -137,7 +174,7 @@ export function macCertOutputHasFingerprint(securityOutput: string, fingerprint:
 
 async function checkCertInstalledMac(certPath: string): Promise<boolean> {
   try {
-    const fingerprint = getCertFingerprint(certPath);
+    const fingerprint = await getCertFingerprintAsync(certPath);
     const output = await execFileText("security", [
       "find-certificate",
       "-a",
@@ -152,10 +189,11 @@ async function checkCertInstalledMac(certPath: string): Promise<boolean> {
 
 async function checkCertInstalledLinux(certPath: string): Promise<boolean> {
   try {
-    const config = getLinuxCertConfig();
+    const config = await getLinuxCertConfigAsync();
     const destFile = `${config.dir}/${LINUX_CERT_NAME}`;
-    if (!fs.existsSync(destFile)) return false;
-    return getCertFingerprint(certPath) === getCertFingerprint(destFile);
+    if (!(nativeMitmEnabled() ? await existsAsync(destFile) : fs.existsSync(destFile)))
+      return false;
+    return (await getCertFingerprintAsync(certPath)) === (await getCertFingerprintAsync(destFile));
   } catch {
     return false;
   }
@@ -179,7 +217,13 @@ export function certutilThumbprint(certPath: string): string {
 
 async function checkCertInstalledWindows(certPath: string): Promise<boolean> {
   try {
-    await execFileText("certutil", ["-store", "Root", certutilThumbprint(certPath)]);
+    await execFileText("certutil", [
+      "-store",
+      "Root",
+      nativeMitmEnabled()
+        ? (await getCertFingerprintAsync(certPath)).replace(/:/g, "")
+        : certutilThumbprint(certPath),
+    ]);
     return true;
   } catch {
     return false;
@@ -190,7 +234,7 @@ async function checkCertInstalledWindows(certPath: string): Promise<boolean> {
  * Install SSL certificate to system trust store
  */
 export async function installCert(sudoPassword: string, certPath: string): Promise<void> {
-  if (!fs.existsSync(certPath)) {
+  if (!(nativeMitmEnabled() ? await existsAsync(certPath) : fs.existsSync(certPath))) {
     throw new Error(`Certificate file not found: ${certPath}`);
   }
 
@@ -202,7 +246,7 @@ export async function installCert(sudoPassword: string, certPath: string): Promi
     // the early return so re-running install fixes a previously wrong-mode
     // cert instead of silently skipping it.
     if (!IS_WIN && !IS_MAC) {
-      const config = getLinuxCertConfig();
+      const config = await getLinuxCertConfigAsync();
       await ensureSystemCertMode(`${config.dir}/${LINUX_CERT_NAME}`, sudoPassword);
     }
     console.log("✅ Certificate already installed");
@@ -269,7 +313,8 @@ export function classifyCertInstallError(message: string): CertInstallReason {
  */
 export function buildCertManualGuide(
   certPath: string,
-  platform: NodeJS.Platform = process.platform
+  platform: NodeJS.Platform = process.platform,
+  linuxConfig?: LinuxCertConfig
 ): CertManualGuide {
   let steps: string[];
   if (platform === "win32") {
@@ -283,7 +328,7 @@ export function buildCertManualGuide(
     ];
   } else {
     // Linux — match the detected distro's anchor dir + refresh command.
-    const config = getLinuxCertConfig();
+    const config = linuxConfig ?? getLinuxCertConfig();
     steps = [
       `sudo cp "${certPath}" ${config.dir}/${LINUX_CERT_NAME}`,
       `sudo ${config.cmd}`,
@@ -318,7 +363,11 @@ export async function installCertResult(
       skipped: true,
       reason,
       message,
-      manualGuide: buildCertManualGuide(certPath),
+      manualGuide: buildCertManualGuide(
+        certPath,
+        process.platform,
+        nativeMitmEnabled() && !IS_WIN && !IS_MAC ? await getLinuxCertConfigAsync() : undefined
+      ),
     };
   }
 }
@@ -370,7 +419,7 @@ async function installCertMac(sudoPassword: string, certPath: string): Promise<v
 
 async function installCertLinux(sudoPassword: string, certPath: string): Promise<void> {
   try {
-    const config = getLinuxCertConfig();
+    const config = await getLinuxCertConfigAsync();
     const destFile = `${config.dir}/${LINUX_CERT_NAME}`;
 
     await execFileWithPassword("sudo", ["-S", "mkdir", "-p", config.dir], sudoPassword);
@@ -405,7 +454,7 @@ async function installCertLinux(sudoPassword: string, certPath: string): Promise
  */
 export async function ensureSystemCertMode(destFile: string, sudoPassword: string): Promise<void> {
   try {
-    const mode = fs.statSync(destFile).mode & 0o777;
+    const mode = (nativeMitmEnabled() ? await stat(destFile) : fs.statSync(destFile)).mode & 0o777;
     if (mode !== 0o644) {
       await execFileWithPassword("sudo", ["-S", "chmod", "0644", destFile], sudoPassword);
     }
@@ -460,7 +509,7 @@ export async function uninstallCert(sudoPassword: string, certPath: string): Pro
 }
 
 async function uninstallCertMac(sudoPassword: string, certPath: string): Promise<void> {
-  const fingerprint = getCertFingerprint(certPath).replace(/:/g, "");
+  const fingerprint = (await getCertFingerprintAsync(certPath)).replace(/:/g, "");
   try {
     await execFileWithPassword(
       "sudo",
@@ -484,10 +533,10 @@ async function uninstallCertLinux(sudoPassword: string, certPath: string): Promi
   try {
     await updateNssDatabases(null, "delete");
 
-    const config = getLinuxCertConfig();
+    const config = await getLinuxCertConfigAsync();
     const destFile = `${config.dir}/${LINUX_CERT_NAME}`;
 
-    if (fs.existsSync(destFile)) {
+    if (nativeMitmEnabled() ? await existsAsync(destFile) : fs.existsSync(destFile)) {
       await execFileWithPassword("sudo", ["-S", "rm", "-f", destFile], sudoPassword);
     }
 
@@ -515,6 +564,12 @@ export function buildWindowsDelstoreScript(thumbprint: string): string {
 }
 
 async function uninstallCertWindows(certPath: string): Promise<void> {
-  await runElevatedPowerShell(buildWindowsDelstoreScript(certutilThumbprint(certPath)));
+  await runElevatedPowerShell(
+    buildWindowsDelstoreScript(
+      nativeMitmEnabled()
+        ? (await getCertFingerprintAsync(certPath)).replace(/:/g, "")
+        : certutilThumbprint(certPath)
+    )
+  );
   console.log("✅ Uninstalled certificate from Windows Root store");
 }

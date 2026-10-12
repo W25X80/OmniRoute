@@ -134,6 +134,11 @@ export function createPostgresComboRepository(
     update: (id, data) =>
       database.transaction(async (transaction) => {
         await lockComboMutation(transaction);
+        if (data.models !== undefined) {
+          // Lock order: routing -> key-value -> policy -> session history. Session
+          // writers/fences take only the last lock, before touching history rows.
+          await transaction.query("SELECT pg_advisory_xact_lock(18765,13)");
+        }
         const { rows } = await transaction.query<ComboRow>(
           `SELECT id, data, sort_order, context_cache_protection FROM omniroute.combos
            WHERE id = $1 FOR UPDATE`,
@@ -182,6 +187,19 @@ export function createPostgresComboRepository(
             id,
           ]
         );
+        if (data.models !== undefined) {
+          const cleared = await transaction.query(
+            "DELETE FROM omniroute.session_model_history WHERE combo_name=$1",
+            [currentName]
+          );
+          // Preserve the facade's existing rename predicate, including zero old pins.
+          if ((cleared.rowCount ?? 0) > 0 && nextName !== currentName) {
+            await transaction.query(
+              "DELETE FROM omniroute.session_model_history WHERE combo_name=$1",
+              [nextName]
+            );
+          }
+        }
         await advanceApiKeyPolicyEpoch(transaction);
         return {
           combo: normalized,

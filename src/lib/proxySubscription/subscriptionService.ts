@@ -21,6 +21,10 @@
  */
 import { randomUUID } from "crypto";
 import fs from "node:fs";
+import { parseDatabaseBackend } from "../db/backendSelection";
+import { getSelectedPersistenceIdentity } from "../db/controlPlaneContext";
+import { runPersistenceBackgroundWork } from "../db/persistenceRuntime";
+import { createPersistencePoller, type PersistencePoller } from "../config/persistencePoller";
 import { decodeUserinfo } from "@/shared/utils/decodeUserinfo";
 import { areLocalProviderUrlsAllowed } from "@/shared/network/outboundUrlGuardPolicy";
 import { readStaleSwitchWarningAsync } from "../db/proxySubscriptionStore";
@@ -53,7 +57,7 @@ import { removeStaleSubscriptionNodes } from "./staleNodes";
 import { resolveTargetScopes } from "./scopes";
 import { clampSelectorGapSeconds, setAnyControlUrlConfigured } from "./selectorTrigger";
 import { stripSelectorSuffix } from "./selectorEndpoint";
-import { removeSubscriptionSideFiles } from "./coreConfig/apply";
+import { removeSubscriptionSideFiles, removeSubscriptionSideFilesAsync } from "./coreConfig/apply";
 import {
   isSubscriptionFetchUrlAllowed,
   isIpLiteral,
@@ -449,7 +453,9 @@ export async function deleteSubscription(id: string): Promise<boolean> {
   // Best-effort: remove the side files this subscription owned. A missing
   // or locked file must not fail the delete (row already gone).
   if (typeof doomed?.core_config_path === "string") {
-    removeSubscriptionSideFiles(fs, doomed.core_config_path, id);
+    if (parseDatabaseBackend() === "postgres")
+      await removeSubscriptionSideFilesAsync(doomed.core_config_path, id);
+    else removeSubscriptionSideFiles(fs, doomed.core_config_path, id);
   }
   // Cache maintenance: a delete may have removed the last
   // control_url — reset to lazy so the next trigger re-reads (never stale-true).
@@ -1143,45 +1149,96 @@ async function setProxyEnabledFlag(value: boolean): Promise<void> {
 let schedulerStarted = false;
 let schedulerTimer: ReturnType<typeof setInterval> | null = null;
 
+interface NativeSubscriptionScheduler {
+  readonly identity: object;
+  readonly poller: PersistencePoller;
+  stopping?: Promise<void>;
+}
+const NATIVE_SUBSCRIPTION_SCHEDULER = Symbol.for("omniroute.proxySubscriptions.nativeScheduler");
+const schedulerGlobals = globalThis as typeof globalThis & {
+  [NATIVE_SUBSCRIPTION_SCHEDULER]?: NativeSubscriptionScheduler;
+};
+
+async function subscriptionSchedulerTick(): Promise<void> {
+  try {
+    const subs = await listSubscriptions();
+    const now = Date.now();
+    for (const sub of subs) {
+      if (!isSubscriptionDue(sub, now)) continue;
+      try {
+        await syncSubscription(sub.id);
+      } catch (error) {
+        console.warn(
+          `[ProxySubscription] refresh failed for ${sub.id}: ${error instanceof Error ? error.message : error}`
+        );
+      }
+    }
+  } catch (error) {
+    console.warn(
+      `[ProxySubscription] scheduler tick error: ${error instanceof Error ? error.message : error}`
+    );
+  }
+}
+
 /** Start a background ticker that refreshes enabled subscriptions on their interval. */
 export function startSubscriptionScheduler(): void {
-  if (schedulerStarted) return;
-  if (typeof window !== "undefined") return; // never in the browser
-  if (process.env.NODE_ENV === "test") return; // no timers during tests
-  schedulerStarted = true;
-
-  const tick = async () => {
-    try {
-      const subs = await listSubscriptions();
-      const now = Date.now();
-      for (const s of subs) {
-        if (!isSubscriptionDue(s, now)) continue;
-        try {
-          await syncSubscription(s.id);
-        } catch (e) {
-          console.warn(
-            `[ProxySubscription] refresh failed for ${s.id}: ${e instanceof Error ? e.message : e}`
-          );
-        }
-      }
-    } catch (e) {
-      console.warn(
-        `[ProxySubscription] scheduler tick error: ${e instanceof Error ? e.message : e}`
-      );
+  if (typeof window !== "undefined") return;
+  if (process.env.NODE_ENV === "test") return;
+  if (parseDatabaseBackend() === "postgres") {
+    const identity = getSelectedPersistenceIdentity();
+    if (!identity) throw new Error("Subscription scheduler requires native persistence");
+    const existing = schedulerGlobals[NATIVE_SUBSCRIPTION_SCHEDULER];
+    if (existing) {
+      if (existing.identity !== identity)
+        throw new Error("Subscription scheduler persistence authority changed");
+      // An accepted sync may reach this idempotent start while shutdown joins its tick.
+      return;
     }
-  };
-
-  // Check every minute; each subscription self-throttles by its interval.
-  schedulerTimer = setInterval(tick, 60_000);
-  if (typeof schedulerTimer.unref === "function") schedulerTimer.unref();
+    const poller = createPersistencePoller({
+      intervalMs: 60_000,
+      initialDelayMs: 60_000,
+      check: () =>
+        runPersistenceBackgroundWork(async () => {
+          if (getSelectedPersistenceIdentity() !== identity)
+            throw new Error("Subscription scheduler persistence authority changed");
+          await subscriptionSchedulerTick();
+        }),
+      onFailure: () => console.warn("[ProxySubscription] Native scheduler tick failed"),
+    });
+    schedulerGlobals[NATIVE_SUBSCRIPTION_SCHEDULER] = { identity, poller };
+    poller.start();
+    return;
+  }
+  if (schedulerStarted) return;
+  schedulerStarted = true;
+  schedulerTimer = setInterval(subscriptionSchedulerTick, 60_000);
+  schedulerTimer.unref?.();
 }
 
 export function stopSubscriptionScheduler(): void {
+  if (parseDatabaseBackend() === "postgres") {
+    void stopSubscriptionSchedulerAsync().catch(() => {});
+    return;
+  }
   if (schedulerTimer) {
     clearInterval(schedulerTimer);
     schedulerTimer = null;
   }
   schedulerStarted = false;
+}
+
+/** Stop admission first, then join the accepted tick and all its awaited writes. */
+export function stopSubscriptionSchedulerAsync(): Promise<void> {
+  if (parseDatabaseBackend() !== "postgres") {
+    stopSubscriptionScheduler();
+    return Promise.resolve();
+  }
+  const owner = schedulerGlobals[NATIVE_SUBSCRIPTION_SCHEDULER];
+  if (!owner) return Promise.resolve();
+  // Terminal for this process owner: an already accepted manual sync must not re-arm
+  // the producer after shutdown has finished joining its last scheduled tick.
+  owner.stopping ??= owner.poller.stop();
+  return owner.stopping;
 }
 
 export { readStaleSwitchWarning, readStaleSwitchWarningAsync } from "../db/proxySubscriptionStore";

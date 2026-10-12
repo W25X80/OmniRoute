@@ -19,7 +19,11 @@
  * explicit, separate DELETE /api/tools/agent-bridge/cert action.
  */
 import { AgentBridgeResetBodySchema } from "@/shared/schemas/agentBridge";
-import { checkDNSEntryForAgent, flushWindowsDnsCache, removeDNSEntry } from "@/mitm/dns/dnsConfig";
+import {
+  checkDNSEntryForAgentAsync,
+  flushWindowsDnsCacheAsync,
+  removeDNSEntry,
+} from "@/mitm/dns/dnsConfig";
 import {
   getAllAgentBridgeStatesAsync,
   upsertAgentBridgeStateAsync,
@@ -30,7 +34,7 @@ import {
 } from "@/lib/db/agentBridgeMappings";
 import { getCachedPassword, setCachedPassword } from "@/mitm/manager";
 import {
-  isMitmSudoPasswordRequired,
+  isMitmSudoPasswordRequiredAsync,
   normalizeMitmSudoPasswordInput,
   resolveMitmSudoPassword,
 } from "@/mitm/sudoGate";
@@ -68,13 +72,13 @@ export async function POST(request: Request, { params }: Params): Promise<Respon
   }
 
   const sudoPassword = resolveMitmSudoPassword(parsed.data.sudoPassword, getCachedPassword());
-  if (isMitmSudoPasswordRequired(sudoPassword)) {
+  if (await isMitmSudoPasswordRequiredAsync(sudoPassword)) {
     return createErrorResponse({ status: 400, message: "Missing sudoPassword" });
   }
 
   try {
     await removeDNSEntry(sudoPassword, id);
-    flushWindowsDnsCache();
+    await flushWindowsDnsCacheAsync();
 
     await setMappingsAsync(id, []);
     await syncAgentBridgeMappingsToMitmAliasAsync(id);
@@ -86,7 +90,7 @@ export async function POST(request: Request, { params }: Params): Promise<Respon
       setCachedPassword(suppliedPassword);
     }
 
-    const verified = !checkDNSEntryForAgent(id);
+    const verified = !(await checkDNSEntryForAgentAsync(id));
     const otherAgentsStillActive = (await getAllAgentBridgeStatesAsync()).some(
       (s) => s.agent_id !== id && s.dns_enabled
     );

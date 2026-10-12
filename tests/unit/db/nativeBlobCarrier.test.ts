@@ -3,12 +3,14 @@ import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import Database from "better-sqlite3";
 import { createBetterSqliteAdapter } from "../../../src/lib/db/adapters/betterSqliteAdapter.ts";
 import {
   captureSqliteApplicationSnapshot,
   checkedApplicationSnapshot,
+  openOfflineSqliteSource,
   ApplicationImportError,
 } from "../../../src/lib/db/postgres/applicationSnapshot.ts";
 import {
@@ -188,7 +190,7 @@ test("SQLite capture uses one read snapshot despite another WAL writer changing 
 });
 
 test(
-  "actual SQLite 512 MiB file boundary has a complete 64-chunk carrier",
+  "selected offline SQLite 512 MiB file boundary has a complete 64-chunk carrier",
   {
     skip:
       process.env.RUN_PG_IMPORT_MAX_BLOB !== "1"
@@ -198,42 +200,51 @@ test(
   () => {
     const folder = mkdtempSync(path.join(os.tmpdir(), "omniroute-max-carrier-")),
       filename = path.join(folder, "source.sqlite");
-    const writer = new Database(filename);
-    writer.exec(
-      "CREATE TABLE key_value(namespace TEXT,key TEXT,value TEXT,PRIMARY KEY(namespace,key)); CREATE TABLE files(id TEXT PRIMARY KEY,bytes INTEGER,content BLOB)"
-    );
-    writer
-      .prepare("INSERT INTO files VALUES('max',?,zeroblob(?))")
-      .run(NATIVE_BLOB_LIMITS.fileBytes, NATIVE_BLOB_LIMITS.fileBytes);
-    writer.close();
-    const reader = createBetterSqliteAdapter(new Database(filename, { readonly: true }));
-    reader.pragma("query_only=ON");
-    let chunks = 0,
-      bytes = 0;
-    const oracle = createHash("sha256"),
-      zero = Buffer.alloc(NATIVE_BLOB_LIMITS.chunkBytes);
     try {
-      const snapshot = captureSqliteApplicationSnapshot(reader, {
-        blobSink: {
-          writeChunk(_id, index, chunk) {
-            assert.equal(reader.inTransaction, true);
-            assert.equal(index, chunks++);
-            assert.equal(chunk.byteLength, NATIVE_BLOB_LIMITS.chunkBytes);
-            bytes += chunk.byteLength;
-            assert.equal(sha(chunk), sha(zero));
+      const writer = new DatabaseSync(filename);
+      try {
+        writer.exec(
+          "CREATE TABLE key_value(namespace TEXT,key TEXT,value TEXT,PRIMARY KEY(namespace,key)); CREATE TABLE files(id TEXT PRIMARY KEY,bytes INTEGER,content BLOB)"
+        );
+        writer
+          .prepare("INSERT INTO files VALUES('max',?,zeroblob(?))")
+          .run(NATIVE_BLOB_LIMITS.fileBytes, NATIVE_BLOB_LIMITS.fileBytes);
+      } finally {
+        writer.close();
+      }
+      // Qualify the same explicit large-file capability used by offline CLI capture.
+      const reader = openOfflineSqliteSource(filename, { largeFiles: true });
+      try {
+        assert.equal(reader.driver, "node:sqlite");
+        assert.equal(reader.pragma("query_only", { simple: true }), 1);
+        let chunks = 0,
+          bytes = 0;
+        const oracle = createHash("sha256"),
+          zero = Buffer.alloc(NATIVE_BLOB_LIMITS.chunkBytes);
+        const snapshot = captureSqliteApplicationSnapshot(reader, {
+          blobSink: {
+            writeChunk(_id, index, chunk) {
+              assert.equal(reader.inTransaction, true);
+              assert.equal(index, chunks++);
+              assert.equal(chunk.byteLength, NATIVE_BLOB_LIMITS.chunkBytes);
+              bytes += chunk.byteLength;
+              assert.equal(sha(chunk), sha(zero));
+            },
           },
-        },
-      });
-      for (let index = 0; index < 64; index++) oracle.update(zero);
-      const reference = snapshot.tables.find((value) => value.name === "files")!.rows[0]
-        .values[2] as NativeBlobReference;
-      assert.equal(chunks, 64);
-      assert.equal(bytes, NATIVE_BLOB_LIMITS.fileBytes);
-      assert.equal(reference.checksum, oracle.digest("hex"));
-      assert.equal(reference.sizeBytes, NATIVE_BLOB_LIMITS.fileBytes);
-      assert.ok(JSON.stringify(snapshot).length < 16384);
+        });
+        for (let index = 0; index < 64; index++) oracle.update(zero);
+        const reference = snapshot.tables.find((value) => value.name === "files")!.rows[0]
+          .values[2] as NativeBlobReference;
+        assert.equal(chunks, 64);
+        assert.equal(bytes, NATIVE_BLOB_LIMITS.fileBytes);
+        assert.equal(reference.checksum, oracle.digest("hex"));
+        assert.equal(reference.sizeBytes, NATIVE_BLOB_LIMITS.fileBytes);
+        assert.ok(JSON.stringify(snapshot).length < 16384);
+        assert.equal(reader.inTransaction, false);
+      } finally {
+        reader.close();
+      }
     } finally {
-      reader.close();
       rmSync(folder, { recursive: true, force: true });
     }
   }

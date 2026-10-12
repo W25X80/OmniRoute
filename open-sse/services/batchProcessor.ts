@@ -18,9 +18,11 @@ import {
   markBatchItemProcessingAsync,
   markBatchItemResultAsync,
   updateBatchAsync,
+  transitionBatchAsync,
+  completeBatchWithFilesAsync,
+  type BatchOutputFile,
 } from "@/lib/db/batches";
 import {
-  createFileAsync,
   deleteFileAsync,
   getFileContentAsync,
   getFileContentForConsumerAsync,
@@ -210,26 +212,24 @@ async function recoverStaleBatch(batch: BatchRecord): Promise<void> {
 
   console.log(`[BATCH] Recovering stale batch ${batch.id} (${batch.status}) → validating`);
 
-  if (batch.outputFileId) {
-    await deleteFileAsync(batch.outputFileId);
-  }
-  if (batch.errorFileId) {
-    await deleteFileAsync(batch.errorFileId);
-  }
-
-  await updateBatchAsync(batch.id, {
-    status: "validating",
-    inProgressAt: null,
-    finalizingAt: null,
-    outputFileId: null,
-    errorFileId: null,
-    ...(checkpointCount === 0
-      ? {
-          requestCountsCompleted: 0,
-          requestCountsFailed: 0,
-        }
-      : {}),
-  });
+  await transitionBatchAsync(
+    batch.id,
+    ["in_progress", "finalizing"],
+    {
+      status: "validating",
+      inProgressAt: null,
+      finalizingAt: null,
+      outputFileId: null,
+      errorFileId: null,
+      ...(checkpointCount === 0
+        ? {
+            requestCountsCompleted: 0,
+            requestCountsFailed: 0,
+          }
+        : {}),
+    },
+    true
+  );
 }
 
 function parseBatchWindowSeconds(window: string | null | undefined): number {
@@ -373,7 +373,10 @@ async function cleanupExpiredBatches(): Promise<void> {
       if (batch.status === "validating") {
         const windowSeconds = parseBatchWindowSeconds(batch.completionWindow);
         if (now - batch.createdAt > windowSeconds) {
-          await updateBatchAsync(batch.id, { status: "expired", expiredAt: now });
+          await transitionBatchAsync(batch.id, ["validating"], {
+            status: "expired",
+            expiredAt: now,
+          });
         }
       }
     }
@@ -426,11 +429,12 @@ async function startBatch(batch: any, identity: object | undefined): Promise<voi
 
       await ensureBatchItemCheckpointsAsync(batch.id, parsedItems.items);
 
-      await updateBatchAsync(batch.id, {
+      const started = await transitionBatchAsync(batch.id, ["validating"], {
         status: "in_progress",
         inProgressAt: Math.floor(Date.now() / 1000),
         requestCountsTotal: total,
       });
+      if (!started.changed) return;
 
       activeBatches.add(batch.id);
 
@@ -879,12 +883,15 @@ async function finalizeBatch(
   results: any[],
   itemsWithErrors: any[]
 ): Promise<void> {
-  const current = await getBatchAsync(batchId);
-
-  if (await handleCancellation(batchId, current)) return;
-
-  // Mark as finalizing first
-  await markFinalizing(batchId);
+  const begun = await transitionBatchAsync(batchId, ["in_progress"], {
+    status: "finalizing",
+    finalizingAt: now(),
+  });
+  if (!begun.changed || !begun.batch) {
+    if (begun.batch?.status === "cancelling") await cancelBatch(begun.batch);
+    return;
+  }
+  const current = begun.batch;
 
   // Compute counts from results
   const successes = results.filter(
@@ -927,146 +934,73 @@ async function finalizeBatch(
 
   const completionTime = now();
 
-  // Persist final counts and (approximate) usage so UI shows correct numbers
+  const completion = {
+    requestCountsTotal: totalCount,
+    requestCountsCompleted: completedCount,
+    requestCountsFailed: failedCount,
+    model,
+    usage: {
+      input_tokens: inputTokens,
+      output_tokens: outputTokens,
+      total_tokens: inputTokens + outputTokens,
+      input_tokens_details: { cached_tokens: 0 },
+      output_tokens_details: { reasoning_tokens: reasoningTokens },
+    },
+    completedAt: completionTime,
+  };
+  // Serialize outside SQL; only the final transaction allocates durable result files.
+  const outputContent = successFileContent(results);
+  const errorContent = errorFileContent(results, itemsWithErrors);
+  const contentOwner =
+    parseDatabaseBackend() === "postgres" ? acquireNativeFileConsumer() : undefined;
   try {
-    await updateBatchAsync(batchId, {
-      requestCountsTotal: totalCount,
-      requestCountsCompleted: completedCount,
-      requestCountsFailed: failedCount,
-      model,
-      usage: {
-        input_tokens: inputTokens,
-        output_tokens: outputTokens,
-        total_tokens: inputTokens + outputTokens,
-        input_tokens_details: { cached_tokens: 0 },
-        output_tokens_details: { reasoning_tokens: reasoningTokens },
-      },
-      // also set completedAt so file expiration calculation can use it
-      completedAt: completionTime,
-    });
-  } catch (err) {
-    console.error(`[BATCH] Failed to persist final progress for ${batchId}:`, err);
+    const bytes = [outputContent, errorContent].reduce(
+      (total, content) => total + (content === null ? 0 : Buffer.byteLength(content)),
+      0
+    );
+    contentOwner?.beforeBuffer(bytes);
+    const expiresAt = getBatchOutputExpiresAt({ ...current, completedAt: completionTime });
+    const file = (kind: string, content: string | null): BatchOutputFile | null =>
+      content === null
+        ? null
+        : { filename: `batch_${batchId}_${kind}.jsonl`, content: Buffer.from(content), expiresAt };
+    // A lost COMMIT reply is not permission to delete or recreate any file. The SQL
+    // transaction either retained every result/link, or rolled all of them back.
+    const completed = await completeBatchWithFilesAsync(
+      batchId,
+      completion,
+      file("output", outputContent),
+      file("error", errorContent)
+    );
+    if (completed.changed && completed.batch?.status === "completed") {
+      console.log(
+        `[BATCH] Completed batch ${batchId} (${completed.batch.requestCountsTotal} items)`
+      );
+    }
+  } finally {
+    contentOwner?.release();
   }
-
-  // Re-read the batch (with completedAt set) so file creation sees a completion timestamp
-  const batchForFiles = await getBatchAsync(batchId);
-
-  const outputFileId = await createSuccessFile(batchId, batchForFiles, results);
-  const errorFileId = await createErrorFile(batchId, batchForFiles, results, itemsWithErrors);
-
-  await completeBatch(batchId, outputFileId, errorFileId);
-}
-
-async function handleCancellation(batchId: string, current: any): Promise<boolean> {
-  if (!current) return true;
-
-  if (current.status === "cancelling") {
-    await updateBatchAsync(batchId, {
-      status: "cancelled",
-      cancelledAt: now(),
-    });
-    return true;
-  }
-
-  return current.status === "cancelled";
-}
-
-async function markFinalizing(batchId: string): Promise<void> {
-  await updateBatchAsync(batchId, {
-    status: "finalizing",
-    finalizingAt: now(),
-  });
-}
-
-async function completeBatch(
-  batchId: string,
-  outputFileId: string | null,
-  errorFileId: string | null
-): Promise<void> {
-  await updateBatchAsync(batchId, {
-    status: "completed",
-    completedAt: now(),
-    outputFileId,
-    errorFileId,
-  });
-
-  const b = await getBatchAsync(batchId);
-  const total = b?.requestCountsTotal ?? "?";
-  console.log(`[BATCH] Completed batch ${batchId} (${total} items)`);
 }
 
 function now(): number {
   return Math.floor(Date.now() / 1_000);
 }
 
-async function createSuccessFile(
-  batchId: string,
-  current: any,
-  results: any[]
-): Promise<string | null> {
+function successFileContent(results: any[]): string | null {
   const successes = results.filter((r) => r.response.status_code < 400 && !r.response.body?.error);
-
-  if (successes.length === 0) return null;
-
-  const content = toJsonl(successes);
-
-  const contentOwner =
-    parseDatabaseBackend() === "postgres" ? acquireNativeFileConsumer() : undefined;
-  try {
-    contentOwner?.beforeBuffer(Buffer.byteLength(content));
-    const file = await createFileAsync({
-      bytes: Buffer.byteLength(content),
-      filename: `batch_${batchId}_output.jsonl`,
-      purpose: "batch_output",
-      content: Buffer.from(content),
-      apiKeyId: current?.apiKeyId,
-      expiresAt: getBatchOutputExpiresAt(current),
-    });
-
-    return file.id;
-  } finally {
-    contentOwner?.release();
-  }
+  return successes.length ? toJsonl(successes) : null;
 }
 
-async function createErrorFile(
-  batchId: string,
-  current: any,
-  results: any[],
-  itemsWithErrors: any[]
-): Promise<string | null> {
+function errorFileContent(results: any[], itemsWithErrors: any[]): string | null {
   const failures = results.filter((r) => r.response.status_code >= 400 || r.response.body?.error);
-
   const processErrors = itemsWithErrors.map((e) => ({
     id: `batch_req_${uuidv4().replaceAll("-", "")}`,
     custom_id: e.custom_id,
     response: null,
     error: { message: e.error, type: "batch_process_error" },
   }));
-
   const allFailures = [...failures, ...processErrors];
-
-  if (allFailures.length === 0) return null;
-
-  const content = toJsonl(allFailures);
-
-  const contentOwner =
-    parseDatabaseBackend() === "postgres" ? acquireNativeFileConsumer() : undefined;
-  try {
-    contentOwner?.beforeBuffer(Buffer.byteLength(content));
-    const file = await createFileAsync({
-      bytes: Buffer.byteLength(content),
-      filename: `batch_${batchId}_error.jsonl`,
-      purpose: "batch_output",
-      content: Buffer.from(content),
-      apiKeyId: current?.apiKeyId,
-      expiresAt: getBatchOutputExpiresAt(current),
-    });
-
-    return file.id;
-  } finally {
-    contentOwner?.release();
-  }
+  return allFailures.length ? toJsonl(allFailures) : null;
 }
 
 function toJsonl(items: any[]): string {
@@ -1074,19 +1008,20 @@ function toJsonl(items: any[]): string {
 }
 
 async function cancelBatch(batch: any): Promise<void> {
-  await updateBatchAsync(batch.id, {
+  const cancelled = await transitionBatchAsync(batch.id, ["cancelling"], {
     status: "cancelled",
     cancelledAt: Math.floor(Date.now() / 1000),
   });
-  console.log(`[BATCH] Cancelled batch ${batch.id}`);
+  if (cancelled.changed) console.log(`[BATCH] Cancelled batch ${batch.id}`);
 }
 
 async function failBatch(batchId: string, reason: string): Promise<void> {
-  await updateBatchAsync(batchId, {
+  const failed = await transitionBatchAsync(batchId, ["validating", "in_progress", "finalizing"], {
     status: "failed",
     failedAt: Math.floor(Date.now() / 1000),
     errors: [{ message: reason }],
   });
+  if (failed.batch?.status === "cancelling") await cancelBatch(failed.batch);
   activeBatches.delete(batchId);
 }
 

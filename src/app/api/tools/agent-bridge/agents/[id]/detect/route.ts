@@ -3,7 +3,7 @@
  * Run detection probe for an agent and return { installed, version?, path? }.
  * LOCAL_ONLY: registered in routeGuard.ts
  */
-import { detectAgent } from "@/mitm/detection/index";
+import { detectAgentAsync } from "@/mitm/detection/index";
 import type { AgentId } from "@/mitm/types";
 import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
 import { createErrorResponse } from "@/lib/api/errorResponse";
@@ -30,7 +30,7 @@ export async function GET(_request: Request, { params }: Params): Promise<Respon
   }
 
   try {
-    const result = detectAgent(id as AgentId);
+    const result = await detectAgentAsync(id as AgentId);
     return Response.json({ agentId: id, ...result });
   } catch (err) {
     const msg = sanitizeErrorMessage(err instanceof Error ? err.message : String(err));

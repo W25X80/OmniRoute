@@ -9,10 +9,10 @@ import { AgentBridgeServerActionSchema } from "@/shared/schemas/agentBridge";
 import { getCachedPassword, setCachedPassword } from "@/mitm/manager";
 import { installCertResult, installCaCert, checkCertInstalled } from "@/mitm/cert/install";
 import { generateCert } from "@/mitm/cert/generate";
-import { resolveActiveCertPath } from "@/mitm/cert/activeCert";
+import { resolveActiveCertPathAsync } from "@/mitm/cert/activeCert";
 import { resolveMitmDataDir } from "@/mitm/dataDir";
 import {
-  isMitmSudoPasswordRequired,
+  isMitmSudoPasswordRequiredAsync,
   normalizeMitmSudoPasswordInput,
   resolveMitmSudoPassword,
 } from "@/mitm/sudoGate";
@@ -76,7 +76,7 @@ export async function POST(request: Request): Promise<Response> {
       if (suppliedPassword) setCachedPassword(suppliedPassword);
       const apiKey = await resolveRouterApiKey(rawApiKey);
       const { startMitm } = await import("@/mitm/manager.runtime");
-      const result = await startMitm(apiKey, sudoPassword);
+      const result = await startMitm(apiKey, sudoPassword, { signal: request.signal });
       return Response.json({ ok: true, ...result });
     }
 
@@ -97,12 +97,12 @@ export async function POST(request: Request): Promise<Response> {
       // stopMitm calls clearCachedPassword() internally, so re-cache after stop
       if (sudoPassword || pwd) setCachedPassword(sudoPassword || pwd);
       const apiKey = await resolveRouterApiKey(rawApiKey);
-      const result = await startMitm(apiKey, sudoPassword || pwd);
+      const result = await startMitm(apiKey, sudoPassword || pwd, { signal: request.signal });
       return Response.json({ ok: true, ...result });
     }
 
     if (action === "trust-cert") {
-      if (isMitmSudoPasswordRequired(sudoPassword)) {
+      if (await isMitmSudoPasswordRequiredAsync(sudoPassword)) {
         return createErrorResponse({ status: 400, message: "Missing sudoPassword" });
       }
       // #14070: resolve + trust the file the active migration decision
@@ -111,7 +111,7 @@ export async function POST(request: Request): Promise<Response> {
       // server.crt — mirrors manager.ts's own branch (startMitmInternal).
       const certDir = path.join(resolveMitmDataDir(), "mitm");
       const rootCaEnabled = process.env.MITM_ROOT_CA_ENABLED === "true";
-      const { certPath, mode } = resolveActiveCertPath(certDir, rootCaEnabled);
+      const { certPath, mode } = await resolveActiveCertPathAsync(certDir, rootCaEnabled);
       const result =
         mode === "use-root-ca"
           ? await installCaCert(sudoPassword, certPath)

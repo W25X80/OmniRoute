@@ -1,3 +1,10 @@
+import { mkdtemp, writeFile, rm } from "node:fs/promises";
+import {
+  nativeMitmEnabled,
+  runNativeMitmCommand,
+  nativeMitmSignal,
+  assertNativeMitmNotAborted,
+} from "./nativeHostIo.ts";
 import { execFile, execFileSync, spawn } from "child_process";
 import fs from "fs";
 import os from "os";
@@ -46,6 +53,7 @@ export function isSudoAvailable(): boolean {
 }
 
 export function execFileText(command: string, args: string[]): Promise<string> {
+  if (nativeMitmEnabled()) return runNativeMitmCommand(command, args).then(stepOutputOrThrow);
   return new Promise((resolve, reject) => {
     execFile(command, args, { encoding: "utf8" }, (error, stdout, stderr) => {
       if (error) {
@@ -180,6 +188,8 @@ function runStep(
   step: SudoStep,
   spawnImpl: SpawnLike
 ): Promise<{ code: number | null; stdout: string; stderr: string; error: Error | null }> {
+  if (nativeMitmEnabled() && spawnImpl === spawn)
+    return runNativeMitmCommand(step.command, step.args, { stdin: step.stdin });
   return new Promise((resolve) => {
     // `command` and `args` are never user-controlled. This helper is a
     // controlled wrapper called only from src/mitm/cert/install.ts with a
@@ -236,12 +246,26 @@ export async function execFileWithPassword(
   // containers succeed for any command that does not actually require root
   // (everything but writing to /etc/hosts or the system trust store).
   const spawnImpl = deps.spawnImpl ?? spawn;
+  let sudoOverrides = deps.sudoOverrides;
+  if (nativeMitmEnabled() && sudoOverrides?.sudoAvailable === undefined) {
+    const result =
+      os.platform() === "win32"
+        ? undefined
+        : await runNativeMitmCommand("sh", ["-c", "command -v sudo"], { timeoutMs: 3000 });
+    assertNativeMitmNotAborted();
+    if (result?.error && (result.error as NodeJS.ErrnoException).code !== "ENOENT")
+      throw new Error("MITM sudo probe unavailable");
+    sudoOverrides = {
+      ...sudoOverrides,
+      sudoAvailable: result?.error === null && result.code === 0,
+    };
+  }
   const { steps, fallback } = planSudoSteps(
     command,
     args,
     password,
     stdinAfterPassword,
-    deps.sudoOverrides
+    sudoOverrides
   );
 
   let stdout = "";
@@ -332,6 +356,17 @@ export function buildElevatedScriptWrapper(scriptPath: string): string {
 //     local dashboard at /dashboard/cli-tools/mitm.
 // See docs/security/SOCKET_DEV_FINDINGS.md §3 for the full attestation.
 export async function runElevatedPowerShell(script: string): Promise<string> {
+  if (nativeMitmEnabled()) {
+    assertNativeMitmNotAborted();
+    const directory = await mkdtemp(path.join(os.tmpdir(), "omniroute-elevate-"));
+    try {
+      const file = path.join(directory, `omniroute-elevate-${crypto.randomUUID()}.ps1`);
+      await writeFile(file, script, { encoding: "utf8", mode: 0o600, signal: nativeMitmSignal() });
+      return await runPowerShell(buildElevatedScriptWrapper(file));
+    } finally {
+      await rm(directory, { recursive: true, force: true }).catch(() => {});
+    }
+  }
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "omniroute-elevate-"));
   const scriptName = `omniroute-elevate-${crypto.randomUUID()}.ps1`;
   const scriptPath = path.join(tempDir, scriptName);

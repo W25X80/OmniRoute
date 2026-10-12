@@ -1,3 +1,9 @@
+import {
+  nativeMitmEnabled,
+  readTextAsync,
+  runNativeMitmCommand,
+  assertNativeMitmNotAborted,
+} from "../nativeHostIo.ts";
 import { execFileSync } from "child_process";
 import fs from "fs";
 import os from "os";
@@ -155,7 +161,7 @@ export async function addDNSEntries(
 ): Promise<void> {
   if (process.env.OMNIROUTE_SKIP_DNS_WRITE === "1") return;
   const commands = resolveCommandDependencies(deps);
-  const hostsContent = readHostsFile();
+  const hostsContent = nativeMitmEnabled() ? await readHostsFileAsync() : readHostsFile();
   const missingEntries: string[] = [];
 
   for (const hostname of hosts) {
@@ -224,7 +230,7 @@ export async function removeDNSEntries(
 ): Promise<void> {
   if (process.env.OMNIROUTE_SKIP_DNS_WRITE === "1") return;
   const commands = resolveCommandDependencies(deps);
-  const hostsContent = readHostsFile();
+  const hostsContent = nativeMitmEnabled() ? await readHostsFileAsync() : readHostsFile();
   const presentHosts = hosts.filter((h) => hasHostEntry(hostsContent, h));
 
   if (presentHosts.length === 0) return;
@@ -329,5 +335,45 @@ export function flushWindowsDnsCache(): void {
     execFileSync("ipconfig", ["/flushdns"], { stdio: "ignore", windowsHide: true, timeout: 5000 });
   } catch {
     // best-effort — never block the caller on this
+  }
+}
+
+async function readHostsFileAsync(): Promise<string> {
+  try {
+    return await readTextAsync(hostsFilePath());
+  } catch {
+    assertNativeMitmNotAborted();
+    return "";
+  }
+}
+export async function checkDNSEntryForAgentAsync(agentId?: string): Promise<boolean> {
+  if (!nativeMitmEnabled()) return checkDNSEntryForAgent(agentId);
+  const content = await readHostsFileAsync();
+  return resolveHostsForAgent(agentId).every((host) => hasHostEntry(content, host));
+}
+export async function isSudoAvailableAsync(): Promise<boolean> {
+  if (!nativeMitmEnabled()) return isSudoAvailable();
+  if (isWin32()) return true;
+  const result = await runNativeMitmCommand("which", ["sudo"], { timeoutMs: 3000 });
+  assertNativeMitmNotAborted();
+  if (result.error && (result.error as NodeJS.ErrnoException).code !== "ENOENT")
+    throw new Error("MITM sudo probe unavailable");
+  return result.error === null && result.code === 0;
+}
+export async function isSudoPasswordRequiredAsync(): Promise<boolean> {
+  if (!nativeMitmEnabled()) return isSudoPasswordRequired();
+  if (isWin32() || isRoot() || !(await isSudoAvailableAsync())) return false;
+  const result = await runNativeMitmCommand("sudo", ["-n", "true"], { timeoutMs: 3000 });
+  assertNativeMitmNotAborted();
+  return result.error !== null || result.code !== 0;
+}
+
+export async function flushWindowsDnsCacheAsync(): Promise<void> {
+  if (!nativeMitmEnabled()) return flushWindowsDnsCache();
+  if (!isWin32()) return;
+  try {
+    await runNativeMitmCommand("ipconfig", ["/flushdns"], { timeoutMs: 5000 });
+  } catch {
+    assertNativeMitmNotAborted();
   }
 }

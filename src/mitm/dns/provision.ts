@@ -1,9 +1,10 @@
+import { nativeMitmEnabled } from "../nativeHostIo.ts";
 /**
  * AgentBridge DNS provisioning — best-effort, extracted from manager.ts so each step
  * is guarded and unit-testable without spawning the MITM server (#6127 / #6198).
  */
 
-import { addDNSEntry, addDNSEntries, isSudoAvailable } from "./dnsConfig.ts";
+import { addDNSEntry, addDNSEntries, isSudoAvailable, isSudoAvailableAsync } from "./dnsConfig.ts";
 import { isRoot } from "../systemCommands.ts";
 import { ALL_TARGETS } from "../targets/index.ts";
 import {
@@ -32,7 +33,7 @@ export interface DnsProvisionDeps {
   listEnabledCustomHosts?: () =>
     ReturnType<typeof listCustomHosts> | Promise<ReturnType<typeof listCustomHosts>>;
   /** Return true if privileged host-file writes are possible (sudo or root). */
-  canElevate?: () => boolean;
+  canElevate?: () => boolean | Promise<boolean>;
   logger?: DnsProvisionLogger;
 }
 
@@ -120,7 +121,12 @@ export async function provisionDnsEntries(
   sudoPassword: string,
   deps: DnsProvisionDeps = {}
 ): Promise<void> {
-  const canElevate = deps.canElevate ?? (() => isSudoAvailable() || isRoot());
+  const canElevate =
+    deps.canElevate ??
+    (() =>
+      nativeMitmEnabled()
+        ? isSudoAvailableAsync().then((available) => available || isRoot())
+        : isSudoAvailable() || isRoot());
   const logger = deps.logger ?? defaultLog;
 
   // Explicit opt-out: skip all DNS modification when the env var is set.
@@ -132,7 +138,7 @@ export async function provisionDnsEntries(
   // In containers (USER node, no sudo installed, not root) we cannot write
   // to /etc/hosts. Rather than attempting sudo and swallowing the error,
   // detect the condition up-front and bail out with a clear message.
-  if (!canElevate()) {
+  if (!(await canElevate())) {
     logger.info(
       "Skipping DNS entries - sudo not available and not running as root (likely a container)"
     );

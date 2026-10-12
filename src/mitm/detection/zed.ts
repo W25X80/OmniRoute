@@ -1,3 +1,4 @@
+import { existsAsync } from "../nativeHostIo.ts";
 /**
  * Zed editor installation detection.
  * Purely filesystem-based — no shell interpolation (Hard Rule #13).
@@ -21,6 +22,13 @@ const PATHS = [
 export function detectZed(): DetectionResult {
   for (const p of PATHS) {
     if (fs.existsSync(p)) return { installed: true, path: p };
+  }
+  return { installed: false };
+}
+
+export async function detectZedAsync(): Promise<DetectionResult> {
+  for (const candidate of PATHS) {
+    if (await existsAsync(candidate)) return { installed: true, path: candidate };
   }
   return { installed: false };
 }

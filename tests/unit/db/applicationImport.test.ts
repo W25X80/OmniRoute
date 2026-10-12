@@ -13,6 +13,7 @@ import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import test, { after } from "node:test";
 import Database from "better-sqlite3";
+import { ArtifactStorageError } from "../../../src/domain/persistence/artifactStore.ts";
 import { createBetterSqliteAdapter } from "../../../src/lib/db/adapters/betterSqliteAdapter.ts";
 import {
   ApplicationImportError,
@@ -28,6 +29,8 @@ import {
 import {
   prepareApplicationArtifacts,
   verifyApplicationArtifacts,
+  type OfflineArtifactCheckpoint,
+  type OfflineArtifactIO,
 } from "../../../src/lib/db/postgres/applicationImportArtifacts.ts";
 import {
   PostgresDatabase,
@@ -341,92 +344,135 @@ function artifactSnapshot(): ApplicationStorageSnapshot {
   });
   return value;
 }
+function artifactIOFixture(bytes: Buffer, failure?: "put_unknown" | "readback") {
+  const checksum = createHash("sha256").update(bytes).digest("hex");
+  const prepared = Object.freeze({
+    reference: `s3/00000000-0000-4000-8000-000000000001_${checksum}.json`,
+    sizeBytes: bytes.byteLength,
+    checksum,
+    storageScope: "a".repeat(64),
+    singleAttempt: true as const,
+  });
+  const events: string[] = [];
+  const checkpoints: OfflineArtifactCheckpoint[][] = [];
+  let object: Buffer | null = null;
+  const io: OfflineArtifactIO = {
+    async readSource(reference) {
+      assert.equal(reference, "legacy/shared.json");
+      events.push("source-read");
+      return bytes;
+    },
+    target: {
+      storageScope: prepared.storageScope,
+      async put(input, options) {
+        assert.deepEqual(Buffer.from(input), bytes);
+        const onPrepared = options?.onPrepared;
+        assert.ok(onPrepared);
+        events.push("prepare");
+        await onPrepared(prepared);
+        assert.equal(checkpoints.at(-1)?.[0].targetReference, prepared.reference);
+        events.push("put");
+        object = Buffer.from(input);
+        if (failure === "put_unknown") {
+          throw new ArtifactStorageError("put_unknown", prepared.reference, true);
+        }
+        return {
+          reference: prepared.reference,
+          sizeBytes: prepared.sizeBytes,
+          checksum: prepared.checksum,
+        };
+      },
+      async get(reference) {
+        assert.equal(reference, prepared.reference);
+        events.push("get");
+        assert.ok(object, "readback must follow the simulated remote PUT effect");
+        const readback = Buffer.from(object);
+        if (failure === "readback") {
+          assert.ok(readback.length > 0);
+          readback[0] ^= 0xff;
+        }
+        return readback;
+      },
+    },
+    async checkpoint(entries) {
+      assert.equal(entries.length, 1);
+      checkpoints.push(structuredClone([...entries]));
+      events.push(`checkpoint:${entries[0].state}:${entries[0].uploadState}`);
+    },
+  };
+  return { io, prepared, events, checkpoints };
+}
+
 test("shared artifact upload is one acknowledged object; unknown put is reconciled by exact readback", async () => {
   const bytes = Buffer.from('{"requestBody":"opaque"}'),
     checksum = createHash("sha256").update(bytes).digest("hex");
-  let reads = 0,
-    puts = 0,
-    checkpoints = 0;
-  const target = {
-    async put() {
-      puts++;
-      throw { kind: "put_unknown", reference: "reconciled-reference" };
-    },
-    async get() {
-      reads++;
-      return bytes;
-    },
-  };
-  const mappings = await prepareApplicationArtifacts(artifactSnapshot(), {
-    async readSource() {
-      return bytes;
-    },
-    target,
-    async checkpoint() {
-      checkpoints++;
-    },
-  });
+  const f = artifactIOFixture(bytes, "put_unknown");
+  const mappings = await prepareApplicationArtifacts(artifactSnapshot(), f.io);
+  assert.deepEqual(f.events, [
+    "source-read",
+    "prepare",
+    "checkpoint:pending:uncertain",
+    "put",
+    "get",
+    "checkpoint:ready:acknowledged",
+  ]);
+  assert.equal(f.checkpoints.length, 2);
+  assert.equal(f.checkpoints[0][0].state, "pending");
+  assert.equal(f.checkpoints[0][0].uploadState, "uncertain");
+  assert.equal(f.checkpoints[1][0].state, "ready");
+  assert.equal(f.checkpoints[1][0].uploadState, "acknowledged");
+  const preparedAt = f.checkpoints[0][0].preparedAt;
+  assert.ok(Number.isFinite(Date.parse(preparedAt)));
   assert.deepEqual(mappings, [
     {
       sourceReference: "legacy/shared.json",
-      targetReference: "reconciled-reference",
+      targetReference: f.prepared.reference,
       sizeBytes: bytes.byteLength,
       checksum,
+      storageScope: f.prepared.storageScope,
+      preparedAt,
+      singleAttempt: true,
     },
   ]);
-  assert.equal(puts, 1);
-  assert.equal(checkpoints, 1);
-  assert.equal(reads, 2);
-  await verifyApplicationArtifacts(mappings, target);
-  await prepareApplicationArtifacts(
+  await verifyApplicationArtifacts(mappings, f.io.target);
+  const repeated = await prepareApplicationArtifacts(
     artifactSnapshot(),
     {
-      async readSource() {
-        return bytes;
-      },
-      target,
+      readSource: f.io.readSource,
+      target: f.io.target,
     },
     mappings
   );
-  assert.equal(puts, 1);
+  assert.deepEqual(repeated, mappings);
+  assert.equal(f.events.filter((event) => event === "put").length, 1);
+  assert.equal(f.events.filter((event) => event === "get").length, 3);
+  assert.equal(f.checkpoints.length, 2);
 });
+
 test("artifact checksum/length mismatch blocks upload and mutated readback blocks qualification", async () => {
-  const input = artifactSnapshot();
-  input.tables.at(-1)!.rows[0].values[2] = { kind: "integer", value: "999" };
-  let puts = 0;
-  const target = {
-    async put(bytes: Uint8Array) {
-      puts++;
-      return {
-        reference: "ref",
-        sizeBytes: bytes.byteLength,
-        checksum: createHash("sha256").update(bytes).digest("hex"),
-      };
-    },
-    async get() {
-      return Buffer.from("corrupt");
-    },
-  };
-  await assert.rejects(
-    prepareApplicationArtifacts(input, {
-      async readSource() {
-        return Buffer.from("body");
-      },
-      target,
-    }),
-    kind("artifact")
-  );
-  assert.equal(puts, 0);
-  await assert.rejects(
-    prepareApplicationArtifacts(artifactSnapshot(), {
-      async readSource() {
-        return Buffer.from("body");
-      },
-      target,
-    }),
-    kind("artifact")
-  );
-  assert.equal(puts, 1);
+  for (const mismatch of ["length", "checksum"] as const) {
+    const input = artifactSnapshot();
+    input.tables.at(-1)!.rows[0].values[mismatch === "length" ? 2 : 3] =
+      mismatch === "length" ? { kind: "integer", value: "999" } : "0".repeat(64);
+    const f = artifactIOFixture(Buffer.from("body"));
+    await assert.rejects(prepareApplicationArtifacts(input, f.io), kind("artifact"));
+    assert.deepEqual(f.events, ["source-read"]);
+    assert.equal(f.checkpoints.length, 0);
+  }
+
+  const f = artifactIOFixture(Buffer.from("body"), "readback");
+  await assert.rejects(prepareApplicationArtifacts(artifactSnapshot(), f.io), kind("artifact"));
+  assert.deepEqual(f.events, [
+    "source-read",
+    "prepare",
+    "checkpoint:pending:uncertain",
+    "put",
+    "checkpoint:pending:acknowledged",
+    "get",
+  ]);
+  assert.equal(f.checkpoints.length, 2);
+  assert.equal(f.checkpoints[1][0].state, "pending");
+  assert.equal(f.checkpoints[1][0].uploadState, "acknowledged");
 });
 
 test("a missing binary chunk rejects before SQL and produces no durable import receipt", async () => {

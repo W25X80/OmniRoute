@@ -1,3 +1,4 @@
+import { mitmFileExists, readMitmFile } from "@/mitm/nativeHostIo";
 /**
  * GET /api/tools/agent-bridge/cert/download
  * Streams the PEM certificate file.
@@ -5,22 +6,22 @@
  */
 import { resolveMitmDataDir } from "@/mitm/dataDir";
 import path from "path";
-import fs from "fs";
 import { createErrorResponse } from "@/lib/api/errorResponse";
 
 export async function GET(): Promise<Response> {
   const crtPath = path.join(resolveMitmDataDir(), "mitm", "server.crt");
 
-  if (!fs.existsSync(crtPath)) {
+  if (!(await mitmFileExists(crtPath))) {
     return createErrorResponse({
       status: 404,
-      message: "Certificate not found. Generate one first via POST /api/tools/agent-bridge/cert/regenerate",
+      message:
+        "Certificate not found. Generate one first via POST /api/tools/agent-bridge/cert/regenerate",
     });
   }
 
   try {
-    const pem = fs.readFileSync(crtPath);
-    return new Response(pem, {
+    const pem = await readMitmFile(crtPath);
+    return new Response(Uint8Array.from(pem), {
       status: 200,
       headers: {
         "Content-Type": "application/x-pem-file",

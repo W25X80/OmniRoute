@@ -10,7 +10,7 @@ import { addDNSEntry, removeDNSEntry } from "@/mitm/dns/dnsConfig";
 import { upsertAgentBridgeStateAsync } from "@/lib/db/agentBridgeState";
 import { getCachedPassword, setCachedPassword } from "@/mitm/manager";
 import {
-  isMitmSudoPasswordRequired,
+  isMitmSudoPasswordRequiredAsync,
   normalizeMitmSudoPasswordInput,
   resolveMitmSudoPassword,
 } from "@/mitm/sudoGate";
@@ -52,7 +52,7 @@ export async function POST(request: Request, { params }: Params): Promise<Respon
     getCachedPassword()
   );
 
-  if (isMitmSudoPasswordRequired(sudoPassword)) {
+  if (await isMitmSudoPasswordRequiredAsync(sudoPassword)) {
     return createErrorResponse({ status: 400, message: "Missing sudoPassword" });
   }
 

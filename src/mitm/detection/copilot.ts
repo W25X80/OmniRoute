@@ -1,3 +1,5 @@
+import { readdir } from "node:fs/promises";
+import { assertNativeMitmNotAborted } from "../nativeHostIo.ts";
 /**
  * GitHub Copilot installation detection.
  *
@@ -33,6 +35,24 @@ export function detectCopilot(): DetectionResult {
       }
     } catch {
       // Permission or transient fs error — skip this directory.
+    }
+  }
+  return { installed: false };
+}
+
+export async function detectCopilotAsync(): Promise<DetectionResult> {
+  for (const dir of EXTENSIONS_DIRS) {
+    assertNativeMitmNotAborted();
+    try {
+      const entries = await readdir(dir);
+      for (const name of entries) {
+        if (name.toLowerCase().startsWith("github.copilot")) {
+          return { installed: true, path: path.join(dir, name) };
+        }
+      }
+    } catch {
+      assertNativeMitmNotAborted();
+      // Preserve the existing inaccessible-directory fallback.
     }
   }
   return { installed: false };

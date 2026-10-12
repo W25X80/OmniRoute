@@ -299,7 +299,7 @@ export async function getSearchAggregateStats(
       database,
       `SELECT
           COUNT(*) as total,
-          COALESCE(SUM(CASE WHEN c.timestamp >= ? THEN 1 ELSE 0 END), 0) as today,
+          COALESCE(SUM(CASE WHEN c.timestamp >= $1 THEN 1 ELSE 0 END), 0) as today,
           COALESCE(SUM(CASE WHEN c.status >= 400 OR c.error_summary IS NOT NULL THEN 1 ELSE 0 END), 0) as errors,
           AVG(CASE WHEN c.duration > 0 THEN c.duration END) as avg_duration,
           COALESCE(SUM(CASE WHEN c.cache_source = 'semantic' THEN 1 ELSE 0 END), 0) as cached

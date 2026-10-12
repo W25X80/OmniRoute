@@ -57,7 +57,8 @@ export async function updateCombo(id: string, data: ComboRecord): Promise<ComboR
   const result = await selectedRepository().update(id, data);
   if (!result) return null;
 
-  if (result.modelsFieldProvided) {
+  // Native SQL clears the pins in the same transaction as the combo mutation.
+  if (result.modelsFieldProvided && !getSelectedControlPlane()) {
     const cleared = await clearSessionModelHistoryForComboAsync(result.previousName);
     if (cleared > 0 && result.currentName !== result.previousName) {
       await clearSessionModelHistoryForComboAsync(result.currentName);

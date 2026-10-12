@@ -1,5 +1,9 @@
 import path from "path";
-import { decideCertMigration, type CertMigrationDecision } from "./migration.ts";
+import {
+  decideCertMigration,
+  decideCertMigrationAsync,
+  type CertMigrationDecision,
+} from "./migration.ts";
 
 // #14070: single source of truth for "which cert file is actually active
 // (installed + trusted) for this run". `decideCertMigration()` only answers
@@ -31,4 +35,12 @@ export function resolveActiveCertPath(certDir: string, rootCaEnabled: boolean): 
   const certPath =
     mode === "use-root-ca" ? path.join(certDir, "ca.crt") : path.join(certDir, "server.crt");
   return { certPath, mode };
+}
+
+export async function resolveActiveCertPathAsync(
+  certDir: string,
+  rootCaEnabled: boolean
+): Promise<ActiveCertInfo> {
+  const mode = await decideCertMigrationAsync(certDir, rootCaEnabled);
+  return { mode, certPath: path.join(certDir, mode === "use-root-ca" ? "ca.crt" : "server.crt") };
 }

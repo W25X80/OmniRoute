@@ -7,7 +7,7 @@ import { logger } from "@omniroute/open-sse/utils/logger";
 const log = logger("A2A_TASKS");
 
 type TaskManagerLike = {
-  flushPersistence?: () => Promise<void>;
+  flushPersistence?: (taskId?: string) => Promise<void>;
   updateTask: (
     taskId: string,
     state: "completed" | "failed",
@@ -170,7 +170,7 @@ export async function executeA2ATaskWithState(
   handler: (task: A2ATask) => Promise<StreamTaskResult>,
   deps?: MemoryHitsDeps
 ) {
-  await tm.flushPersistence?.();
+  await tm.flushPersistence?.(task.id);
   try {
     const hits = await collectMemoryHits(task, deps);
     if (hits.length) {
@@ -188,14 +188,14 @@ export async function executeA2ATaskWithState(
 
     const result = await handler(task);
     tm.updateTask(task.id, "completed", result.artifacts);
-    await tm.flushPersistence?.();
+    await tm.flushPersistence?.(task.id);
     return result;
   } catch (err) {
     if (isNativeAgentPersistenceError(err)) throw err;
     const msg = err instanceof Error ? err.message : String(err);
     try {
       tm.updateTask(task.id, "failed", [{ type: "error", content: msg }], msg);
-      await tm.flushPersistence?.();
+      await tm.flushPersistence?.(task.id);
     } catch {
       // Task may already be terminal (e.g., cancelled). Preserve original error.
     }

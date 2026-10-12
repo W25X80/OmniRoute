@@ -338,6 +338,13 @@ async function main(): Promise<void> {
         if ((error as { code?: unknown })?.code !== "ENOENT")
           throw new ApplicationImportError("artifact");
       }
+      const needsArtifactStore =
+        references(snapshot).length > 0 ||
+        snapshot.tables.some((table) => {
+          if (table.name !== "artifact_deletion_queue") return false;
+          const scope = table.columns.indexOf("store_scope");
+          return scope >= 0 && table.rows.some((row) => row.values[scope] !== null);
+        });
       const mappings = await prepareApplicationArtifacts(
         snapshot,
         {
@@ -352,7 +359,7 @@ async function main(): Promise<void> {
               throw new ApplicationImportError("artifact");
             return bytes;
           },
-          target: references(snapshot).length
+          target: needsArtifactStore
             ? artifacts()
             : {
                 async put() {

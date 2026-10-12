@@ -4,7 +4,7 @@ import { trackPendingRequest } from "@/lib/usageDb";
 import { STREAM_ACTIVE_TIMEOUT_MS, STREAM_IDLE_TIMEOUT_MS } from "../config/constants.ts";
 import { FORMATS } from "../translator/formats.ts";
 import { buildErrorBody } from "./error.ts";
-import { PENDING_REQUEST_CLEARED_MARKER } from "./stream.ts";
+import { PENDING_REQUEST_CLEARED_MARKER, finalizeTerminalStream } from "./stream.ts";
 import { createCompletedResponsesToolHandoffWatcher } from "./responsesToolHandoff.ts";
 import { createStreamContentWatcher, type StreamContentWatcher } from "./streamReadiness.ts";
 import { hasOpenReasoning } from "./emptyTurnRetry.ts";
@@ -660,7 +660,11 @@ function resolveSilentCloseOutcome(input: {
 export function createDisconnectAwareStream(
   transformStream,
   streamController,
-  options: { highWaterMark?: number; permitsEmptyTurn?: () => boolean } = {}
+  options: {
+    highWaterMark?: number;
+    permitsEmptyTurn?: () => boolean;
+    onTerminalDisconnect?: () => void | Promise<void>;
+  } = {}
 ) {
   const reader = transformStream.readable.getReader();
   const writer = transformStream.writable.getWriter();
@@ -679,6 +683,39 @@ export function createDisconnectAwareStream(
     cleanupClientAbortSignal?.();
     cleanupClientAbortSignal = null;
   };
+  let terminalAccountingClaimed = false;
+  const completeTerminalAccounting = () => {
+    if (!clientTerminalSeen || terminalAccountingClaimed) return;
+    contentWatcher.finish();
+    // The same empty/error guard used at normal EOF must also hold on cancellation.
+    if (
+      contentWatcher.sawError() ||
+      resolveSilentCloseOutcome({
+        bytesWereForwarded,
+        clientTerminalSeen,
+        clientResponseFormat: streamController.clientResponseFormat,
+        contentWatcher,
+        permitsEmptyTurn: options.permitsEmptyTurn,
+      })
+    )
+      return;
+    terminalAccountingClaimed = true;
+    try {
+      const work = options.onTerminalDisconnect?.();
+      if (work)
+        void work.catch((error: unknown) =>
+          console.warn(
+            "[STREAM] Terminal accounting failed:",
+            error instanceof Error ? error.name : "Error"
+          )
+        );
+    } catch (error) {
+      console.warn(
+        "[STREAM] Terminal accounting failed:",
+        error instanceof Error ? error.name : "Error"
+      );
+    }
+  };
   const cancelUpstream = (reason: unknown) =>
     (cancellation ??= Promise.allSettled<unknown>([
       Promise.resolve().then(() => reader.cancel(reason)),
@@ -691,6 +728,7 @@ export function createDisconnectAwareStream(
     )
       return;
     removeClientAbortListener();
+    completeTerminalAccounting();
     streamController.handleComplete();
     void cancelUpstream(reason);
   };
@@ -852,6 +890,7 @@ export function createDisconnectAwareStream(
           }
 
           if (clientTerminalSeen) {
+            completeTerminalAccounting();
             streamController.handleComplete();
             void cancelUpstream(new Error("Client terminal seen"));
             try {
@@ -894,6 +933,7 @@ export function createDisconnectAwareStream(
         const deferCompletedToolHandoff =
           streamController.shouldDeferCompletedToolHandoff?.() === true;
         if (clientTerminalSeen) {
+          completeTerminalAccounting();
           streamController.handleComplete();
         } else {
           streamController.handleDisconnect(reason || "cancelled");
@@ -961,6 +1001,7 @@ export function pipeWithDisconnect(
       {
         highWaterMark: opts.highWaterMark,
         permitsEmptyTurn: () => hasTrustedEmptyTurn(providerResponse),
+        onTerminalDisconnect: () => finalizeTerminalStream(transformStream),
       }
     );
   }
@@ -1232,6 +1273,7 @@ export function pipeWithDisconnect(
     {
       highWaterMark: opts.highWaterMark,
       permitsEmptyTurn: () => hasTrustedEmptyTurn(providerResponse),
+      onTerminalDisconnect: () => finalizeTerminalStream(transformStream),
     }
   );
 }

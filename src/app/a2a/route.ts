@@ -213,13 +213,13 @@ export async function POST(req: NextRequest) {
       }
 
       const task = tm.createTask({ skill, messages, metadata: params?.metadata }, callerOwner);
-      await tm.flushPersistence();
+      await tm.flushPersistence(task.id);
       try {
         tm.updateTask(task.id, "working");
-        await tm.flushPersistence();
+        await tm.flushPersistence(task.id);
         const result = await handler(task);
         tm.updateTask(task.id, "completed", result.artifacts);
-        await tm.flushPersistence();
+        await tm.flushPersistence(task.id);
 
         // Log routing decision
         if (skill === "smart-routing" && result.metadata) {
@@ -261,7 +261,7 @@ export async function POST(req: NextRequest) {
         const msg = err instanceof Error ? err.message : String(err);
         if (!isNativeAgentPersistenceError(err)) {
           tm.updateTask(task.id, "failed", [{ type: "error", content: msg }], msg);
-          await tm.flushPersistence();
+          await tm.flushPersistence(task.id);
         }
         return jsonRpcError(id, -32603, `Skill execution failed: ${msg}`);
       }
@@ -285,9 +285,9 @@ export async function POST(req: NextRequest) {
       }
 
       const task = tm.createTask({ skill, messages, metadata: params?.metadata }, callerOwner);
-      await tm.flushPersistence();
+      await tm.flushPersistence(task.id);
       tm.updateTask(task.id, "working");
-      await tm.flushPersistence();
+      await tm.flushPersistence(task.id);
 
       const stream = createA2AStream(
         task,
@@ -320,7 +320,7 @@ export async function POST(req: NextRequest) {
 
       try {
         const task = tm.cancelTask(taskId, callerOwner);
-        await tm.flushPersistence();
+        await tm.flushPersistence(task.id);
         return jsonRpcResult(id, { task: { id: task.id, state: task.state } });
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);

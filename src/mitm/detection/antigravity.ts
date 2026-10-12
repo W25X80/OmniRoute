@@ -1,3 +1,4 @@
+import { existsAsync } from "../nativeHostIo.ts";
 /**
  * Antigravity IDE installation detection.
  * Purely filesystem-based — no shell interpolation (Hard Rule #13).
@@ -28,6 +29,13 @@ const PATHS = [
 export function detectAntigravity(): DetectionResult {
   for (const p of PATHS) {
     if (fs.existsSync(p)) return { installed: true, path: p };
+  }
+  return { installed: false };
+}
+
+export async function detectAntigravityAsync(): Promise<DetectionResult> {
+  for (const candidate of PATHS) {
+    if (await existsAsync(candidate)) return { installed: true, path: candidate };
   }
   return { installed: false };
 }

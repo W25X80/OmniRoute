@@ -183,7 +183,7 @@ export function createPostgresMemoryRepository(database: PostgresDatabase) {
         if (filters.query?.trim()) {
           values.push(`%${filters.query.trim().toLowerCase()}%`);
           conditions.push(
-            `(translate(content,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz') LIKE $${values.length} OR translate(key,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz') LIKE $${values.length})`
+            `(translate(content,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz') LIKE $${values.length} ESCAPE '' OR translate(key,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz') LIKE $${values.length} ESCAPE '')`
           );
         }
         const where = conditions.length ? ` WHERE ${conditions.join(" AND ")}` : "";

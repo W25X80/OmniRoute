@@ -1,3 +1,4 @@
+import { existsAsync } from "../nativeHostIo.ts";
 /**
  * OpenCode installation detection.
  * Purely filesystem-based — no shell interpolation (Hard Rule #13).
@@ -27,6 +28,13 @@ const PATHS = [
 export function detectOpenCode(): DetectionResult {
   for (const p of PATHS) {
     if (fs.existsSync(p)) return { installed: true, path: p };
+  }
+  return { installed: false };
+}
+
+export async function detectOpenCodeAsync(): Promise<DetectionResult> {
+  for (const candidate of PATHS) {
+    if (await existsAsync(candidate)) return { installed: true, path: candidate };
   }
   return { installed: false };
 }

@@ -166,6 +166,14 @@ type StreamCompletePayload = {
   } | null;
 };
 
+// An internal transform identity, never a client-supplied callback or response header.
+const terminalCompletionByStream = new WeakMap<object, () => Promise<void>>();
+
+/** Complete the existing SSE owner after a validated client terminal, before cancelling its pipe. */
+export function finalizeTerminalStream(stream: object): Promise<void> | undefined {
+  return terminalCompletionByStream.get(stream)?.();
+}
+
 /** Queue budget every provider used before `streamBufferBytes` existed. */
 const DEFAULT_STREAM_BUFFER_BYTES = 16384;
 
@@ -773,7 +781,7 @@ export function createSSEStream(options: StreamOptions = {}) {
     connectionId = null,
     apiKeyInfo = null,
     body = null,
-    onComplete = null,
+    onComplete: completionListener = null,
     onBeforeTerminal = null,
     onFailure = null,
     dropResponsesCommentary,
@@ -782,6 +790,16 @@ export function createSSEStream(options: StreamOptions = {}) {
     streamBufferBytes = DEFAULT_STREAM_BUFFER_BYTES,
     pendingRequestId = null,
   } = options;
+  let completionClaimed = false;
+  let completionWork: void | Promise<void>;
+  const onComplete = completionListener
+    ? (payload: StreamCompletePayload): void | Promise<void> => {
+        if (completionClaimed) return completionWork;
+        completionClaimed = true;
+        completionWork = completionListener(payload);
+        return completionWork;
+      }
+    : null;
   // Request-body-size metric (for monitoring payload size distribution & correlation with TTFT).
   // The size is JSON-serialised byte count; stored as a performance mark detail so monitoring
   // tools can query performance.getEntriesByType("mark") filtered by name.
@@ -1418,6 +1436,248 @@ export function createSSEStream(options: StreamOptions = {}) {
       notifyComplete: true,
     });
     return true;
+  };
+
+  // EOF and a downstream terminal disconnect share the same captured payload owner.
+  // Invoke synchronously through the first await so the existing tail claims completion
+  // before a disconnect grace callback can manufacture a failure.
+  const completeSuccessfulStream = async (): Promise<void> => {
+    clearIdleTimer();
+    if (completionClaimed) {
+      await completionWork;
+      return;
+    }
+    if (streamTimedOut || upstreamErrorForwarded) return;
+    if (mode === STREAM_MODE.PASSTHROUGH) {
+      if (!hasValidUsage(usage) && totalContentLength > 0)
+        usage = estimateUsage(body, totalContentLength, sourceFormat || FORMATS.OPENAI);
+      // Notify caller for call log persistence (include full response body with accumulated content)
+      if (onComplete) {
+        try {
+          const u = usage as Record<string, unknown> | null;
+          const prompt = Number(u?.prompt_tokens ?? u?.input_tokens ?? 0);
+          const completion = Number(u?.completion_tokens ?? u?.output_tokens ?? 0);
+          let content = passthroughAccumulatedContent.trim() || "";
+          const finalBufferedTextualToolCall = passthroughBufferedTextualToolCallContent.trim();
+          if (finalBufferedTextualToolCall) {
+            if (
+              collectPassthroughTextualToolCall(
+                finalBufferedTextualToolCall,
+                passthroughToolCalls,
+                allowedToolNames
+              )
+            ) {
+              passthroughHasToolCalls = true;
+            }
+            passthroughBufferedTextualToolCallContent = "";
+          }
+          if (
+            content &&
+            collectPassthroughTextualToolCall(content, passthroughToolCalls, allowedToolNames)
+          ) {
+            passthroughHasToolCalls = true;
+            content = "";
+          } else if (containsMalformedTextualToolCall(content, allowedToolNames)) {
+            content = "";
+          }
+          const message: Record<string, unknown> = {
+            role: "assistant",
+            content: content || null,
+          };
+          const reasoning = passthroughAccumulatedReasoning.trim();
+          if (reasoning) {
+            message.reasoning_content = reasoning;
+          }
+          if (passthroughToolCalls.size > 0) {
+            message.tool_calls = [...passthroughToolCalls.values()].sort(
+              (a, b) => a.index - b.index
+            );
+          }
+          // Hardening: log empty assistant response after tool completion
+          // for observability — helps diagnose Copilot "Sorry, no response was returned"
+          if (passthroughHasToolCalls && !content.trim() && !reasoning.trim()) {
+            console.warn(
+              `[STREAM] Empty assistant response after tool_calls completion (${provider || "provider"}:${model || "unknown"}) — sessionId=${sessionId}`
+            );
+          } else if (passthroughHasToolCalls && !content.trim() && reasoning.trim()) {
+            message.content = "";
+          }
+
+          const responseBody = {
+            choices: [
+              {
+                message,
+                finish_reason: passthroughHasToolCalls ? "tool_calls" : "stop",
+              },
+            ],
+            usage: {
+              prompt_tokens: prompt,
+              completion_tokens: completion,
+              total_tokens: prompt + completion,
+            },
+            _streamed: true,
+          };
+          await onComplete({
+            status: 200,
+            usage,
+            responseBody,
+            reasoningMeta: reasoningObserver.take(),
+            ...timing.completionTiming(),
+            // #9315 switched the summary to the accumulated responseBody to avoid
+            // stale/truncated event data — but responseBody here is synthesized in
+            // chat-completion shape, which loses the Responses API `response` object.
+            // Keep a Responses-shaped summary for OPENAI_RESPONSES only. responseBody
+            // itself never carries an `object` marker (it's built purely for the
+            // client, which doesn't need one) — the dashboard's Provider Response
+            // panel does, so stamp `object: "chat.completion"` on a shallow copy
+            // used only for this summary, leaving responseBody itself untouched.
+            // getSummary(), not buildStreamSummaryFromEvents(getEvents(), ...): the
+            // latter only sees the collector's RETAINED (possibly cap-truncated)
+            // events, silently losing a late response.completed event on a long
+            // reasoning-heavy stream (live incident 2026-09-04) -- see
+            // providerPayloadCollector's own `format:` construction comment above.
+            providerPayload: providerPayloadCollector.build(
+              sourceFormat === FORMATS.OPENAI_RESPONSES
+                ? providerPayloadCollector.getSummary()
+                : { object: "chat.completion", ...responseBody },
+              { includeEvents: false }
+            ),
+            // Same OPENAI_RESPONSES carve-out as providerPayload above, but keyed on
+            // clientResponseFormat (what the client actually receives) rather than
+            // sourceFormat (what the upstream sent) -- they're equal in passthrough
+            // mode but conceptually distinct. Without this, `entry.responseId` in
+            // src/lib/usage/callLogs.ts is always null for a Responses-API client
+            // (extractResponsesId reads `clientResponse.id`, which the chat-shaped
+            // responseBody never has), so previous_response_id continuation lookups
+            // in src/lib/db/responsesContinuationStore.ts always miss. getSummary(),
+            // not buildStreamSummaryFromEvents(getEvents(), ...) -- same cap-truncation
+            // reasoning as providerPayload above; clientPayloadCollector's own `format:`
+            // construction above gives it the same live, cap-independent reducer.
+            clientPayload: clientPayloadCollector.build(
+              clientResponseFormat === FORMATS.OPENAI_RESPONSES
+                ? clientPayloadCollector.getSummary()
+                : responseBody,
+              { includeEvents: false }
+            ),
+          });
+        } catch (e) {
+          console.debug(`[STREAM] onComplete callback error (${model || "unknown"}):`, e);
+        }
+      } else {
+        clearPendingRequestFromStream();
+      }
+    } else {
+      if (!hasValidUsage(state?.usage) && totalContentLength > 0 && state)
+        state.usage = estimateUsage(body, totalContentLength, sourceFormat);
+      // Notify caller for call log persistence (include full response body with accumulated content)
+      if (onComplete) {
+        try {
+          const u = state?.usage as Record<string, unknown> | null | undefined;
+          const prompt = Number(u?.prompt_tokens ?? u?.input_tokens ?? 0);
+          const completion = Number(u?.completion_tokens ?? u?.output_tokens ?? 0);
+          let content = (state?.accumulatedContent ?? "").trim() || "";
+          const normalizedToolCalls: ToolCall[] = state?.toolCalls?.size
+            ? [...state.toolCalls.values()]
+                .map((tc: Record<string, unknown>): ToolCall => ({
+                  id: tc.id != null ? String(tc.id) : null,
+                  index: (tc.index as number) ?? (tc.blockIndex as number) ?? 0,
+                  type: (tc.type as string) ?? "function",
+                  function: (tc.function as ToolCall["function"]) ?? {
+                    name: (tc.name as string) ?? "",
+                    arguments: "",
+                  },
+                }))
+                .sort((a, b) => a.index - b.index)
+            : [];
+          const textualToolCall = parseTextualToolCallFromContent(content);
+          if (textualToolCall) {
+            normalizedToolCalls.push({
+              id: `call_${Date.now()}_${normalizedToolCalls.length}`,
+              index: normalizedToolCalls.length,
+              type: "function",
+              function: {
+                name: textualToolCall.name,
+                arguments: JSON.stringify(textualToolCall.args || {}),
+              },
+            });
+            content = "";
+          } else if (containsMalformedTextualToolCall(content, allowedToolNames)) {
+            content = "";
+          }
+          const reasoning = (state?.accumulatedReasoning ?? "").trim();
+          const message: Record<string, unknown> = {
+            role: "assistant",
+            content: content || null,
+          };
+          if (reasoning) {
+            message.reasoning_content = reasoning;
+          }
+          const hasToolCalls = normalizedToolCalls.length > 0;
+          if (hasToolCalls) {
+            message.tool_calls = normalizedToolCalls;
+          }
+          const responseBody = {
+            choices: [
+              {
+                message,
+                finish_reason: hasToolCalls ? "tool_calls" : "stop",
+              },
+            ],
+            usage: {
+              prompt_tokens: prompt,
+              completion_tokens: completion,
+              total_tokens: prompt + completion,
+            },
+            _streamed: true,
+          };
+          await onComplete({
+            status: 200,
+            usage: state?.usage,
+            responseBody,
+            ...timing.completionTiming(),
+            reasoningMeta: reasoningObserver.take(),
+            // Same OPENAI_RESPONSES carve-out as the passthrough branch above —
+            // the synthesized chat-shaped responseBody drops the `response` object,
+            // and (like the passthrough branch) never carries an `object` marker at
+            // all — stamp `object: "chat.completion"` on a shallow copy used only
+            // for this summary; responseBody itself (sent to the client / below)
+            // stays untouched.
+            // getSummary(), not buildStreamSummaryFromEvents(getEvents(), ...) -- the
+            // latter only sees the collector's RETAINED (possibly cap-truncated)
+            // events, silently losing a late response.completed event on a long
+            // reasoning-heavy stream (live incident 2026-09-04) -- see
+            // providerPayloadCollector's own `format:` construction comment above.
+            providerPayload: providerPayloadCollector.build(
+              targetFormat === FORMATS.OPENAI_RESPONSES
+                ? providerPayloadCollector.getSummary()
+                : { object: "chat.completion", ...responseBody },
+              { includeEvents: false }
+            ),
+            // Same OPENAI_RESPONSES carve-out as providerPayload above and the
+            // passthrough branch's onComplete, but keyed on sourceFormat (what the
+            // client requested/receives in translate mode) rather than targetFormat
+            // (what the upstream provider speaks) -- translateResponse(targetFormat,
+            // sourceFormat, ...) above confirms that direction. emitTranslatedClientItem
+            // already pushes every client-visible translated item into
+            // clientPayloadCollector unconditionally, so the events are already there;
+            // getSummary() (not buildStreamSummaryFromEvents(getEvents(), ...)) makes
+            // reading them back cap-independent -- same reasoning as providerPayload
+            // above; clientPayloadCollector's own `format:` construction gives it the
+            // same live reducer.
+            clientPayload: clientPayloadCollector.build(
+              sourceFormat === FORMATS.OPENAI_RESPONSES
+                ? clientPayloadCollector.getSummary()
+                : responseBody,
+              { includeEvents: false }
+            ),
+          });
+        } catch (e) {
+          console.debug(`[STREAM] onComplete callback error in flush (${model || "unknown"}):`, e);
+        }
+      } else {
+        clearPendingRequestFromStream();
+      }
+    }
   };
 
   const sseStream = new TransformStream(
@@ -2897,122 +3157,7 @@ export function createSSEStream(options: StreamOptions = {}) {
             }
             const publication = settleTerminalPublication();
             if (publication) await publication;
-            // Notify caller for call log persistence (include full response body with accumulated content)
-            if (onComplete) {
-              try {
-                const u = usage as Record<string, unknown> | null;
-                const prompt = Number(u?.prompt_tokens ?? u?.input_tokens ?? 0);
-                const completion = Number(u?.completion_tokens ?? u?.output_tokens ?? 0);
-                let content = passthroughAccumulatedContent.trim() || "";
-                const finalBufferedTextualToolCall =
-                  passthroughBufferedTextualToolCallContent.trim();
-                if (finalBufferedTextualToolCall) {
-                  if (
-                    collectPassthroughTextualToolCall(
-                      finalBufferedTextualToolCall,
-                      passthroughToolCalls,
-                      allowedToolNames
-                    )
-                  ) {
-                    passthroughHasToolCalls = true;
-                  }
-                  passthroughBufferedTextualToolCallContent = "";
-                }
-                if (
-                  content &&
-                  collectPassthroughTextualToolCall(content, passthroughToolCalls, allowedToolNames)
-                ) {
-                  passthroughHasToolCalls = true;
-                  content = "";
-                } else if (containsMalformedTextualToolCall(content, allowedToolNames)) {
-                  content = "";
-                }
-                const message: Record<string, unknown> = {
-                  role: "assistant",
-                  content: content || null,
-                };
-                const reasoning = passthroughAccumulatedReasoning.trim();
-                if (reasoning) {
-                  message.reasoning_content = reasoning;
-                }
-                if (passthroughToolCalls.size > 0) {
-                  message.tool_calls = [...passthroughToolCalls.values()].sort(
-                    (a, b) => a.index - b.index
-                  );
-                }
-                // Hardening: log empty assistant response after tool completion
-                // for observability — helps diagnose Copilot "Sorry, no response was returned"
-                if (passthroughHasToolCalls && !content.trim() && !reasoning.trim()) {
-                  console.warn(
-                    `[STREAM] Empty assistant response after tool_calls completion (${provider || "provider"}:${model || "unknown"}) — sessionId=${sessionId}`
-                  );
-                } else if (passthroughHasToolCalls && !content.trim() && reasoning.trim()) {
-                  message.content = "";
-                }
-
-                const responseBody = {
-                  choices: [
-                    {
-                      message,
-                      finish_reason: passthroughHasToolCalls ? "tool_calls" : "stop",
-                    },
-                  ],
-                  usage: {
-                    prompt_tokens: prompt,
-                    completion_tokens: completion,
-                    total_tokens: prompt + completion,
-                  },
-                  _streamed: true,
-                };
-                await onComplete({
-                  status: 200,
-                  usage,
-                  responseBody,
-                  reasoningMeta: reasoningObserver.take(),
-                  ...timing.completionTiming(),
-                  // #9315 switched the summary to the accumulated responseBody to avoid
-                  // stale/truncated event data — but responseBody here is synthesized in
-                  // chat-completion shape, which loses the Responses API `response` object.
-                  // Keep a Responses-shaped summary for OPENAI_RESPONSES only. responseBody
-                  // itself never carries an `object` marker (it's built purely for the
-                  // client, which doesn't need one) — the dashboard's Provider Response
-                  // panel does, so stamp `object: "chat.completion"` on a shallow copy
-                  // used only for this summary, leaving responseBody itself untouched.
-                  // getSummary(), not buildStreamSummaryFromEvents(getEvents(), ...): the
-                  // latter only sees the collector's RETAINED (possibly cap-truncated)
-                  // events, silently losing a late response.completed event on a long
-                  // reasoning-heavy stream (live incident 2026-09-04) -- see
-                  // providerPayloadCollector's own `format:` construction comment above.
-                  providerPayload: providerPayloadCollector.build(
-                    sourceFormat === FORMATS.OPENAI_RESPONSES
-                      ? providerPayloadCollector.getSummary()
-                      : { object: "chat.completion", ...responseBody },
-                    { includeEvents: false }
-                  ),
-                  // Same OPENAI_RESPONSES carve-out as providerPayload above, but keyed on
-                  // clientResponseFormat (what the client actually receives) rather than
-                  // sourceFormat (what the upstream sent) -- they're equal in passthrough
-                  // mode but conceptually distinct. Without this, `entry.responseId` in
-                  // src/lib/usage/callLogs.ts is always null for a Responses-API client
-                  // (extractResponsesId reads `clientResponse.id`, which the chat-shaped
-                  // responseBody never has), so previous_response_id continuation lookups
-                  // in src/lib/db/responsesContinuationStore.ts always miss. getSummary(),
-                  // not buildStreamSummaryFromEvents(getEvents(), ...) -- same cap-truncation
-                  // reasoning as providerPayload above; clientPayloadCollector's own `format:`
-                  // construction above gives it the same live, cap-independent reducer.
-                  clientPayload: clientPayloadCollector.build(
-                    clientResponseFormat === FORMATS.OPENAI_RESPONSES
-                      ? clientPayloadCollector.getSummary()
-                      : responseBody,
-                    { includeEvents: false }
-                  ),
-                });
-              } catch (e) {
-                console.debug(`[STREAM] onComplete callback error (${model || "unknown"}):`, e);
-              }
-            } else {
-              clearPendingRequestFromStream();
-            }
+            await completeSuccessfulStream();
             {
               const publication = settleTerminalPublication();
               if (publication) await publication;
@@ -3231,117 +3376,7 @@ export function createSSEStream(options: StreamOptions = {}) {
           }
           const publication = settleTerminalPublication();
           if (publication) await publication;
-          // Notify caller for call log persistence (include full response body with accumulated content)
-          if (onComplete) {
-            try {
-              const u = state?.usage as Record<string, unknown> | null | undefined;
-              const prompt = Number(u?.prompt_tokens ?? u?.input_tokens ?? 0);
-              const completion = Number(u?.completion_tokens ?? u?.output_tokens ?? 0);
-              let content = (state?.accumulatedContent ?? "").trim() || "";
-              const normalizedToolCalls: ToolCall[] = state?.toolCalls?.size
-                ? [...state.toolCalls.values()]
-                    .map((tc: Record<string, unknown>): ToolCall => ({
-                      id: tc.id != null ? String(tc.id) : null,
-                      index: (tc.index as number) ?? (tc.blockIndex as number) ?? 0,
-                      type: (tc.type as string) ?? "function",
-                      function: (tc.function as ToolCall["function"]) ?? {
-                        name: (tc.name as string) ?? "",
-                        arguments: "",
-                      },
-                    }))
-                    .sort((a, b) => a.index - b.index)
-                : [];
-              const textualToolCall = parseTextualToolCallFromContent(content);
-              if (textualToolCall) {
-                normalizedToolCalls.push({
-                  id: `call_${Date.now()}_${normalizedToolCalls.length}`,
-                  index: normalizedToolCalls.length,
-                  type: "function",
-                  function: {
-                    name: textualToolCall.name,
-                    arguments: JSON.stringify(textualToolCall.args || {}),
-                  },
-                });
-                content = "";
-              } else if (containsMalformedTextualToolCall(content, allowedToolNames)) {
-                content = "";
-              }
-              const reasoning = (state?.accumulatedReasoning ?? "").trim();
-              const message: Record<string, unknown> = {
-                role: "assistant",
-                content: content || null,
-              };
-              if (reasoning) {
-                message.reasoning_content = reasoning;
-              }
-              const hasToolCalls = normalizedToolCalls.length > 0;
-              if (hasToolCalls) {
-                message.tool_calls = normalizedToolCalls;
-              }
-              const responseBody = {
-                choices: [
-                  {
-                    message,
-                    finish_reason: hasToolCalls ? "tool_calls" : "stop",
-                  },
-                ],
-                usage: {
-                  prompt_tokens: prompt,
-                  completion_tokens: completion,
-                  total_tokens: prompt + completion,
-                },
-                _streamed: true,
-              };
-              await onComplete({
-                status: 200,
-                usage: state?.usage,
-                responseBody,
-                ...timing.completionTiming(),
-                reasoningMeta: reasoningObserver.take(),
-                // Same OPENAI_RESPONSES carve-out as the passthrough branch above —
-                // the synthesized chat-shaped responseBody drops the `response` object,
-                // and (like the passthrough branch) never carries an `object` marker at
-                // all — stamp `object: "chat.completion"` on a shallow copy used only
-                // for this summary; responseBody itself (sent to the client / below)
-                // stays untouched.
-                // getSummary(), not buildStreamSummaryFromEvents(getEvents(), ...) -- the
-                // latter only sees the collector's RETAINED (possibly cap-truncated)
-                // events, silently losing a late response.completed event on a long
-                // reasoning-heavy stream (live incident 2026-09-04) -- see
-                // providerPayloadCollector's own `format:` construction comment above.
-                providerPayload: providerPayloadCollector.build(
-                  targetFormat === FORMATS.OPENAI_RESPONSES
-                    ? providerPayloadCollector.getSummary()
-                    : { object: "chat.completion", ...responseBody },
-                  { includeEvents: false }
-                ),
-                // Same OPENAI_RESPONSES carve-out as providerPayload above and the
-                // passthrough branch's onComplete, but keyed on sourceFormat (what the
-                // client requested/receives in translate mode) rather than targetFormat
-                // (what the upstream provider speaks) -- translateResponse(targetFormat,
-                // sourceFormat, ...) above confirms that direction. emitTranslatedClientItem
-                // already pushes every client-visible translated item into
-                // clientPayloadCollector unconditionally, so the events are already there;
-                // getSummary() (not buildStreamSummaryFromEvents(getEvents(), ...)) makes
-                // reading them back cap-independent -- same reasoning as providerPayload
-                // above; clientPayloadCollector's own `format:` construction gives it the
-                // same live reducer.
-                clientPayload: clientPayloadCollector.build(
-                  sourceFormat === FORMATS.OPENAI_RESPONSES
-                    ? clientPayloadCollector.getSummary()
-                    : responseBody,
-                  { includeEvents: false }
-                ),
-              });
-            } catch (e) {
-              console.debug(
-                `[STREAM] onComplete callback error in flush (${model || "unknown"}):`,
-                e
-              );
-            }
-          } else {
-            clearPendingRequestFromStream();
-          }
+          await completeSuccessfulStream();
         } catch (error) {
           console.log(`[STREAM] Error in flush (${model || "unknown"}):`, error.message || error);
         }
@@ -3352,6 +3387,7 @@ export function createSSEStream(options: StreamOptions = {}) {
     },
     ...createByteLengthQueueStrategies(streamBufferBytes)
   );
+  terminalCompletionByStream.set(sseStream, completeSuccessfulStream);
   return registerStreamTiming(sseStream, timing);
 }
 

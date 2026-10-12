@@ -27,6 +27,7 @@ import { join, dirname, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { assembleStandalone } from "./assembleStandalone.mjs";
+import { bundleOmpHostWorker } from "./colocate-standalone.mjs";
 import { buildMitmUtilities } from "./buildMitm.mjs";
 import { isNativeExecutable, resolveLocalBinEntry } from "./buildToolRunner.mjs";
 import { resolveBundledNpmEntry } from "./resolveNpmEntry.ts";
@@ -327,6 +328,10 @@ runBuildTool(
   ],
   { cwd: ROOT, stdio: "inherit" }
 );
+
+// The cold prepublish path invokes Next directly and does not run npm postbuild.
+// Reuse the same narrow bundler so both staging paths carry the required CJS worker.
+bundleOmpHostWorker(join(DIST_DIR, "src/lib/db/ompHostWorker.cjs"));
 
 const callLogWorkerSrc = join(ROOT, "src", "lib", "usage", "callLogArtifactWorker.ts");
 const callLogWorkerDest = join(DIST_DIR, "src", "lib", "usage", "callLogArtifactWorker.js");

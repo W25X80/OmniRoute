@@ -90,6 +90,9 @@ async function stopPostgresApplication(): Promise<void> {
           import("@/lib/freeProxyProviders/scheduler").then(
             (module) => () => module.stopFreeProxyAutoSyncAsync()
           ),
+          import("@/lib/proxySubscription/subscriptionService").then(
+            (module) => () => module.stopSubscriptionSchedulerAsync()
+          ),
           import("@/lib/proxyHealth/scheduler").then(
             (module) => () => module.stopProxyHealthCheckAsync()
           ),

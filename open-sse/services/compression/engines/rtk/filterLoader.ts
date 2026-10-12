@@ -548,6 +548,9 @@ async function nativeFilterSnapshot(
     process.env.OMNIROUTE_RTK_TRUST_PROJECT_FILTERS === "1" ? "env-trust" : "env-normal",
   ].join("|");
   const caches = (filterGlobals[NATIVE_FILTERS] ??= new Map());
+  // Global filter files are shared by every trust variant. Detach pending reads too,
+  // so an older snapshot cannot republish into the cache after an explicit refresh.
+  if (options.refresh) caches.clear();
   let state = caches.get(key);
   if (!state) {
     state = {};

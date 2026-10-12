@@ -405,3 +405,98 @@ test("native cold RTK inline matching never borrows the synchronous filter loade
       normalize(applyRtkCompression(body, { config: { enabled: true } }))
     );
   }));
+
+test("global RTK import refreshes every warmed native trust variant without sharing project trust", async (t) =>
+  withNative(t, async (directory) => {
+    const { installGlobalRtkTomlV1Async } =
+      await import("../../../open-sse/services/compression/engines/rtk/tomlCompatibility");
+    const globalToml = (id: string, replacement: boolean) =>
+      [
+        "schema_version = 1",
+        "[filters." + id + "]",
+        'match_command = "^customcmd"',
+        replacement
+          ? 'strip_lines_matching = ["^noise", "^verbose progress details"]'
+          : 'strip_lines_matching = ["^noise"]',
+        "[[tests." + id + "]]",
+        'name = "removes noise"',
+        'input = "noise\\nkept"',
+        'expected = "kept"',
+      ].join("\n");
+    await installFilter(directory);
+    const project = path.join(directory, "project");
+    await files.mkdir(path.join(project, ".rtk"), { recursive: true });
+    const projectFilter = JSON.parse(
+      await files.readFile(path.join(directory, "rtk", "filters.json"), "utf8")
+    ) as {
+      id: string;
+      label: string;
+      match: { outputTypes: string[]; commands: string[]; patterns: string[] };
+    };
+    projectFilter.id = "project-only";
+    projectFilter.label = "project-only";
+    projectFilter.match.commands = ["^projectcmd\\b"];
+    projectFilter.match.patterns = [];
+    await files.writeFile(
+      path.join(project, ".rtk", "filters.json"),
+      JSON.stringify(projectFilter)
+    );
+    // No trust.json: only the explicitly trusting variant may admit this overlay.
+    const cwd = process.cwd();
+    process.chdir(project);
+    try {
+      await installGlobalRtkTomlV1Async(globalToml("global-old", false));
+      const body = toolBody();
+      body.messages[1].content =
+        "noise repeated\n".repeat(30) + "verbose progress details\nKEEP valuable result\n";
+      const compress = (trustProjectFilters: boolean) =>
+        applyCompressionAsync(body, "stacked", {
+          config: {
+            ...DEFAULT_COMPRESSION_CONFIG,
+            stackedPipeline: [{ engine: "rtk" }, { engine: "lite" }],
+            rtkConfig: {
+              ...DEFAULT_RTK_CONFIG,
+              enabled: true,
+              customFiltersEnabled: true,
+              trustProjectFilters,
+              rawOutputRetention: "never",
+            },
+          },
+        });
+      for (const trustProjectFilters of [false, true]) {
+        const filters = await loadRtkFiltersAsync({ trustProjectFilters });
+        assert.equal(matchPreparedRtkFilter(filters, "noise\nKEEP", "customcmd")?.id, "global-old");
+        assert.equal(
+          matchPreparedRtkFilter(filters, "noise\nKEEP", "projectcmd")?.id === "project-only",
+          trustProjectFilters
+        );
+        assert.ok(
+          JSON.stringify((await compress(trustProjectFilters)).body).includes(
+            "verbose progress details"
+          )
+        );
+      }
+
+      await assert.rejects(installGlobalRtkTomlV1Async(globalToml("global-new", true)));
+      const replacement = await installGlobalRtkTomlV1Async(globalToml("global-new", true), {
+        overwrite: true,
+      });
+      assert.equal(replacement.backupCreated, true);
+      // Exact publication sequence used by POST /api/context/rtk/import.
+      await loadRtkFiltersAsync({ refresh: true });
+      for (const trustProjectFilters of [false, true]) {
+        const filters = await loadRtkFiltersAsync({ trustProjectFilters });
+        assert.equal(matchPreparedRtkFilter(filters, "noise\nKEEP", "customcmd")?.id, "global-new");
+        assert.equal(
+          matchPreparedRtkFilter(filters, "noise\nKEEP", "projectcmd")?.id === "project-only",
+          trustProjectFilters,
+          "refresh must revalidate each variant instead of borrowing another variant's trust"
+        );
+        const result = await compress(trustProjectFilters);
+        assert.ok(JSON.stringify(result.body).includes("KEEP valuable result"));
+        assert.ok(!JSON.stringify(result.body).includes("verbose progress details"));
+      }
+    } finally {
+      process.chdir(cwd);
+    }
+  }));

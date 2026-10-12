@@ -179,3 +179,47 @@ export const dispatch = {
     return batchFixture.dispatchGate ?? new Response(JSON.stringify({ data: [] }), { status: 200 });
   },
 };
+
+export async function transitionBatchAsync(
+  id: string,
+  expected: readonly BatchRecord["status"][],
+  changes: Partial<BatchRecord> & { status: BatchRecord["status"] },
+  discardOutputs = false
+) {
+  const current = await getBatchAsync();
+  if (!current || !expected.includes(current.status)) return { changed: false, batch: current };
+  await updateBatchAsync(id, changes);
+  if (discardOutputs) {
+    for (const fileId of [current.outputFileId, current.errorFileId])
+      if (fileId) await deleteFileAsync(fileId);
+  }
+  return { changed: true, batch: await getBatchAsync() };
+}
+export async function completeBatchWithFilesAsync(
+  id: string,
+  completion: import("../../../src/lib/db/batches.ts").BatchCompletion,
+  output: import("../../../src/lib/db/batches.ts").BatchOutputFile | null,
+  error: import("../../../src/lib/db/batches.ts").BatchOutputFile | null
+) {
+  const current = await getBatchAsync();
+  if (current?.status === "cancelling")
+    return transitionBatchAsync(id, ["cancelling"], { status: "cancelled" });
+  if (!current || current.status !== "finalizing") return { changed: false, batch: current };
+  const save = async (file: typeof output) =>
+    file
+      ? (
+          await createFileAsync({
+            ...file,
+            bytes: file.content.length,
+            purpose: "batch_output",
+            apiKeyId: current.apiKeyId,
+          })
+        ).id
+      : null;
+  return transitionBatchAsync(id, ["finalizing"], {
+    ...completion,
+    status: "completed",
+    outputFileId: await save(output),
+    errorFileId: await save(error),
+  });
+}

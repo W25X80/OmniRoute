@@ -697,7 +697,7 @@ export async function getProviderDailyUsageRows(
       SELECT
         to_char(timestamp::timestamptz AT TIME ZONE 'UTC', 'YYYY-MM-DD') as date,
         LOWER(provider) as provider,
-        COUNT(*) as requests,
+        COALESCE(SUM(requests), 0) as requests,
         COALESCE(SUM(tokens_input), 0) as "promptTokens",
         COALESCE(SUM(tokens_output), 0) as "completionTokens",
         COALESCE(SUM(tokens_input + tokens_output), 0) as "totalTokens"

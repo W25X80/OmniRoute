@@ -1,3 +1,11 @@
+import { mkdir, writeFile, unlink } from "node:fs/promises";
+import {
+  nativeMitmEnabled,
+  existsAsync,
+  readTextAsync,
+  assertNativeMitmNotAborted,
+  withNativeMitmCancellation,
+} from "./nativeHostIo.ts";
 import { spawn, type ChildProcess } from "child_process";
 import path from "path";
 import fs from "fs";
@@ -7,19 +15,20 @@ import {
   removeDNSEntries,
   checkDNSEntryForAgent,
   checkDNSEntry,
+  checkDNSEntryForAgentAsync,
 } from "./dns/dnsConfig.ts";
 import { provisionDnsEntries } from "./dns/provision.ts";
 import { generateCert } from "./cert/generate.ts";
 import { installCertResult, installCaCert } from "./cert/install.ts";
 import { loadOrCreateMitmCa, resolveMitmCertDir } from "./cert/rootCa.ts";
-import { resolveActiveCertPath } from "./cert/activeCert.ts";
+import { resolveActiveCertPath, resolveActiveCertPathAsync } from "./cert/activeCert.ts";
 import { ALL_TARGETS } from "./targets/index.ts";
-import { detectAgent } from "./detection/index.ts";
+import { detectAgent, detectAgentAsync } from "./detection/index.ts";
 import type { AgentId, DetectionResult, MitmTarget } from "./types.ts";
 import {} from "@/lib/db/agentBridgeState.ts";
 import { getUserBypassPatterns, getUserBypassPatternsAsync } from "@/lib/db/agentBridgeBypass.ts";
 import { getGheCopilotHosts, getGheCopilotHostsAsync } from "@/lib/db/providers.ts";
-import { configureUpstreamCa } from "./upstreamTrust.ts";
+import { configureUpstreamCa, configureUpstreamCaAsync } from "./upstreamTrust.ts";
 import { createLogger } from "@/shared/utils/logger.ts";
 import {
   buildRepairPlan,
@@ -100,6 +109,22 @@ export function __setServerProcessForTest(proc: ChildProcess | null, pid: number
 // startMitm() calls would both pass that check before either assigns
 // serverProcess. (upstream 9router#2316)
 let mitmStarting = false;
+let nativePidCleanup: Promise<void> = Promise.resolve();
+let nativePidTail: Promise<unknown> = Promise.resolve();
+function withNativePidFile<T>(body: () => Promise<T>): Promise<T> {
+  const work = nativePidTail.then(body);
+  nativePidTail = work.catch(() => {});
+  return work;
+}
+function removeNativePidFile(expectedPid?: number): Promise<void> {
+  return withNativePidFile(async () => {
+    if (expectedPid !== undefined) {
+      const saved = await readTextAsync(PID_FILE).catch(() => "");
+      if (parseInt(saved.trim(), 10) !== expectedPid) return;
+    }
+    await unlink(PID_FILE);
+  });
+}
 
 /**
  * Attempt to acquire the single-flight "MITM server is starting" lock.
@@ -148,10 +173,15 @@ const BYPASS_JSON_FILE = path.join(resolveMitmDataDir(), "mitm", "bypass.json");
 const CA_PATH_FILE = path.join(resolveMitmDataDir(), "mitm", "upstream-ca.path");
 
 /** Read the persisted upstream CA path written by the POST upstream-ca route handler. */
-function readStoredUpstreamCaPath(): string | null {
+async function readStoredUpstreamCaPath(): Promise<string | null> {
   try {
-    if (!fs.existsSync(CA_PATH_FILE)) return null;
-    const raw = fs.readFileSync(CA_PATH_FILE, "utf8").trim();
+    if (!(nativeMitmEnabled() ? await existsAsync(CA_PATH_FILE) : fs.existsSync(CA_PATH_FILE)))
+      return null;
+    const raw = (
+      nativeMitmEnabled()
+        ? await readTextAsync(CA_PATH_FILE)
+        : fs.readFileSync(CA_PATH_FILE, "utf8")
+    ).trim();
     return raw || null;
   } catch {
     return null;
@@ -172,7 +202,12 @@ export function writeTargetsJson(targets: MitmTarget[] = ALL_TARGETS, gheHosts?:
   } catch {
     // mkdir failures are non-fatal; the write below will report the real error.
   }
-  const payload = {
+  const payload = buildTargetsPayload(targets, gheHosts);
+  fs.writeFileSync(TARGETS_JSON_FILE, JSON.stringify(payload, null, 2));
+}
+
+function buildTargetsPayload(targets: MitmTarget[], gheHosts?: string[]) {
+  return {
     version: 1,
     generatedAt: new Date().toISOString(),
     targets: targets.map((t) => ({
@@ -186,7 +221,6 @@ export function writeTargetsJson(targets: MitmTarget[] = ALL_TARGETS, gheHosts?:
       viability: t.viability ?? "supported",
     })),
   };
-  fs.writeFileSync(TARGETS_JSON_FILE, JSON.stringify(payload, null, 2));
 }
 
 /**
@@ -277,7 +311,8 @@ export async function repairMitm(sudoPassword: string): Promise<{ repaired: stri
 
   // Stale PID file.
   try {
-    if (fs.existsSync(PID_FILE)) fs.unlinkSync(PID_FILE);
+    if (nativeMitmEnabled()) await removeNativePidFile();
+    else if (fs.existsSync(PID_FILE)) fs.unlinkSync(PID_FILE);
   } catch {
     // ignore
   }
@@ -393,7 +428,26 @@ export async function getMitmStatus(agentId?: string): Promise<{
   let running = serverProcess !== null && !serverProcess.killed;
   let pid = serverPid;
 
-  if (!running) {
+  if (!running && nativeMitmEnabled()) {
+    try {
+      const savedPid = await withNativePidFile(async () => {
+        if (!(await existsAsync(PID_FILE))) return null;
+        const saved = parseInt((await readTextAsync(PID_FILE)).trim(), 10);
+        if (saved && isProcessAlive(saved)) return saved;
+        await unlink(PID_FILE);
+        _orphanedStateDetected = true;
+        log.warn("Stale MITM PID file found — system state may be orphaned (offer Repair).");
+        return null;
+      });
+      if (savedPid) {
+        running = true;
+        pid = savedPid;
+      }
+    } catch {
+      assertNativeMitmNotAborted();
+    }
+  }
+  if (!running && !nativeMitmEnabled()) {
     try {
       if (fs.existsSync(PID_FILE)) {
         const savedPid = parseInt(fs.readFileSync(PID_FILE, "utf-8").trim(), 10);
@@ -421,10 +475,12 @@ export async function getMitmStatus(agentId?: string): Promise<{
   let dnsConfigured = false;
   try {
     if (agentId) {
-      dnsConfigured = checkDNSEntryForAgent(agentId);
+      dnsConfigured = nativeMitmEnabled()
+        ? await checkDNSEntryForAgentAsync(agentId)
+        : checkDNSEntryForAgent(agentId);
     } else {
       // Use Windows-aware checkDNSEntry() instead of hardcoded /etc/hosts
-      dnsConfigured = checkDNSEntry();
+      dnsConfigured = nativeMitmEnabled() ? await checkDNSEntryForAgentAsync() : checkDNSEntry();
     }
   } catch {
     // Ignore
@@ -436,7 +492,12 @@ export async function getMitmStatus(agentId?: string): Promise<{
   // generated would wrongly report certExists:false.
   const certDir = path.join(resolveMitmDataDir(), "mitm");
   const rootCaEnabledForStatus = process.env.MITM_ROOT_CA_ENABLED === "true";
-  const certExists = fs.existsSync(resolveActiveCertPath(certDir, rootCaEnabledForStatus).certPath);
+  const activeCert = nativeMitmEnabled()
+    ? await resolveActiveCertPathAsync(certDir, rootCaEnabledForStatus)
+    : resolveActiveCertPath(certDir, rootCaEnabledForStatus);
+  const certExists = nativeMitmEnabled()
+    ? await existsAsync(activeCert.certPath)
+    : fs.existsSync(activeCert.certPath);
 
   return {
     running,
@@ -455,8 +516,9 @@ export async function getMitmStatus(agentId?: string): Promise<{
 export async function startMitm(
   apiKey: string,
   sudoPassword: string,
-  options: { port?: number } = {}
+  options: { port?: number; signal?: AbortSignal } = {}
 ): Promise<{ running: true; pid: number | null; certTrusted: boolean }> {
+  if (nativeMitmEnabled()) await nativePidCleanup;
   // Check if already running
   if (serverProcess && !serverProcess.killed) {
     throw new Error("MITM proxy is already running");
@@ -469,7 +531,9 @@ export async function startMitm(
   }
 
   try {
-    return await startMitmInternal(apiKey, sudoPassword, options);
+    return await withNativeMitmCancellation(options.signal, () =>
+      startMitmInternal(apiKey, sudoPassword, options)
+    );
   } finally {
     releaseMitmStartLock();
   }
@@ -508,10 +572,11 @@ async function startMitmInternal(
   // 0c. Apply upstream CA certificate (env var wins over stored path).
   //     Spec: plan 11 §4.7 + acceptance criterion §12 #18.
   try {
-    const storedCaPath = readStoredUpstreamCaPath();
+    const storedCaPath = await readStoredUpstreamCaPath();
     const activeCaPath = process.env.AGENTBRIDGE_UPSTREAM_CA_CERT || storedCaPath;
     if (activeCaPath) {
-      configureUpstreamCa(activeCaPath);
+      if (nativeMitmEnabled()) await configureUpstreamCaAsync(activeCaPath);
+      else configureUpstreamCa(activeCaPath);
       log.info({ caPath: activeCaPath }, "Upstream CA certificate configured");
     }
   } catch (err) {
@@ -531,11 +596,13 @@ async function startMitmInternal(
   //    `tproxy/dynamicCert.ts`).
   const certDir = resolveMitmCertDir();
   const rootCaEnabled = process.env.MITM_ROOT_CA_ENABLED === "true";
-  const { mode: migrationDecision } = resolveActiveCertPath(certDir, rootCaEnabled);
+  const { mode: migrationDecision } = nativeMitmEnabled()
+    ? await resolveActiveCertPathAsync(certDir, rootCaEnabled)
+    : resolveActiveCertPath(certDir, rootCaEnabled);
   let certPath: string;
   if (migrationDecision === "use-legacy-leaf") {
     certPath = path.join(resolveMitmDataDir(), "mitm", "server.crt");
-    if (!fs.existsSync(certPath)) {
+    if (!(nativeMitmEnabled() ? await existsAsync(certPath) : fs.existsSync(certPath))) {
       log.info("Generating SSL certificate...");
       try {
         await generateCert();
@@ -626,7 +693,12 @@ async function startMitmInternal(
     }
   }
 
-  serverProcess = spawn(process.execPath, [resolveMitmServerPath()], {
+  assertNativeMitmNotAborted();
+  const nativeServerPath = nativeMitmEnabled()
+    ? await resolveMitmServerPathAsync()
+    : resolveMitmServerPath();
+  assertNativeMitmNotAborted();
+  serverProcess = spawn(process.execPath, [nativeServerPath], {
     windowsHide: true,
     env: {
       ...process.env,
@@ -646,10 +718,18 @@ async function startMitmInternal(
   const proc = serverProcess;
   serverPid = proc.pid ?? null;
 
+  let pidWrite: Promise<void> = Promise.resolve();
   // Save PID to file — best-effort, must not orphan spawned child process
   if (serverPid !== null) {
     try {
-      fs.writeFileSync(PID_FILE, String(serverPid));
+      if (nativeMitmEnabled()) {
+        const pid = serverPid;
+        pidWrite = withNativePidFile(() => writeFile(PID_FILE, String(pid))).catch(
+          (err: unknown) => {
+            log.error({ err, pid }, "Failed to write MITM PID file (continuing)");
+          }
+        );
+      } else fs.writeFileSync(PID_FILE, String(serverPid));
     } catch (err) {
       log.error({ err, pid: serverPid }, "Failed to write MITM PID file (continuing)");
     }
@@ -671,6 +751,18 @@ async function startMitmInternal(
   });
 
   proc.on("exit", (code) => {
+    if (nativeMitmEnabled()) {
+      nativePidCleanup = pidWrite
+        .then(() => removeNativePidFile(proc.pid))
+        .catch(() => {})
+        .then(() => {
+          if (serverProcess === proc) {
+            serverProcess = null;
+            serverPid = null;
+          }
+        });
+      return;
+    }
     log.info({ exitCode: code }, "MITM server exited");
     serverProcess = null;
     serverPid = null;
@@ -714,6 +806,8 @@ async function startMitmInternal(
       }
     });
   });
+
+  if (nativeMitmEnabled()) await pidWrite;
 
   if (!started) {
     // Step 3 above already wrote the /etc/hosts entries. Leaving them behind
@@ -763,8 +857,14 @@ async function killMitmServerProcessOnStop(): Promise<void> {
 
   // Fallback: kill by PID file
   try {
-    if (fs.existsSync(PID_FILE)) {
-      const savedPid = parseInt(fs.readFileSync(PID_FILE, "utf-8").trim(), 10);
+    if (nativeMitmEnabled() ? await existsAsync(PID_FILE) : fs.existsSync(PID_FILE)) {
+      const savedPid = parseInt(
+        (nativeMitmEnabled()
+          ? await readTextAsync(PID_FILE)
+          : fs.readFileSync(PID_FILE, "utf-8")
+        ).trim(),
+        10
+      );
       if (savedPid && isProcessAlive(savedPid)) {
         log.info({ pid: savedPid }, "Killing MITM server by PID...");
         process.kill(savedPid, "SIGTERM");
@@ -823,7 +923,8 @@ export async function stopMitm(
   // 3. Clean up
   clearCachedPassword(); // Clear password from memory when proxy stops
   try {
-    fs.unlinkSync(PID_FILE);
+    if (nativeMitmEnabled()) await removeNativePidFile();
+    else fs.unlinkSync(PID_FILE);
   } catch (_error) {
     // Ignore
   }
@@ -835,9 +936,39 @@ export async function stopMitm(
 }
 
 export async function writeBypassJsonAsync(userPatterns?: string[]): Promise<void> {
-  writeBypassJson(Array.isArray(userPatterns) ? userPatterns : await getUserBypassPatternsAsync());
+  const patterns = Array.isArray(userPatterns) ? userPatterns : await getUserBypassPatternsAsync();
+  if (!nativeMitmEnabled()) return writeBypassJson(patterns);
+  assertNativeMitmNotAborted();
+  await mkdir(path.dirname(BYPASS_JSON_FILE), { recursive: true }).catch(() => {});
+  await writeFile(
+    BYPASS_JSON_FILE,
+    JSON.stringify({ version: 1, generatedAt: new Date().toISOString(), patterns }, null, 2)
+  );
 }
 
 export async function writeTargetsJsonAsync(targets: MitmTarget[] = ALL_TARGETS): Promise<void> {
-  writeTargetsJson(targets, await getGheCopilotHostsAsync());
+  const hosts = await getGheCopilotHostsAsync();
+  if (!nativeMitmEnabled()) return writeTargetsJson(targets, hosts);
+  assertNativeMitmNotAborted();
+  await mkdir(path.dirname(TARGETS_JSON_FILE), { recursive: true }).catch(() => {});
+  await writeFile(TARGETS_JSON_FILE, JSON.stringify(buildTargetsPayload(targets, hosts), null, 2));
+}
+
+export async function getAllAgentsStatusAsync(): Promise<AgentStatus[]> {
+  if (!nativeMitmEnabled()) return getAllAgentsStatus();
+  const agents: AgentStatus[] = [];
+  for (const target of ALL_TARGETS) {
+    agents.push({
+      id: target.id,
+      name: target.name,
+      hosts: target.hosts,
+      viability: target.viability ?? "supported",
+      detection: await detectAgentAsync(target.id),
+    });
+  }
+  return agents;
+}
+async function resolveMitmServerPathAsync(): Promise<string> {
+  const cwdPath = path.join(/* turbopackIgnore: true */ process.cwd(), "src", "mitm", "server.cjs");
+  return (await existsAsync(cwdPath)) ? cwdPath : urlPath;
 }

@@ -1,3 +1,4 @@
+import { existsAsync, nativeMitmEnabled } from "../nativeHostIo.ts";
 import path from "path";
 import fs from "fs";
 
@@ -40,4 +41,19 @@ export function decideCertMigration(
   if (hasLegacyLeaf && !hasCaPair) return "use-legacy-leaf";
 
   return "use-root-ca";
+}
+
+export async function decideCertMigrationAsync(
+  certDir: string,
+  rootCaEnabled: boolean
+): Promise<CertMigrationDecision> {
+  if (!nativeMitmEnabled()) return decideCertMigration(certDir, rootCaEnabled);
+  if (rootCaEnabled) return "use-root-ca";
+  const legacy =
+    (await existsAsync(path.join(certDir, "server.crt"))) &&
+    (await existsAsync(path.join(certDir, "server.key")));
+  const ca =
+    (await existsAsync(path.join(certDir, "ca.crt"))) &&
+    (await existsAsync(path.join(certDir, "ca.key")));
+  return legacy && !ca ? "use-legacy-leaf" : "use-root-ca";
 }

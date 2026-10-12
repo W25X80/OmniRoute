@@ -5,7 +5,7 @@
  */
 import { z } from "zod";
 import { resolveTarget } from "@/mitm/targets/index";
-import { detectAgent } from "@/mitm/detection/index";
+import { detectAgentAsync } from "@/mitm/detection/index";
 import { getAgentBridgeStateAsync, upsertAgentBridgeStateAsync } from "@/lib/db/agentBridgeState";
 import type { AgentId } from "@/mitm/types";
 import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
@@ -24,7 +24,7 @@ export async function GET(_request: Request, { params }: Params): Promise<Respon
     if (!target) {
       return createErrorResponse({ status: 404, message: `Agent not found: ${id}` });
     }
-    const detection = detectAgent(id as AgentId);
+    const detection = await detectAgentAsync(id as AgentId);
     const state = (await getAgentBridgeStateAsync(id)) ?? null;
     return Response.json({ agent: target, detection, state });
   } catch (err) {

@@ -21,18 +21,17 @@ function esmRuntimeRequire(specifier: string): unknown {
 export function runtimeRequire(specifier: string): unknown {
   const isCjs = typeof module !== "undefined" && typeof module.require === "function";
   if (isCjs) {
-    const req = module.require;
     switch (specifier) {
       case "better-sqlite3":
-        return req("better-sqlite3");
+        return module.require("better-sqlite3");
       case "node:sqlite":
-        return req("node:sqlite");
+        return module.require("node:sqlite");
       case "bun:sqlite":
-        return req("bun:sqlite");
+        return module.require("bun:sqlite");
       case "sql.js":
-        return req("sql.js");
+        return module.require("sql.js");
       case "sqlite-vec":
-        return req("sqlite-vec");
+        return module.require("sqlite-vec");
     }
   }
 

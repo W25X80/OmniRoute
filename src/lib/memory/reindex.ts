@@ -3,6 +3,7 @@
  * Used by POST /api/memory/reindex (F6).
  */
 
+import { getSelectedMemoryRepository } from "../db/memory";
 import {
   getMemoryReindexQueueAsync,
   countMemoryReindexPending,
@@ -98,7 +99,9 @@ async function reindexOneItem(
     }
 
     await vec.upsertVector(item.id, embeddingResult.vector, item.content);
-    await markMemoryNeedsReindexAsync(item.id, false);
+    // Native upsert acknowledges this content/signature in its own transaction. A later
+    // unconditional acknowledgement could clear work queued by a concurrent reset/update.
+    if (!getSelectedMemoryRepository()) await markMemoryNeedsReindexAsync(item.id, false);
     return "processed";
   } catch (err: unknown) {
     log.warn("memory.reindex.item.fail", {

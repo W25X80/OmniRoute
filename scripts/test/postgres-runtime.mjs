@@ -109,27 +109,37 @@ try {
       "-c",
       "DROP SCHEMA IF EXISTS omniroute CASCADE",
     ]);
-    const child = spawn(
-      process.execPath,
-      ["--import", "tsx/esm", "--test", "--test-concurrency=1", `tests/integration/${file}`],
-      {
-        stdio: "inherit",
-        env: {
-          ...process.env,
-          OMNIROUTE_TEST_POSTGRES_PORT: port,
-          OMNIROUTE_TEST_POSTGRES_CA: join(directory, "server.crt"),
-          OMNIROUTE_TEST_POSTGRES_KEY: join(directory, "server.key"),
-        },
-      }
-    );
-    const code = await new Promise((resolve, reject) => {
-      child.once("error", reject);
-      child.once("exit", (status) => resolve(status ?? 1));
-    });
-    if (code !== 0) failed = true;
+    // Native startup requires explicit scratch; never reuse an operator data directory.
+    const dataDir = await mkdtemp(join(directory, "suite-"));
+    try {
+      const child = spawn(
+        process.execPath,
+        ["--import", "tsx/esm", "--test", "--test-concurrency=1", `tests/integration/${file}`],
+        {
+          stdio: "inherit",
+          env: {
+            ...process.env,
+            DATA_DIR: dataDir,
+            OMNIROUTE_TEST_POSTGRES_PORT: port,
+            OMNIROUTE_TEST_POSTGRES_CA: join(directory, "server.crt"),
+            OMNIROUTE_TEST_POSTGRES_KEY: join(directory, "server.key"),
+          },
+        }
+      );
+      const code = await new Promise((resolve, reject) => {
+        child.once("error", reject);
+        child.once("exit", (status) => resolve(status ?? 1));
+      });
+      if (code !== 0) failed = true;
+    } finally {
+      await rm(dataDir, { recursive: true, force: true });
+    }
   }
   process.exitCode = failed ? 1 : 0;
 } finally {
-  if (created) run("docker", ["rm", "--force", "--volumes", name]);
-  await rm(directory, { recursive: true, force: true });
+  try {
+    if (created) run("docker", ["rm", "--force", "--volumes", name]);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 }

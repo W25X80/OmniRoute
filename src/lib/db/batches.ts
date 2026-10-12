@@ -12,7 +12,7 @@ export {
 } from "./batches/persistenceSemantics";
 import { getSelectedPostgresDatabase } from "./controlPlaneContext";
 import { getDbInstance, objToSnake } from "./core";
-import { deleteFile, deleteFileOwnedBy } from "./files";
+import { createFile, deleteFile, deleteFileOwnedBy } from "./files";
 import { v4 as uuidv4 } from "uuid";
 import { logger } from "../../../open-sse/utils/logger.ts";
 
@@ -53,6 +53,95 @@ export interface BatchRecord {
   usage?: any | null;
   outputExpiresAfterSeconds?: number | null;
   outputExpiresAfterAnchor?: string | null;
+}
+
+/** The returned row and decision belong to one acknowledged transaction. */
+export interface BatchTransitionResult {
+  changed: boolean;
+  batch: BatchRecord | null;
+}
+
+export interface BatchOutputFile {
+  filename: string;
+  content: Buffer;
+  expiresAt: number | null;
+}
+
+export type BatchCompletion = Pick<
+  BatchRecord,
+  "requestCountsTotal" | "requestCountsCompleted" | "requestCountsFailed" | "model" | "usage"
+> & { completedAt: number };
+
+/** Expected states are checked under the same lock as the write, never by a facade read. */
+export function transitionBatch(
+  id: string,
+  expectedStatuses: readonly BatchRecord["status"][],
+  updates: Partial<BatchRecord> & { status: BatchRecord["status"] },
+  discardOutputs = false
+): BatchTransitionResult {
+  return getDbInstance().transaction(() => {
+    const current = getBatch(id);
+    if (!current || !expectedStatuses.includes(current.status))
+      return { changed: false, batch: current };
+    updateBatch(id, updates);
+    if (discardOutputs) {
+      // The update clears these links first. Preserve any other surviving reference.
+      for (const fileId of new Set([current.outputFileId, current.errorFileId])) {
+        if (fileId && !isFileReferencedByOtherBatch(fileId, [])) deleteFile(fileId);
+      }
+    }
+    return { changed: true, batch: getBatch(id) };
+  })();
+}
+
+/** File rows and their completed batch links share one commit; rejection creates no files. */
+export function completeBatchWithFiles(
+  id: string,
+  completion: BatchCompletion,
+  output: BatchOutputFile | null,
+  error: BatchOutputFile | null
+): BatchTransitionResult {
+  return getDbInstance().transaction(() => {
+    const current = getBatch(id);
+    if (current?.status === "cancelling") {
+      return transitionBatch(id, ["cancelling"], {
+        status: "cancelled",
+        cancelledAt: Math.floor(Date.now() / 1000),
+      });
+    }
+    if (!current || current.status !== "finalizing") return { changed: false, batch: current };
+    const save = (file: BatchOutputFile | null) =>
+      file
+        ? createFile({
+            ...file,
+            bytes: file.content.byteLength,
+            purpose: "batch_output",
+            apiKeyId: current.apiKeyId,
+          }).id
+        : null;
+    const outputFileId = save(output);
+    const errorFileId = save(error);
+    updateBatch(id, { ...completion, status: "completed", outputFileId, errorFileId });
+    return { changed: true, batch: getBatch(id) };
+  })();
+}
+
+export async function transitionBatchAsync(
+  ...args: Parameters<typeof transitionBatch>
+): Promise<BatchTransitionResult> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return transitionBatch(...args);
+  const native = await import("./postgres/serviceBatches");
+  return database.transaction((transaction) => native.transitionBatch(transaction, ...args));
+}
+
+export async function completeBatchWithFilesAsync(
+  ...args: Parameters<typeof completeBatchWithFiles>
+): Promise<BatchTransitionResult> {
+  const database = getSelectedPostgresDatabase();
+  if (!database) return completeBatchWithFiles(...args);
+  const native = await import("./postgres/serviceBatches");
+  return database.transaction((transaction) => native.completeBatchWithFiles(transaction, ...args));
 }
 
 export type BatchItemCheckpointStatus = "pending" | "processing" | "completed" | "errored";

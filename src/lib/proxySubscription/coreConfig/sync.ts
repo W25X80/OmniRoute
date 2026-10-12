@@ -13,8 +13,15 @@
  * the writer (the write itself stays atomic either way).
  */
 import fs from "node:fs";
+import asyncFs from "node:fs/promises";
+import { parseDatabaseBackend } from "@/lib/db/backendSelection";
 import path from "node:path";
-import { readPrivateConfigFile, writePrivateConfigFile } from "@/lib/cli-helper/privateConfigFile";
+import {
+  readPrivateConfigFile,
+  readPrivateConfigFileAsync,
+  writePrivateConfigFile,
+  writePrivateConfigFileAsync,
+} from "@/lib/cli-helper/privateConfigFile";
 import { parseLocalCoreEndpoints } from "../coreEndpoint";
 import type { ParsedSubscription } from "../parse";
 import { applyRendered, type ApplyBesideReason, type RunCheck } from "./apply";
@@ -192,7 +199,8 @@ export async function generateCoreConfigIntention(
     target = (sub.coreConfigPath ?? "").trim();
     if (!target) return blank(target);
 
-    const existingText = readExisting(target);
+    const native = parseDatabaseBackend() === "postgres";
+    const existingText = native ? await readExistingAsync(target) : readExisting(target);
     if (existingText.failed) return { ...blank(target), warning: warn("read_failed") };
 
     const model = buildCoreModel(parseLocalCoreEndpoints(sub.localCoreEndpoint), [
@@ -206,8 +214,9 @@ export async function generateCoreConfigIntention(
 
     const dir = path.dirname(`${target}.generated`);
     try {
-      if (!fs.statSync(dir).isDirectory())
-        return { ...blank(target), warning: warn("write_failed") };
+      const directory =
+        parseDatabaseBackend() === "postgres" ? await asyncFs.stat(dir) : fs.statSync(dir);
+      if (!directory.isDirectory()) return { ...blank(target), warning: warn("write_failed") };
     } catch {
       return { ...blank(target), warning: warn("write_failed") };
     }
@@ -224,7 +233,9 @@ export async function generateCoreConfigIntention(
         [...model.skipped, ...rendered.resultSkipped],
         opts
       );
-    return finishBeside(sub, target, rendered.text, digest, rendered.skippedSummary);
+    return native
+      ? await finishBesideAsync(sub, target, rendered.text, digest, rendered.skippedSummary)
+      : finishBeside(sub, target, rendered.text, digest, rendered.skippedSummary);
   } catch {
     // Fixed text only: the thrown message can carry node names or addresses.
     console.warn("[ProxySubscription] core config generation failed");
@@ -357,6 +368,42 @@ function writeBeside(target: string, text: string): string | null {
   } catch {
     return warn("write_failed");
   }
+}
+
+async function readExistingAsync(
+  target: string
+): Promise<{ failed: boolean; text: string | null }> {
+  try {
+    return { failed: false, text: await readPrivateConfigFileAsync(`${target}.generated`) };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") return { failed: true, text: null };
+    try {
+      return { failed: false, text: await readPrivateConfigFileAsync(target) };
+    } catch (adoptedError) {
+      return {
+        failed: (adoptedError as NodeJS.ErrnoException).code !== "ENOENT",
+        text: null,
+      };
+    }
+  }
+}
+
+async function finishBesideAsync(
+  sub: CoreConfigSub,
+  target: string,
+  text: string,
+  digest: string | undefined,
+  skippedSummary?: SkippedSummary | null
+): Promise<CoreConfigIntention> {
+  if (sub.id && digest) setLastMembersDigest(sub.id, digest);
+  let warning: string | null;
+  try {
+    await writePrivateConfigFileAsync(`${target}.generated`, text);
+    warning = skippedSummary ? entriesSkippedWarning(skippedSummary) : null;
+  } catch {
+    warning = warn("write_failed");
+  }
+  return { status: "none", digestChanged: false, configPath: target, warning };
 }
 
 /**

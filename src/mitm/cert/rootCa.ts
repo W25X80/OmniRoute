@@ -1,3 +1,10 @@
+import { mkdir, writeFile, chmod } from "node:fs/promises";
+import {
+  nativeMitmEnabled,
+  existsAsync,
+  readTextAsync,
+  nativeMitmSignal,
+} from "../nativeHostIo.ts";
 import path from "path";
 import fs from "fs";
 import { resolveMitmDataDir } from "../dataDir.ts";
@@ -47,10 +54,16 @@ export async function loadOrCreateMitmCa(
 ): Promise<MitmCaPair> {
   const { keyPath, certPath } = caPaths(certDir);
 
-  if (fs.existsSync(keyPath) && fs.existsSync(certPath)) {
+  if (
+    nativeMitmEnabled()
+      ? (await existsAsync(keyPath)) && (await existsAsync(certPath))
+      : fs.existsSync(keyPath) && fs.existsSync(certPath)
+  ) {
     return {
-      key: fs.readFileSync(keyPath, "utf-8"),
-      cert: fs.readFileSync(certPath, "utf-8"),
+      key: nativeMitmEnabled() ? await readTextAsync(keyPath) : fs.readFileSync(keyPath, "utf-8"),
+      cert: nativeMitmEnabled()
+        ? await readTextAsync(certPath)
+        : fs.readFileSync(certPath, "utf-8"),
       keyPath,
       certPath,
     };
@@ -58,16 +71,22 @@ export async function loadOrCreateMitmCa(
 
   const ca = await generateMitmCa();
 
-  if (!fs.existsSync(certDir)) {
-    fs.mkdirSync(certDir, { recursive: true });
-  }
+  if (nativeMitmEnabled()) await mkdir(certDir, { recursive: true });
+  else if (!fs.existsSync(certDir)) fs.mkdirSync(certDir, { recursive: true });
 
-  fs.writeFileSync(keyPath, ca.key);
-  fs.writeFileSync(certPath, ca.cert);
+  if (nativeMitmEnabled()) {
+    nativeMitmSignal()?.throwIfAborted();
+    await writeFile(keyPath, ca.key, { mode: 0o600 });
+    await chmod(keyPath, 0o600);
+    await writeFile(certPath, ca.cert);
+  } else {
+    fs.writeFileSync(keyPath, ca.key);
+    fs.writeFileSync(certPath, ca.cert);
+  }
   // Owner-only read/write — the CA private key must never be group/world-
   // readable (it can sign a trusted leaf for any host). No-op on Windows,
   // which does not honor POSIX chmod bits.
-  fs.chmodSync(keyPath, 0o600);
+  if (!nativeMitmEnabled()) fs.chmodSync(keyPath, 0o600);
 
   return { key: ca.key, cert: ca.cert, keyPath, certPath };
 }

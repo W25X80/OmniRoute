@@ -1,6 +1,12 @@
+import {
+  mitmFileExists,
+  mkdirMitmDirectory,
+  readMitmFile,
+  removeMitmFile,
+  writeMitmFile,
+} from "@/mitm/nativeHostIo";
 export const runtime = "nodejs";
 
-import fs from "fs";
 import path from "path";
 import { z } from "zod";
 import { NextResponse } from "next/server";
@@ -98,9 +104,9 @@ function defaultTargets(port = DEFAULT_PORT): MitmTargetRoute[] {
   ];
 }
 
-function readConfig(): MitmConfig {
+async function readConfig(): Promise<MitmConfig> {
   try {
-    JSON.parse(fs.readFileSync(getConfigPath(), "utf8"));
+    JSON.parse(await readMitmFile(getConfigPath(), "utf8"));
     return {
       port: DEFAULT_PORT,
       targets: defaultTargets(DEFAULT_PORT),
@@ -113,15 +119,15 @@ function readConfig(): MitmConfig {
   }
 }
 
-function writeConfig() {
+async function writeConfig() {
   const mitmDir = getMitmDir();
-  fs.mkdirSync(mitmDir, { recursive: true });
-  fs.writeFileSync(getConfigPath(), JSON.stringify({ port: DEFAULT_PORT }, null, 2));
+  await mkdirMitmDirectory(mitmDir);
+  await writeMitmFile(getConfigPath(), JSON.stringify({ port: DEFAULT_PORT }, null, 2));
 }
 
-function readStats(): MitmStats {
+async function readStats(): Promise<MitmStats> {
   try {
-    const raw = JSON.parse(fs.readFileSync(getStatsPath(), "utf8"));
+    const raw = JSON.parse(await readMitmFile(getStatsPath(), "utf8"));
     return {
       startedAt: typeof raw.startedAt === "string" ? raw.startedAt : null,
       totalRequests: Number(raw.totalRequests || 0),
@@ -145,14 +151,14 @@ function readStats(): MitmStats {
 async function buildMitmResponse() {
   const { getMitmStatus, getCachedPassword } = await import("@/mitm/manager.runtime");
   const status = await getMitmStatus();
-  const config = readConfig();
-  const stats = readStats();
+  const config = await readConfig();
+  const stats = await readStats();
 
   return {
     running: status.running,
     pid: status.pid || null,
     dnsConfigured: status.dnsConfigured || false,
-    certExists: status.certExists || fs.existsSync(getCertPath()),
+    certExists: status.certExists || (await mitmFileExists(getCertPath())),
     hasCachedPassword: !!getCachedPassword(),
     port: config.port,
     targets: config.targets,
@@ -168,10 +174,10 @@ export async function GET(request: Request) {
     const { searchParams } = new URL(request.url);
     if (searchParams.get("download") === "cert") {
       const certPath = getCertPath();
-      if (!fs.existsSync(certPath)) {
+      if (!(await mitmFileExists(certPath))) {
         return NextResponse.json({ error: "MITM certificate not found" }, { status: 404 });
       }
-      return new NextResponse(fs.readFileSync(certPath), {
+      return new NextResponse(Uint8Array.from(await readMitmFile(certPath)), {
         headers: {
           "Content-Type": "application/x-pem-file",
           "Content-Disposition": 'attachment; filename="omniroute-mitm-ca.crt"',
@@ -199,7 +205,7 @@ export async function PUT(request: Request) {
       return NextResponse.json({ error: parsed.error.flatten() }, { status: 400 });
     }
 
-    const config = readConfig();
+    const config = await readConfig();
     if (parsed.data.port !== undefined && parsed.data.port !== DEFAULT_PORT) {
       return NextResponse.json({ error: MITM_PORT_ERROR }, { status: 400 });
     }
@@ -207,7 +213,7 @@ export async function PUT(request: Request) {
     if (parsed.data.port !== undefined) {
       config.port = DEFAULT_PORT;
       config.targets = defaultTargets(config.port);
-      writeConfig();
+      await writeConfig();
     }
 
     if (typeof parsed.data.enabled === "boolean") {
@@ -268,7 +274,7 @@ export async function POST(request: Request) {
 
     for (const filePath of [getCertPath(), getKeyPath()]) {
       try {
-        if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+        if (await mitmFileExists(filePath)) await removeMitmFile(filePath);
       } catch {
         /* ignore */
       }

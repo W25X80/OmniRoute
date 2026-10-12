@@ -1,3 +1,4 @@
+import { nativeMitmEnabled, existsAsync, readTextAsync } from "./nativeHostIo.ts";
 /**
  * Upstream CA certificate configuration for corporate network environments.
  * Configures undici's global dispatcher to trust a custom CA when connecting
@@ -28,12 +29,21 @@ export function configureUpstreamCa(pemPath?: string): void {
 
   if (!existsSync(pemPath)) {
     // Safe error: message only contains the user-supplied path (no stack trace).
-    throw new Error(
-      `AGENTBRIDGE_UPSTREAM_CA_CERT path does not exist: ${pemPath}`,
-    );
+    throw new Error(`AGENTBRIDGE_UPSTREAM_CA_CERT path does not exist: ${pemPath}`);
   }
 
   const ca = readFileSync(pemPath, "utf8");
+  const require = createRequire(import.meta.url);
+  const { Agent, setGlobalDispatcher } = require("undici") as typeof import("undici");
+  setGlobalDispatcher(new Agent({ connect: { ca } }));
+}
+
+export async function configureUpstreamCaAsync(pemPath?: string): Promise<void> {
+  if (!nativeMitmEnabled()) return configureUpstreamCa(pemPath);
+  if (!pemPath) return;
+  if (!(await existsAsync(pemPath)))
+    throw new Error(`AGENTBRIDGE_UPSTREAM_CA_CERT path does not exist: ${pemPath}`);
+  const ca = await readTextAsync(pemPath);
   const require = createRequire(import.meta.url);
   const { Agent, setGlobalDispatcher } = require("undici") as typeof import("undici");
   setGlobalDispatcher(new Agent({ connect: { ca } }));

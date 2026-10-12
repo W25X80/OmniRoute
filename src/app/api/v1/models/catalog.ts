@@ -337,6 +337,10 @@ async function buildUnifiedModelsResponseCore(
     });
     if (authRejection) return authRejection;
 
+    if (getSelectedPostgresDatabase() && isCcDiscoveryModelCatalogClient(request)) {
+      void incrementCcDiscoveryHitCountAsync();
+    }
+
     // #9147: yield after auth check before DB initialization prologue
     await yieldCatalogBuildTurn();
 

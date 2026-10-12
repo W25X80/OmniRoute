@@ -1,3 +1,4 @@
+import { mitmFileExists } from "@/mitm/nativeHostIo";
 /**
  * GET /api/tools/agent-bridge/diagnose
  *
@@ -14,16 +15,15 @@
  */
 import net from "node:net";
 import path from "node:path";
-import fs from "node:fs";
 import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
 import { createErrorResponse } from "@/lib/api/errorResponse";
 import { getMitmStatus } from "@/mitm/manager";
 import { checkCertInstalled } from "@/mitm/cert/install";
-import { resolveActiveCertPath } from "@/mitm/cert/activeCert";
+import { resolveActiveCertPathAsync } from "@/mitm/cert/activeCert";
 import { resolveMitmDataDir } from "@/mitm/dataDir";
 import { summarizeDiagnostics } from "@/mitm/inspector/diagnostics";
 import { getAllAgentBridgeStatesAsync } from "@/lib/db/agentBridgeState";
-import { checkDNSEntryForAgent } from "@/mitm/dns/dnsConfig";
+import { checkDNSEntryForAgentAsync } from "@/mitm/dns/dnsConfig";
 
 /** Best-effort TCP reachability probe; resolves false on error/timeout. */
 function probeTcp(port: number, host = "127.0.0.1", timeoutMs = 1500): Promise<boolean> {
@@ -52,8 +52,8 @@ export async function GET(request: Request): Promise<Response> {
     // hard-coding the legacy server.crt path.
     const certDir = path.join(resolveMitmDataDir(), "mitm");
     const rootCaEnabled = process.env.MITM_ROOT_CA_ENABLED === "true";
-    const { certPath } = resolveActiveCertPath(certDir, rootCaEnabled);
-    const certExists = fs.existsSync(certPath);
+    const { certPath } = await resolveActiveCertPathAsync(certDir, rootCaEnabled);
+    const certExists = await mitmFileExists(certPath);
     const certTrusted = certExists ? await checkCertInstalled(certPath) : false;
     const port =
       Number(process.env.MITM_LOCAL_PORT) > 0 ? Number(process.env.MITM_LOCAL_PORT) : 443;
@@ -65,9 +65,13 @@ export async function GET(request: Request): Promise<Response> {
     if (!agentId) {
       // Check if ANY agent has DNS configured (aggregate view)
       const agentStates = await getAllAgentBridgeStatesAsync();
-      dnsConfigured =
-        agentStates.length > 0 &&
-        agentStates.some((s) => s.dns_enabled && checkDNSEntryForAgent(s.agent_id));
+      dnsConfigured = false;
+      for (const state of agentStates) {
+        if (state.dns_enabled && (await checkDNSEntryForAgentAsync(state.agent_id))) {
+          dnsConfigured = true;
+          break;
+        }
+      }
     }
 
     const report = summarizeDiagnostics({

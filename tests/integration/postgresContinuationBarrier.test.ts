@@ -938,6 +938,40 @@ test(
       assert.equal((await continueFrom(5)).found, true);
       await eventually(() => upstreamCancelled.has(5));
       assert.equal(upstreamCancelled.has(5), true);
+      // The upstream EOF is still held: cancellation must finish the actual SSE
+      // accounting owner, not synthesize a 499 after the disconnect grace period.
+      await eventually(async () => {
+        const counts = await verification!.transaction((tx) =>
+          tx.query<{ count: string }>(
+            "SELECT COUNT(*)::text AS count FROM omniroute.request_cost_ledger WHERE api_key_id=$1",
+            [completedKey]
+          )
+        );
+        return counts.rows[0].count === "1";
+      });
+      const terminalAccounting = await verification!.transaction(async (tx) => ({
+        usage: (
+          await tx.query(
+            "SELECT status,success,tokens_input,tokens_output FROM omniroute.usage_history WHERE api_key_id=$1",
+            [completedKey]
+          )
+        ).rows,
+        logs: (
+          await tx.query(
+            "SELECT status,tokens_in,tokens_out FROM omniroute.call_logs WHERE api_key_id=$1",
+            [completedKey]
+          )
+        ).rows,
+      }));
+      assert.equal(terminalAccounting.usage.length, 1);
+      assert.equal(String(terminalAccounting.usage[0].status), "200");
+      assert.equal(Number(terminalAccounting.usage[0].success), 1);
+      assert.equal(Number(terminalAccounting.usage[0].tokens_input), 105);
+      assert.equal(Number(terminalAccounting.usage[0].tokens_output), 10);
+      assert.equal(terminalAccounting.logs.length, 1);
+      assert.equal(Number(terminalAccounting.logs[0].status), 200);
+      assert.equal(Number(terminalAccounting.logs[0].tokens_in), 105);
+      assert.equal(Number(terminalAccounting.logs[0].tokens_out), 10);
       await runtime!.runPersistenceRequest(() =>
         apiKeys!.updateApiKeyPermissions(completedKey, { noLog: true })
       );

@@ -1,5 +1,12 @@
 import { v4 as uuidv4 } from "uuid";
-import type { BatchRecord, BatchItemCheckpoint, DeleteCompletedBatchesScope } from "../batches";
+import type {
+  BatchRecord,
+  BatchItemCheckpoint,
+  DeleteCompletedBatchesScope,
+  BatchTransitionResult,
+  BatchCompletion,
+  BatchOutputFile,
+} from "../batches";
 import {
   parseBatchRow,
   parseBatchItemCheckpoint,
@@ -9,7 +16,7 @@ import {
 import { objToSnake } from "../caseMapping";
 import type { PostgresDatabase, PostgresTransaction } from "./database";
 import { affected, first, rows, safeInteger, lockServices, placeholders } from "./serviceQuery";
-import { deleteFile, deleteFileOwnedBy } from "./serviceFiles";
+import { createFile, deleteFile, deleteFileOwnedBy } from "./serviceFiles";
 
 const BATCH_COLUMNS = new Set([
   "id",
@@ -107,6 +114,67 @@ export async function updateBatch(
     )) > 0
   );
 }
+/** Lock order is the existing files-batches advisory lock, then file content row locks. */
+export async function transitionBatch(
+  transaction: PostgresTransaction,
+  id: string,
+  expectedStatuses: readonly BatchRecord["status"][],
+  updates: Partial<BatchRecord> & { status: BatchRecord["status"] },
+  discardOutputs = false
+): Promise<BatchTransitionResult> {
+  await lockServices(transaction);
+  const current = await getBatch(transaction, id);
+  if (!current || !expectedStatuses.includes(current.status))
+    return { changed: false, batch: current };
+  await updateBatch(transaction, id, updates);
+  if (discardOutputs) {
+    for (const fileId of new Set([current.outputFileId, current.errorFileId])) {
+      if (fileId && !(await isFileReferencedByOtherBatch(transaction, fileId, [])))
+        await deleteFile(transaction, fileId);
+    }
+  }
+  return { changed: true, batch: await getBatch(transaction, id) };
+}
+
+/** No provider I/O: both result files and their links commit with the terminal state. */
+export async function completeBatchWithFiles(
+  transaction: PostgresTransaction,
+  id: string,
+  completion: BatchCompletion,
+  output: BatchOutputFile | null,
+  error: BatchOutputFile | null
+): Promise<BatchTransitionResult> {
+  await lockServices(transaction);
+  const current = await getBatch(transaction, id);
+  if (current?.status === "cancelling") {
+    return transitionBatch(transaction, id, ["cancelling"], {
+      status: "cancelled",
+      cancelledAt: Math.floor(Date.now() / 1000),
+    });
+  }
+  if (!current || current.status !== "finalizing") return { changed: false, batch: current };
+  const save = async (file: BatchOutputFile | null) =>
+    file
+      ? (
+          await createFile(transaction, {
+            ...file,
+            bytes: file.content.byteLength,
+            purpose: "batch_output",
+            apiKeyId: current.apiKeyId,
+          })
+        ).id
+      : null;
+  const outputFileId = await save(output);
+  const errorFileId = await save(error);
+  await updateBatch(transaction, id, {
+    ...completion,
+    status: "completed",
+    outputFileId,
+    errorFileId,
+  });
+  return { changed: true, batch: await getBatch(transaction, id) };
+}
+
 export async function ensureBatchItemCheckpoints(
   transaction: PostgresTransaction,
   batchId: string,

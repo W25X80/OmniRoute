@@ -1,5 +1,5 @@
 import os from "os";
-import { isSudoPasswordRequired } from "./dns/dnsConfig.ts";
+import { isSudoPasswordRequired, isSudoPasswordRequiredAsync } from "./dns/dnsConfig.ts";
 import { isRoot } from "./systemCommands.ts";
 
 /** Trim and treat whitespace-only sudo passwords as missing (#7865 review). */
@@ -33,4 +33,10 @@ export function isMitmSudoPasswordRequired(sudoPassword: string): boolean {
 /** Whether cert trust / DNS provisioning may run (inverse of the hard gate). */
 export function canRunPrivilegedMitmSteps(sudoPassword: string): boolean {
   return !isMitmSudoPasswordRequired(sudoPassword);
+}
+
+export async function isMitmSudoPasswordRequiredAsync(sudoPassword: string): Promise<boolean> {
+  if (os.platform() === "win32" || isRoot() || normalizeMitmSudoPasswordInput(sudoPassword))
+    return false;
+  return isSudoPasswordRequiredAsync();
 }

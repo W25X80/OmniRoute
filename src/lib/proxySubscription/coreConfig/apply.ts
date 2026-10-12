@@ -14,9 +14,17 @@
 import { execFile } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import fs from "node:fs";
+import asyncFs from "node:fs/promises";
+import { parseDatabaseBackend } from "@/lib/db/backendSelection";
+import { createKeyedMutex } from "@/shared/utils/keyedMutex";
 import path from "node:path";
 import { promisify } from "node:util";
-import { readPrivateConfigFile, writePrivateConfigFile } from "@/lib/cli-helper/privateConfigFile";
+import {
+  readPrivateConfigFile,
+  readPrivateConfigFileAsync,
+  writePrivateConfigFile,
+  writePrivateConfigFileAsync,
+} from "@/lib/cli-helper/privateConfigFile";
 import { checkArgsFor } from "./pathGuard";
 
 export type ApplyBesideReason =
@@ -100,14 +108,28 @@ function stderrHead(stderr: unknown): string {
  * (or, when the adopted file is absent and every rename succeeds, creates
  * it directly from a checked candidate).
  */
+const NATIVE_CORE_APPLY = Symbol.for("omniroute.proxySubscriptions.coreApply");
+const applyGlobals = globalThis as typeof globalThis & {
+  [NATIVE_CORE_APPLY]?: ReturnType<typeof createKeyedMutex<ApplyOutcome>>;
+};
+
 export async function applyRendered(opts: ApplyRenderedOptions): Promise<ApplyOutcome> {
+  if (parseDatabaseBackend() !== "postgres") return applyRenderedWithFiles(opts, false);
+  const mutex = (applyGlobals[NATIVE_CORE_APPLY] ??= createKeyedMutex<ApplyOutcome>());
+  return mutex.run(path.resolve(opts.adoptedPath), () => applyRenderedWithFiles(opts, true));
+}
+
+async function applyRenderedWithFiles(
+  opts: ApplyRenderedOptions,
+  native: boolean
+): Promise<ApplyOutcome> {
   const deps = resolveDeps(opts);
   // (a) no binary configured: nothing to verify against, so write beside only.
   if (!opts.binaryPath || !opts.binaryPath.trim()) {
     return { status: "beside", beside: "no_binary" };
   }
   // (b) already current: skip before any write or fork, so mtime is intact.
-  const current = readAdopted(opts);
+  const current = native ? await readAdoptedAsync(opts) : readAdopted(opts);
   if (current.failed) return { status: "beside", beside: "write_failed" };
   if (current.text === opts.renderedText) {
     return { status: "beside", beside: "unchanged_skip" };
@@ -116,16 +138,19 @@ export async function applyRendered(opts: ApplyRenderedOptions): Promise<ApplyOu
   // rename is atomic. The random suffix keeps concurrent subscriptions on a
   // shared path from colliding (per-id sync dedup does not cover cross-id).
   const candidate = `${opts.adoptedPath}.check.${process.pid}.${randomBytes(8).toString("hex")}`;
-  if (!writeCandidate(opts, candidate)) {
+  if (!(native ? await writeCandidateAsync(opts, candidate) : writeCandidate(opts, candidate))) {
     return { status: "beside", beside: "write_failed" };
   }
   try {
-    const checked = await runNativeCheck(opts, opts.binaryPath, candidate, deps);
+    const checked = await runNativeCheck(opts, opts.binaryPath, candidate, deps, native);
     if (!checked.ok) return (checked as { ok: false; outcome: ApplyOutcome }).outcome;
-    return swapCandidate(opts, candidate, current, deps);
+    return native
+      ? await swapCandidateAsync(opts, candidate, current)
+      : swapCandidate(opts, candidate, current, deps);
   } finally {
     try {
-      deps.unlinkSync(candidate);
+      if (native) await asyncFs.unlink(candidate);
+      else deps.unlinkSync(candidate);
     } catch {
       // The candidate is already gone on the success path.
     }
@@ -195,11 +220,13 @@ async function runNativeCheck(
   opts: ApplyRenderedOptions,
   binaryPath: string,
   candidate: string,
-  deps: CheckDeps
+  deps: CheckDeps,
+  native: boolean
 ): Promise<{ ok: true } | { ok: false; outcome: ApplyOutcome }> {
   let executable = false;
   try {
-    fs.accessSync(binaryPath, fs.constants.X_OK);
+    if (native) await asyncFs.access(binaryPath, fs.constants.X_OK);
+    else fs.accessSync(binaryPath, fs.constants.X_OK);
     executable = true;
   } catch {
     executable = false;
@@ -328,5 +355,81 @@ function restoreBackup(
       opts.subscriptionId,
       `replace failed and restore failed (${(restoreError as Error).message})`
     );
+  }
+}
+
+async function writeCandidateAsync(
+  opts: ApplyRenderedOptions,
+  candidate: string
+): Promise<boolean> {
+  try {
+    await writePrivateConfigFileAsync(candidate, opts.renderedText);
+    return true;
+  } catch (error) {
+    warn(opts.subscriptionId, `cannot write candidate (${(error as Error).message})`);
+    return false;
+  }
+}
+
+async function readAdoptedAsync(opts: ApplyRenderedOptions): Promise<AdoptedState> {
+  try {
+    const text = await readPrivateConfigFileAsync(opts.adoptedPath);
+    let mode: number | null = null;
+    try {
+      mode = (await asyncFs.stat(opts.adoptedPath)).mode & 0o777;
+    } catch {
+      mode = null;
+    }
+    return { text, mode, failed: false };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT")
+      return { text: null, mode: null, failed: false };
+    warn(opts.subscriptionId, `cannot read adopted file (${(error as Error).message})`);
+    return { text: null, mode: null, failed: true };
+  }
+}
+
+async function swapCandidateAsync(
+  opts: ApplyRenderedOptions,
+  candidate: string,
+  current: AdoptedState
+): Promise<ApplyOutcome> {
+  const previous = `${opts.adoptedPath}.prev`;
+  let backedUp = false;
+  try {
+    if (current.text !== null && current.mode !== null)
+      await asyncFs.chmod(candidate, current.mode);
+    if (current.text !== null) {
+      await asyncFs.rename(opts.adoptedPath, previous);
+      backedUp = true;
+    }
+    await asyncFs.rename(candidate, opts.adoptedPath);
+  } catch (error) {
+    if (backedUp) {
+      try {
+        await asyncFs.rename(previous, opts.adoptedPath);
+      } catch (restoreError) {
+        warn(
+          opts.subscriptionId,
+          `replace failed and restore failed (${(restoreError as Error).message})`
+        );
+      }
+    }
+    warn(opts.subscriptionId, `replace failed (${(error as Error).message})`);
+    return { status: "beside", beside: "write_failed" };
+  }
+  await removeSubscriptionSideFilesAsync(opts.adoptedPath, opts.subscriptionId);
+  return { status: "replaced" };
+}
+
+export async function removeSubscriptionSideFilesAsync(
+  adoptedPath: string | null | undefined,
+  subscriptionId: string
+): Promise<void> {
+  if (typeof adoptedPath !== "string" || !adoptedPath.trim()) return;
+  try {
+    await asyncFs.unlink(`${adoptedPath.trim()}.generated`);
+  } catch {
+    warn(subscriptionId, "cannot remove stale beside copy");
   }
 }

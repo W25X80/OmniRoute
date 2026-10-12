@@ -23,6 +23,8 @@ import { sanitizeTimingMs } from "@omniroute/open-sse/utils/timingMs.ts";
 // Queries
 // ---------------------------------------------------------------------------
 
+const PROXY_LOG_TIMING_FIELDS = ["headers_ms", "first_chunk_ms"];
+
 /**
  * Returns all proxy_logs rows with timestamp >= `since`, ordered by timestamp
  * descending (most recent first).
@@ -36,7 +38,8 @@ export async function exportProxyLogsSince(
   return (await queryNamedUsageRows(
     database,
     "SELECT * FROM omniroute.proxy_logs WHERE timestamp >= @since ORDER BY timestamp DESC,id DESC",
-    { since }
+    { since },
+    PROXY_LOG_TIMING_FIELDS
   )) as Record<string, unknown>[];
 }
 
@@ -99,7 +102,8 @@ export async function* iterateProxyLogsSince(
     const page = (await queryNamedUsageRows(
       database,
       "SELECT * FROM omniroute.proxy_logs WHERE timestamp >= @since ORDER BY timestamp DESC,id DESC LIMIT @pageLimit OFFSET @offset",
-      { since, pageLimit, offset }
+      { since, pageLimit, offset },
+      PROXY_LOG_TIMING_FIELDS
     )) as Record<string, unknown>[];
     if (page.length === 0) break;
     for (const row of page) {

@@ -1,3 +1,4 @@
+import { mitmFileExists } from "@/mitm/nativeHostIo";
 /**
  * GET  /api/tools/agent-bridge/cert   — cert status
  * POST /api/tools/agent-bridge/cert   — trust (install) the cert
@@ -8,12 +9,11 @@ import { installCertResult, uninstallCert, checkCertInstalled } from "@/mitm/cer
 import { resolveMitmDataDir } from "@/mitm/dataDir";
 import { getCachedPassword, setCachedPassword } from "@/mitm/manager";
 import {
-  isMitmSudoPasswordRequired,
+  isMitmSudoPasswordRequiredAsync,
   normalizeMitmSudoPasswordInput,
   resolveMitmSudoPassword,
 } from "@/mitm/sudoGate";
 import path from "path";
-import fs from "fs";
 import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
 import { createErrorResponse } from "@/lib/api/errorResponse";
 
@@ -30,7 +30,7 @@ function certPath(): string {
 export async function GET(): Promise<Response> {
   try {
     const crtPath = certPath();
-    const exists = fs.existsSync(crtPath);
+    const exists = await mitmFileExists(crtPath);
     const trusted = exists ? await checkCertInstalled(crtPath) : false;
     return Response.json({ exists, trusted, path: exists ? crtPath : null });
   } catch (err) {
@@ -47,13 +47,13 @@ export async function POST(request: Request): Promise<Response> {
     getCachedPassword()
   );
 
-  if (isMitmSudoPasswordRequired(sudoPassword)) {
+  if (await isMitmSudoPasswordRequiredAsync(sudoPassword)) {
     return createErrorResponse({ status: 400, message: "Missing sudoPassword" });
   }
 
   try {
     const crtPath = certPath();
-    if (!fs.existsSync(crtPath)) {
+    if (!(await mitmFileExists(crtPath))) {
       return createErrorResponse({
         status: 404,
         message: "Certificate not found. Generate one first.",
@@ -105,13 +105,13 @@ export async function DELETE(request: Request): Promise<Response> {
     getCachedPassword()
   );
 
-  if (isMitmSudoPasswordRequired(sudoPassword)) {
+  if (await isMitmSudoPasswordRequiredAsync(sudoPassword)) {
     return createErrorResponse({ status: 400, message: "Missing sudoPassword" });
   }
 
   try {
     const crtPath = certPath();
-    if (!fs.existsSync(crtPath)) {
+    if (!(await mitmFileExists(crtPath))) {
       // No cert on disk → nothing to untrust. Idempotent success.
       return Response.json({ ok: true, trusted: false });
     }

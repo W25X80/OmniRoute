@@ -140,10 +140,17 @@ const VALID_TRANSITIONS: Record<TaskState, TaskState[]> = {
 
 // ============ Task Manager ============
 
+interface TaskPersistenceOutcome {
+  settled: Promise<void>;
+  failed: boolean;
+  error?: unknown;
+}
+
 export class A2ATaskManager {
   private tasks = new Map<string, A2ATask>();
   private persistenceQueue: Promise<void> | undefined;
-  private persistenceFailure: unknown;
+  // Task objects leave the strong live map on TTL cleanup; their outcomes can then be collected.
+  private taskPersistence = new WeakMap<A2ATask, TaskPersistenceOutcome>();
   private pendingPurge: Promise<void> | undefined;
   private shuttingDown = false;
   private readonly runtimeAuthority = getAgentRuntimeAuthority();
@@ -181,9 +188,8 @@ export class A2ATaskManager {
   }
 
   /**
-   * Persist a task's current state to the history tables (Task C2). Best-effort: any failure
-   * (SQLite unavailable, schema drift, …) is logged and swallowed — the in-memory `Map` stays
-   * the source of truth for live tasks, and this call must never break the caller's write path.
+   * Keep synchronous live transitions. SQLite history remains best-effort; native callers
+   * acknowledge their task's accepted transition through flushPersistence(task.id).
    */
   private persist(task: A2ATask, eventType: string, message?: string): void {
     // Freeze the mutable live task now, before an asynchronous predecessor finishes.
@@ -199,7 +205,13 @@ export class A2ATaskManager {
       completedAt: TERMINAL.has(task.state) ? task.updatedAt : null,
     };
     const dataJson = message ? JSON.stringify({ message }) : undefined;
+    const previous = this.taskPersistence.get(task);
+    const outcome: TaskPersistenceOutcome = { settled: Promise.resolve(), failed: false };
+    if (this.durablePersistence) this.taskPersistence.set(task, outcome);
     const work = (): void | Promise<void> => {
+      // The preceding outcome has settled before this serialized work starts. Never overwrite
+      // an uncertain/failed transition with a later state or silently replay the same task.
+      if (this.durablePersistence && previous?.failed) throw previous.error;
       if (this.persistence.persist) return this.persistence.persist(row, eventType, dataJson);
       const upsert = this.persistence.upsert(row);
       if (upsert && typeof upsert.then === "function")
@@ -207,13 +219,17 @@ export class A2ATaskManager {
       return this.persistence.appendEvent(task.id, eventType, dataJson);
     };
     const failed = (err: unknown) => {
-      if (this.durablePersistence) this.persistenceFailure ??= err;
+      if (this.durablePersistence) {
+        outcome.failed = true;
+        outcome.error = err;
+      }
       log.warn("a2a task history persist failed", { err, taskId: task.id, eventType });
     };
     try {
       const result = this.persistenceQueue ? this.persistenceQueue.then(work) : work();
       if (result && typeof result.then === "function") {
         const pending = result.catch(failed);
+        outcome.settled = pending;
         this.persistenceQueue = pending;
         void pending.finally(() => {
           if (this.persistenceQueue === pending) this.persistenceQueue = undefined;
@@ -224,10 +240,21 @@ export class A2ATaskManager {
     }
   }
 
-  /** Await queued history without changing the synchronous live-task state API. */
-  async flushPersistence(): Promise<void> {
-    await this.persistenceQueue;
-    if (this.persistenceFailure) throw this.persistenceFailure;
+  /** Capture before awaiting: later writes cannot replace another caller's accepted outcome. */
+  async flushPersistence(taskId?: string): Promise<void> {
+    if (!this.durablePersistence) {
+      await this.persistenceQueue;
+      return;
+    }
+    const task = taskId === undefined ? undefined : this.tasks.get(taskId);
+    if (taskId !== undefined && !task) throw new Error(`Task ${taskId} not found`);
+    const outcomes = (task ? [task] : [...this.tasks.values()])
+      .map((acceptedTask) => this.taskPersistence.get(acceptedTask))
+      .filter((outcome): outcome is TaskPersistenceOutcome => outcome !== undefined);
+    const queued = taskId === undefined ? this.persistenceQueue : undefined;
+    await Promise.all([queued, ...outcomes.map((outcome) => outcome.settled)]);
+    const failed = outcomes.find((outcome) => outcome.failed);
+    if (failed) throw failed.error;
   }
 
   /**
