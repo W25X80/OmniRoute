@@ -263,12 +263,15 @@ test(
           const global = await lookup(id);
           assert.equal(global.level, "global");
           assert.equal(host(await lookup(id)), host(global));
-          await database.transaction((tx) =>
-            tx.query("INSERT INTO omniroute.combos(id,data) VALUES('stable-combo',$1)", [
-              JSON.stringify({ models: ["grok-web/model"] }),
-            ])
+          const combo = await planes[0].run((binding) =>
+            binding.combos!.create({
+              id: "stable-combo",
+              name: "Stable egress combo",
+              models: ["grok-web/model"],
+            })
           );
-          await repository.addToPool("combo", "stable-combo", [b.id, c.id]);
+          assert.equal(typeof combo.id, "string");
+          await repository.addToPool("combo", String(combo.id), [b.id, c.id]);
           assert.equal((await lookup(id)).level, "combo");
           await repository.addToPool("provider", "grok-web", [a.id, c.id]);
           const provider = await lookup(id);

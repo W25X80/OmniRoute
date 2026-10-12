@@ -62,6 +62,8 @@ test(
     const database = await createTestPostgresDatabase({
       maxConnections: 8,
       lockTimeoutMs: 10_000,
+      statementTimeoutMs: 12_000,
+      queryTimeoutMs: 13_000,
       transactionTimeoutMs: 20_000,
     });
     const savedKey = process.env.STORAGE_ENCRYPTION_KEY;

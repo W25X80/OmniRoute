@@ -113,14 +113,14 @@ test(
           return body as Analytics;
         });
       });
-    const assertCosts = (body: Analytics, expected: number) => {
+    const assertCosts = (body: Analytics, expected: number, expectedSevenDay = expected) => {
       assert.equal(body.summary.totalCost, expected);
       for (const rows of [body.dailyTrend, body.byModel, body.byProvider, body.byServiceTier])
         assert.equal(
           rows.reduce((sum, row) => sum + row.cost, 0),
           expected
         );
-      assert.equal(body.presetSummaries["7d"].totalCost, expected);
+      assert.equal(body.presetSummaries["7d"].totalCost, expectedSevenDay);
     };
 
     try {
@@ -213,13 +213,57 @@ test(
           assert.equal((await analytics()).byModel[0].avgLatencyMs, 0);
 
           await reset();
+          const legacyCutoffDate = await plane!.run((binding) =>
+            withPostgresCatalogSnapshot(binding.database!, async () => {
+              const { getUserDatabaseSettings } =
+                await import("../../src/lib/db/databaseSettings.ts");
+              const cutoff = new Date();
+              cutoff.setDate(
+                cutoff.getDate() - (getUserDatabaseSettings().retention?.usageHistory ?? 30)
+              );
+              return cutoff.toISOString().slice(0, 10);
+            })
+          );
+          // Legacy summaries are admitted only before the route's retention cutoff.
+          // This fixture must also be outside 7d: all-range and preset costs differ.
+          const legacyDay = new Date(
+            Math.min(
+              Date.parse(`${legacyCutoffDate}T00:00:00.000Z`) - 2 * 86_400_000,
+              Date.now() - 9 * 86_400_000
+            )
+          )
+            .toISOString()
+            .slice(0, 10);
+          assert.ok(legacyDay < legacyCutoffDate);
+          const ineligibleDay = new Date(
+            Date.parse(`${legacyCutoffDate}T00:00:00.000Z`) + 2 * 86_400_000
+          )
+            .toISOString()
+            .slice(0, 10);
           await database.transaction((tx) =>
             tx.query(
-              "INSERT INTO omniroute.daily_usage_summary(provider,model,date,total_requests,total_input_tokens,total_cost) VALUES('openai','partial-cost-model',$1,2,3,0)",
-              [twoDaysAgo]
+              // A recent legacy-only row must stay excluded even when its price is zero.
+              "INSERT INTO omniroute.daily_usage_summary(provider,model,date,total_requests,total_input_tokens,total_cost) VALUES('openai','partial-cost-model',$1,2,3,0),('openai','partial-cost-model',$2,99,99,0)",
+              [legacyDay, ineligibleDay]
             )
           );
-          assertCosts(await analytics(), 3 /* legacy zero cost retains pricing fallback */);
+          const legacySource = buildUnifiedSource({
+            ...sourceOptions,
+            rawCutoffDate: legacyCutoffDate,
+          });
+          const legacyOperands = await getModelUsageRows(
+            database,
+            legacySource.unifiedSource,
+            legacySource.unifiedParams
+          );
+          assert.equal(legacyOperands.length, 1);
+          assert.equal(legacyOperands[0].isAggregated, 1);
+          assert.equal(legacyOperands[0].storedCost, 0);
+          assert.equal(legacyOperands[0].promptTokens, 3);
+          const legacyBody = await analytics();
+          assertCosts(legacyBody, 3, 0);
+          assert.equal(legacyBody.summary.totalRequests, 2);
+          assert.equal(legacyBody.summary.totalTokens, 3);
 
           await reset();
           await archived(yesterday, 5, 500, 5, "claude");
