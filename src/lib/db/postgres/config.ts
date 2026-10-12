@@ -23,7 +23,8 @@ const configurationSchema = z
     statementTimeoutMs: milliseconds.default(5_000),
     lockTimeoutMs: milliseconds.default(1_000),
     queryTimeoutMs: milliseconds.default(6_000),
-    transactionTimeoutMs: milliseconds.default(15_000),
+    // Offline history imports can require a longer transaction; live defaults stay unchanged.
+    transactionTimeoutMs: z.number().int().min(1).max(1_800_000).default(15_000),
     idleInTransactionTimeoutMs: milliseconds.default(5_000),
   })
   .strict()

@@ -51,6 +51,12 @@ import {
   type OfflineArtifactMapping,
   type OfflineArtifactCheckpoint,
 } from "../../src/lib/db/postgres/applicationImportArtifacts.ts";
+import {
+  APPLICATION_ROW_LIMITS,
+  ApplicationRowCarrierError,
+  type ApplicationRowSink,
+  type ApplicationRowSource,
+} from "../../src/lib/db/postgres/applicationRowCarrier.ts";
 
 const digest = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("hex");
 const objectSchema = z
@@ -223,6 +229,48 @@ function carrierSource(filename: string): NativeBlobSource {
     },
   };
 }
+function rowCarrierSink(filename: string): ApplicationRowSink {
+  const root = path.join(path.dirname(path.resolve(filename)), "rows");
+  mkdirSync(root, { mode: 0o700 });
+  const directories = new Set<string>();
+  return {
+    writeChunk(id, index, bytes) {
+      if (
+        !/^[0-9a-f-]{36}$/.test(id) ||
+        !Number.isSafeInteger(index) ||
+        index < 0 ||
+        index >= APPLICATION_ROW_LIMITS.chunks ||
+        bytes.byteLength > APPLICATION_ROW_LIMITS.chunkBytes
+      )
+        throw new ApplicationRowCarrierError("limits");
+      const folder = path.join(root, id);
+      if (!directories.has(id)) {
+        mkdirSync(folder, { mode: 0o700 });
+        directories.add(id);
+      }
+      writeFileSync(path.join(folder, `${index}.json`), bytes, { mode: 0o600, flag: "wx" });
+    },
+  };
+}
+function rowCarrierSource(filename: string): ApplicationRowSource {
+  const root = path.dirname(path.resolve(filename));
+  return {
+    async readChunk(id, index) {
+      if (
+        !/^[0-9a-f-]{36}$/.test(id) ||
+        !Number.isSafeInteger(index) ||
+        index < 0 ||
+        index >= APPLICATION_ROW_LIMITS.chunks
+      )
+        throw new ApplicationRowCarrierError("verification");
+      try {
+        return await localArtifact(root, `rows/${id}/${index}.json`);
+      } catch {
+        throw new ApplicationRowCarrierError("verification");
+      }
+    },
+  };
+}
 async function main(): Promise<void> {
   const { values } = parseArgs({
     allowPositionals: false,
@@ -233,6 +281,7 @@ async function main(): Promise<void> {
       "artifact-dir": { type: "string" },
       offline: { type: "boolean", default: false },
       "large-files": { type: "boolean", default: false },
+      "large-rows": { type: "boolean", default: false },
       "memory-budget-mib": { type: "string" },
     },
   });
@@ -250,7 +299,10 @@ async function main(): Promise<void> {
     const source = openOfflineSqliteSource(values.source, { largeFiles: values["large-files"] });
     let snapshot: ReturnType<typeof captureSqliteApplicationSnapshot>;
     try {
-      snapshot = captureSqliteApplicationSnapshot(source, { blobSink: sink() });
+      snapshot = captureSqliteApplicationSnapshot(source, {
+        blobSink: sink(),
+        ...(values["large-rows"] ? { rowSink: rowCarrierSink(values.bundle!) } : {}),
+      });
     } finally {
       source.close();
     }
@@ -267,8 +319,14 @@ async function main(): Promise<void> {
     );
     return;
   }
+  const connection = await readPostgresEnvironment();
   const database = await createPostgresDatabase(
-    { ...(await readPostgresEnvironment()), transactionTimeoutMs: 300000 },
+    {
+      ...connection,
+      transactionTimeoutMs: values["large-rows"]
+        ? Math.max(connection.transactionTimeoutMs, 300000)
+        : 300000,
+    },
     {
       warn() {
         process.stderr.write("PostgreSQL connection warning\n");
@@ -325,8 +383,12 @@ async function main(): Promise<void> {
     const blobs = { source: carrierSource(values.bundle!), memoryBudgetBytes };
     for (const reference of carrierReferences.values())
       await verifyNativeBlob(reference, blobs.source);
+    const hasRows = snapshot.tables.some((table) => table.rowCarrier);
+    if (hasRows && !values["large-rows"]) throw new ApplicationRowCarrierError("limits");
+    const rowSource = hasRows ? rowCarrierSource(values.bundle!) : undefined;
     let receipt = await readApplicationImportReceipt(database, snapshot);
-    if (action === "verify" || receipt) receipt = await verifyApplicationImport(database, snapshot);
+    if (action === "verify" || receipt)
+      receipt = await verifyApplicationImport(database, snapshot, rowSource);
     else {
       const filename = `${values.bundle}.uploads.json`;
       let prior: (OfflineArtifactMapping | OfflineArtifactCheckpoint)[] = [];
@@ -373,7 +435,14 @@ async function main(): Promise<void> {
         },
         prior
       );
-      receipt = await importApplicationSnapshot(database, snapshot, mappings, store, blobs);
+      receipt = await importApplicationSnapshot(
+        database,
+        snapshot,
+        mappings,
+        store,
+        blobs,
+        rowSource
+      );
     }
     if (receipt.artifacts.length) {
       try {
@@ -404,7 +473,7 @@ main().catch((error: unknown) => {
   process.stderr.write(
     isPostgresErrorKind(error, "commit_unknown")
       ? "Import COMMIT outcome is unknown. Rerun with the same bundle to reconcile the durable receipt; uploaded objects were retained.\n"
-      : error instanceof NativeBlobCarrierError
+      : error instanceof NativeBlobCarrierError || error instanceof ApplicationRowCarrierError
         ? `Offline binary carrier action failed (${error.kind}); no qualified import receipt was produced by this action.\n`
         : error instanceof ApplicationImportEffectsError
           ? "Import committed; artifact_readback failed. Rerun with the same bundle to verify the durable receipt and retained objects.\n"

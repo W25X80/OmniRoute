@@ -16,6 +16,23 @@ const options: PostgresOptions = {
   tls: { mode: "verify-full" },
 };
 
+test("explicit offline transaction deadline has an independent finite bound", () => {
+  assert.equal(parsePostgresConfiguration(options).transactionTimeoutMs, 15000);
+  const config = parsePostgresConfiguration({ ...options, transactionTimeoutMs: 1800000 });
+  assert.equal(config.transactionTimeoutMs, 1800000);
+  assert.match(postgresPoolConfiguration(config).options!, /transaction_timeout=1800000/);
+  assert.throws(() => parsePostgresConfiguration({ ...options, transactionTimeoutMs: 1800001 }));
+  assert.throws(() =>
+    parsePostgresConfiguration({
+      ...options,
+      statementTimeoutMs: 300001,
+      queryTimeoutMs: 300002,
+      transactionTimeoutMs: 1800000,
+    })
+  );
+  assert.throws(() => parsePostgresConfiguration({ ...options, transactionTimeoutMs: 6000 }));
+});
+
 test("importing the optional factory does not load pg", () => {
   const require = createRequire(import.meta.url);
   assert.equal(typeof createPostgresDatabase, "function");

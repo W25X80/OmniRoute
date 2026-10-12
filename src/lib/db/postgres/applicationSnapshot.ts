@@ -18,6 +18,13 @@ import {
   APPLICATION_IMPORT_SOURCE_METADATA,
 } from "./applicationImportManifest";
 import {
+  applicationRowCarrierSchema,
+  checkedApplicationRowCarrier,
+  captureApplicationHistory,
+  TURN_NODE_COLUMNS,
+  type ApplicationRowSink,
+} from "./applicationRowCarrier";
+import {
   qualifySqliteVecDerivedStorage,
   qualifiedSqliteVecMetadata,
   SqliteVecQualificationError,
@@ -80,6 +87,7 @@ const tableSchema = z
     name: z.string().regex(identifier),
     columns: z.array(z.string().regex(identifier)).max(512),
     rowOrder: z.enum(["rowid", "primary-key", "native"]),
+    rowCarrier: applicationRowCarrierSchema.optional(),
     rows: z.array(
       z
         .object({
@@ -135,6 +143,17 @@ export function checkedApplicationSnapshot(input: unknown): ApplicationStorageSn
   }
   const names = new Set<string>();
   for (const table of [...parsed.data.tables, ...parsed.data.metadataTables]) {
+    if (table.rowCarrier) {
+      if (
+        parsed.data.source !== "sqlite" ||
+        table.name !== "conversation_turn_nodes" ||
+        table.rowOrder !== "rowid" ||
+        table.rows.length ||
+        JSON.stringify(table.columns) !== JSON.stringify(TURN_NODE_COLUMNS)
+      )
+        throw new ApplicationImportError("schema", table.name);
+      checkedApplicationRowCarrier(table.rowCarrier);
+    }
     if (names.has(table.name) || new Set(table.columns).size !== table.columns.length)
       throw new ApplicationImportError("schema", table.name);
     names.add(table.name);
@@ -197,7 +216,8 @@ function readTable(
   source: SqliteAdapter,
   table: SourceTable,
   budget: { rows: number; bytes: number; carrierBytes: number },
-  sink?: NativeBlobSink
+  sink?: NativeBlobSink,
+  rowSink?: ApplicationRowSink
 ): ApplicationSnapshotTable {
   const name = importIdentifier(table.name);
   const metadata = source.pragma(`table_xinfo(${name})`) as SourceColumn[];
@@ -213,6 +233,17 @@ function readTable(
   const rowid = table.wr === 0 && pseudo ? pseudo : null;
   const order = rowid ? importIdentifier(rowid) : primary.map(importIdentifier).join(",");
   if (!order) throw new ApplicationImportError("schema", table.name);
+  if (rowSink && table.name === "conversation_turn_nodes") {
+    if (rowid !== "rowid" || JSON.stringify(columns) !== JSON.stringify(TURN_NODE_COLUMNS))
+      throw new ApplicationImportError("schema", table.name);
+    return {
+      name: table.name,
+      columns,
+      rowOrder: "rowid",
+      rows: [],
+      rowCarrier: captureApplicationHistory(source, rowSink),
+    };
+  }
   const carried = (column: string) => !!sink && table.name === "files" && column === "content";
   if (sink && table.name === "files" && !rowid) throw new ApplicationImportError("schema", "files");
   const projection = columns.flatMap((column, index) => {
@@ -329,7 +360,7 @@ function readTable(
 /** Read-only, synchronous and consistent. Never await or run migrations/repair in this source scope. */
 export function captureSqliteApplicationSnapshot(
   source: SqliteAdapter,
-  options: { blobSink?: NativeBlobSink } = {}
+  options: { blobSink?: NativeBlobSink; rowSink?: ApplicationRowSink } = {}
 ): ApplicationStorageSnapshot {
   if (source.inTransaction || source.pragma("query_only", { simple: true }) !== 1)
     throw new ApplicationImportError("source_not_readonly");
@@ -420,7 +451,7 @@ export function captureSqliteApplicationSnapshot(
       if ((APPLICATION_IMPORT_SOURCE_METADATA as readonly string[]).includes(table.name))
         snapshot.metadataTables.push(readTable(source, table, budget));
       else if ((APPLICATION_IMPORT_TABLES as readonly string[]).includes(table.name))
-        snapshot.tables.push(readTable(source, table, budget, options.blobSink));
+        snapshot.tables.push(readTable(source, table, budget, options.blobSink, options.rowSink));
       else throw new ApplicationImportError("schema", table.name);
     }
     if (!snapshot.tables.some((table) => table.name === "key_value"))

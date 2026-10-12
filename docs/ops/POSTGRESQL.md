@@ -109,6 +109,25 @@ representations block qualification; there is no automatic data repair. Import p
 records and summaries but cannot reconstruct history or objects already deleted from the source;
 it does not invent historical per-key archives.
 
+For a SQLite source whose `conversation_turn_nodes` history exceeds the inline row budget,
+add `--large-rows` to **capture, import and verify**. This optional profile writes history into
+private `rows/` files next to the bundle; retain those files with the other carriers. It preserves
+source rowids as native insertion order and binds every chunk's size, count and SHA-256 to the
+snapshot and import receipt. Import, full row verification, identity restart and receipt publication
+share the same transaction. Missing, reordered or modified chunks reject the action; reruns use
+the same bundle and verify the acknowledged receipt rather than replaying writes.
+
+The history carrier allows at most 10,000,000 rows, 10 GiB and 10,000 chunks. Each chunk contains
+at most 5,000 rows and 8 MiB; capture reduces the batch size using a conservative row-size bound
+before loading rows. SQLite and PostgreSQL use keyset reads rather than growing offsets for this
+table. Other tables retain the original inline limits. This profile is specific to SQLite history
+import; it does not enlarge native logical export/restore limits. With `--large-rows`, the CLI uses
+the greater of the configured transaction deadline and 300,000 milliseconds. Configure the offline
+deadline explicitly for large datasets, up to 1,800,000 milliseconds. This expands the parser's
+accepted explicit transaction configuration; its 15,000-millisecond default and the other timeout
+bounds and ordering requirements remain unchanged. Live gateway deadlines remain unchanged. These bounds are
+not an RSS ceiling or a guarantee of completion within any deadline.
+
 The maximum-file maintenance witness uses explicit PostgreSQL statement/query/idle/transaction
 budgets of 60000/90000/90000/300000 milliseconds through
 `OMNIROUTE_POSTGRES_STATEMENT_TIMEOUT_MS`, `OMNIROUTE_POSTGRES_QUERY_TIMEOUT_MS`,

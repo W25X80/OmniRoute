@@ -42,6 +42,12 @@ import {
   getStoredFileContentBounds,
   type StoredFileContent,
 } from "./serviceFileContent";
+import {
+  readApplicationHistory,
+  TURN_NODE_COLUMNS,
+  type ApplicationRowCarrier,
+  type ApplicationRowSource,
+} from "./applicationRowCarrier";
 
 export interface ApplicationBlobImportOptions {
   source: NativeBlobSource;
@@ -95,6 +101,7 @@ interface PlannedTable {
   columns: TargetColumn[];
   rows: ApplicationImportCell[][];
   order: string[];
+  rowCarrier?: ApplicationRowCarrier;
 }
 interface ImportPlan {
   snapshot: ApplicationStorageSnapshot;
@@ -380,7 +387,7 @@ function buildPlan(
         !column.defaultExpression &&
         !column.identity &&
         !columns.some((value) => value.name === column.name) &&
-        source.rows.length
+        (source.rows.length || source.rowCarrier?.rowCount)
       )
         throw new ApplicationImportError("schema", source.name, column.name);
     const rows = source.rows.map((row, index) => {
@@ -460,7 +467,25 @@ function buildPlan(
       }
       return 0;
     });
-    planned.push({ name: source.name, columns, rows, order });
+    if (
+      source.rowCarrier &&
+      (columns.length !== TURN_NODE_COLUMNS.length + 1 ||
+        columns.some((column, index) =>
+          index < TURN_NODE_COLUMNS.length
+            ? column.name !== TURN_NODE_COLUMNS[index] || column.type !== "text"
+            : column.name !== "insertion_order" || column.type !== "bigint" || !column.identity
+        ) ||
+        order.length !== 1 ||
+        order[0] !== "insertion_order")
+    )
+      throw new ApplicationImportError("schema", source.name);
+    planned.push({
+      name: source.name,
+      columns,
+      rows,
+      order,
+      ...(source.rowCarrier ? { rowCarrier: source.rowCarrier } : {}),
+    });
   }
   addArtifactPublicationPlan(planned, schema, artifacts, transformations);
   const sourceDigest = applicationSnapshotDigest(snapshot);
@@ -707,7 +732,32 @@ async function readSnapshotFileBytes(content: StoredFileContent): Promise<Buffer
   return bytes;
 }
 
-async function verifyPlan(transaction: PostgresTransaction, plan: ImportPlan): Promise<void> {
+async function* plannedRowBatches(
+  table: PlannedTable,
+  source?: ApplicationRowSource
+): AsyncGenerator<ApplicationImportCell[][]> {
+  if (table.rowCarrier) {
+    if (!source) throw new ApplicationImportError("verification", table.name);
+    for await (const rows of readApplicationHistory(table.rowCarrier, source))
+      yield rows.map((row) =>
+        [...row.values, { kind: "integer" as const, value: row.rowid }].map((cell, index) =>
+          checkedCell(cell, table.columns[index], table.name)
+        )
+      );
+    return;
+  }
+  const carried = table.rows.some((row) =>
+    row.some((cell) => cell && typeof cell === "object" && cell.kind === "blob-reference")
+  );
+  const size = carried ? 1 : APPLICATION_SNAPSHOT_LIMITS.chunkRows;
+  for (let start = 0; start < table.rows.length; start += size)
+    yield table.rows.slice(start, start + size);
+}
+async function verifyPlan(
+  transaction: PostgresTransaction,
+  plan: ImportPlan,
+  rowSource?: ApplicationRowSource
+): Promise<void> {
   await getStoredFileContentBounds(transaction);
   for (const table of plan.tables) {
     const count = (
@@ -715,8 +765,32 @@ async function verifyPlan(transaction: PostgresTransaction, plan: ImportPlan): P
         `SELECT COUNT(*)::text AS count FROM omniroute.${importIdentifier(table.name)}`
       )
     ).rows[0];
-    if (BigInt(count?.count ?? "-1") !== BigInt(table.rows.length))
+    if (BigInt(count?.count ?? "-1") !== BigInt(table.rowCarrier?.rowCount ?? table.rows.length))
       throw new ApplicationImportError("verification", table.name);
+    if (table.rowCarrier) {
+      let last: string | undefined;
+      for await (const expected of plannedRowBatches(table, rowSource)) {
+        const { rows } = await transaction.query<Record<string, unknown>>(
+          `SELECT ${table.columns.map((column) => importIdentifier(column.name)).join(",")}
+           FROM omniroute.${importIdentifier(table.name)} ${last === undefined ? "" : "WHERE insertion_order > $1"}
+           ORDER BY insertion_order LIMIT $${last === undefined ? 1 : 2}`,
+          [...(last === undefined ? [] : [last]), expected.length]
+        );
+        if (rows.length !== expected.length)
+          throw new ApplicationImportError("verification", table.name);
+        for (let index = 0; index < rows.length; index++) {
+          const actual = table.columns.map((column) =>
+            column.type === "bigint"
+              ? { kind: "integer", value: String(rows[index][column.name]) }
+              : rows[index][column.name]
+          );
+          if (canonical(actual) !== canonical(expected[index]))
+            throw new ApplicationImportError("verification", table.name);
+        }
+        last = String(rows.at(-1)!.insertion_order);
+      }
+      continue;
+    }
     const fileContent = table.name === "files";
     const from = `FROM omniroute.${importIdentifier(table.name)} ORDER BY ${importOrderSql(table.columns, table.order)}`;
     const projection = table.columns
@@ -883,10 +957,17 @@ export async function importApplicationSnapshot(
   input: unknown,
   artifacts: OfflineArtifactMapping[] = [],
   store?: Pick<NativeArtifactStore, "get" | "storageScope">,
-  blobs?: ApplicationBlobImportOptions
+  blobs?: ApplicationBlobImportOptions,
+  rowSource?: ApplicationRowSource
 ): Promise<ApplicationImportReceipt> {
   validateApplicationSnapshotCredentials(input);
   const snapshot = checkedApplicationSnapshot(input);
+  for (const table of snapshot.tables.filter((entry) => entry.rowCarrier)) {
+    if (!rowSource) throw new ApplicationImportError("verification", table.name);
+    for await (const _batch of readApplicationHistory(table.rowCarrier!, rowSource)) {
+      // Qualify all external bytes before any SQL write; revalidate every subsequent read.
+    }
+  }
   const hasArtifacts = snapshot.tables.some(
     (table) =>
       ["call_logs", "call_logs_v1_legacy"].includes(table.name) &&
@@ -925,7 +1006,7 @@ export async function importApplicationSnapshot(
       const plan = buildPlan(snapshot, schema, receipt.artifacts, receipt.restoreAuthority);
       if (receipt.planDigest !== plan.planDigest || receipt.schemaDigest !== schema.digest)
         throw new ApplicationImportError("different_import");
-      await verifyPlan(transaction, plan);
+      await verifyPlan(transaction, plan, rowSource);
       return { ...receipt, alreadyImported: true };
     }
     const occupied = await transaction.query(
@@ -937,19 +1018,14 @@ export async function importApplicationSnapshot(
     const plan = buildPlan(snapshot, schema, artifacts, freshRestoreAuthority(snapshot));
     await assertEmptyTarget(transaction, schema, plan);
     for (const table of insertionOrder(plan, schema)) {
-      const carried = table.rows.some((row) =>
-        row.some((cell) => cell && typeof cell === "object" && cell.kind === "blob-reference")
-      );
       const fileContentAt =
         table.name === "files"
           ? table.columns.findIndex((column) => column.name === "content")
           : -1;
       const fileIdAt =
         table.name === "files" ? table.columns.findIndex((column) => column.name === "id") : -1;
-      const batchSize = carried ? 1 : APPLICATION_SNAPSHOT_LIMITS.chunkRows;
-      for (let start = 0; start < table.rows.length; start += batchSize) {
-        const rows = table.rows.slice(start, start + batchSize),
-          values: unknown[] = [];
+      for await (const rows of plannedRowBatches(table, rowSource)) {
+        const values: unknown[] = [];
         for (const row of rows)
           for (let column = 0; column < row.length; column++)
             values.push(column === fileContentAt ? null : bind(row[column]));
@@ -1015,9 +1091,9 @@ export async function importApplicationSnapshot(
         await transaction.query(`ALTER SEQUENCE ${qualified} RESTART WITH ${maximum + 1n}`);
       }
     }
-    await verifyPlan(transaction, plan);
+    await verifyPlan(transaction, plan, rowSource);
     const tableCounts = Object.fromEntries(
-      plan.tables.map((table) => [table.name, table.rows.length])
+      plan.tables.map((table) => [table.name, table.rowCarrier?.rowCount ?? table.rows.length])
     );
     const receipt: ApplicationImportReceipt = {
       format: "omniroute-application-import-receipt-v1",
@@ -1071,7 +1147,8 @@ export class ApplicationImportEffectsError extends Error {
 /** Read-only verification rejects data drift; it never repairs rows or repeats import writes. */
 export async function verifyApplicationImport(
   database: PostgresDatabase,
-  input: unknown
+  input: unknown,
+  rowSource?: ApplicationRowSource
 ): Promise<ApplicationImportReceipt> {
   const snapshot = checkedApplicationSnapshot(input);
   return database.transaction(async (transaction) => {
@@ -1087,7 +1164,7 @@ export async function verifyApplicationImport(
       throw new ApplicationImportError("different_import");
     const plan = buildPlan(snapshot, schema, receipt.artifacts, receipt.restoreAuthority);
     if (receipt.planDigest !== plan.planDigest) throw new ApplicationImportError("verification");
-    await verifyPlan(transaction, plan);
+    await verifyPlan(transaction, plan, rowSource);
     return { ...receipt, alreadyImported: true };
   });
 }
