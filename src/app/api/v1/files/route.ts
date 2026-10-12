@@ -1,3 +1,8 @@
+import {
+  getNativeFileHttpWork,
+  isNativeFileCapacityError,
+  nativeFileCapacityResponse,
+} from "@/lib/db/nativeFileWork";
 import { parseDatabaseBackend } from "@/lib/db/backendSelection";
 import { getCachedSettings } from "@/lib/db/readCache";
 import {
@@ -125,7 +130,12 @@ export async function POST(request: Request) {
       } catch {
         console.warn("[FILES] Request body limit settings unavailable; using defaults.");
       }
-      formData = await readFormDataWithLimit(request, getBodySizeLimit("/api/v1/files", settings));
+      const nativeFile = getNativeFileHttpWork();
+      formData = await readFormDataWithLimit(request, getBodySizeLimit("/api/v1/files", settings), {
+        beforeForward: (total) => nativeFile.beforeForward(total),
+        beforeComplete: (total) => nativeFile.beforeComplete(total),
+      });
+      nativeFile.afterMultipart(formData);
     } else formData = await request.formData();
     const file = formData.get("file") as File;
     const purpose = formData.get("purpose") as string;
@@ -155,6 +165,8 @@ export async function POST(request: Request) {
     const bytes = file.size;
     const filename = file.name;
     const mimeType = file.type;
+    if (parseDatabaseBackend() === "postgres")
+      getNativeFileHttpWork().beforeFileArrayBuffer(file.size);
     const content = Buffer.from(await file.arrayBuffer());
 
     let expiresAt: number | undefined;
@@ -177,6 +189,7 @@ export async function POST(request: Request) {
 
     return NextResponse.json(formatFileResponse(record), { headers: CORS_HEADERS });
   } catch (error) {
+    if (isNativeFileCapacityError(error)) return nativeFileCapacityResponse(CORS_HEADERS);
     if (error instanceof RequestBodyTooLargeError) {
       const response = createBodyTooLargeResponse(error.limit);
       for (const [name, value] of Object.entries(CORS_HEADERS)) response.headers.set(name, value);

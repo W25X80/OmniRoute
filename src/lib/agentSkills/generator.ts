@@ -324,7 +324,11 @@ function readReferenceFile(skillDir: string, referencePath: string): string | un
  */
 export async function generateAgentSkills(opts: GeneratorOptions): Promise<GeneratorReport> {
   if (parseDatabaseBackend() === "postgres") {
-    return (await import("./generatorAsync")).generateAgentSkillsWithAsyncFiles(opts);
+    return (await import("./generatorAsync")).generateAgentSkillsWithAsyncFiles(
+      opts,
+      buildSkillMarkdown,
+      assembleFileContent
+    );
   }
   const { dryRun = true, prune = false, outputDir = "skills", onlyIds } = opts;
 

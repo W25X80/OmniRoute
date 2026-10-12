@@ -160,22 +160,34 @@ test("automatic relay keeps the Bifrost timeout active until an SSE stream final
     new URL("../../../../src/app/api/v1/relay/chat/completions/route.ts", import.meta.url),
     "utf8"
   );
-  const forwardToBifrost = routeSource.slice(
-    routeSource.indexOf("async function forwardToBifrost"),
-    routeSource.indexOf("export async function OPTIONS")
+  const forwardStart = routeSource.indexOf("async function forwardToBifrost");
+  const forwardEnd = routeSource.indexOf("export async function OPTIONS", forwardStart);
+  assert.ok(forwardStart >= 0 && forwardEnd > forwardStart, "Bifrost function boundaries exist");
+  const forwardToBifrost = routeSource.slice(forwardStart, forwardEnd);
+  const streamStart = forwardToBifrost.indexOf("if (wantsStream && upstream.body)");
+  const nonStreamStart = forwardToBifrost.indexOf(
+    "clearTimeout(tid);\n    await recordUsage(",
+    streamStart
   );
-  const streamBranch = forwardToBifrost.slice(
-    forwardToBifrost.indexOf("if (wantsStream && upstream.body)"),
-    forwardToBifrost.indexOf("clearTimeout(tid);\n    recordUsage(")
-  );
+  assert.ok(streamStart >= 0 && nonStreamStart > streamStart, "stream boundaries exist");
+  const streamBranch = forwardToBifrost.slice(streamStart, nonStreamStart);
+  const nonStreamBranch = forwardToBifrost.slice(nonStreamStart);
 
   assert.match(
+    forwardToBifrost,
+    /const tid = setTimeout\(\(\) => \{\s*timedOut = true;\s*ac\.abort\(\);\s*\}, config\.timeoutMs\)/
+  );
+  assert.match(forwardToBifrost, /signal: ac\.signal/);
+  assert.match(
     streamBranch,
-    /finalizeReadableStream\(upstream\.body, \(error\) => \{\s*clearTimeout\(tid\)/
+    /if \(wantsStream && upstream\.body\) \{\s*const stream = finalizeReadableStream\(upstream\.body, async \(error\) => \{\s*clearTimeout\(tid\)/
   );
   assert.match(streamBranch, /const statusCode = timedOut \? 504 : upstream\.status/);
   assert.match(streamBranch, /error && backend === "auto"/);
   assert.match(streamBranch, /recordBifrostFailure\(/);
+  assert.match(streamBranch, /await recordUsage\(/);
+  assert.match(streamBranch, /return new Response\(stream,/);
+  assert.match(nonStreamBranch, /^clearTimeout\(tid\);\s*await recordUsage\(/);
 });
 
 test("relay routing fallback reason header strips dynamic cooldown detail to the stable code", () => {

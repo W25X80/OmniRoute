@@ -35,6 +35,7 @@ const instrumentationDependencies = new Set([
   "@/lib/db/persistenceRuntime",
   "@/lib/serverLifecycle",
   "@/lib/startup/nonLoopbackApiKeyGuard",
+  "@/lib/startup/nativeFileCaches",
   "@omniroute/open-sse/utils/error.ts",
 ]);
 const hooks = registerHooks({

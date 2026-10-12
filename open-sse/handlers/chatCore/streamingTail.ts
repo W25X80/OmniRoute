@@ -13,6 +13,7 @@ import {
   releaseFailedStreamingHandoff,
   settleStreamAccountingWork,
 } from "./streamingCompletion.ts";
+import { inheritEmptyTurnPolicy } from "../../utils/emptyTurnPolicy.ts";
 import { getCodexClientSessionId } from "../../config/codexIdentity.ts";
 import {
   noteCodexTurnStateProvenance,
@@ -372,8 +373,9 @@ export async function runStreamingTail(deps: StreamingTailDeps) {
     persistenceTail &&
     prepareStreamContinuation &&
     clientResponseFormat === FORMATS.OPENAI_RESPONSES
-      ? (payload: StreamBeforeTerminalPayload) =>
-          persistenceTail
+      ? (payload: StreamBeforeTerminalPayload) => {
+          const activePersistenceTail = persistenceTail!;
+          return activePersistenceTail
             .run(async () => {
               const seed = await prepareStreamContinuation(
                 payload.clientResponse,
@@ -389,7 +391,8 @@ export async function runStreamingTail(deps: StreamingTailDeps) {
                 "[stream] Continuation preparation unavailable:",
                 sanitizeErrorMessage(error) || "Continuation preparation failed"
               );
-            })
+            });
+        }
       : null;
   if (onBeforeTerminal)
     streamController.signal.addEventListener("abort", clearContinuationSeed, { once: true });
@@ -800,17 +803,21 @@ export async function runStreamingTail(deps: StreamingTailDeps) {
     isStreamCompletionRecorded: () => streamCompletionRecorded,
     onStreamComplete,
     persistFailureUsage: persistenceTail
-      ? (status: number, errorCode?: string) =>
-          persistenceTail.run(async () => {
+      ? (status: number, errorCode?: string) => {
+          const activePersistenceTail = persistenceTail!;
+          return activePersistenceTail.run(async () => {
             await persistFailureUsage(status, errorCode, undefined, completionMetadata?.clock);
-          })
+          });
+        }
       : persistFailureUsage,
     onStreamFailure:
       persistenceTail && onStreamFailure
-        ? (...args) =>
-            persistenceTail.run(async () => {
+        ? (...args) => {
+            const activePersistenceTail = persistenceTail!;
+            return activePersistenceTail.run(async () => {
               await onStreamFailure(...args);
-            })
+            });
+          }
         : onStreamFailure,
     hasEmittedOutput: () => streamEmittedOutput(transformStream),
   });
@@ -976,9 +983,12 @@ export async function runStreamingTail(deps: StreamingTailDeps) {
     response: { status: 200, streamed: true },
   });
 
-  const response = new Response(clientFacingStream, {
-    headers: responseHeaders,
-  });
+  const response = inheritEmptyTurnPolicy(
+    providerResponse,
+    new Response(clientFacingStream, {
+      headers: responseHeaders,
+    })
+  );
   // The controller can observe abort before the barrel installs the carried callbacks.
   // Start the same grace owner now so an unread, already-aborted Response cannot leak a tail.
   if (

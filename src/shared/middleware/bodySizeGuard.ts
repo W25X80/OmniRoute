@@ -175,7 +175,11 @@ export async function readRequestBodyWithLimit(
 }
 
 /** Count bytes before multipart parsing without retaining a second full request buffer. */
-export async function readFormDataWithLimit(request: Request, limit: number): Promise<FormData> {
+export async function readFormDataWithLimit(
+  request: Request,
+  limit: number,
+  observe?: { beforeForward(total: number): void; beforeComplete(total: number): void }
+): Promise<FormData> {
   const declared = Number.parseInt(request.headers.get("content-length") || "", 10);
   if (!Number.isNaN(declared) && declared > limit) {
     await request.body?.cancel("request body too large").catch(() => {});
@@ -222,6 +226,7 @@ export async function readFormDataWithLimit(request: Request, limit: number): Pr
           const chunk = await reader.read();
           if (stopped) return;
           if (chunk.done) {
+            observe?.beforeComplete(total);
             stopped = true;
             release();
             value.close();
@@ -234,6 +239,7 @@ export async function readFormDataWithLimit(request: Request, limit: number): Pr
             if (!consumerCanceled) value.error(error);
             return;
           }
+          observe?.beforeForward(total);
           value.enqueue(chunk.value);
         } catch (error) {
           if (!stopped) {

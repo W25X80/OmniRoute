@@ -22,7 +22,7 @@ function getCustomModelRow(
   const db = getSelectedPostgresDatabase() ? undefined : getDbInstance();
   const row = getSelectedPostgresDatabase()
     ? catalogValue("modelCompatOverrides", `${providerId}::${modelId}`)
-    : db
+    : db!
         .prepare("SELECT value FROM key_value WHERE namespace = 'modelCompatOverrides' AND key = ?")
         .get(`${providerId}::${modelId}`);
   if (!row) return undefined;

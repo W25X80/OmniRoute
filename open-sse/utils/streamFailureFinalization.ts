@@ -202,7 +202,7 @@ export function finalizeStreamRequestLog({
 
 function observeStreamCallback(work: void | Promise<void>, label: string): void {
   if (!work) return;
-  void work.catch((error: unknown) => {
+  void Promise.resolve(work).catch((error: unknown) => {
     console.warn(
       `[STREAM] ${label} callback failed:`,
       error instanceof Error ? error.name : "Error"

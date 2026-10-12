@@ -1,5 +1,4 @@
 import { getSelectedPostgresDatabase } from "./controlPlaneContext";
-import { createPostgresOperationsRepository } from "./postgres/operationsRepository";
 import { normalizeComboStep } from "@/lib/combos/steps";
 import { getSyntheticApiKeyIds } from "@/shared/constants/apiKeyIdentities";
 
@@ -695,7 +694,10 @@ export async function runManagedDatabaseHealthCheck(
   } = {}
 ): Promise<DbHealthCheckResult> {
   const database = getSelectedPostgresDatabase();
-  if (database) return createPostgresOperationsRepository(database).healthCheck(options);
+  if (database) {
+    const { createPostgresOperationsRepository } = await import("./postgres/operationsRepository");
+    return createPostgresOperationsRepository(database).healthCheck(options);
+  }
   const { runManagedDbHealthCheck } = await import("./core");
   return runManagedDbHealthCheck(options);
 }

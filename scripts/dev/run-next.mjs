@@ -19,7 +19,10 @@ import { getMainServerTimeoutConfig } from "./main-server-timeouts.mjs";
 import { createSystemdNotifier } from "./systemd-notify.mjs";
 import { attachRequestStreamGuards, installProcessCrashGuard } from "./httpClientAbortGuard.mjs";
 import { listenWithRetry } from "./listen-with-retry.mjs";
-import { wrapRequestListenerWithPersistence } from "./persistence-request-boundary.mjs";
+import {
+  isSqlitePersistenceRequested,
+  wrapRequestListenerWithPersistence,
+} from "./persistence-request-boundary.mjs";
 
 const { maybeHandleDisallowedMethod } = methodGuard;
 const { wrapRequestListenerWithHeadResponseGuard } = headResponseGuard;
@@ -183,6 +186,12 @@ async function prepareWithHeal() {
   }
 }
 
+function wrapServingRequestListener(listener) {
+  return isSqlitePersistenceRequested()
+    ? wrapRequestListenerWithPersistence(listener)
+    : wrapRequestListenerWithPersistence(listener, nextApp.server.nextConfig);
+}
+
 async function start() {
   // Safety net: a client aborting a connection (browser navigation, HMR reconnect,
   // Back/Forward cache) can emit `Error: aborted`/`ECONNRESET` on the request
@@ -205,7 +214,7 @@ async function start() {
 
   const server = http.createServer(
     wrapRequestListenerWithHeadResponseGuard(
-      wrapRequestListenerWithPersistence((req, res) => {
+      wrapServingRequestListener((req, res) => {
         // Absorb client-abort errors (browser closes the socket during
         // navigation/HMR/bfcache) on the request/response streams so they never
         // surface as an uncaughtException that kills the whole server (#fix-dev-server-aborted).

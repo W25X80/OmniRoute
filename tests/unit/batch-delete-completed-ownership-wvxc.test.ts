@@ -121,11 +121,11 @@ describe("the route passes the caller's key through", () => {
       "utf8"
     );
     assert.ok(
-      !/deleteCompletedBatches\(\s*\)/.test(src),
+      !/deleteCompletedBatches(?:Async)?\(\s*\)/.test(src),
       "the route still calls deleteCompletedBatches() with no owner — every tenant's batches go"
     );
     assert.ok(
-      /deleteCompletedBatches\(\s*sweepScope\s*\)/.test(src) &&
+      /deleteCompletedBatches(?:Async)?\(\s*sweepScope\s*\)/.test(src) &&
         // The caller's own key id — raw `scope.apiKeyId`, or the LEDGER-27
         // `effectiveApiKeyId` that falls back to the id the policy resolved on
         // the x-api-key transport. Never a bare/instance-wide value.

@@ -37,12 +37,23 @@ test("strict dispatch blocks a changed connection before invoking its executor",
     /dispatch/
   );
   assert.equal(calls, 0);
-  assert.throws(() => fence.assertDispatched(), /dispatch/);
+  await assert.rejects(() => fence.assertDispatched(), /dispatch/);
 });
 
 test("strict dispatch rejects proxy wrappers, alternate models, repeated attempts and cache-only results", async () => {
   let calls = 0;
+  let freshnessChecks = 0;
+  let finalFreshnessReleased = false;
+  let enterFinalFreshness!: () => void;
+  let releaseFinalFreshness!: () => void;
+  const finalFreshnessEntered = new Promise<void>((resolve) => {
+    enterFinalFreshness = resolve;
+  });
+  const finalFreshnessGate = new Promise<void>((resolve) => {
+    releaseFinalFreshness = resolve;
+  });
   globalThis.fetch = async () => {
+    assert.equal(finalFreshnessReleased, true, "physical dispatch must await final freshness");
     calls++;
     return Response.json({ choices: [] });
   };
@@ -52,7 +63,13 @@ test("strict dispatch rejects proxy wrappers, alternate models, repeated attempt
     modelId: "chosen-model",
     connectionId: "chosen",
     signal: new AbortController().signal,
-    assertFresh: () => {},
+    assertFresh: async () => {
+      freshnessChecks++;
+      if (freshnessChecks === 2) {
+        enterFinalFreshness();
+        await finalFreshnessGate;
+      }
+    },
     expectedExecutor: executor,
     expectedCredentials: credentials,
   };
@@ -60,7 +77,7 @@ test("strict dispatch rejects proxy wrappers, alternate models, repeated attempt
     () => createValidationDispatchFence(options).wrap(Object.create(executor)),
     /dispatch/
   );
-  assert.throws(() => createValidationDispatchFence(options).assertDispatched(), /dispatch/);
+  await assert.rejects(() => createValidationDispatchFence(options).assertDispatched(), /dispatch/);
   const alternative = createValidationDispatchFence(options).wrap(executor);
   await assert.rejects(
     () =>
@@ -80,11 +97,21 @@ test("strict dispatch rejects proxy wrappers, alternate models, repeated attempt
     stream: false,
     credentials,
   };
-  await guarded.execute(input);
-  fence.assertDispatched();
+  const pending = guarded.execute(input);
+  try {
+    await finalFreshnessEntered;
+    // Allow an incorrectly un-awaited observer to reach the stub before releasing its gate.
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(calls, 0);
+  } finally {
+    finalFreshnessReleased = true;
+    releaseFinalFreshness();
+  }
+  await pending;
+  await fence.assertDispatched();
   await assert.rejects(() => guarded.execute(input), /dispatch/);
   assert.equal(calls, 1);
-  assert.throws(() => fence.assertDispatched(), /dispatch/);
+  await assert.rejects(() => fence.assertDispatched(), /dispatch/);
 });
 
 test("custom execute overrides and final auth/model rewriting are fail-closed", async () => {
@@ -127,7 +154,7 @@ test("custom execute overrides and final auth/model rewriting are fail-closed", 
         }),
       /dispatch/
     );
-    assert.throws(() => fence.assertDispatched(), /dispatch/);
+    await assert.rejects(() => fence.assertDispatched(), /dispatch/);
   }
   assert.equal(calls, 0);
 });

@@ -1,7 +1,7 @@
 ---
 title: "Environment Variables Reference"
 version: 3.8.52
-lastUpdated: 2026-10-11
+lastUpdated: 2026-10-12
 ---
 
 # Environment Variables Reference
@@ -976,6 +976,7 @@ The logging system writes to both stdout and rotated log files. All configuratio
 | `SEMANTIC_CACHE_MAX_SIZE`  | `100`              | Max cached temperature=0 responses.                                                                                                                                                                                                                                               |
 | `SEMANTIC_CACHE_MAX_BYTES` | `4194304` (4 MB)   | Max total semantic cache size.                                                                                                                                                                                                                                                    |
 | `SEMANTIC_CACHE_TTL_MS`    | `1800000` (30 min) | Semantic cache entry TTL.                                                                                                                                                                                                                                                         |
+| `OMNIROUTE_SEMANTIC_CACHE_EMBEDDING_API_KEY` | _(unset)_ | Embedding credential preferred over stored configuration; per-call overrides retain final precedence (`open-sse/config/semanticCacheConfig.ts`). |
 | `OMNIROUTE_CORPUS_CACHE_SIZE` | `5`             | Local-corpus roots that keep a live in-memory index at once (`src/lib/localCorpus/configured.ts`). LRU: at the limit the least-recently-used root's index is evicted and rebuilt on its next query. Clamped to a minimum of `1`; a non-numeric value falls back to the default.     |
 | `STREAM_HISTORY_MAX`       | `50`               | Max recent stream events in the Dashboard live view buffer.                                                                                                                                                                                                                       |
 | `CONTEXT_LENGTH_DEFAULT`   | _(unset)_          | Global context-length override (tokens) for every provider that has no `CONTEXT_LENGTH_<PROVIDER>` variable. When set, it **replaces** the catalog, dashboard override and registry values for those providers; when unset, OmniRoute uses its built-in chain, whose last resort is `128000`. See [Per-provider context length](#per-provider-context-length-context_length_provider). |

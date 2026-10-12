@@ -406,6 +406,11 @@ export const EXTRA_MODULE_ENTRIES = [
     dest: ["webdav-handler.mjs"],
   },
   {
+    label: "native WebDAV file handler (webdav-handler.mjs dependency)",
+    src: ["scripts", "dev", "webdav-native-handler.mjs"],
+    dest: ["webdav-native-handler.mjs"],
+  },
+  {
     // #5242: opt-in HTTPS/TLS resolver (server-ws.mjs dependency).
     label: "tls-options (server-ws.mjs dependency)",
     src: ["scripts", "dev", "tls-options.mjs"],

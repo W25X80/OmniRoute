@@ -24,6 +24,13 @@ import { logger } from "../../../open-sse/utils/logger.ts";
 
 const log = logger("SKILLS_EXECUTOR");
 
+class SkillTimeoutError extends Error {
+  constructor() {
+    super("Skill execution timed out");
+    this.name = "SkillTimeoutError";
+  }
+}
+
 function toSafeSkillErrorMessage(value: unknown): string {
   try {
     const raw = value instanceof Error ? value.message : value;
@@ -291,12 +298,15 @@ class SkillExecutor {
   }
 
   private async executeWithTimeout<T>(promise: Promise<T>): Promise<T> {
-    return Promise.race([
-      promise,
-      new Promise<T>((_, reject) =>
-        setTimeout(() => reject(new Error("Skill execution timed out")), this.timeout)
-      ),
-    ]);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new SkillTimeoutError()), this.timeout);
+    });
+    try {
+      return await Promise.race([promise, timeout]);
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   private async executeNativeWithTimeout<T>(
@@ -306,8 +316,9 @@ class SkillExecutor {
     let timeoutId: ReturnType<typeof setTimeout>;
     const deadline = new Promise<T>((_, reject) => {
       timeoutId = setTimeout(() => {
+        // Settle the executor deadline before cooperative cancellation can reject the handler.
+        reject(new SkillTimeoutError());
         controller.abort();
-        reject(new Error("Skill execution timed out"));
       }, this.timeout);
     });
     try {
@@ -375,7 +386,7 @@ class SkillExecutor {
       }
     } catch (err) {
       errorMessage = toSafeSkillErrorMessage(err);
-      status = SkillStatus.ERROR;
+      status = err instanceof SkillTimeoutError ? SkillStatus.TIMEOUT : SkillStatus.ERROR;
     }
 
     return { output, errorMessage, status };

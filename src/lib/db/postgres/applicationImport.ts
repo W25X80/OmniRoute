@@ -8,6 +8,7 @@ import type { PostgresDatabase, PostgresTransaction } from "./database";
 import {
   APPLICATION_IMPORT_TABLES,
   APPLICATION_IMPORT_NATIVE_ONLY,
+  APPLICATION_IMPORT_NATIVE_FILE_TABLES,
 } from "./applicationImportManifest";
 import {
   ApplicationImportError,
@@ -26,7 +27,6 @@ import {
 import type { NativeArtifactStore } from "@/domain/persistence/artifactStore";
 
 import {
-  assembleNativeBlob,
   captureNativeBlobAsync,
   verifyNativeBlob,
   NATIVE_BLOB_LIMITS,
@@ -34,6 +34,13 @@ import {
   type NativeBlobSource,
   type NativeBlobSink,
 } from "./nativeBlobCarrier";
+
+import {
+  openStoredFileContent,
+  replaceStoredFileContent,
+  getStoredFileContentBounds,
+  type StoredFileContent,
+} from "./serviceFileContent";
 
 export interface ApplicationBlobImportOptions {
   source: NativeBlobSource;
@@ -104,10 +111,12 @@ const controlTables = new Set([
   "application_import_receipts",
 ]);
 const integerTypes = new Set(["smallint", "integer", "bigint"]);
-const allTables = new Set<string>([
+const logicalTables = new Set<string>([
   ...APPLICATION_IMPORT_TABLES,
   ...APPLICATION_IMPORT_NATIVE_ONLY,
 ]);
+const fileContentTables = new Set<string>(APPLICATION_IMPORT_NATIVE_FILE_TABLES);
+const allTables = new Set<string>([...logicalTables, ...fileContentTables]);
 
 async function readTargetSchema(transaction: PostgresTransaction): Promise<TargetSchema> {
   const columns = await transaction.query<{
@@ -335,7 +344,7 @@ function buildPlan(
     transformations: ApplicationImportReceipt["transformations"] = [];
   for (const source of snapshot.tables) {
     if (
-      !allTables.has(source.name) ||
+      !logicalTables.has(source.name) ||
       controlTables.has(source.name) ||
       (snapshot.source === "sqlite" &&
         (APPLICATION_IMPORT_NATIVE_ONLY as readonly string[]).includes(source.name) &&
@@ -571,6 +580,13 @@ async function assertEmptyTarget(
         await transaction.query("DELETE FROM omniroute.api_key_policy_epoch");
       continue;
     }
+    if (table.name === "files" || fileContentTables.has(table.name)) {
+      const occupied = await transaction.query(
+        `SELECT 1 FROM omniroute.${importIdentifier(table.name)} LIMIT 1`
+      );
+      if (occupied.rows.length) throw new ApplicationImportError("target_not_empty", table.name);
+      continue;
+    }
     const { rows } = await transaction.query<Record<string, unknown>>(
       `SELECT * FROM omniroute.${importIdentifier(table.name)} LIMIT 7`
     );
@@ -580,7 +596,19 @@ async function assertEmptyTarget(
       await transaction.query(`DELETE FROM omniroute.${importIdentifier(table.name)}`);
   }
 }
+async function readSnapshotFileBytes(content: StoredFileContent): Promise<Buffer> {
+  const size = content.sizeBytes;
+  if (size === null || size > APPLICATION_SNAPSHOT_LIMITS.blobBytes)
+    throw new ApplicationImportError("limits", "files", "content");
+  if (size === 0) return Buffer.alloc(0);
+  const bytes = await content.readChunk(0);
+  if (!Buffer.isBuffer(bytes) || bytes.byteLength !== size)
+    throw new ApplicationImportError("verification", "files", "content");
+  return bytes;
+}
+
 async function verifyPlan(transaction: PostgresTransaction, plan: ImportPlan): Promise<void> {
+  await getStoredFileContentBounds(transaction);
   for (const table of plan.tables) {
     const count = (
       await transaction.query<{ count: string }>(
@@ -589,16 +617,12 @@ async function verifyPlan(transaction: PostgresTransaction, plan: ImportPlan): P
     ).rows[0];
     if (BigInt(count?.count ?? "-1") !== BigInt(table.rows.length))
       throw new ApplicationImportError("verification", table.name);
-    const carried =
-      table.name === "files" &&
-      table.rows.some((row) =>
-        row.some((cell) => cell && typeof cell === "object" && cell.kind === "blob-reference")
-      );
+    const fileContent = table.name === "files";
     const from = `FROM omniroute.${importIdentifier(table.name)} ORDER BY ${table.order.map(importIdentifier).join(",")}`;
     const projection = table.columns
       .map((column) =>
-        carried && column.name === "content"
-          ? `NULL AS "content",octet_length("content") AS "_native_blob_size"`
+        fileContent && column.name === "content"
+          ? `NULL AS "content"`
           : importIdentifier(column.name)
       )
       .join(",");
@@ -617,39 +641,32 @@ async function verifyPlan(transaction: PostgresTransaction, plan: ImportPlan): P
           const column = table.columns[at],
             expected = table.rows[start + index][at];
           let stored = rows[index][column.name];
-          if (carried && column.name === "content") {
+          if (fileContent && column.name === "content") {
+            const id = rows[index].id;
+            if (typeof id !== "string") throw new ApplicationImportError("verification", "files");
+            const content = await openStoredFileContent(transaction, id);
+            if (!content) throw new ApplicationImportError("verification", "files");
             if (expected && typeof expected === "object" && expected.kind === "blob-reference") {
-              if (rows[index]._native_blob_size !== expected.sizeBytes)
+              if (
+                content.sizeBytes !== expected.sizeBytes ||
+                (content.checksum !== null && content.checksum !== expected.checksum)
+              )
                 throw new ApplicationImportError("verification", table.name, column.name);
               await verifyNativeBlob(expected, {
-                async readChunk(_id, chunk) {
-                  const result = await transaction.query<{ chunk: Uint8Array }>(
-                    `SELECT substring("content" from $1::integer for $2::integer) AS chunk ${from} LIMIT 1 OFFSET $3`,
-                    [
-                      chunk * NATIVE_BLOB_LIMITS.chunkBytes + 1,
-                      expected.chunks[chunk].sizeBytes,
-                      start + index,
-                    ]
-                  );
-                  return result.rows[0]?.chunk ?? null;
-                },
+                readChunk: (_id, chunk) => content.readChunk(chunk),
               });
               actual.push(expected);
               continue;
             }
             if (expected === null) {
-              if (rows[index]._native_blob_size !== null)
-                throw new ApplicationImportError("verification", table.name);
-            } else {
-              if (Number(rows[index]._native_blob_size) > APPLICATION_SNAPSHOT_LIMITS.blobBytes)
-                throw new ApplicationImportError("limits", table.name);
-              stored = (
-                await transaction.query<{ content: Uint8Array }>(
-                  `SELECT "content" ${from} LIMIT 1 OFFSET $1`,
-                  [start + index]
-                )
-              ).rows[0]?.content;
+              if (content.sizeBytes !== null)
+                throw new ApplicationImportError("verification", table.name, column.name);
+              actual.push(null);
+              continue;
             }
+            if (content.sizeBytes === null)
+              throw new ApplicationImportError("verification", table.name, column.name);
+            stored = await readSnapshotFileBytes(content);
           }
           const value = stored instanceof Date ? stored.toISOString() : stored;
           actual.push(
@@ -820,21 +837,37 @@ export async function importApplicationSnapshot(
       const carried = table.rows.some((row) =>
         row.some((cell) => cell && typeof cell === "object" && cell.kind === "blob-reference")
       );
+      const fileContentAt =
+        table.name === "files"
+          ? table.columns.findIndex((column) => column.name === "content")
+          : -1;
+      const fileIdAt =
+        table.name === "files" ? table.columns.findIndex((column) => column.name === "id") : -1;
       const batchSize = carried ? 1 : APPLICATION_SNAPSHOT_LIMITS.chunkRows;
       for (let start = 0; start < table.rows.length; start += batchSize) {
         const rows = table.rows.slice(start, start + batchSize),
           values: unknown[] = [];
         for (const row of rows)
-          for (const cell of row)
-            values.push(
-              cell && typeof cell === "object" && cell.kind === "blob-reference"
-                ? await assembleNativeBlob(cell, blobs!.source, blobs!.memoryBudgetBytes)
-                : bind(cell)
-            );
+          for (let column = 0; column < row.length; column++)
+            values.push(column === fileContentAt ? null : bind(row[column]));
         await transaction.query(
           `INSERT INTO omniroute.${importIdentifier(table.name)} (${table.columns.map((column) => importIdentifier(column.name)).join(",")}) OVERRIDING SYSTEM VALUE VALUES ${rows.map((_, at) => `(${table.columns.map((_, column) => `$${at * table.columns.length + column + 1}`).join(",")})`).join(",")}`,
           values
         );
+        if (fileContentAt >= 0) {
+          for (const row of rows) {
+            const id = row[fileIdAt],
+              cell = row[fileContentAt];
+            if (typeof id !== "string") throw new ApplicationImportError("schema", "files", "id");
+            const content =
+              cell && typeof cell === "object" && cell.kind === "blob-reference"
+                ? cell
+                : cell && typeof cell === "object" && cell.kind === "bytes"
+                  ? Buffer.from(cell.value, "base64")
+                  : null;
+            await replaceStoredFileContent(transaction, id, content, blobs?.source);
+          }
+        }
       }
       for (const column of table.columns.filter((column) => column.identity)) {
         const sequence = await transaction.query<{ name: string }>(
@@ -979,6 +1012,13 @@ export async function capturePostgresApplicationSnapshot(
       rows: [],
     };
     for (const table of schema.tables) {
+      if (fileContentTables.has(table.name)) {
+        snapshot.excluded.push({
+          name: table.name,
+          reason: "native file representation verified and reconstructed as logical files.content",
+        });
+        continue;
+      }
       if (controlTables.has(table.name)) {
         const bound = (
           await transaction.query<{ count: string; bytes: string }>(
@@ -1039,20 +1079,17 @@ export async function capturePostgresApplicationSnapshot(
       const columns = table.columns.filter((column) => !column.generated),
         order = columnOrder(table),
         rows: ApplicationSnapshotTable["rows"] = [];
-      const carried = (column: TargetColumn) =>
-        !!options.blobSink &&
-        table.name === "files" &&
-        column.name === "content" &&
-        column.type === "bytea";
+      const fileContent = (column: TargetColumn) =>
+        table.name === "files" && column.name === "content";
       const lengths = columns.map((column) =>
-        carried(column)
-          ? `CASE WHEN ${importIdentifier(column.name)} IS NULL THEN 0 ELSE 16384 END`
+        fileContent(column)
+          ? "0"
           : column.type === "bytea"
             ? `4*((COALESCE(octet_length(${importIdentifier(column.name)}),0)+2)/3)`
             : `6*COALESCE(octet_length(${importIdentifier(column.name)}::text),0)`
       );
       const blobs = columns
-        .filter((column) => column.type === "bytea" && !carried(column))
+        .filter((column) => column.type === "bytea" && !fileContent(column))
         .map((column) => `COALESCE(octet_length(${importIdentifier(column.name)}),0)`);
       const bound = (
         await transaction.query<{ count: string; bytes: string; blob: number }>(
@@ -1067,41 +1104,52 @@ export async function capturePostgresApplicationSnapshot(
         throw new ApplicationImportError("limits", table.name);
       budget.rows += Number(bound.count);
       budget.bytes += Number(bound.bytes);
-      if (table.name === "files" && options.blobSink) {
-        const bound = (
-          await transaction.query<{ maximum: number; total: string }>(
-            "SELECT COALESCE(MAX(octet_length(content)),0) AS maximum,COALESCE(SUM(octet_length(content)),0)::text AS total FROM omniroute.files"
-          )
-        ).rows[0];
+      if (table.name === "files") {
+        const contentBounds = await getStoredFileContentBounds(transaction);
         if (
-          bound.maximum > NATIVE_BLOB_LIMITS.fileBytes ||
-          BigInt(bound.total) > BigInt(NATIVE_BLOB_LIMITS.carrierBytes)
+          contentBounds.maximum >
+            (options.blobSink
+              ? NATIVE_BLOB_LIMITS.fileBytes
+              : APPLICATION_SNAPSHOT_LIMITS.blobBytes) ||
+          (options.blobSink &&
+            BigInt(contentBounds.total) > BigInt(NATIVE_BLOB_LIMITS.carrierBytes))
         )
           throw new ApplicationImportError("limits", "files", "content");
       }
       for (let start = 0; ; start += APPLICATION_SNAPSHOT_LIMITS.chunkRows) {
         const result = await transaction.query<Record<string, unknown>>(
-          `SELECT ${columns.map((column) => (carried(column) ? `octet_length(${importIdentifier(column.name)}) AS ${importIdentifier(column.name)}` : importIdentifier(column.name))).join(",")} FROM omniroute.${importIdentifier(table.name)} ORDER BY ${order.map(importIdentifier).join(",")} LIMIT $1 OFFSET $2`,
+          `SELECT ${columns.map((column) => (fileContent(column) ? `NULL AS ${importIdentifier(column.name)}` : importIdentifier(column.name))).join(",")} FROM omniroute.${importIdentifier(table.name)} ORDER BY ${order.map(importIdentifier).join(",")} LIMIT $1 OFFSET $2`,
           [APPLICATION_SNAPSHOT_LIMITS.chunkRows, start]
         );
         for (let index = 0; index < result.rows.length; index++) {
           const row = result.rows[index],
             cells: ApplicationImportCell[] = [];
           for (const column of columns) {
-            if (carried(column) && row[column.name] !== null) {
-              cells.push(
-                await captureNativeBlobAsync(
-                  Number(row[column.name]),
-                  async (offset, length) => {
-                    const chunk = await transaction.query<{ chunk: Uint8Array }>(
-                      `SELECT substring(${importIdentifier(column.name)} from $1::integer for $2::integer) AS chunk FROM omniroute.${importIdentifier(table.name)} ORDER BY ${order.map(importIdentifier).join(",")} LIMIT 1 OFFSET $3`,
-                      [offset + 1, length, start + index]
-                    );
-                    return chunk.rows[0]?.chunk ?? null;
-                  },
-                  options.blobSink!
-                )
-              );
+            if (fileContent(column)) {
+              if (typeof row.id !== "string")
+                throw new ApplicationImportError("schema", "files", "id");
+              const content = await openStoredFileContent(transaction, row.id);
+              if (!content) throw new ApplicationImportError("verification", "files");
+              if (content.sizeBytes === null) {
+                cells.push(null);
+              } else {
+                budget.bytes += options.blobSink ? 16384 : 4 * Math.ceil(content.sizeBytes / 3);
+                if (budget.bytes > APPLICATION_SNAPSHOT_LIMITS.bytes)
+                  throw new ApplicationImportError("limits", "files", "content");
+                if (options.blobSink) {
+                  const reference = await captureNativeBlobAsync(
+                    content.sizeBytes,
+                    (offset) => content.readChunk(offset / NATIVE_BLOB_LIMITS.chunkBytes),
+                    options.blobSink
+                  );
+                  if (content.checksum !== null && content.checksum !== reference.checksum)
+                    throw new ApplicationImportError("verification", "files", "content");
+                  cells.push(reference);
+                } else {
+                  const bytes = await readSnapshotFileBytes(content);
+                  cells.push({ kind: "bytes", value: bytes.toString("base64") });
+                }
+              }
               continue;
             }
             cells.push(

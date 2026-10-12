@@ -339,8 +339,8 @@ function* translateRequestSteps(
   model,
   body,
   stream = true,
-  credentials = null,
-  provider = null,
+  credentials: Record<string, unknown> | null = null,
+  provider: string | null = null,
   reqLogger: Awaited<ReturnType<typeof createRequestLogger>> | null = null,
   options?: {
     normalizeToolCallId?: boolean;

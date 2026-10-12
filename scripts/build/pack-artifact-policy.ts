@@ -61,6 +61,7 @@ export const APP_STAGING_ALLOWED_EXACT_PATHS: string[] = [
   "src/lib/db/healthCheckWorker.js",
   "package.json",
   "peer-stamp.mjs",
+  "persistence-request-boundary.mjs",
   // #13636/#14064: server-ws.mjs imports ./httpClientAbortGuard.mjs (process crash
   // guard); assembleStandalone copies it from src/shared/utils. Without this entry
   // the prepublish prune deletes it and every boot of the published package dies
@@ -82,6 +83,7 @@ export const APP_STAGING_ALLOWED_EXACT_PATHS: string[] = [
   // crashes with ERR_MODULE_NOT_FOUND (regressed in the published 3.8.41 tarball).
   "tls-options.mjs",
   "webdav-handler.mjs",
+  "webdav-native-handler.mjs",
 ];
 
 export const APP_STAGING_ALLOWED_PATH_PREFIXES: string[] = [
@@ -163,6 +165,7 @@ export const PACK_ARTIFACT_ROOT_ALLOWED_EXACT_PATHS: string[] = [
   "package.json",
   "scripts/build/assembleStandalone.mjs",
   "scripts/build/backendOnlyPages.mjs",
+  "scripts/i18n/generate-global-error-messages.mjs",
   "scripts/build/build-tproxy-native.mjs",
   "scripts/build/build-next-isolated.mjs",
   "scripts/check/check-supported-node-runtime.ts",
@@ -229,6 +232,7 @@ export const PACK_ARTIFACT_REQUIRED_PATHS: string[] = [
   "dist/server-ws.mjs",
   "dist/responses-ws-proxy.mjs",
   "dist/peer-stamp.mjs",
+  "dist/persistence-request-boundary.mjs",
   "dist/main-server-timeouts.mjs",
   // server-ws.mjs import (sd_notify helper) — enforced by the closure test.
   "dist/systemd-notify.mjs",
@@ -241,6 +245,7 @@ export const PACK_ARTIFACT_REQUIRED_PATHS: string[] = [
   // #7065: regression guard for the HEAD response guard (dist/server-ws.mjs import).
   "dist/head-response-guard.cjs",
   "dist/webdav-handler.mjs",
+  "dist/webdav-native-handler.mjs",
   "bin/cli/program.mjs",
   // Direct imports of bin/omniroute.mjs — bin/cli/ is only an allowlist PREFIX, so a
   // file vanishing from the tarball never fails the unexpected-paths check; only these

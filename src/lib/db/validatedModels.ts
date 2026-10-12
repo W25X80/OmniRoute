@@ -239,10 +239,12 @@ export async function commitValidatedModelAsync(
   db!.transaction(() => {
     assertValidationSnapshotFresh(snapshot);
     const { models } = readState(input);
-    db.prepare(
-      "INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES ('customModels', ?, ?)"
-    ).run(input.provider, JSON.stringify([...models, model]));
-    const row = db
+    db!
+      .prepare(
+        "INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES ('customModels', ?, ?)"
+      )
+      .run(input.provider, JSON.stringify([...models, model]));
+    const row = db!
       .prepare("SELECT value FROM key_value WHERE namespace = 'customModels' AND key = ?")
       .get(input.provider) as ValueRow;
     const saved = JSON.parse(row.value).find(

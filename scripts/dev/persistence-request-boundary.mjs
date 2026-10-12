@@ -139,7 +139,10 @@ function httpLifetime(req, res, onSettled) {
 }
 
 /** The hook owns handler Promise + HTTP lifetime; detached SSE tails need a separate permit. */
-export function wrapRequestListenerWithPersistence(listener) {
+export function wrapRequestListenerWithPersistence(listener, loadedNextConfiguration) {
+  const routing = isSqlitePersistenceRequested()
+    ? undefined
+    : captureNativeFileRouting(loadedNextConfiguration);
   return function persistenceAwareRequestHandler(req, res) {
     const hook = globalThis.__omniroutePersistenceRequest;
     if (isPureHealthRequest(req)) return listener.call(this, req, res);
@@ -163,7 +166,14 @@ export function wrapRequestListenerWithPersistence(listener) {
     };
     let owned;
     try {
-      owned = hook(run, lifetime.promise);
+      if (routing) {
+        const file = classifyNativeFileRequest(req.url || "", req.method || "GET", routing);
+        owned = hook(
+          run,
+          lifetime.promise,
+          file ? { req, res, ...file, onFailure: () => failUnavailable(res) } : undefined
+        );
+      } else owned = hook(run, lifetime.promise);
     } catch {
       lifetime.dispose();
       bodyGate.restore();
@@ -181,4 +191,50 @@ export function wrapRequestListenerWithPersistence(listener) {
         bodyGate.restore();
       });
   };
+}
+
+/** Capture the already loaded Next config; never infer routing from a mutable env alias. */
+export function captureNativeFileRouting(config) {
+  const basePath = config?.basePath;
+  const caseSensitiveRoutes = config?.experimental?.caseSensitiveRoutes;
+  if (
+    typeof basePath !== "string" ||
+    typeof caseSensitiveRoutes !== "boolean" ||
+    (basePath !== "" && (!basePath.startsWith("/") || basePath.endsWith("/"))) ||
+    /[?#\\]/.test(basePath)
+  )
+    throw new TypeError("Native file routing configuration unavailable");
+  return Object.freeze({ basePath, caseSensitiveRoutes });
+}
+/** Generated server.js sets this exact config before its serving createServer call. */
+export function loadedStandaloneNextConfiguration() {
+  try {
+    return JSON.parse(process.env.__NEXT_PRIVATE_STANDALONE_CONFIG);
+  } catch {
+    throw new TypeError("Native file routing configuration unavailable");
+  }
+}
+export function classifyNativeFileRequest(url, method, routing) {
+  // Match Next's parseUrl before rewrites, including fragments and dot segments.
+  const pathname = new URL(url.startsWith("/") ? "http://n" + url : url).pathname;
+  // Next redirects these raw paths before installing the clone/body consumer.
+  if (/(\\|\/\/)/.test(url.split("?", 1)[0])) return;
+  if (pathname.length > 1 && pathname.endsWith("/")) return;
+  const base = routing.basePath;
+  let canonical;
+  if (!base || pathname === base || pathname.startsWith(base + "/")) {
+    canonical = pathname.slice(base.length) || "/";
+  }
+  const escaped = base.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const alias = pathname.match(
+    new RegExp("^" + escaped + "/v1(?:/v1)?(?=/|$)", routing.caseSensitiveRoutes ? "" : "i")
+  );
+  if (alias) canonical = "/api/v1" + pathname.slice(alias[0].length);
+  if (method === "POST" && canonical === "/api/v1/files") return { kind: "upload", api: true };
+  if (method === "GET" || method === "HEAD") {
+    if (/^\/api\/v1\/files\/[^/]+\/content$/.test(canonical || ""))
+      return { kind: "download", api: true };
+    if (/^\/api\/files\/[^/]+\/content$/.test(canonical || ""))
+      return { kind: "download", api: false };
+  }
 }

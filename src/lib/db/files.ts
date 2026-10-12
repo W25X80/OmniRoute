@@ -1,3 +1,4 @@
+import type { NativeFileWork } from "./nativeFileWork";
 import { getSelectedPostgresDatabase } from "./controlPlaneContext";
 import { getDbInstance, rowToCamel, objToSnake } from "./core";
 import { v4 as uuidv4 } from "uuid";
@@ -302,4 +303,18 @@ export async function pruneExpiredFilesAsync(
     return postgres.transaction((transaction) => native.pruneExpiredFiles(transaction, ...args));
   }
   return pruneExpiredFiles(...args);
+}
+
+/** App-owned consumption; reserve actual locked content before native output allocation. */
+export async function getFileContentForConsumerAsync(
+  id: string,
+  consumer: NativeFileWork
+): Promise<Buffer | null> {
+  const postgres = getSelectedPostgresDatabase();
+  if (!postgres) return getFileContent(id);
+  consumer.assertActive();
+  const native = await import("./postgres/serviceFiles");
+  return postgres.transaction((transaction) =>
+    native.getFileContent(transaction, id, (size) => consumer.reserveDownload(size))
+  );
 }

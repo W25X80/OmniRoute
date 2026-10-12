@@ -1,5 +1,11 @@
+import { parseDatabaseBackend } from "@/lib/db/backendSelection";
+import {
+  getNativeFileHttpWork,
+  isNativeFileCapacityError,
+  nativeFileCapacityResponse,
+} from "@/lib/db/nativeFileWork";
 import { NextResponse } from "next/server";
-import { getFileAsync, getFileContentAsync } from "@/lib/db/files";
+import { getFileAsync, getFileContentAsync, getFileContentForConsumerAsync } from "@/lib/db/files";
 import { getApiKeyRequestScope, canAccessOwnedRecord } from "@/app/api/v1/_helpers/apiKeyScope";
 
 export async function GET(request: Request, { params }: { params: Promise<{ id: string }> }) {
@@ -20,7 +26,15 @@ export async function GET(request: Request, { params }: { params: Promise<{ id: 
     );
   }
 
-  const content = await getFileContentAsync(id);
+  let content: Buffer | null;
+  if (parseDatabaseBackend() === "postgres") {
+    try {
+      content = await getFileContentForConsumerAsync(id, getNativeFileHttpWork());
+    } catch (error) {
+      if (isNativeFileCapacityError(error)) return nativeFileCapacityResponse();
+      throw error;
+    }
+  } else content = await getFileContentAsync(id);
   if (!content) {
     return NextResponse.json(
       { error: { message: "File content not found", type: "invalid_request_error" } },

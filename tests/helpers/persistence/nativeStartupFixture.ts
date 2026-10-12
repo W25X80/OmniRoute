@@ -156,7 +156,9 @@ export const seedDefaultModelAliases = async () => ({
   removed: [],
   failed: [],
 });
-export const migrateCodexConnectionDefaultsFromLegacySettings = async () => ({ migrated: false });
+export const migrateCodexConnectionDefaultsFromLegacySettings = async () => ({
+  migrated: false,
+});
 export const initAuditLog = () => {};
 export const cleanupExpiredLogs = async () => ({});
 
@@ -190,6 +192,7 @@ export function beginPersistenceAdmissionClose(): void {
 }
 export async function drainPersistenceAcceptedWork(): Promise<void> {
   while (background.size) await Promise.allSettled([...background]);
+  record("accepted:drain");
 }
 
 export async function closeNativeNotionThreadSessions(): Promise<void> {

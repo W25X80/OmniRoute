@@ -4,7 +4,9 @@ import type { FileRecord } from "../files";
 import { rowToCamel } from "../core";
 import type { PostgresTransaction } from "./database";
 import { NATIVE_BLOB_LIMITS } from "./nativeBlobCarrier";
-import { affected, first, rows, safeInteger, lockServices } from "./serviceQuery";
+import { first, rows, safeInteger, lockServices } from "./serviceQuery";
+
+import { openStoredFileContent, replaceStoredFileContent } from "./serviceFileContent";
 
 const METADATA =
   "id, bytes, created_at, filename, purpose, mime_type, api_key_id, expires_at, deleted_at";
@@ -21,6 +23,9 @@ export async function createFile(
   transaction: PostgresTransaction,
   file: Omit<FileRecord, "id" | "createdAt">
 ): Promise<FileRecord> {
+  if (file.content && file.content.byteLength > NATIVE_BLOB_LIMITS.fileBytes) {
+    throw new Error("File content exceeds the supported size limit");
+  }
   await lockServices(transaction);
   const createdAt = Math.floor(Date.now() / 1000);
   const record: FileRecord = {
@@ -48,13 +53,14 @@ export async function createFile(
       record.createdAt,
       record.filename,
       record.purpose,
-      record.content,
+      null,
       record.mimeType,
       record.apiKeyId,
       record.expiresAt,
       record.deletedAt,
     ]
   );
+  await replaceStoredFileContent(transaction, record.id, record.content ?? null);
   return record;
 }
 export async function getFile(
@@ -70,30 +76,29 @@ export async function getFile(
 }
 export async function getFileContent(
   transaction: PostgresTransaction,
-  id: string
+  id: string,
+  reserve?: (sizeBytes: number) => void
 ): Promise<Buffer | null> {
-  // Default bytea text decoding first constructs a hex string. Read bounded
-  // fields while retaining one row version across the complete transaction.
-  const row = await first<{ content_length: number | null }>(
-    transaction,
-    "SELECT octet_length(content) AS content_length FROM omniroute.files WHERE id = $1 AND deleted_at IS NULL FOR SHARE",
-    [id]
-  );
-  if (!row || row.content_length === null) return null;
-  const size = safeInteger(row.content_length);
-  if (size < 0) throw new Error("Stored file content is incomplete or invalid");
-  const content = Buffer.allocUnsafe(size);
-  for (let offset = 0; offset < size; offset += NATIVE_BLOB_LIMITS.chunkBytes) {
-    const length = Math.min(NATIVE_BLOB_LIMITS.chunkBytes, size - offset);
-    const chunk = await first<{ content: Buffer | null }>(
-      transaction,
-      "SELECT substr(content, $2, $3) AS content FROM omniroute.files WHERE id = $1 AND deleted_at IS NULL",
-      [id, offset + 1, length]
-    );
-    if (!Buffer.isBuffer(chunk?.content) || chunk.content.byteLength !== length) {
+  const stored = await openStoredFileContent(transaction, id, { includeDeleted: false });
+  if (!stored || stored.sizeBytes === null) return null;
+  // Private app-consumer admission is synchronous/fail-fast while the SQL lease is held.
+  // Its caller retains ownership through SQL settlement and response/body consumption.
+  reserve?.(stored.sizeBytes);
+  const content = Buffer.allocUnsafe(stored.sizeBytes);
+  const count = Math.ceil(stored.sizeBytes / NATIVE_BLOB_LIMITS.chunkBytes);
+  for (let index = 0; index < count; index++) {
+    const chunk = await stored.readChunk(index);
+    const offset = index * NATIVE_BLOB_LIMITS.chunkBytes;
+    if (
+      !Buffer.isBuffer(chunk) ||
+      chunk.byteLength !== Math.min(NATIVE_BLOB_LIMITS.chunkBytes, stored.sizeBytes - offset)
+    ) {
       throw new Error("Stored file content is incomplete or invalid");
     }
-    chunk.content.copy(content, offset);
+    chunk.copy(content, offset);
+  }
+  if ((await stored.readChunk(count)) !== null) {
+    throw new Error("Stored file content is incomplete or invalid");
   }
   return content;
 }
@@ -155,13 +160,13 @@ export async function countFiles(
 }
 export async function deleteFile(transaction: PostgresTransaction, id: string): Promise<boolean> {
   await lockServices(transaction);
-  return (
-    (await affected(
-      transaction,
-      "UPDATE omniroute.files SET deleted_at = $1, content = NULL WHERE id = $2",
-      [Math.floor(Date.now() / 1000), id]
-    )) > 0
+  const result = await transaction.query(
+    "UPDATE omniroute.files SET deleted_at = $1, content = NULL WHERE id = $2",
+    [Math.floor(Date.now() / 1000), id]
   );
+  if ((result.rowCount ?? 0) === 0) return false;
+  await transaction.query("DELETE FROM omniroute.files_content_state WHERE file_id = $1", [id]);
+  return true;
 }
 export async function deleteFileOwnedBy(
   transaction: PostgresTransaction,
@@ -171,22 +176,28 @@ export async function deleteFileOwnedBy(
   if (typeof apiKeyId !== "string" || apiKeyId.trim() === "")
     throw new Error("deleteFileOwnedBy: apiKeyId is required");
   await lockServices(transaction);
-  return (
-    (await affected(
-      transaction,
-      "UPDATE omniroute.files SET deleted_at = $1, content = NULL WHERE id = $2 AND api_key_id = $3",
-      [Math.floor(Date.now() / 1000), id, apiKeyId]
-    )) > 0
+  const result = await transaction.query(
+    "UPDATE omniroute.files SET deleted_at = $1, content = NULL WHERE id = $2 AND api_key_id = $3",
+    [Math.floor(Date.now() / 1000), id, apiKeyId]
   );
+  if ((result.rowCount ?? 0) === 0) return false;
+  await transaction.query("DELETE FROM omniroute.files_content_state WHERE file_id = $1", [id]);
+  return true;
 }
 export async function pruneExpiredFiles(
   transaction: PostgresTransaction,
   now: number
 ): Promise<number> {
   await lockServices(transaction);
-  return affected(
+  const result = await first<{ count: string }>(
     transaction,
-    "UPDATE omniroute.files SET deleted_at = $1, content = NULL WHERE expires_at IS NOT NULL AND expires_at < $1 AND deleted_at IS NULL",
+    `WITH expired AS (
+      UPDATE omniroute.files SET deleted_at = $1, content = NULL
+      WHERE expires_at IS NOT NULL AND expires_at < $1 AND deleted_at IS NULL RETURNING id
+    ), cleared AS (
+      DELETE FROM omniroute.files_content_state WHERE file_id IN (SELECT id FROM expired)
+    ) SELECT COUNT(*)::text AS count FROM expired`,
     [now]
   );
+  return safeInteger(result?.count);
 }

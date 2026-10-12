@@ -150,12 +150,15 @@ export async function generateEmbeddingWithTimeout(
  * Creates a standard HTTP embedding generator against any OpenAI-compatible
  * embeddings endpoint (e.g. Lemonade server, OpenAI, Ollama).
  */
-export function createDefaultEmbeddingGenerator(config: {
-  embeddingProvider?: string;
-  embeddingModel?: string;
-  embeddingBaseUrl?: string;
-  embeddingApiKey?: string;
-}): EmbeddingGenerator {
+export function createDefaultEmbeddingGenerator(
+  config: {
+    embeddingProvider?: string;
+    embeddingModel?: string;
+    embeddingBaseUrl?: string;
+    embeddingApiKey?: string;
+  },
+  beforeDispatch?: () => Promise<void>
+): EmbeddingGenerator {
   return async (
     text: string,
     options?: { model?: string; provider?: string; signal?: AbortSignal }
@@ -210,6 +213,7 @@ export function createDefaultEmbeddingGenerator(config: {
           input: text,
         }),
         signal: options?.signal,
+        ...(beforeDispatch ? { beforeDispatch } : {}),
       });
 
       if (!res.ok) {

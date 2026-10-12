@@ -22,6 +22,7 @@ import {
 } from "./comboConfig.ts";
 
 import { getHiddenModelsByProvider } from "@/models";
+import { getHiddenChatModels } from "../../src/lib/hiddenChatModels";
 
 import { evaluateQuotaCutoff, getQuotaFetcher, type QuotaInfo } from "./quotaPreflight.ts";
 import { resolveProviderId } from "../../src/shared/constants/providers.ts";
@@ -701,7 +702,7 @@ async function handleComboChatInner({
   signal,
   apiKeyAllowedConnections = null,
   nesting = null,
-  hiddenModelsByProvider = getHiddenModelsByProvider(),
+  hiddenModelsByProvider,
   clientManagedResponsesContext = false,
   perTargetAdmission = null,
   deferContextOverflowWhenCompressible = false,
@@ -711,6 +712,7 @@ async function handleComboChatInner({
   requestHeaders = null,
   invocationId,
 }: HandleComboChatOptions): Promise<Response> {
+  hiddenModelsByProvider ??= await getHiddenChatModels();
   const comboCtx = createComboContext({ body, combo, settings, relayOptions, log });
   const {
     strategy,

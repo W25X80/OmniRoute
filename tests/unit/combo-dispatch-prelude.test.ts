@@ -28,6 +28,7 @@ const {
   tryPipelineDispatch,
   tryRuntimeUnitDispatch,
 } = await import("../../open-sse/services/combo/dispatchPrelude.ts");
+const { markEmptyTurnExecution } = await import("../../open-sse/utils/emptyTurnPolicy.ts");
 const { resolveComboSetupConfig } = await import("../../open-sse/services/comboConfig.ts");
 const { resolveComboRuntimeUnits } =
   await import("../../open-sse/services/combo/comboStructure.ts");
@@ -478,12 +479,16 @@ test("tryPinnedModelDispatch: accepts an official empty turn for a pinned Anthro
     'event: message_stop\ndata: {"type":"message_stop"}',
     "",
   ];
-  const response = new Response(events.join("\n\n"), {
+  const nativeResponse = new Response(events.join("\n\n"), {
     status: 200,
     headers: {
       "Content-Type": "text/event-stream",
       "X-OmniRoute-Selected-Connection-Id": connection.id,
     },
+  });
+  const response = markEmptyTurnExecution(nativeResponse, "https://api.anthropic.com/v1/messages", {
+    connectionId: connection.id,
+    apiKey: "sk-test-pinned-empty-turn",
   });
   const res = await tryPinnedModelDispatch({
     body: { ...ctx.body, stream: true },
@@ -513,7 +518,7 @@ test("tryPinnedModelDispatch: accepts an official empty turn for an unprefixed a
     models: [{ model: "claude-alias" }],
     config: {},
   });
-  const response = new Response(
+  const nativeResponse = new Response(
     [
       'event: message_start\ndata: {"type":"message_start","message":{"content":[]}}',
       'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}',
@@ -528,6 +533,10 @@ test("tryPinnedModelDispatch: accepts an official empty turn for an unprefixed a
       },
     }
   );
+  const response = markEmptyTurnExecution(nativeResponse, "https://api.anthropic.com/v1/messages", {
+    connectionId: connection.id,
+    apiKey: "sk-test-pinned-alias-empty-turn",
+  });
   const res = await tryPinnedModelDispatch({
     body: { ...ctx.body, stream: true },
     combo: ctx.combo,

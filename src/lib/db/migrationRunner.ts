@@ -18,6 +18,7 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import type { SqliteAdapter } from "./adapters/types";
+import { parseDatabaseBackend } from "./backendSelection";
 import { DEFAULT_DATABASE_SETTINGS } from "@/types/databaseSettings";
 import { isAutomatedTestProcess } from "@/shared/utils/testProcess";
 import {
@@ -110,7 +111,9 @@ function resolveMigrationsDir(): string {
   );
 }
 
-const MIGRATIONS_DIR = resolveMigrationsDir();
+// Native serving does not inspect the SQLite migration carrier on a cold import.
+// The default SQLite directory remains fixed eagerly, as before.
+let MIGRATIONS_DIR = parseDatabaseBackend() === "postgres" ? undefined : resolveMigrationsDir();
 
 /**
  * Default maximum number of migrations allowed to run in a single startup on an
@@ -221,10 +224,11 @@ function isDeferredUnsupportedMigration(
 function getMigrationFiles(): Array<{ version: string; name: string; path: string }> {
   // The extra directories are an independent set: a missing core directory must not
   // make them vanish silently.
-  if (!fs.existsSync(MIGRATIONS_DIR)) return getExtraMigrationFiles();
+  const migrationsDir = (MIGRATIONS_DIR ??= resolveMigrationsDir());
+  if (!fs.existsSync(migrationsDir)) return getExtraMigrationFiles();
 
   const files = fs
-    .readdirSync(MIGRATIONS_DIR)
+    .readdirSync(migrationsDir)
     .filter((f) => f.endsWith(".sql"))
     .sort()
     .map((filename) => {
@@ -233,7 +237,7 @@ function getMigrationFiles(): Array<{ version: string; name: string; path: strin
       return {
         version: match[1],
         name: match[2],
-        path: path.join(MIGRATIONS_DIR, filename),
+        path: path.join(migrationsDir, filename),
       };
     })
     .filter(Boolean) as Array<{ version: string; name: string; path: string }>;

@@ -11,7 +11,19 @@ export * from "./backend";
 export * from "./manager";
 export * from "./settings";
 export * from "./types";
-export * from "./store";
+export {
+  createMemory,
+  deleteMemory,
+  getMemory,
+  getMemoryTokensUsed,
+  getMemoryTokensUsedAsync,
+  listMemories,
+  listMemoriesForDecay,
+  listMemoriesForDecayAsync,
+  recordMemoryAccess,
+  recordMemoryAccessAsync,
+  updateMemory,
+} from "./store";
 export * from "./retrieval";
 export * from "./vectorStore";
 export * from "./embedding";
@@ -59,5 +71,3 @@ export async function initMemoryBackends(): Promise<void> {
     log.warn("Failed to initialize backends", { error: String(e) });
   }
 }
-
-export { PostgresMemoryBackend, postgresMemoryBackend } from "./postgresBackend";

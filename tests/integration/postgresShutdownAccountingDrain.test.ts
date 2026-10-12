@@ -89,7 +89,9 @@ test(
     const ownerGlobals = globalThis as typeof globalThis & { [ownerSymbol]?: unknown };
     const external = new AsyncResource("native-shutdown-late-accounting");
     const entered = barrier(),
-      complete = barrier();
+      complete = barrier(),
+      admissionClosed = barrier();
+    let producers: typeof import("../helpers/persistence/shutdownOrderingFixture.ts") | undefined;
     let runtime: typeof import("../../src/lib/db/persistenceRuntime.ts") | undefined;
     let permit: PersistenceTailPermit | undefined;
     let tail: Promise<void> | undefined;
@@ -100,6 +102,12 @@ test(
       nativeRuntimeFixture.artifactsClosed = 0;
       runtime = await import(runtimeUrl);
       await runtime.ensurePersistenceReady();
+      producers = await import(producersUrl);
+      assert.equal(typeof producers.beginNativeEmbeddedServicesClose, "function");
+      producers.shutdownFixture.reset();
+      producers.shutdownFixture.onPhase = (phase) => {
+        if (phase === "embedded:admission-close") admissionClosed.resolve();
+      };
       const cost = await import("../../src/domain/costRules.ts");
       const logs = await import("../../src/lib/usage/callLogs.ts");
       const { getSelectedPostgresDatabase } =
@@ -138,6 +146,7 @@ test(
             requestBody: { messages: [{ role: "user", content: "must not be stored" }] },
             responseBody: { choices: [{ message: { content: "private response" } }] },
           });
+          producers!.shutdownFixture.events.push("tail:accounted");
         })
       );
       void tail.catch(() => {});
@@ -153,7 +162,11 @@ test(
         runtime.runPersistenceRequest(async () => {}),
         /unavailable|draining/
       );
+      await admissionClosed.promise;
       await new Promise<void>((done) => setImmediate(done));
+      assert.equal(producers.shutdownFixture.events.includes("embedded:stop"), false);
+      assert.equal(producers.shutdownFixture.events.includes("embedded:buffers-close"), false);
+      assert.equal(producers.shutdownFixture.events.includes("rtk:close"), false);
       assert.equal(closed, false);
       assert.equal(nativeRuntimeFixture.plane?.state, "ready");
       assert.equal(nativeRuntimeFixture.artifactsClosed, 0);
@@ -161,6 +174,24 @@ test(
       await tail;
       await permit!.release();
       await closing;
+      const phases = producers.shutdownFixture.events;
+      const completedAt = phases.indexOf("tail:accounted");
+      assert.ok(completedAt >= 0);
+      for (const phase of [
+        "history:close",
+        "rtk:close",
+        "codex:close",
+        "compression:close",
+        "llmlingua:close",
+        "embedded:stop",
+        "embedded:buffers-close",
+        "host:close",
+        "codegraph:close",
+      ]) {
+        assert.ok(phases.indexOf(phase) > completedAt, `${phase} must follow accepted accounting`);
+      }
+      assert.ok(phases.indexOf("embedded:admission-close") < phases.indexOf("embedded:stop"));
+      assert.ok(phases.indexOf("embedded:stop") < phases.indexOf("embedded:buffers-close"));
       assert.equal(nativeRuntimeFixture.plane?.state, "closed");
       assert.equal(nativeRuntimeFixture.artifactsClosed, 1);
       assert.equal(existsSync(join(directory, "storage.sqlite")), false);
@@ -217,6 +248,7 @@ test(
       await permit?.release().catch(() => {});
       await closing?.catch(() => {});
       await runtime?.closePersistenceRuntime().catch(() => {});
+      if (producers) producers.shutdownFixture.onPhase = undefined;
       hooks.deregister();
       external.emitDestroy();
       try {

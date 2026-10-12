@@ -42,13 +42,21 @@ test("required native initialization failures reject and leave initialization re
       attempts[1].reason,
       "concurrent callers share one initialization"
     );
+    assert.ok(attempts[0].reason instanceof Error);
+    assert.equal(attempts[0].reason.name, "Error");
+    assert.equal(attempts[0].reason.message, "PostgreSQL application persistence is not ready");
   }
   assert.equal(globalThis.__omnirouteBackgroundSyncInitialization?.initialized, false);
   assert.equal(globalThis.__omnirouteBackgroundSyncInitialization?.pending, undefined);
-  // Initialization may have created producers before a required job read fails.
-  // The coordinator closes those producers when it observes this rejection.
+  // Cloud sync starts first; the native model scheduler rejects missing authority
+  // before the job registry is created. The coordinator closes partial producers.
   assert.ok(globalThis.__omnirouteCloudSyncScheduler);
-  assert.ok(globalThis.__omnirouteJobRegistry);
+  assert.equal(globalThis.__omnirouteJobRegistry, undefined);
+  assert.equal(
+    Reflect.get(globalThis, Symbol.for("omniroute.postgresModelSyncScheduler")),
+    undefined
+  );
+  assert.equal(fs.existsSync(path.join(directory, "storage.sqlite")), false);
   await assert.rejects(ensureCloudSyncInitialized());
   assert.equal(
     errors.filter(

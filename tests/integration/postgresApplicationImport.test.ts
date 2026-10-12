@@ -19,10 +19,29 @@ import {
   capturePostgresApplicationSnapshot,
 } from "../../src/lib/db/postgres/applicationImport.ts";
 import { migratePostgresSchema } from "../../src/lib/db/postgres/migrations.ts";
+import type { PostgresTransaction } from "../../src/lib/db/postgres/database.ts";
+import { openStoredFileContent } from "../../src/lib/db/postgres/serviceFileContent.ts";
 import {
   createTestPostgresDatabase,
   postgresTestsEnabled,
 } from "../helpers/persistence/postgresTestDatabase.ts";
+
+async function readLogicalFileContent(transaction: PostgresTransaction, id: string) {
+  const content = await openStoredFileContent(transaction, id);
+  assert.ok(content, "the logical file must exist");
+  if (content.sizeBytes === null) return null;
+  const chunks: Buffer[] = [];
+  for (
+    let index = 0;
+    index < Math.ceil(content.sizeBytes / NATIVE_BLOB_LIMITS.chunkBytes);
+    index++
+  ) {
+    const bytes = await content.readChunk(index);
+    assert.ok(Buffer.isBuffer(bytes));
+    chunks.push(bytes);
+  }
+  return Buffer.concat(chunks, content.sizeBytes);
+}
 
 test(
   "native offline import and logical restore preserve selected durable owner records",
@@ -98,11 +117,7 @@ test(
                 "SELECT api_key,insertion_order::text AS insertion_order FROM omniroute.provider_connections WHERE id='provider-fixture'"
               )
             ).rows[0];
-            const file = (
-              await tx.query<{ content: Buffer }>(
-                "SELECT content FROM omniroute.files WHERE id='file-fixture'"
-              )
-            ).rows[0];
+            const file = { content: await readLogicalFileContent(tx, "file-fixture") };
             const usage = (
               await tx.query<{ timestamp: string; latency_ms: number; ttft_ms: number }>(
                 "SELECT timestamp,latency_ms,ttft_ms FROM omniroute.usage_history WHERE id=41"
@@ -281,9 +296,14 @@ test(
                   "SELECT COUNT(*)::text AS count FROM omniroute.application_import_receipts"
                 )
               ).rows[0];
-              return { files: files.count, receipts: receipts.count };
+              const physical = (
+                await tx.query<{ states: string; chunks: string }>(
+                  "SELECT (SELECT COUNT(*) FROM omniroute.files_content_state)::text AS states,(SELECT COUNT(*) FROM omniroute.files_content_chunks)::text AS chunks"
+                )
+              ).rows[0];
+              return { files: files.count, receipts: receipts.count, ...physical };
             });
-            assert.deepEqual(rollback, { files: "0", receipts: "0" });
+            assert.deepEqual(rollback, { files: "0", receipts: "0", states: "0", chunks: "0" });
             const imported = await importApplicationSnapshot(
               database,
               fileSnapshot,
@@ -306,14 +326,10 @@ test(
               restored.restoreAuthority?.targetAuthority
             );
             await verifyApplicationImport(database, native);
-            const actual = await database.transaction(
-              async (tx) =>
-                (
-                  await tx.query<{ content: Buffer }>(
-                    "SELECT content FROM omniroute.files WHERE id='carrier-file'"
-                  )
-                ).rows[0].content
+            const actual = await database.transaction((tx) =>
+              readLogicalFileContent(tx, "carrier-file")
             );
+            assert.ok(Buffer.isBuffer(actual));
             assert.equal(actual.length, content.length);
             assert.equal(
               createHash("sha256").update(actual).digest("hex"),
@@ -321,6 +337,146 @@ test(
             );
           } finally {
             fileSource.close();
+          }
+        }
+      );
+      await t.test(
+        "logical maintenance preserves NULL, empty, tombstones and legacy inline fallback",
+        async () => {
+          await database.transaction((tx) => tx.query("DROP SCHEMA omniroute CASCADE"));
+          await migratePostgresSchema(database);
+          const rawFiles = new Database(":memory:");
+          const sourceFiles = createBetterSqliteAdapter(rawFiles);
+          const expected = new Map<string, Buffer | null>([
+            ["null-file", null],
+            ["empty-file", Buffer.alloc(0)],
+            ["live-file", Buffer.from([0, 0xff, 2])],
+            ["deleted-file", Buffer.from("deleted content")],
+          ]);
+          const chunks = new Map<string, Uint8Array>();
+          const sink = {
+            writeChunk(id: string, index: number, bytes: Uint8Array) {
+              chunks.set(`${id}/${index}`, Buffer.from(bytes));
+            },
+          };
+          const reader = {
+            async readChunk(id: string, index: number) {
+              return chunks.get(`${id}/${index}`) ?? null;
+            },
+          };
+          try {
+            sourceFiles.exec(
+              "CREATE TABLE files(id TEXT PRIMARY KEY,bytes INTEGER,created_at INTEGER,filename TEXT,purpose TEXT,deleted_at INTEGER,content BLOB)"
+            );
+            for (const [id, content] of expected)
+              sourceFiles
+                .prepare("INSERT INTO files VALUES(?,?,?,?,?,?,?)")
+                .run(
+                  id,
+                  41,
+                  1000,
+                  `${id}.bin`,
+                  "batch",
+                  id === "deleted-file" ? 2000 : null,
+                  content
+                );
+            sourceFiles.pragma("query_only=ON");
+            const logical = captureSqliteApplicationSnapshot(sourceFiles);
+            const receipt = await importApplicationSnapshot(database, logical);
+            assert.equal(receipt.rowCount, 4);
+            await verifyApplicationImport(database, logical);
+            const observed = await database.transaction(async (tx) => {
+              const rows = (
+                await tx.query<{ id: string; bytes: string; deleted_at: string | null }>(
+                  "SELECT id,bytes::text AS bytes,deleted_at::text AS deleted_at FROM omniroute.files ORDER BY id"
+                )
+              ).rows;
+              const contents: { id: string; content: Buffer | null }[] = [];
+              for (const row of rows)
+                contents.push({ id: row.id, content: await readLogicalFileContent(tx, row.id) });
+              const states = (
+                await tx.query<{ count: string }>(
+                  "SELECT COUNT(*)::text AS count FROM omniroute.files_content_state"
+                )
+              ).rows[0].count;
+              return { rows, contents, states };
+            });
+            assert.equal(observed.states, "3");
+            for (const row of observed.rows) {
+              assert.equal(row.bytes, "41", "files.bytes is source metadata, not a content length");
+              assert.equal(row.deleted_at, row.id === "deleted-file" ? "2000" : null);
+            }
+            for (const file of observed.contents)
+              assert.deepEqual(file.content, expected.get(file.id));
+            await database.transaction(async (tx) => {
+              await tx.query("DELETE FROM omniroute.files_content_state WHERE file_id='live-file'");
+              await tx.query("UPDATE omniroute.files SET content=$1 WHERE id='live-file'", [
+                expected.get("live-file"),
+              ]);
+            });
+            await verifyApplicationImport(database, logical);
+            assert.equal(
+              (await importApplicationSnapshot(database, logical)).alreadyImported,
+              true
+            );
+            const native = await capturePostgresApplicationSnapshot(database, { blobSink: sink });
+            assert.equal(native.format, "omniroute-application-storage-v1");
+            for (const table of ["files_content_state", "files_content_chunks"]) {
+              assert.equal(
+                native.tables.some((row) => row.name === table),
+                false
+              );
+              assert.ok(
+                native.excluded.some(
+                  (row) => row.name === table && row.reason.includes("files.content")
+                )
+              );
+            }
+            const exportedFiles = native.tables.find((table) => table.name === "files")!;
+            const contentAt = exportedFiles.columns.indexOf("content");
+            const nullRow = exportedFiles.rows.find(
+              (row) => row.values[exportedFiles.columns.indexOf("id")] === "null-file"
+            )!;
+            assert.equal(nullRow.values[contentAt], null);
+            await database.transaction((tx) => tx.query("DROP SCHEMA omniroute CASCADE"));
+            await migratePostgresSchema(database);
+            const restored = await importApplicationSnapshot(database, native, [], undefined, {
+              source: reader,
+              memoryBudgetBytes: NATIVE_BLOB_LIMITS.importMemoryBudgetBytes,
+            });
+            assert.notEqual(
+              restored.restoreAuthority?.sourceAuthority,
+              restored.restoreAuthority?.targetAuthority
+            );
+            await verifyApplicationImport(database, native);
+            for (const [id, content] of expected)
+              assert.deepEqual(
+                await database.transaction((tx) => readLogicalFileContent(tx, id)),
+                content
+              );
+            await database.transaction((tx) =>
+              tx.query(
+                "UPDATE omniroute.files_content_chunks SET checksum=$1 WHERE file_id='deleted-file'",
+                ["a".repeat(64)]
+              )
+            );
+            const incomplete = (error: unknown) =>
+              error instanceof Error &&
+              error.message === "Stored file content is incomplete or invalid";
+            await assert.rejects(verifyApplicationImport(database, native), incomplete);
+            await assert.rejects(
+              capturePostgresApplicationSnapshot(database, { blobSink: sink }),
+              incomplete
+            );
+            await database.transaction((tx) =>
+              tx.query(
+                "UPDATE omniroute.files_content_chunks SET checksum=$1 WHERE file_id='deleted-file'",
+                [createHash("sha256").update(expected.get("deleted-file")!).digest("hex")]
+              )
+            );
+            await verifyApplicationImport(database, native);
+          } finally {
+            sourceFiles.close();
           }
         }
       );

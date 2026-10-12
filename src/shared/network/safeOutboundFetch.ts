@@ -60,6 +60,8 @@ export interface SafeOutboundFetchOptions extends RequestInit {
   pinDns?: boolean;
   /** Resolver used by the `public-only` host check; tests inject a fake one. */
   dnsLookup?: DnsLookup;
+  /** Internal admission fence after local DNS preparation, never an HTTP option. */
+  beforeDispatch?: () => void | Promise<void>;
 }
 
 type SafeOutboundFetchPresetMap = {
@@ -417,6 +419,7 @@ export async function safeOutboundFetch(url: string | URL, options: SafeOutbound
     bypassProxyPatch = false,
     pinDns = false,
     dnsLookup,
+    beforeDispatch,
     signal,
     ...fetchOptions
   } = options;
@@ -449,7 +452,7 @@ export async function safeOutboundFetch(url: string | URL, options: SafeOutbound
 
   for (let attempt = 1; attempt <= retryConfig.attempts; attempt++) {
     try {
-      const executeFetch = () =>
+      const startFetch = () =>
         fetchWithTimeout(targetUrl.toString(), {
           ...fetchOptions,
           method,
@@ -463,6 +466,15 @@ export async function safeOutboundFetch(url: string | URL, options: SafeOutbound
               ? getOriginalFetch()
               : undefined,
         });
+
+      const executeFetch = beforeDispatch
+        ? async () => {
+            signal?.throwIfAborted();
+            await beforeDispatch();
+            signal?.throwIfAborted();
+            return startFetch();
+          }
+        : startFetch;
 
       const response = bypassProxyPatch
         ? await executeFetch()

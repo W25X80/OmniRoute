@@ -78,7 +78,7 @@ export function getCcAliasProviderSetting(providerId: string): CcAliasSetting {
   const row = (
     getSelectedPostgresDatabase()
       ? catalogValue(NAMESPACE, providerKey(providerId))
-      : db
+      : db!
           .prepare("SELECT value FROM key_value WHERE namespace = ? AND key = ?")
           .get(NAMESPACE, providerKey(providerId))
   ) as { value: string } | undefined;
@@ -119,7 +119,7 @@ export function getCcAliasModelSetting(providerId: string, modelId: string): CcA
   const row = (
     getSelectedPostgresDatabase()
       ? catalogValue(NAMESPACE, modelKey(providerId, modelId))
-      : db
+      : db!
           .prepare("SELECT value FROM key_value WHERE namespace = ? AND key = ?")
           .get(NAMESPACE, modelKey(providerId, modelId))
   ) as { value: string } | undefined;
@@ -168,7 +168,7 @@ export function getCcAliasSettingsBulk(): {
   const rows = (
     getSelectedPostgresDatabase()
       ? catalogNamespaceRows(NAMESPACE)
-      : db.prepare("SELECT key, value FROM key_value WHERE namespace = ?").all(NAMESPACE)
+      : db!.prepare("SELECT key, value FROM key_value WHERE namespace = ?").all(NAMESPACE)
   ) as Array<{ key: string; value: string }>;
 
   const providers = new Map<string, "on" | "off">();

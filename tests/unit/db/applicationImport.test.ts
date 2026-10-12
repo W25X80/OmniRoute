@@ -1,6 +1,7 @@
 import {
   APPLICATION_IMPORT_TABLES,
   APPLICATION_IMPORT_NATIVE_ONLY,
+  APPLICATION_IMPORT_NATIVE_FILE_TABLES,
 } from "../../../src/lib/db/postgres/applicationImportManifest.ts";
 import {
   captureNativeBlob,
@@ -92,9 +93,14 @@ function fixture(initial: Record<string, unknown>[] = []) {
     generation: "0",
   };
   let receipt: Record<string, unknown> | undefined;
+  let invalidContent = false;
   const events = new EventEmitter();
   const columns = [
-    ...new Set([...APPLICATION_IMPORT_TABLES, ...APPLICATION_IMPORT_NATIVE_ONLY]),
+    ...new Set([
+      ...APPLICATION_IMPORT_TABLES,
+      ...APPLICATION_IMPORT_NATIVE_ONLY,
+      ...APPLICATION_IMPORT_NATIVE_FILE_TABLES,
+    ]),
   ].map((name) => ({
     name,
     columns:
@@ -133,6 +139,8 @@ function fixture(initial: Record<string, unknown>[] = []) {
         primary: table.name === "key_value" ? ["namespace", "key"] : table.columns,
         parents: [],
       }));
+    else if (text.startsWith("WITH headers AS"))
+      data = [{ maximum: 0, total: "0", invalid: invalidContent }];
     else if (text.startsWith("SELECT singleton,generation")) data = epoch ? [epoch] : [];
     else if (text.startsWith("DELETE FROM omniroute.api_key_policy_epoch")) epoch = undefined;
     else if (text.startsWith('INSERT INTO omniroute."api_key_policy_epoch"'))
@@ -189,7 +197,16 @@ function fixture(initial: Record<string, unknown>[] = []) {
     { maxConnections: 1, transactionTimeoutMs: 500 },
     { warn() {} }
   );
-  return { database, calls, rows, getReceipt: () => receipt, getEpoch: () => epoch };
+  return {
+    database,
+    calls,
+    rows,
+    getReceipt: () => receipt,
+    getEpoch: () => epoch,
+    invalidateContent() {
+      invalidContent = true;
+    },
+  };
 }
 
 test("read-only capture preserves integer strings, BLOB bytes and source schema provenance", () => {
@@ -494,5 +511,58 @@ test("unversioned candidate-era receipts fail closed without replaying import wr
     assert.equal(calls.filter((value) => value.text.startsWith("INSERT")).length, before);
   } finally {
     await database.close();
+  }
+});
+
+test("private file tables cannot be imported as portable logical owner records", async () => {
+  process.env.STORAGE_ENCRYPTION_KEY = "isolated-application-import-unit-key";
+  for (const table of APPLICATION_IMPORT_NATIVE_FILE_TABLES) {
+    const input = snapshot();
+    input.tables.push({ name: table, columns: ["id"], rowOrder: "rowid", rows: [] });
+    const { database, calls, getReceipt } = fixture();
+    try {
+      await assert.rejects(importApplicationSnapshot(database, input), kind("schema"));
+      assert.equal(
+        calls.some((call) => call.text.startsWith("INSERT")),
+        false
+      );
+      assert.equal(getReceipt(), undefined);
+    } finally {
+      await database.close();
+    }
+  }
+});
+
+test("physical file integrity is checked on explicit verification and receipt reconciliation", async () => {
+  process.env.STORAGE_ENCRYPTION_KEY = "isolated-application-import-unit-key";
+  const f = fixture();
+  try {
+    await importApplicationSnapshot(f.database, snapshot());
+    const inserts = f.calls.filter((call) => call.text.startsWith("INSERT")).length;
+    f.invalidateContent();
+    const incomplete = (error: unknown) =>
+      error instanceof Error && error.message === "Stored file content is incomplete or invalid";
+    await assert.rejects(verifyApplicationImport(f.database, snapshot()), incomplete);
+    await assert.rejects(importApplicationSnapshot(f.database, snapshot()), incomplete);
+    assert.equal(f.calls.filter((call) => call.text.startsWith("INSERT")).length, inserts);
+  } finally {
+    await f.database.close();
+  }
+});
+
+test("a receipt from a different physical schema cannot authorize import replay", async () => {
+  process.env.STORAGE_ENCRYPTION_KEY = "isolated-application-import-unit-key";
+  const f = fixture();
+  try {
+    await importApplicationSnapshot(f.database, snapshot());
+    f.getReceipt()!.schemaDigest = "previous-physical-schema";
+    const inserts = f.calls.filter((call) => call.text.startsWith("INSERT")).length;
+    await assert.rejects(
+      importApplicationSnapshot(f.database, snapshot()),
+      kind("different_import")
+    );
+    assert.equal(f.calls.filter((call) => call.text.startsWith("INSERT")).length, inserts);
+  } finally {
+    await f.database.close();
   }
 });

@@ -46,7 +46,7 @@ export function getFunctionalGatewayProviderSetting(providerId: string): Functio
   const row = (
     getSelectedPostgresDatabase()
       ? catalogValue(NAMESPACE, providerKey(providerId))
-      : db
+      : db!
           .prepare("SELECT value FROM key_value WHERE namespace = ? AND key = ?")
           .get(NAMESPACE, providerKey(providerId))
   ) as { value: string } | undefined;
@@ -85,7 +85,7 @@ export function getFunctionalGatewayModelSetting(modelId: string): FunctionalGat
   const row = (
     getSelectedPostgresDatabase()
       ? catalogValue(NAMESPACE, modelKey(modelId))
-      : db
+      : db!
           .prepare("SELECT value FROM key_value WHERE namespace = ? AND key = ?")
           .get(NAMESPACE, modelKey(modelId))
   ) as { value: string } | undefined;
@@ -127,7 +127,7 @@ export function getFunctionalGatewaySettingsBulk(): {
   const rows = (
     getSelectedPostgresDatabase()
       ? catalogNamespaceRows(NAMESPACE)
-      : db.prepare("SELECT key, value FROM key_value WHERE namespace = ?").all(NAMESPACE)
+      : db!.prepare("SELECT key, value FROM key_value WHERE namespace = ?").all(NAMESPACE)
   ) as Array<{ key: string; value: string }>;
 
   const providers = new Map<string, "on" | "off">();

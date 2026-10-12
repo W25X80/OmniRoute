@@ -74,6 +74,14 @@ test("changed unit test under memory/ → run itself", () => {
   assert.deepEqual(sel, ["tests/unit/memory/store.test.ts"]);
 });
 
+test("changed unit test under persistence/ → run itself", () => {
+  const sel = selectImpacted({
+    changed: ["tests/unit/persistence/runtimeOwnedWork.test.ts"],
+    map: MAP,
+  });
+  assert.deepEqual(sel, ["tests/unit/persistence/runtimeOwnedWork.test.ts"]);
+});
+
 test("changed unit test under usage/ → run itself", () => {
   const sel = selectImpacted({
     changed: ["tests/unit/usage/quota.test.ts"],

@@ -139,7 +139,7 @@ test("native skill deadline is admitted before shared detection and prevents a l
         { code: "1", language: "javascript" },
         { apiKeyId: "fixture", sessionId: "" }
       );
-      assert.equal(result.status, "error");
+      assert.equal(result.status, "timeout");
       assert.match(result.errorMessage!, /Skill execution timed out/);
     });
     const shared = await resolveProvider();

@@ -27,7 +27,7 @@ function extractParens(src: string, openAt: number): string {
   return src.slice(openAt, i);
 }
 
-test("createSSETransformStreamWithLogger declares the buffer-size slot last", () => {
+test("createSSETransformStreamWithLogger preserves the buffer slot before its optional terminal hook", () => {
   const src = readFileSync(join(root, "open-sse", "utils", "stream.ts"), "utf8");
   const needle = "export function createSSETransformStreamWithLogger(";
   const start = src.indexOf(needle);
@@ -38,7 +38,15 @@ test("createSSETransformStreamWithLogger declares the buffer-size slot last", ()
   // #12925: the slot GLM had been filling since #12179 is now declared, so the
   // value reaches TransformStream instead of being dropped as an extra arg.
   assert.match(header, /streamBufferBytes\s*:\s*number/);
-  assert.match(header, /streamBufferBytes[^,)]*\)\s*$/, `buffer size must stay last:\n${header}`);
+  const params = splitTopLevel(header).map((param) => param.split(/[:=]/)[0].trim());
+  assert.equal(params.indexOf("streamBufferBytes"), 16);
+  assert.equal(params[17], "onBeforeTerminal");
+  assert.match(header, /onBeforeTerminal: StreamBeforeTerminal \| null = null/);
+  const implementation = src.slice(
+    start,
+    src.indexOf("export function createPassthroughStreamWithLogger", start)
+  );
+  assert.match(implementation, /streamBufferBytes,\s*onBeforeTerminal,/);
 });
 
 test("GLM translateSseResponse fills the buffer-size slot with the named constant", () => {
@@ -58,9 +66,16 @@ test("GLM translateSseResponse fills the buffer-size slot with the named constan
   const params = splitTopLevel(header).map((param) => param.split(/[:=]/)[0].trim());
   const args = splitTopLevel(call);
 
-  assert.equal(args.length, params.length, `GLM must match the helper arity:\n${call}`);
-  assert.equal(params.at(-1), "streamBufferBytes");
-  assert.equal(args.at(-1), "GLM_STREAM_BUFFER_BYTES");
+  const bufferSlot = params.indexOf("streamBufferBytes");
+  assert.equal(bufferSlot, 16);
+  assert.equal(args[bufferSlot], "GLM_STREAM_BUFFER_BYTES");
+  assert.equal(
+    args.length,
+    bufferSlot + 1,
+    "GLM intentionally omits the default-null terminal hook"
+  );
+  assert.equal(params[args.length], "onBeforeTerminal");
+  assert.match(header, /onBeforeTerminal: StreamBeforeTerminal \| null = null/);
   assert.equal(args[params.indexOf("suppressThinkClose")], "suppressThinkClose");
   assert.match(src, /const GLM_STREAM_BUFFER_BYTES = 65536;/);
 });

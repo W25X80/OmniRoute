@@ -203,7 +203,7 @@ function readLastFailedAt(): number | null {
     const row = (
       native
         ? catalogValue("arena_elo", "lastFailedAt")
-        : db.prepare(KV_READ_SQL).get("arena_elo", "lastFailedAt")
+        : db!.prepare(KV_READ_SQL).get("arena_elo", "lastFailedAt")
     ) as { value: string } | undefined;
     if (!row?.value) return null;
     const ts = Date.parse(row.value);

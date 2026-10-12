@@ -5,6 +5,8 @@ import { getSelectedPostgresDatabase } from "./db/controlPlaneContext";
 const require = createRequire(import.meta.url);
 const childProcess = require("node:child_process") as typeof import("node:child_process");
 const OUTPUT_LIMIT_BYTES = 1024 * 1024;
+const MAX_ACTIVE_PROBES = 64;
+const MAX_PROBE_TIMEOUT_MS = 30_000;
 
 type ProbeState = { closing: boolean; active: Map<ChildProcess, Promise<void>> };
 declare global {
@@ -23,22 +25,35 @@ export function usesNativeHostProfile(): boolean {
 export interface NativeHostProbeResult {
   success: boolean;
   stdout: string;
-  failure?: "closed" | "failed" | "timeout" | "output_limit";
+  failure?: "closed" | "failed" | "timeout" | "output_limit" | "busy" | "aborted";
 }
 
 /** Internal capability probes only: callers own fixed argv and ACP version validation. */
 export function probeNativeHostCapability(
   command: string,
   args: readonly string[],
-  options: { shell?: boolean; ignoreOutput?: boolean; timeoutMs?: number } = {}
+  options: {
+    shell?: boolean;
+    ignoreOutput?: boolean;
+    timeoutMs?: number;
+    env?: NodeJS.ProcessEnv;
+    signal?: AbortSignal;
+    windowsHide?: boolean;
+  } = {}
 ): Promise<NativeHostProbeResult> {
   if (state.closing) return Promise.resolve({ success: false, stdout: "", failure: "closed" });
+  if (options.signal?.aborted)
+    return Promise.resolve({ success: false, stdout: "", failure: "aborted" });
+  if (state.active.size >= MAX_ACTIVE_PROBES)
+    return Promise.resolve({ success: false, stdout: "", failure: "busy" });
   return new Promise((resolve) => {
     let proc: ChildProcess;
     try {
       proc = childProcess.spawn(command, [...args], {
         stdio: options.ignoreOutput ? "ignore" : ["pipe", "pipe", "pipe"],
         ...(options.shell ? { shell: true } : {}),
+        ...(options.env ? { env: options.env } : {}),
+        ...(options.windowsHide ? { windowsHide: true } : {}),
       });
     } catch {
       resolve({ success: false, stdout: "", failure: "failed" });
@@ -60,7 +75,14 @@ export function probeNativeHostCapability(
       proc.stdout?.destroy();
       proc.stderr?.destroy();
     };
-    const timer = setTimeout(() => stop("timeout"), options.timeoutMs ?? 5000);
+    const timeoutMs =
+      Number.isFinite(options.timeoutMs) && options.timeoutMs! > 0
+        ? Math.min(options.timeoutMs!, MAX_PROBE_TIMEOUT_MS)
+        : 5000;
+    const timer = setTimeout(() => stop("timeout"), timeoutMs);
+    const abort = () => stop("aborted");
+    options.signal?.addEventListener("abort", abort, { once: true });
+    if (options.signal?.aborted) abort();
     proc.stdout?.on("data", (value: Buffer) => {
       stdoutBytes += value.length;
       if (stdoutBytes > OUTPUT_LIMIT_BYTES) stop("output_limit");
@@ -75,6 +97,7 @@ export function probeNativeHostCapability(
     });
     proc.once("close", (code) => {
       clearTimeout(timer);
+      options.signal?.removeEventListener("abort", abort);
       state.active.delete(proc);
       closed();
       resolve({

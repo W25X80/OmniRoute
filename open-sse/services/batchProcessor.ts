@@ -1,3 +1,4 @@
+import { acquireNativeFileConsumer } from "@/lib/db/nativeFileWork";
 import { v4 as uuidv4 } from "uuid";
 import { parseDatabaseBackend } from "@/lib/db/backendSelection";
 import { getSelectedPersistenceIdentity } from "@/lib/db/controlPlaneContext";
@@ -22,6 +23,7 @@ import {
   createFileAsync,
   deleteFileAsync,
   getFileContentAsync,
+  getFileContentForConsumerAsync,
   listFilesAsync,
 } from "@/lib/db/files";
 import { getApiKeyById } from "@/lib/db/apiKeys";
@@ -392,72 +394,79 @@ async function cleanupExpiredBatches(): Promise<void> {
 async function startBatch(batch: any, identity: object | undefined): Promise<void> {
   console.log(`[BATCH] Starting batch ${batch.id}`);
 
-  const content = await getFileContentAsync(batch.inputFileId);
-  if (!content) {
-    await failBatch(batch.id, "Input file content not found");
-    return;
-  }
-
+  const contentOwner = identity ? acquireNativeFileConsumer() : undefined;
   try {
-    const parsedItems = parseBatchItems(content, batch.endpoint);
-    if (parsedItems.error || parsedItems.items === null) {
-      // Set total count even on validation failure so UI shows correct numbers
-      const lines = content
-        .toString()
-        .split("\n")
-        .map((line) => line.trim())
-        .filter(Boolean);
-      await updateBatchAsync(batch.id, {
-        requestCountsTotal: lines.length,
-        requestCountsFailed: lines.length, // All failed due to validation error
-      });
-      await failBatch(batch.id, parsedItems.error);
+    const content = contentOwner
+      ? await getFileContentForConsumerAsync(batch.inputFileId, contentOwner)
+      : await getFileContentAsync(batch.inputFileId);
+    if (!content) {
+      await failBatch(batch.id, "Input file content not found");
       return;
     }
-    const total = parsedItems.items.length;
 
-    console.log(`[BATCH] Batch ${batch.id} contains (${total} items)`);
-
-    await ensureBatchItemCheckpointsAsync(batch.id, parsedItems.items);
-
-    await updateBatchAsync(batch.id, {
-      status: "in_progress",
-      inProgressAt: Math.floor(Date.now() / 1000),
-      requestCountsTotal: total,
-    });
-
-    activeBatches.add(batch.id);
-
-    // Admission owns the detached worker, failure persistence and underlying dispatches.
-    const pendingDispatches = identity ? new Set<Promise<Response>>() : undefined;
-    const work = runPersistenceBackgroundWork(async () => {
-      assertAuthority(identity);
-      try {
-        await processBatchItems(batch, parsedItems.items, pendingDispatches);
-      } catch (error) {
-        console.error(`[BATCH] Critical error in processBatchItems for ${batch.id}:`, error);
-        try {
-          await failBatch(batch.id, String(error));
-        } catch (storageError) {
-          console.error(`[BATCH] Unable to persist failure for ${batch.id}:`, storageError);
-        }
-      } finally {
-        // A deadline acknowledgement does not mean the underlying HTTP call has settled.
-        while (pendingDispatches?.size) await Promise.allSettled([...pendingDispatches]);
+    try {
+      const parsedItems = parseBatchItems(content, batch.endpoint);
+      if (parsedItems.error || parsedItems.items === null) {
+        // Set total count even on validation failure so UI shows correct numbers
+        const lines = content
+          .toString()
+          .split("\n")
+          .map((line) => line.trim())
+          .filter(Boolean);
+        await updateBatchAsync(batch.id, {
+          requestCountsTotal: lines.length,
+          requestCountsFailed: lines.length, // All failed due to validation error
+        });
+        await failBatch(batch.id, parsedItems.error);
+        return;
       }
-    });
-    activeProcesses.add(work);
-    const finished = () => {
-      activeProcesses.delete(work);
-      activeBatches.delete(batch.id);
-    };
-    void work.then(finished, (error: unknown) => {
-      finished();
-      console.error(`[BATCH] Background admission failed for ${batch.id}:`, error);
-    });
-  } catch (err) {
-    console.error(`[BATCH] Error starting batch ${batch.id}:`, err);
-    await failBatch(batch.id, err instanceof Error ? err.message : String(err));
+      const total = parsedItems.items.length;
+
+      console.log(`[BATCH] Batch ${batch.id} contains (${total} items)`);
+
+      await ensureBatchItemCheckpointsAsync(batch.id, parsedItems.items);
+
+      await updateBatchAsync(batch.id, {
+        status: "in_progress",
+        inProgressAt: Math.floor(Date.now() / 1000),
+        requestCountsTotal: total,
+      });
+
+      activeBatches.add(batch.id);
+
+      // Admission owns the detached worker, failure persistence and underlying dispatches.
+      const pendingDispatches = identity ? new Set<Promise<Response>>() : undefined;
+      const work = runPersistenceBackgroundWork(async () => {
+        assertAuthority(identity);
+        try {
+          await processBatchItems(batch, parsedItems.items, pendingDispatches);
+        } catch (error) {
+          console.error(`[BATCH] Critical error in processBatchItems for ${batch.id}:`, error);
+          try {
+            await failBatch(batch.id, String(error));
+          } catch (storageError) {
+            console.error(`[BATCH] Unable to persist failure for ${batch.id}:`, storageError);
+          }
+        } finally {
+          // A deadline acknowledgement does not mean the underlying HTTP call has settled.
+          while (pendingDispatches?.size) await Promise.allSettled([...pendingDispatches]);
+        }
+      });
+      activeProcesses.add(work);
+      const finished = () => {
+        activeProcesses.delete(work);
+        activeBatches.delete(batch.id);
+      };
+      void work.then(finished, (error: unknown) => {
+        finished();
+        console.error(`[BATCH] Background admission failed for ${batch.id}:`, error);
+      });
+    } catch (err) {
+      console.error(`[BATCH] Error starting batch ${batch.id}:`, err);
+      await failBatch(batch.id, err instanceof Error ? err.message : String(err));
+    }
+  } finally {
+    contentOwner?.release();
   }
 }
 
@@ -1001,16 +1010,23 @@ async function createSuccessFile(
 
   const content = toJsonl(successes);
 
-  const file = await createFileAsync({
-    bytes: Buffer.byteLength(content),
-    filename: `batch_${batchId}_output.jsonl`,
-    purpose: "batch_output",
-    content: Buffer.from(content),
-    apiKeyId: current?.apiKeyId,
-    expiresAt: getBatchOutputExpiresAt(current),
-  });
+  const contentOwner =
+    parseDatabaseBackend() === "postgres" ? acquireNativeFileConsumer() : undefined;
+  try {
+    contentOwner?.beforeBuffer(Buffer.byteLength(content));
+    const file = await createFileAsync({
+      bytes: Buffer.byteLength(content),
+      filename: `batch_${batchId}_output.jsonl`,
+      purpose: "batch_output",
+      content: Buffer.from(content),
+      apiKeyId: current?.apiKeyId,
+      expiresAt: getBatchOutputExpiresAt(current),
+    });
 
-  return file.id;
+    return file.id;
+  } finally {
+    contentOwner?.release();
+  }
 }
 
 async function createErrorFile(
@@ -1034,16 +1050,23 @@ async function createErrorFile(
 
   const content = toJsonl(allFailures);
 
-  const file = await createFileAsync({
-    bytes: Buffer.byteLength(content),
-    filename: `batch_${batchId}_error.jsonl`,
-    purpose: "batch_output",
-    content: Buffer.from(content),
-    apiKeyId: current?.apiKeyId,
-    expiresAt: getBatchOutputExpiresAt(current),
-  });
+  const contentOwner =
+    parseDatabaseBackend() === "postgres" ? acquireNativeFileConsumer() : undefined;
+  try {
+    contentOwner?.beforeBuffer(Buffer.byteLength(content));
+    const file = await createFileAsync({
+      bytes: Buffer.byteLength(content),
+      filename: `batch_${batchId}_error.jsonl`,
+      purpose: "batch_output",
+      content: Buffer.from(content),
+      apiKeyId: current?.apiKeyId,
+      expiresAt: getBatchOutputExpiresAt(current),
+    });
 
-  return file.id;
+    return file.id;
+  } finally {
+    contentOwner?.release();
+  }
 }
 
 function toJsonl(items: any[]): string {

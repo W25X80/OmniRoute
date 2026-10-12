@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import test from "node:test";
+import { pipeToNodeResponse } from "next/dist/server/pipe-readable.js";
 import {
   createTestPostgresDatabase,
   postgresTestsEnabled,
@@ -199,7 +200,11 @@ test(
             return;
           }
           if (active.calls > 1) {
-            response.end(encodeChat({ content: "Recovered tail." }, "stop") + "data: [DONE]\n\n");
+            // One deliberately accepted continuation under the existing overlap heuristic.
+            response.end(
+              encodeChat({ content: "Preparing tool. Recovered tail." }, "stop") +
+                "data: [DONE]\n\n"
+            );
             return;
           }
           response.write(encodeChat({ role: "assistant", content: "Preparing tool. " }));
@@ -296,17 +301,11 @@ test(
         assert.ok(result.response?.body);
         assert.equal(result.success, true);
         response.writeHead(result.response.status, Object.fromEntries(result.response.headers));
-        const reader = result.response.body!.getReader();
         try {
-          while (!response.destroyed) {
-            const chunk = await reader.read();
-            if (chunk.done) break;
-            response.write(chunk.value);
-          }
-          if (!response.destroyed) response.end();
+          // Match Next's abort-aware HTTP pump: socket close cancels a pending body read.
+          // The source completed-tool grace keeps its producer on the same accepted tail.
+          await pipeToNodeResponse(result.response.body!, response);
         } finally {
-          await reader.cancel().catch(() => {});
-          reader.releaseLock();
           active.done.resolve();
         }
       })();
@@ -551,6 +550,14 @@ test(
           if (kind === "flag-off") {
             assert.equal(current.calls, 2);
             assert.equal(postCloseExecutions, 1);
+            assert.deepEqual(
+              current.recoveryOutcomes.map(({ attempt, outcome }) => [attempt, outcome]),
+              [
+                [1, "started"],
+                [1, "suffix"],
+              ],
+              "one post-close continuation accepts its coherent suffix"
+            );
           }
           if (kind === "credits") {
             const rows = await verification.transaction((tx) =>

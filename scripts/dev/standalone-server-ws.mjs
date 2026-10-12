@@ -1,4 +1,8 @@
-import { wrapRequestListenerWithPersistence } from "./persistence-request-boundary.mjs";
+import {
+  isSqlitePersistenceRequested,
+  loadedStandaloneNextConfiguration,
+  wrapRequestListenerWithPersistence,
+} from "./persistence-request-boundary.mjs";
 import http from "node:http";
 import net from "node:net";
 import { randomUUID } from "node:crypto";
@@ -229,6 +233,12 @@ function wrapRequestListenerWithWebdav(listener) {
   };
 }
 
+function wrapServingRequestListener(listener) {
+  return isSqlitePersistenceRequested()
+    ? wrapRequestListenerWithPersistence(listener)
+    : wrapRequestListenerWithPersistence(listener, loadedStandaloneNextConfiguration());
+}
+
 http.createServer = function createServerWithResponsesWs(...args) {
   // Next's standalone server.js may pass its request listener directly to
   // createServer; wrap it so the real TCP peer IP is stamped before Next runs.
@@ -239,7 +249,7 @@ http.createServer = function createServerWithResponsesWs(...args) {
     // HEAD request regardless of which inner layer ends up handling it (#6400).
     args[lastFnIdx] = wrapRequestListenerWithHeadResponseGuard(
       wrapRequestListenerWithMethodGuard(
-        wrapRequestListenerWithPersistence(
+        wrapServingRequestListener(
           wrapRequestListenerWithWebdav(wrapRequestListenerWithPeerStamp(args[lastFnIdx]))
         )
       )
@@ -278,7 +288,7 @@ http.createServer = function createServerWithResponsesWs(...args) {
         eventName,
         wrapRequestListenerWithHeadResponseGuard(
           wrapRequestListenerWithMethodGuard(
-            wrapRequestListenerWithPersistence(
+            wrapServingRequestListener(
               wrapRequestListenerWithWebdav(wrapRequestListenerWithPeerStamp(listener))
             )
           )
@@ -297,7 +307,7 @@ http.createServer = function createServerWithResponsesWs(...args) {
         eventName,
         wrapRequestListenerWithHeadResponseGuard(
           wrapRequestListenerWithMethodGuard(
-            wrapRequestListenerWithPersistence(
+            wrapServingRequestListener(
               wrapRequestListenerWithWebdav(wrapRequestListenerWithPeerStamp(listener))
             )
           )

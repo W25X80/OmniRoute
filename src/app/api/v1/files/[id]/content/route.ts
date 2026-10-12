@@ -1,5 +1,11 @@
+import { parseDatabaseBackend } from "@/lib/db/backendSelection";
+import {
+  getNativeFileHttpWork,
+  isNativeFileCapacityError,
+  nativeFileCapacityResponse,
+} from "@/lib/db/nativeFileWork";
 import { CORS_HEADERS, handleCorsOptions } from "@/shared/utils/cors";
-import { getFileAsync, getFileContentAsync } from "@/lib/db/files";
+import { getFileAsync, getFileContentAsync, getFileContentForConsumerAsync } from "@/lib/db/files";
 import { NextResponse } from "next/server";
 import {
   getApiKeyRequestScope,
@@ -60,7 +66,15 @@ export async function GET(request: Request, { params }: { params: Promise<{ id: 
     );
   }
 
-  const content = await getFileContentAsync(id);
+  let content: Buffer | null;
+  if (parseDatabaseBackend() === "postgres") {
+    try {
+      content = await getFileContentForConsumerAsync(id, getNativeFileHttpWork());
+    } catch (error) {
+      if (isNativeFileCapacityError(error)) return nativeFileCapacityResponse(CORS_HEADERS);
+      throw error;
+    }
+  } else content = await getFileContentAsync(id);
   if (!content) {
     return NextResponse.json(
       { error: { message: "File content not found", type: "invalid_request_error" } },

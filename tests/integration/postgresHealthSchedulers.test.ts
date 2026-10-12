@@ -88,10 +88,15 @@ test(
         runtime: { applyRuntimeSettings() {}, scheduleCatalogRevalidationAfterInit() {} },
       };
       plane = await initializePostgresControlPlane(options);
+      const applicationIdentity = await plane.run((binding) => {
+        assert.ok(binding.databaseIdentity);
+        return binding.databaseIdentity;
+      });
       const state: NonNullable<typeof globalThis.__omniroutePersistenceRuntime> = {
         backend: "postgres",
         phase: "ready",
         plane,
+        applicationIdentity,
         requests: new Set(),
         background: new Set(),
         tails: new Set(),
@@ -99,6 +104,7 @@ test(
       };
       globalThis.__omniroutePersistenceRuntime = state;
       await runPersistenceRequest(async () => {
+        assert.equal(getSelectedControlPlane()!.databaseIdentity, applicationIdentity);
         credential = await import("../../src/lib/credentialHealth/scheduler.ts");
         proxy = await import("../../src/lib/proxyHealth/scheduler.ts");
         free = await import("../../src/lib/freeProxyProviders/scheduler.ts");
@@ -299,6 +305,10 @@ test(
           await credential!.stopCredentialHealthCheckAsync();
           await proxy!.stopProxyHealthCheckAsync();
           await free!.stopFreeProxyAutoSyncAsync();
+          await waitUntil(() => globalThis.__omniroutePersistenceRuntime!.background.size === 0);
+          await (
+            await import("../../src/lib/proxyHealth/blockedHistory.ts")
+          ).closeBlockedHistoryAsync();
         });
       }
       await second?.close();

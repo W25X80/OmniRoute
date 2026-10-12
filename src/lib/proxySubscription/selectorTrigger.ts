@@ -525,6 +525,7 @@ export async function maybeSwitchOnSetAside(
     // Deterministic tie-break: first pair in (updated_at DESC, id ASC) order.
     const hit = pairs[0]!;
     const now = typeof opts?.nowMs === "number" ? opts.nowMs : Date.now();
+    const kind = await switchOutcomeKind(setAsideKey, now, opts?.kind);
     if (isThrottled(hit, now)) {
       // A throttled repeat still documents why nothing moved: the list shows
       // the last outcome, and a throttle is normal backoff, never a failure.
@@ -535,7 +536,7 @@ export async function maybeSwitchOnSetAside(
       });
       return { switched: false, reason: "throttled" };
     }
-    return runSwitch(hit, setAsideKey, now, await switchOutcomeKind(setAsideKey, now, opts?.kind));
+    return runSwitch(hit, setAsideKey, now, kind);
   } catch {
     return { switched: false, reason: "network-error" };
   }

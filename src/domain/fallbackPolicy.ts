@@ -81,7 +81,7 @@ export function registerFallback(model, chain) {
  * @param {string[]} [excludeProviders=[]] - Providers to skip (e.g. already tried)
  * @returns {FallbackEntry[]} Ordered list of fallback providers
  */
-export function resolveFallbackChain(model, excludeProviders = []) {
+export function resolveFallbackChain(model, excludeProviders: string[] = []) {
   ensureLoaded();
   const chain = fallbackChains.get(model);
   if (!chain) return [];

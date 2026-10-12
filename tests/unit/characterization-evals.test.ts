@@ -49,10 +49,13 @@ test("surface: evals module runtime exports", () => {
         "createScorecard",
         "evaluateCase",
         "getSuite",
+        "getSuiteAsync",
         "listSuites",
+        "listSuitesAsync",
         "registerSuite",
         "resetSuites",
         "runSuite",
+        "runSuiteAsync",
       ],
       runtime: [
         "buildEvalCaseRequest",

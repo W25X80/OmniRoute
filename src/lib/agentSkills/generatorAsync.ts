@@ -2,10 +2,12 @@ import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
 import { getCatalog, refreshCatalog } from "./catalog";
-import { assembleFileContent, buildSkillMarkdown } from "./generator";
 import { parseOpenapiAsync } from "./openapiParser";
 import { parseCliRegistryAsync } from "./cliRegistryParser";
 import type { GeneratorOptions, GeneratorReport } from "./types";
+
+type SkillMarkdownBuilder = typeof import("./generator").buildSkillMarkdown;
+type FileContentAssembler = typeof import("./generator").assembleFileContent;
 
 const GENERATIONS = Symbol.for("omniroute.agentSkillFileGenerations");
 const generationGlobals = globalThis as typeof globalThis & {
@@ -14,7 +16,9 @@ const generationGlobals = globalThis as typeof globalThis & {
 
 /** Preserve the synchronous generator's non-interleaving file operation per output base. */
 export function generateAgentSkillsWithAsyncFiles(
-  opts: GeneratorOptions
+  opts: GeneratorOptions,
+  buildSkillMarkdown: SkillMarkdownBuilder,
+  assembleFileContent: FileContentAssembler
 ): Promise<GeneratorReport> {
   const outputDir = opts.outputDir ?? "skills";
   const outputBase = path.isAbsolute(outputDir) ? outputDir : path.join(process.cwd(), outputDir);
@@ -22,7 +26,7 @@ export function generateAgentSkillsWithAsyncFiles(
   const options = { ...opts, onlyIds: opts.onlyIds ? [...opts.onlyIds] : undefined };
   const pending = (generationGlobals[GENERATIONS] ??= new Map());
   const work = (pending.get(key) ?? Promise.resolve()).then(() =>
-    generateFiles(options, outputBase)
+    generateFiles(options, outputBase, buildSkillMarkdown, assembleFileContent)
   );
   const settled = work.then(
     () => {},
@@ -43,7 +47,12 @@ async function readOptionalFile(file: string): Promise<string | undefined> {
   }
 }
 
-async function generateFiles(opts: GeneratorOptions, outputBase: string): Promise<GeneratorReport> {
+async function generateFiles(
+  opts: GeneratorOptions,
+  outputBase: string,
+  buildSkillMarkdown: SkillMarkdownBuilder,
+  assembleFileContent: FileContentAssembler
+): Promise<GeneratorReport> {
   const { dryRun = true, prune = false, onlyIds } = opts;
   const catalog = getCatalog();
   const catalogIds = new Set(catalog.map((skill) => skill.id));

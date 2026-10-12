@@ -19,7 +19,8 @@ SQLite file operations retain explicit capability boundaries.
 migrations, encrypted bootstrap secrets and settings before installing the selected application
 binding. Explicit nonempty `JWT_SECRET` and `API_KEY_SECRET` keep precedence; otherwise their
 imported or atomically created durable secrets are used. Startup requires a stable explicit
-`STORAGE_ENCRYPTION_KEY`. Corrupt or undecryptable bootstrap secrets fail startup rather than
+`STORAGE_ENCRYPTION_KEY` and a nonempty explicit `DATA_DIR` for local scratch. Cold imports do not
+initialize the application SQLite database. Corrupt or undecryptable bootstrap secrets fail startup rather than
 being replaced. The runtime installs the chosen authentication secrets before consumers start.
 
 The supported HTTP wrappers in `scripts/dev/run-next.mjs` and
@@ -107,10 +108,34 @@ are not evidence that no object exists. Log cleanup queues deletion in SQL when 
 is removed; acknowledged object deletion is followed by queue acknowledgement. SQL and S3 are
 separate commit domains. The store does not expose a production endpoint override or filesystem fallback.
 
-Uploaded application `files.content` remains PostgreSQL bytea, with the existing 512 MiB file
-boundary. It is distinct from the 8 MiB call-log S3 object limit. Local writable scratch remains
-necessary for workers, temporary artifacts and optional host integrations. OMP's
-`~/.omp/agent/agent.db` is an explicit host SQLite capability, not application fallback.
+Application files retain their existing logical `files.content` contract and 512 MiB content
+boundary. Migration 4 adds private `files_content_state` and `files_content_chunks` tables.
+New content is stored as at most 64 bytea chunks of 8 MiB inside the metadata transaction; the
+whole-file marker is inserted last. Parent row locks serialize replacement, reading and deletion.
+Mapped readers check sizes, sequential indexes, chunk hashes and the whole SHA before returning the
+last chunk. NULL, an empty file, soft-deleted rows and the independent metadata `files.bytes`
+value remain distinct. Legacy inline bytea rows are read explicitly; neither representation
+falls back to a local file. This file boundary is separate from the 8 MiB call-log S3 object limit.
+Size limits do not guarantee completion before the configured transaction deadline.
+
+[`nativeFileWork.ts`](../nativeFileWork.ts) bounds the existing application file consumers to
+64 active consumers and 4 GiB of retained payload credit per process identity. Native HTTP
+uploads reserve eight times actual accepted wire bytes before Next.js clones the body. Downloads
+reserve the larger of three content copies or output plus a bounded chunk-codec allowance before
+allocation. Credit remains until accepted handler/SQL work and HTTP consumption both settle;
+internal batch consumers retain it through their awaited consumption. A disconnect does not prove
+that an accepted SQL write failed. Capacity admission fails with a sanitized 503 and never waits
+while holding a SQL client. The ordinary file HTTP wire limit is 500 MiB; it is separate from the
+512 MiB logical content limit. These bounds cover the inspected parser/binary/response payload,
+not every metadata or JSON graph, process RSS, GC, native or socket allocation.
+
+Local writable scratch remains necessary for workers, temporary artifacts and optional host
+integrations. OMP's `~/.omp/agent/agent.db` is an explicit host SQLite capability, not application
+fallback. In the native profile, [`ompHostClient.ts`](../ompHostClient.ts) delegates fixed host
+operations to one owned worker with bounded job count, payload and deadlines. An uncertain
+mutation acknowledgement is not retried. Headroom's native process/probe path uses asynchronous
+child processes and filesystem calls. Shutdown stops new producers, drains admitted work, then
+joins these resources. Those host integrations are distinct from application PostgreSQL state.
 
 [`persistenceCapabilities.ts`](../persistenceCapabilities.ts) reports unavailable SQLite file
 backup/restore/import/export, optimization, legacy JSON import and integrity repair as capability
@@ -134,15 +159,19 @@ retained summaries are preserved without inventing per-key archive history.
 The bounded profile permits 250,000 rows, 512 MiB JSON, ordinary BLOBs/artifacts up to 8 MiB and
 100-row SQL batches. `--large-files` captures file BLOBs into separate 8 MiB binary chunks with
 size/SHA manifests, up to 512 MiB per file and 10 GiB aggregate carrier data. Large bytes are never
-base64-embedded in the JSON snapshot. Import validates all chunks before SQL and rechecks one
-assembled file at a time; `--memory-budget-mib` must declare at least 2048 MiB. That declaration is
+base64-embedded in the JSON snapshot. Import validates all chunks before SQL and streams verified
+chunks into the same file transaction without assembling a whole 512 MiB file. Export and
+verification expose logical content, validate every stored chunk and omit private physical tables
+from the portable row owners. `--memory-budget-mib` must declare at least 2048 MiB. That declaration is
 not an OS-enforced RSS ceiling. The max-file qualification witness declares 4096 MiB.
 
 Import/restore requires an empty target apart from recognized migration seeds, uses offline table
 locks and checks every copied row before COMMIT. A canonical-JSON SHA-256 receipt binds source,
 plan and target schema. Reusing the same bundle reconciles that receipt and verifies current rows;
 it does not replay writes. Unversioned experimental receipts from the former hash algorithm fail
-closed. A confirmed import followed by failed artifact readback reports `committed = true` with
+closed. Receipts also bind the exact physical schema. An older schema receipt is not silently
+reinterpreted: use a verified logical export and restore to a fresh target for a schema transition.
+A confirmed import followed by failed artifact readback reports `committed = true` with
 `artifact_readback`. Historical native restore creates a fresh authority UUID/generation 0 and
 retains source epoch lineage in the receipt. The older `postgres-import-routing.ts` remains a
 routing-slice utility, not the complete migration command.

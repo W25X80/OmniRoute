@@ -1,4 +1,6 @@
-import { getProviderConnections } from "@/lib/db/providers";
+import { getProviderConnections, getProviderConnectionById } from "@/lib/db/providers";
+import { getSelectedPersistenceIdentity } from "@/lib/db/controlPlaneContext";
+import { isConnectionUnavailableToAuxiliaryActivity } from "@/lib/exclusiveLeaseIsolation";
 import { getUserDatabaseSettings, getUserDatabaseSettingsAsync } from "@/lib/db/databaseSettings";
 import { getDbInstance } from "@/lib/db/core";
 import { decryptConnectionFields } from "@/lib/db/encryption";
@@ -6,7 +8,10 @@ import {
   registerSemanticCacheConfigResolver,
   registerSemanticCacheAsyncConfigResolver,
 } from "@omniroute/open-sse/config/semanticCacheConfig.ts";
-import { resolveEmbeddingCredentials } from "@omniroute/open-sse/services/cache/embeddingEndpoint";
+import {
+  embeddingEndpoint,
+  resolveEmbeddingCredentials,
+} from "@omniroute/open-sse/services/cache/embeddingEndpoint";
 
 let registered = false;
 
@@ -61,7 +66,10 @@ export function ensureSemanticCacheDbBridge(): void {
         : {};
 
       const { baseUrl: embeddingBaseUrl, apiKey: embeddingApiKey } = resolveEmbeddingCredentials(
-        { baseUrl: s.semanticCacheEmbeddingBaseUrl, apiKey: s.semanticCacheEmbeddingApiKey },
+        {
+          baseUrl: s.semanticCacheEmbeddingBaseUrl,
+          apiKey: s.semanticCacheEmbeddingApiKey,
+        },
         conn
       );
 
@@ -87,20 +95,67 @@ export function ensureSemanticCacheDbBridge(): void {
       return null;
     }
   });
-  registerSemanticCacheAsyncConfigResolver(async () => {
+  registerSemanticCacheAsyncConfigResolver(async (captureStoredCredential) => {
     try {
       // Configuration reads must not run full DB statistics or integrity checks.
       const s = (await getUserDatabaseSettingsAsync()).cache;
       if (!s) return null;
 
       const conn = s.semanticCacheEmbeddingProvider
-        ? await resolveProviderConnectionDetailsAsync(s.semanticCacheEmbeddingProvider)
+        ? await resolveProviderConnectionSelectionAsync(s.semanticCacheEmbeddingProvider)
         : {};
 
       const { baseUrl: embeddingBaseUrl, apiKey: embeddingApiKey } = resolveEmbeddingCredentials(
-        { baseUrl: s.semanticCacheEmbeddingBaseUrl, apiKey: s.semanticCacheEmbeddingApiKey },
+        {
+          baseUrl: s.semanticCacheEmbeddingBaseUrl,
+          apiKey: s.semanticCacheEmbeddingApiKey,
+        },
         conn
       );
+
+      const identity = captureStoredCredential ? getSelectedPersistenceIdentity() : undefined;
+      if (
+        identity &&
+        !s.semanticCacheEmbeddingApiKey &&
+        "connectionId" in conn &&
+        typeof conn.connectionId === "string" &&
+        typeof embeddingApiKey === "string" &&
+        embeddingApiKey === conn.apiKey
+      ) {
+        const connectionId = conn.connectionId;
+        const provider = s.semanticCacheEmbeddingProvider;
+        const endpoint = conn.baseUrl ? embeddingEndpoint(conn.baseUrl) : undefined;
+        captureStoredCredential!(
+          Object.freeze({
+            connectionId,
+            apiKey: embeddingApiKey,
+            endpoint,
+            async assertFresh() {
+              const unavailable = () => new Error("Stored embedding credentials are unavailable");
+              if (getSelectedPersistenceIdentity() !== identity) throw unavailable();
+              const current = await getProviderConnectionById(connectionId);
+              const data = current?.providerSpecificData as Record<string, unknown> | undefined;
+              const currentEndpoint =
+                typeof data?.baseUrl === "string" && data.baseUrl.trim()
+                  ? embeddingEndpoint(data.baseUrl.trim())
+                  : undefined;
+              if (
+                !current ||
+                current.id !== connectionId ||
+                current.provider !== provider ||
+                current.isActive !== true ||
+                typeof current.apiKey !== "string" ||
+                current.apiKey.trim() !== embeddingApiKey ||
+                currentEndpoint !== endpoint
+              )
+                throw unavailable();
+              // true means leased/unavailable; false is necessary, never sufficient by itself.
+              if (await isConnectionUnavailableToAuxiliaryActivity(connectionId))
+                throw unavailable();
+            },
+          })
+        );
+      }
 
       return {
         // The vector layer is opt-in (#14159): it only runs when the operator turned
@@ -129,9 +184,20 @@ export function ensureSemanticCacheDbBridge(): void {
 export async function resolveProviderConnectionDetailsAsync(
   provider: string
 ): Promise<{ baseUrl?: string; apiKey?: string }> {
+  const selected = await resolveProviderConnectionSelectionAsync(provider);
+  if (!("connectionId" in selected)) return {};
+  return { baseUrl: selected.baseUrl, apiKey: selected.apiKey };
+}
+
+async function resolveProviderConnectionSelectionAsync(
+  provider: string
+): Promise<{ connectionId?: string; baseUrl?: string; apiKey?: string }> {
   if (!provider) return {};
   try {
-    const connections = await getProviderConnections({ provider, isActive: true });
+    const connections = await getProviderConnections({
+      provider,
+      isActive: true,
+    });
     connections.sort((a, b) => {
       const priority =
         a.priority == null
@@ -149,6 +215,7 @@ export async function resolveProviderConnectionDetailsAsync(
     if (!connection) return {};
     const data = connection.providerSpecificData as Record<string, unknown> | undefined;
     return {
+      connectionId: String(connection.id),
       baseUrl:
         typeof data?.baseUrl === "string" && data.baseUrl.trim() ? data.baseUrl.trim() : undefined,
       apiKey:

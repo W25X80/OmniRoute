@@ -96,7 +96,12 @@ test("a2a modules consumed outside src/lib/a2a export exactly this surface", () 
         "collectMemoryHits",
         "executeA2ATaskWithState",
       ],
-      taskManager: ["A2ATaskManager", "getTaskManager", "historyRetentionDays"],
+      taskManager: [
+        "A2ATaskManager",
+        "getTaskManager",
+        "historyRetentionDays",
+        "shutdownA2ATaskManagerRuntime",
+      ],
     }
   );
 });

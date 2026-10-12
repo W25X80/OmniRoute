@@ -328,17 +328,24 @@ test("findMissingArtifactPaths flags missing root runtime files in the tarball",
     // #13636/#14064: server-ws.mjs crash guard, enforced by the closure suites.
     "dist/httpClientAbortGuard.mjs",
     "dist/main-server-timeouts.mjs",
+    "dist/open-sse/executors/chatgpt-web-codex/package.json",
+    "dist/open-sse/executors/chatgpt-web-codex/tunnelZipWorker.js",
     "dist/open-sse/services/compression/engines/rtk/filters/generic-output.json",
     "dist/open-sse/services/compression/rules/en/filler.json",
     "dist/open-sse/vendor/codex-chatgpt-web/adapters/chatgpt-web/mcp-server.js",
+    "dist/open-sse/vendor/codex-chatgpt-web/responses/package.json",
+    "dist/open-sse/vendor/codex-chatgpt-web/responses/stateWorker.js",
     "dist/peer-stamp.mjs",
+    "dist/persistence-request-boundary.mjs",
     "dist/responses-ws-proxy.mjs",
     "dist/server-ws.mjs",
+    "dist/src/lib/copilot/codegraphQueryWorker.cjs",
     "dist/src/lib/db/healthCheckWorker.js",
     "dist/src/lib/usage/callLogArtifactWorker.js",
     "dist/systemd-notify.mjs",
     "dist/tls-options.mjs",
     "dist/webdav-handler.mjs",
+    "dist/webdav-native-handler.mjs",
     "scripts/build/colocateOptionals.mjs",
     "scripts/build/native-binary-compat.mjs",
     "scripts/build/runtime-env.mjs",
@@ -362,4 +369,42 @@ test("every shipped @omniroute workspace package is covered by an artifact prefi
     (prefix) => !PACK_ARTIFACT_ALLOWED_PATH_PREFIXES.includes(prefix)
   );
   assert.deepEqual(uncovered, []);
+});
+
+test("native persistence sidecars survive staging and fail loudly when absent", () => {
+  for (const file of ["persistence-request-boundary.mjs", "webdav-native-handler.mjs"]) {
+    assert.ok(APP_STAGING_ALLOWED_EXACT_PATHS.includes(file));
+    assert.deepEqual(
+      findUnexpectedArtifactPaths([file, `${file}.bak`], {
+        exactPaths: APP_STAGING_ALLOWED_EXACT_PATHS,
+        prefixPaths: APP_STAGING_ALLOWED_PATH_PREFIXES,
+        neverAllowedSegments: [],
+      }),
+      [`${file}.bak`]
+    );
+    const required = `dist/${file}`;
+    assert.ok(PACK_ARTIFACT_REQUIRED_PATHS.includes(required));
+    assert.deepEqual(
+      findMissingArtifactPaths(
+        PACK_ARTIFACT_REQUIRED_PATHS.filter((entry) => entry !== required),
+        PACK_ARTIFACT_REQUIRED_PATHS
+      ),
+      [required]
+    );
+  }
+});
+
+test("global-error catalog generator ships as the exact build-wrapper dependency", () => {
+  const generator = "scripts/i18n/generate-global-error-messages.mjs";
+  const files: string[] = JSON.parse(
+    readFileSync(new URL("../../package.json", import.meta.url), "utf8")
+  ).files;
+  assert.ok(files.includes(generator));
+  assert.deepEqual(
+    findUnexpectedArtifactPaths([generator, `${generator}.bak`, "scripts/i18n/other.mjs"], {
+      exactPaths: PACK_ARTIFACT_ALLOWED_EXACT_PATHS,
+      prefixPaths: PACK_ARTIFACT_ALLOWED_PATH_PREFIXES,
+    }),
+    [`${generator}.bak`, "scripts/i18n/other.mjs"]
+  );
 });

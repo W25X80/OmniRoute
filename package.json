@@ -40,6 +40,7 @@
     "scripts/dev/sync-env.mjs",
     "scripts/build/assembleStandalone.mjs",
     "scripts/build/backendOnlyPages.mjs",
+    "scripts/i18n/generate-global-error-messages.mjs",
     "scripts/build/build-tproxy-native.mjs",
     "scripts/build/native-binary-compat.mjs",
     "scripts/build/wreqJsNative.mjs",

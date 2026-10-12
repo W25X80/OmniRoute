@@ -9,7 +9,11 @@ import fs from "fs/promises";
 import { load as yamlLoad, dump as yamlDump } from "js-yaml";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
 import { cliAuthOnlyConfigSchema } from "@/shared/validation/schemas/cli";
-import { getOmpCredentials, saveOmpCredentials, deleteOmpCredentials } from "@/lib/db/omp";
+import {
+  getOmpCredentialsAsync,
+  saveOmpCredentialsAsync,
+  deleteOmpCredentialsAsync,
+} from "@/lib/db/omp";
 import { requireCliToolsAuth } from "@/lib/api/requireCliToolsAuth";
 import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
 
@@ -78,7 +82,7 @@ export async function GET(request: Request) {
       });
     }
 
-    const creds = getOmpCredentials(PROVIDER_ID);
+    const creds = await getOmpCredentialsAsync(PROVIDER_ID, request.signal);
     const modelsYml = await readModelsYml();
     const ymlProvider = modelsYml?.providers?.[PROVIDER_ID];
 
@@ -97,10 +101,7 @@ export async function GET(request: Request) {
       configPath: getOmpModelsYmlPath(),
     });
   } catch (error) {
-    return NextResponse.json(
-      { error: { message: sanitizeErrorMessage(error) } },
-      { status: 500 }
-    );
+    return NextResponse.json({ error: { message: sanitizeErrorMessage(error) } }, { status: 500 });
   }
 }
 
@@ -142,7 +143,7 @@ export async function POST(request: Request) {
     await fs.writeFile(getOmpModelsYmlPath(), yamlDump(modelsYml, { lineWidth: -1 }), "utf-8");
 
     // 2. Write auth_credentials — so omp sees omniroute as "logged in"
-    saveOmpCredentials(PROVIDER_ID, keyRef, normalizedBaseUrl);
+    await saveOmpCredentialsAsync(PROVIDER_ID, keyRef, normalizedBaseUrl, request.signal);
 
     return NextResponse.json({
       success: true,
@@ -151,10 +152,7 @@ export async function POST(request: Request) {
       configPath: getOmpModelsYmlPath(),
     });
   } catch (error) {
-    return NextResponse.json(
-      { error: { message: sanitizeErrorMessage(error) } },
-      { status: 500 }
-    );
+    return NextResponse.json({ error: { message: sanitizeErrorMessage(error) } }, { status: 500 });
   }
 }
 
@@ -176,16 +174,13 @@ export async function DELETE(request: Request) {
     }
 
     // 2. Remove from auth_credentials
-    deleteOmpCredentials(PROVIDER_ID);
+    await deleteOmpCredentialsAsync(PROVIDER_ID, request.signal);
 
     return NextResponse.json({
       success: true,
       message: "OmniRoute removed from Oh My Pi",
     });
   } catch (error) {
-    return NextResponse.json(
-      { error: { message: sanitizeErrorMessage(error) } },
-      { status: 500 }
-    );
+    return NextResponse.json({ error: { message: sanitizeErrorMessage(error) } }, { status: 500 });
   }
 }

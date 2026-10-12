@@ -31,7 +31,7 @@ export function getServiceModels(tool: string): ServiceModel[] {
   const row = (
     getSelectedPostgresDatabase()
       ? catalogValue(NAMESPACE, tool)
-      : db
+      : db!
           .prepare("SELECT value FROM key_value WHERE namespace = ? AND key = ?")
           .get(NAMESPACE, tool)
   ) as { value: string } | undefined;

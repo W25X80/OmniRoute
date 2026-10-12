@@ -13,13 +13,30 @@
  *     (assertWithinPluginDir invocation site, wx/0o600 in loader.ts).
  */
 
-import test, { describe } from "node:test";
+import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { readFileSync } from "node:fs";
 import { resolve as pathResolve } from "node:path";
+import ts from "typescript";
+function sourceNodes(root: ts.Node): ts.Node[] {
+  const nodes: ts.Node[] = [];
+  function visit(node: ts.Node) {
+    nodes.push(node);
+    ts.forEachChild(node, visit);
+  }
+  visit(root);
+  return nodes;
+}
+
+function namedCalls(root: ts.Node, name: string): ts.CallExpression[] {
+  return sourceNodes(root).filter(
+    (node): node is ts.CallExpression =>
+      ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === name
+  );
+}
 
 // ── Temp DB — must be set BEFORE any DB-touching import ──────────────────────
 const TEST_DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "omniroute-plugins-fs-safety-"));
@@ -38,6 +55,58 @@ const managerSource = readFileSync(
   "utf-8"
 );
 const loaderSource = readFileSync(pathResolve(process.cwd(), "src/lib/plugins/loader.ts"), "utf-8");
+
+function assertGuardedPluginInsert(methodName: "install" | "upgrade") {
+  const source = ts.createSourceFile("manager.ts", managerSource, ts.ScriptTarget.Latest, true);
+  const methods = sourceNodes(source).filter(
+    (node): node is ts.MethodDeclaration =>
+      ts.isMethodDeclaration(node) && node.name.getText(source) === methodName
+  );
+  assert.equal(methods.length, 1, `${methodName} method must exist`);
+  const body = methods[0].body;
+  assert.ok(body);
+  const guards = namedCalls(body, "assertEntryPointWithinDest");
+  const inserts = namedCalls(body, "insertPluginAsync");
+  const renames = namedCalls(body, "rename");
+  assert.equal(guards.length, 1, `entry containment must be checked in ${methodName}`);
+  assert.equal(
+    inserts.length,
+    1,
+    `the native-compatible insert owner must be called in ${methodName}`
+  );
+  assert.equal(renames.length, 1, `validated staging must be renamed in ${methodName}`);
+  assert.ok(ts.isAwaitExpression(inserts[0].parent), "the insert ACK must settle before use");
+  assert.deepEqual(
+    guards[0].arguments.map((argument) => argument.getText(source)),
+    ["stagingDir", "entryPoint"]
+  );
+  assert.deepEqual(
+    renames[0].arguments.map((argument) => argument.getText(source)),
+    ["stagingDir", "destDir"]
+  );
+  assert.ok(ts.isAwaitExpression(renames[0].parent));
+  const guardedBlock = guards[0].parent.parent;
+  assert.ok(
+    ts.isBlock(guardedBlock) &&
+      ts.isTryStatement(guardedBlock.parent) &&
+      guardedBlock.parent.tryBlock === guardedBlock,
+    "containment must gate the successful staging path"
+  );
+  const entries = sourceNodes(guardedBlock).filter(
+    (node): node is ts.VariableDeclaration =>
+      ts.isVariableDeclaration(node) && node.name.getText(source) === "entryPoint"
+  );
+  assert.equal(entries.length, 1);
+  assert.ok(entries[0].initializer && ts.isCallExpression(entries[0].initializer));
+  assert.equal(entries[0].initializer.expression.getText(source), "join");
+  assert.equal(entries[0].initializer.arguments[0].getText(source), "stagingDir");
+  assert.ok(entries[0].end < guards[0].getStart(source));
+  assert.ok(guards[0].end < renames[0].getStart(source), "validation must precede staging rename");
+  assert.ok(
+    renames[0].end < inserts[0].getStart(source),
+    "validation and rename must precede insertion"
+  );
+}
 
 // ── Fixture helpers ───────────────────────────────────────────────────────────
 
@@ -372,39 +441,11 @@ test("source: assertEntryPointWithinDest helper is defined in manager.ts", () =>
 });
 
 test("source: assertEntryPointWithinDest is called in install before insertPlugin", () => {
-  const installIdx = managerSource.indexOf("async install(");
-  assert.ok(installIdx !== -1, "install method not found");
-
-  const afterInstall = managerSource.slice(installIdx);
-  const nextMethodIdx = afterInstall.indexOf("\n  async upgrade(");
-  const installBody = nextMethodIdx !== -1 ? afterInstall.slice(0, nextMethodIdx) : afterInstall;
-
-  const guardIdx = installBody.indexOf("assertEntryPointWithinDest");
-  const insertIdx = installBody.indexOf("insertPlugin(");
-  assert.ok(guardIdx !== -1, "assertEntryPointWithinDest must be called in install");
-  assert.ok(insertIdx !== -1, "insertPlugin must be called in install");
-  assert.ok(
-    guardIdx < insertIdx,
-    `assertEntryPointWithinDest (pos ${guardIdx}) must appear before insertPlugin (pos ${insertIdx}) in install`
-  );
+  assertGuardedPluginInsert("install");
 });
 
 test("source: assertEntryPointWithinDest is called in upgrade before insertPlugin", () => {
-  const upgradeIdx = managerSource.indexOf("async upgrade(");
-  assert.ok(upgradeIdx !== -1, "upgrade method not found");
-
-  const afterUpgrade = managerSource.slice(upgradeIdx);
-  const nextMethodIdx = afterUpgrade.indexOf("\n  async activate(");
-  const upgradeBody = nextMethodIdx !== -1 ? afterUpgrade.slice(0, nextMethodIdx) : afterUpgrade;
-
-  const guardIdx = upgradeBody.indexOf("assertEntryPointWithinDest");
-  const insertIdx = upgradeBody.indexOf("insertPlugin(");
-  assert.ok(guardIdx !== -1, "assertEntryPointWithinDest must be called in upgrade");
-  assert.ok(insertIdx !== -1, "insertPlugin must be called in upgrade");
-  assert.ok(
-    guardIdx < insertIdx,
-    `assertEntryPointWithinDest (pos ${guardIdx}) must appear before insertPlugin (pos ${insertIdx}) in upgrade`
-  );
+  assertGuardedPluginInsert("upgrade");
 });
 
 // ══════════════════════════════════════════════════════════════════════════════

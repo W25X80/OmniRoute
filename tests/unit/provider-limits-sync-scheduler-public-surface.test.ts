@@ -17,7 +17,10 @@ test.after(() => {
   fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
-test("provider limits sync scheduler public surface excludes unused stop helper", () => {
-  assert.equal("startProviderLimitsSyncScheduler" in schedulerModule, true);
-  assert.equal("stopProviderLimitsSyncScheduler" in schedulerModule, false);
+test("provider limits sync scheduler exposes start and awaitable shutdown", async () => {
+  assert.equal(typeof schedulerModule.startProviderLimitsSyncScheduler, "function");
+  assert.equal(typeof schedulerModule.stopProviderLimitsSyncScheduler, "function");
+  const stopping = schedulerModule.stopProviderLimitsSyncScheduler();
+  assert.ok(stopping instanceof Promise);
+  await stopping;
 });

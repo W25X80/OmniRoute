@@ -211,7 +211,17 @@ export function resolveSemanticCacheConfig(
   return resolved;
 }
 
-type AsyncDynamicConfigResolver = () => Promise<Partial<SemanticCacheConfig> | null | undefined>;
+/** Internal stored-key custody, kept beside the public cache configuration. */
+export interface StoredSemanticEmbeddingCredential {
+  readonly connectionId: string;
+  readonly apiKey: string;
+  readonly endpoint: string | undefined;
+  assertFresh(): Promise<void>;
+}
+
+type AsyncDynamicConfigResolver = (
+  captureStoredCredential?: (selection: StoredSemanticEmbeddingCredential) => void
+) => Promise<Partial<SemanticCacheConfig> | null | undefined>;
 let asyncDynamicResolver: AsyncDynamicConfigResolver | null = null;
 
 export function registerSemanticCacheAsyncConfigResolver(
@@ -223,8 +233,28 @@ export function registerSemanticCacheAsyncConfigResolver(
 export async function resolveSemanticCacheConfigAsync(
   overrides?: Partial<SemanticCacheConfig>
 ): Promise<SemanticCacheConfig> {
-  return resolveSemanticCacheConfig(
-    overrides,
-    asyncDynamicResolver ? ((await asyncDynamicResolver()) ?? null) : undefined
-  );
+  return (await resolveSemanticCacheRuntimeConfigAsync(overrides)).config;
+}
+
+/** Resolve one native operation's configuration and its internal borrowed-key capability. */
+export async function resolveSemanticCacheRuntimeConfigAsync(
+  overrides?: Partial<SemanticCacheConfig>
+): Promise<{
+  config: SemanticCacheConfig;
+  storedCredential?: StoredSemanticEmbeddingCredential;
+}> {
+  let storedCredential: StoredSemanticEmbeddingCredential | undefined;
+  const dynamic = asyncDynamicResolver
+    ? ((await asyncDynamicResolver((selection) => {
+        storedCredential = selection;
+      })) ?? null)
+    : undefined;
+  const config = resolveSemanticCacheConfig(overrides, dynamic);
+  // An explicit key retains its own provenance even when its bytes equal a stored key.
+  if (
+    process.env.OMNIROUTE_SEMANTIC_CACHE_EMBEDDING_API_KEY?.trim() ||
+    (overrides && Object.prototype.hasOwnProperty.call(overrides, "embeddingApiKey"))
+  )
+    storedCredential = undefined;
+  return { config, storedCredential };
 }

@@ -19,6 +19,23 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import ts from "typescript";
+function sourceNodes(root: ts.Node): ts.Node[] {
+  const nodes: ts.Node[] = [];
+  function visit(node: ts.Node) {
+    nodes.push(node);
+    ts.forEachChild(node, visit);
+  }
+  visit(root);
+  return nodes;
+}
+
+function namedCalls(root: ts.Node, name: string): ts.CallExpression[] {
+  return sourceNodes(root).filter(
+    (node): node is ts.CallExpression =>
+      ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === name
+  );
+}
 
 const TEST_DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "omniroute-sticky-failover-6219-"));
 process.env.DATA_DIR = TEST_DATA_DIR;
@@ -89,9 +106,40 @@ test("eviction is not TTL-gated — clears the pin even for a stale stored recor
 
 test("chat.ts generic account-failover path wires in the sticky eviction (#6219)", () => {
   const src = fs.readFileSync(new URL("../../src/sse/handlers/chat.ts", import.meta.url), "utf8");
-  assert.match(
-    src,
-    /evictSessionAccountAffinityForConnection\(/,
-    "chat.ts must call evictSessionAccountAffinityForConnection on the failover path"
+  const source = ts.createSourceFile("chat.ts", src, ts.ScriptTarget.Latest, true);
+  const branches = sourceNodes(source).filter(
+    (node): node is ts.IfStatement =>
+      ts.isIfStatement(node) &&
+      node.expression.getText(source).replace(/\s/g, "") ===
+        "shouldFallback&&!hasForcedConnection" &&
+      namedCalls(node.thenStatement, "evictSessionAccountAffinityForConnectionAsync").length === 1
   );
+  assert.equal(branches.length, 1, "the guarded generic failover must call the eviction owner");
+  const branch = branches[0];
+  const eviction = namedCalls(
+    branch.thenStatement,
+    "evictSessionAccountAffinityForConnectionAsync"
+  )[0];
+  assert.ok(ts.isAwaitExpression(eviction.parent), "failover must await native eviction");
+  assert.deepEqual(
+    eviction.arguments.map((argument) => argument.getText(source)),
+    ["runtimeOptions.sessionAffinityKey", "provider", "credentials.connectionId"]
+  );
+  const keyGuard = sourceNodes(branch.thenStatement).find(
+    (node): node is ts.IfStatement =>
+      ts.isIfStatement(node) &&
+      node.expression.getText(source) === "runtimeOptions.sessionAffinityKey" &&
+      namedCalls(node.thenStatement, "evictSessionAccountAffinityForConnectionAsync").includes(
+        eviction
+      )
+  );
+  assert.ok(keyGuard, "an absent session key must never evict a pin");
+  const exclusion = sourceNodes(branch.thenStatement).find(
+    (node): node is ts.CallExpression =>
+      ts.isCallExpression(node) && node.expression.getText(source) === "excludedConnectionIds.add"
+  );
+  assert.ok(exclusion && exclusion.getStart(source) > eviction.end);
+  assert.equal(exclusion.arguments[0].getText(source), "credentials.connectionId");
+  const retry = sourceNodes(branch.thenStatement).find(ts.isContinueStatement);
+  assert.ok(retry && retry.getStart(source) > exclusion.end, "eviction must settle before retry");
 });

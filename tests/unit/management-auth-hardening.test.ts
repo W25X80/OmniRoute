@@ -49,10 +49,9 @@ test("compression analytics route requires management authentication before retu
   assert.ok(!content.includes("enforceApiKeyPolicy"));
   assert.ok(content.includes("const authError = await requireManagementAuth(req);"));
   assert.ok(content.includes("if (authError) return authError;"));
-  assert.ok(
-    content.indexOf("requireManagementAuth(req)") <
-      content.indexOf("getCompressionAnalyticsSummary(")
-  );
+  const summaryRead = content.indexOf("await getCompressionAnalyticsSummaryAsync(");
+  assert.ok(summaryRead >= 0, "the current awaited analytics read must exist");
+  assert.ok(content.indexOf("requireManagementAuth(req)") < summaryRead);
 });
 
 test("administrative pricing and routing routes require management authentication", () => {

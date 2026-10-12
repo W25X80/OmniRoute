@@ -3,6 +3,11 @@
  * implementation; the only change is that closed-over request state arrives
  * through deps.
  */
+import {
+  markEmptyTurnExecution,
+  inheritEmptyTurnPolicy,
+  adoptEmptyTurnPolicy,
+} from "../../utils/emptyTurnPolicy.ts";
 
 import type { BaseExecutor, ExecuteInput } from "../../executors/base.ts";
 import {
@@ -212,7 +217,7 @@ export type ExecuteProviderRequestDeps = {
   executor: Pick<BaseExecutor, "execute">;
   extendedContext?: boolean;
   getExecutionCredentials: () => Record<string, unknown>;
-  getExecutorClientHeaders: () => Record<string, string>;
+  getExecutorClientHeaders: () => Record<string, string> | null;
   isModelScope: () => boolean;
   isOpencodeClient: boolean;
   log: ChatLog;
@@ -464,6 +469,7 @@ export async function executeProviderRequest(
               }
             );
             const res = normalizeExecutorResult(rawExecutorResult);
+            res.response = markEmptyTurnExecution(res.response, res.url, execCreds);
             trace("post_executor", { status: res?.response?.status });
 
             // When a payload override rewrote body.model (custom-model alias →
@@ -667,6 +673,12 @@ export async function executeProviderRequest(
                     const retryOk =
                       retryRes.response.status >= 200 && retryRes.response.status < 300;
                     if (retryOk && retryRes.response.body) {
+                      retryRes.response = markEmptyTurnExecution(
+                        retryRes.response,
+                        retryRes.url,
+                        execCreds
+                      );
+                      adoptEmptyTurnPolicy(retryRes.response, res.response);
                       return retryRes.response.body as ReadableStream<Uint8Array>;
                     }
                     await retryRes.response.body?.cancel().catch(() => {});
@@ -731,11 +743,14 @@ export async function executeProviderRequest(
               return {
                 ...res,
                 _executionCredentials: execCreds,
-                response: new Response(clientBody, {
-                  status: res.response.status,
-                  statusText: res.response.statusText,
-                  headers: new Headers(normalizeHeaders(res.response.headers)),
-                }),
+                response: inheritEmptyTurnPolicy(
+                  res.response,
+                  new Response(clientBody, {
+                    status: res.response.status,
+                    statusText: res.response.statusText,
+                    headers: new Headers(normalizeHeaders(res.response.headers)),
+                  })
+                ),
               };
             }
 
@@ -804,7 +819,10 @@ export async function executeProviderRequest(
 
       return {
         ...rawResult,
-        response: new Response(payload, { status, statusText, headers: responseHeaders }),
+        response: inheritEmptyTurnPolicy(
+          rawResult.response,
+          new Response(payload, { status, statusText, headers: responseHeaders })
+        ),
         _dedupSnapshot: {
           status,
           statusText,

@@ -6,6 +6,7 @@ export type SettingsRecord = Record<string, unknown>;
 
 /** Environment values that already participate in SQLite settings reads. */
 export interface SettingsEnvironment {
+  [name: string]: string | undefined;
   OMNIROUTE_PREFER_CLAUDE_CODE_FOR_UNPREFIXED_CLAUDE_MODELS?: string;
   MAX_BODY_SIZE_BYTES?: string;
   INITIAL_PASSWORD?: string;

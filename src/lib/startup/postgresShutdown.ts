@@ -36,6 +36,9 @@ async function stopPostgresApplication(): Promise<void> {
           import("@/lib/services/nativeLifecycle").then(
             (module) => () => module.beginNativeEmbeddedServicesClose()
           ),
+          import("@/lib/headroom/nativeProcess").then(
+            (module) => () => module.beginNativeHeadroomClose()
+          ),
           import("@/lib/startup/liveDashboard").then(
             (module) => () => module.stopPostgresLiveDashboard()
           ),
@@ -178,9 +181,15 @@ async function stopPostgresApplication(): Promise<void> {
         );
         await attempt(async () => (await import("@/lib/plugins/manager")).shutdownPluginRuntime());
         // Accepted callers retain these request capabilities until their owned work settles.
+        await attempt(async () =>
+          (await import("@/lib/headroom/nativeProcess")).stopNativeHeadroomProcesses()
+        );
         await attempt(async () => (await import("@/lib/nativeHostProbes")).stopNativeHostProbes());
         await attempt(async () =>
           (await import("@/lib/copilot/codegraphQueryClient")).closeNativeCodeGraphQueries()
+        );
+        await attempt(async () =>
+          (await import("@/lib/db/ompHostClient")).closeNativeOmpHostStorage()
         );
       })
     );

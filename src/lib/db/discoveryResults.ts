@@ -156,7 +156,7 @@ export async function upsertDiscoveryResultAsync(
                 (row.endpoint ?? "") === (result.endpoint ?? "")
             )
             .sort((a, b) => a.id - b.id)[0]
-        : db
+        : db!
             .prepare(
               `SELECT * FROM discovery_results
        WHERE provider_id = ? AND method = ? AND ifnull(endpoint, '') = ifnull(?, '')`
@@ -184,7 +184,7 @@ export function getDiscoveryResults(providerId?: string): DiscoveryResult[] {
         ? catalogTableRows<DiscoveryRow>("discovery_results")
             .filter((row) => row.provider_id === providerId)
             .sort((a, b) => compareCatalogText(b.discovered_at, a.discovered_at) || b.id - a.id)
-        : db
+        : db!
             .prepare(
               "SELECT * FROM discovery_results WHERE provider_id = ? ORDER BY discovered_at DESC, id DESC"
             )
@@ -193,7 +193,7 @@ export function getDiscoveryResults(providerId?: string): DiscoveryResult[] {
         ? catalogTableRows<DiscoveryRow>("discovery_results").sort(
             (a, b) => compareCatalogText(b.discovered_at, a.discovered_at) || b.id - a.id
           )
-        : db
+        : db!
             .prepare("SELECT * FROM discovery_results ORDER BY discovered_at DESC, id DESC")
             .all()) as DiscoveryRow[]);
   return rows.map(rowToResult);
@@ -229,7 +229,7 @@ export async function markVerifiedAsync(id: number): Promise<DiscoveryResult | n
               )
             ).rowCount ?? 0,
         }
-      : db
+      : db!
           .prepare(
             "UPDATE discovery_results SET status = 'verified', verified_at = datetime('now') WHERE id = ?"
           )

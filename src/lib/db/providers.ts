@@ -52,8 +52,8 @@ const CONNECTION_CREDENTIAL_FIELDS = ["apiKey", "accessToken", "refreshToken", "
 export { ManagementPasswordAsCredentialError } from "./providers/credentialGuard";
 import { assertApiKeyIsNotManagementPassword as assertCredential } from "./providers/credentialGuard";
 
-async function assertApiKeyIsNotManagementPassword(apiKey: unknown): Promise<void> {
-  await assertCredential(apiKey, getSettings);
+function assertApiKeyIsNotManagementPassword(apiKey: unknown): Promise<void> {
+  return assertCredential(apiKey, getSettings);
 }
 
 interface StatementLike<TRow = unknown> {

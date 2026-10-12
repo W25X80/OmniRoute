@@ -63,6 +63,20 @@ async function compileRuntimeRequireModules(): Promise<string[]> {
       entries[entryName] = entryPath;
     }
 
+    // machineToken's backend selector is a real dependency, not a runtime require probe.
+    // Keep its exact transpilation at the literal extensionless operand, preserving
+    // the fully-specified ESM parser and avoiding a fabricated stub.
+    const backendSelectionPath = "src/lib/db/backendSelection.ts";
+    const backendSelection = transpileModule(
+      fs.readFileSync(path.resolve(backendSelectionPath), "utf8"),
+      {
+        compilerOptions: { module: ModuleKind.ESNext, target: ScriptTarget.ES2022 },
+        fileName: backendSelectionPath,
+      }
+    ).outputText;
+    fs.mkdirSync(path.join(tempDir, "db"), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, "db", "backendSelection"), backendSelection, "utf8");
+
     const compiler = webpack({
       devtool: false,
       entry: entries,

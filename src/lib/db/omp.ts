@@ -1,5 +1,6 @@
 import os from "os";
 import path from "path";
+import { getSelectedPostgresDatabase } from "./controlPlaneContext";
 import { runtimeRequire as _require } from "./adapters/runtimeRequire";
 
 type DatabaseConstructor = typeof import("better-sqlite3");
@@ -102,4 +103,34 @@ export function deleteOmpCredentials(
   const db = new Database(dbPath, databaseOptions());
   db.prepare("DELETE FROM auth_credentials WHERE provider = ?").run(providerId);
   db.close();
+}
+
+/** Native serving isolates the external CLI database; SQLite retains its original owner. */
+export async function getOmpCredentialsAsync(
+  providerId: string,
+  signal?: AbortSignal
+): Promise<ReturnType<typeof getOmpCredentials>> {
+  if (!getSelectedPostgresDatabase()) return getOmpCredentials(providerId);
+  const { getNativeOmpHostActor } = await import("./ompHostClient");
+  return (await getNativeOmpHostActor().execute({ kind: "get", providerId }, signal)) as ReturnType<
+    typeof getOmpCredentials
+  >;
+}
+export async function saveOmpCredentialsAsync(
+  providerId: string,
+  apiKey: string,
+  baseUrl: string,
+  signal?: AbortSignal
+): Promise<void> {
+  if (!getSelectedPostgresDatabase()) return saveOmpCredentials(providerId, apiKey, baseUrl);
+  const { getNativeOmpHostActor } = await import("./ompHostClient");
+  await getNativeOmpHostActor().execute({ kind: "save", providerId, apiKey, baseUrl }, signal);
+}
+export async function deleteOmpCredentialsAsync(
+  providerId: string,
+  signal?: AbortSignal
+): Promise<void> {
+  if (!getSelectedPostgresDatabase()) return deleteOmpCredentials(providerId);
+  const { getNativeOmpHostActor } = await import("./ompHostClient");
+  await getNativeOmpHostActor().execute({ kind: "delete", providerId }, signal);
 }

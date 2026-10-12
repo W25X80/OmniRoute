@@ -1,6 +1,10 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { NativeArtifactStore } from "@/domain/persistence/artifactStore";
-import { parseDatabaseBackend, type DatabaseBackend } from "./backendSelection";
+import {
+  parseDatabaseBackend,
+  readNativeScratchDataDir,
+  type DatabaseBackend,
+} from "./backendSelection";
 import {
   getSelectedPersistenceIdentity,
   installApplicationPersistence,
@@ -66,6 +70,7 @@ function runtime(): Runtime {
 }
 
 async function initializePostgres(state: Runtime): Promise<void> {
+  readNativeScratchDataDir();
   const [connectionModule, planeModule, artifactConfig, artifactFactory] = await Promise.all([
     import("./postgres/environment"),
     import("./postgres/controlPlane"),

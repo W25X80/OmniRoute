@@ -23,6 +23,24 @@ function parse(file: string): ts.SourceFile {
   return ts.createSourceFile(file, fs.readFileSync(file, "utf8"), ts.ScriptTarget.Latest, true);
 }
 
+function collectObjectKeys(expression: ts.Expression, keys: Set<string>): void {
+  if (ts.isParenthesizedExpression(expression)) {
+    collectObjectKeys(expression.expression, keys);
+  } else if (ts.isConditionalExpression(expression)) {
+    collectObjectKeys(expression.whenTrue, keys);
+    collectObjectKeys(expression.whenFalse, keys);
+  } else if (ts.isObjectLiteralExpression(expression)) {
+    for (const prop of expression.properties) {
+      if (ts.isSpreadAssignment(prop)) {
+        collectObjectKeys(prop.expression, keys);
+      } else {
+        const name = prop.name;
+        if (name && (ts.isIdentifier(name) || ts.isStringLiteral(name))) keys.add(name.text);
+      }
+    }
+  }
+}
+
 function passedKeys(sf: ts.SourceFile, fn: string): Set<string> {
   const keys = new Set<string>();
   const walk = (node: ts.Node) => {
@@ -32,12 +50,7 @@ function passedKeys(sf: ts.SourceFile, fn: string): Set<string> {
       node.expression.text === fn
     ) {
       const arg = node.arguments[0];
-      if (arg && ts.isObjectLiteralExpression(arg)) {
-        for (const prop of arg.properties) {
-          const name = prop.name;
-          if (name && (ts.isIdentifier(name) || ts.isStringLiteral(name))) keys.add(name.text);
-        }
-      }
+      if (arg) collectObjectKeys(arg, keys);
     }
     ts.forEachChild(node, walk);
   };

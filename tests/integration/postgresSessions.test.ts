@@ -318,30 +318,37 @@ test(
         resolvePreviousResponseStateAsync,
         clearPendingContinuationState,
       } = await import("../../src/lib/db/responsesContinuationStore.ts");
-      const responseId = `response-${randomUUID()}`,
-        apiKeyId = `key-${randomUUID()}`;
+      const { createApiKey, deleteApiKey } = await import("../../src/lib/db/apiKeys.ts");
+      const responseId = `response-${randomUUID()}`;
+      const apiKey = await plane.run(() =>
+        createApiKey("pending-continuation-fixture", randomUUID())
+      );
+      const apiKeyId = apiKey.id;
       const expected = {
         input: [{ role: "user", content: "hello" }],
         output: [{ type: "message", role: "assistant", content: [] }],
       };
-      await plane.run(async () => {
-        seedPendingContinuationState(
-          responseId,
-          apiKeyId,
-          {
-            clientRawRequest: { effectiveInput: expected.input },
-            clientResponse: { output: expected.output },
-          },
-          false
-        );
-      });
       try {
+        await plane.run(async () => {
+          seedPendingContinuationState(
+            responseId,
+            apiKeyId,
+            {
+              clientRawRequest: { effectiveInput: expected.input },
+              clientResponse: { output: expected.output },
+            },
+            false
+          );
+        });
         await plane.run(async () => {
           assert.deepEqual(await resolvePreviousResponseStateAsync(responseId, apiKeyId), expected);
           assert.equal(await resolvePreviousResponseStateAsync(responseId, "another-key"), null);
         });
       } finally {
-        clearPendingContinuationState(responseId);
+        await plane.run(async () => {
+          clearPendingContinuationState(responseId);
+          await deleteApiKey(apiKeyId);
+        });
       }
     } finally {
       await plane?.close();

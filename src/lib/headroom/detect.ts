@@ -16,6 +16,8 @@
  */
 
 import { execFileSync } from "node:child_process";
+import { getSelectedPersistenceIdentity } from "../db/controlPlaneContext";
+import { probeNativeHostCapability } from "../nativeHostProbes";
 
 const EXTRA_BINS = ["/usr/local/bin", "/opt/homebrew/bin", "/usr/bin", "/bin"];
 
@@ -210,5 +212,97 @@ export async function getHeadroomStatus(url: string): Promise<HeadroomStatus> {
   const binaryPath = findHeadroomBinary();
   const python = findPython310();
   const proxyReachable = await probeProxyRunning(url);
+  return buildHeadroomStatus({ url, binaryPath, python, proxyReachable });
+}
+
+interface AsyncHeadroomProbeOptions {
+  signal?: AbortSignal;
+}
+
+function captureHeadroomProbeScope(): () => void {
+  const identity = getSelectedPersistenceIdentity();
+  if (!identity) throw new Error("Native Headroom requires persistence authority");
+  return () => {
+    if (getSelectedPersistenceIdentity() !== identity)
+      throw new Error("Headroom persistence identity changed");
+  };
+}
+
+export async function findHeadroomBinaryAsync(
+  options: AsyncHeadroomProbeOptions = {}
+): Promise<string | null> {
+  const assertScope = captureHeadroomProbeScope();
+  options.signal?.throwIfAborted();
+  const result = await probeNativeHostCapability("which", ["headroom"], {
+    env: { ...process.env, PATH: buildPythonSearchPath() },
+    signal: options.signal,
+    windowsHide: true,
+    timeoutMs: 3000,
+  });
+  assertScope();
+  options.signal?.throwIfAborted();
+  if (result.failure === "closed" || result.failure === "busy")
+    throw new Error("Headroom capability probes are unavailable");
+  return result.success ? result.stdout.trim() || null : null;
+}
+
+export async function findPython310Async(
+  options: AsyncHeadroomProbeOptions = {}
+): Promise<string | null> {
+  const assertScope = captureHeadroomProbeScope();
+  const searchPath = buildPythonSearchPath();
+  for (const candidate of resolvePythonCandidates()) {
+    assertScope();
+    options.signal?.throwIfAborted();
+    const result = await probeNativeHostCapability(candidate, ["--version"], {
+      env: { ...process.env, PATH: searchPath },
+      signal: options.signal,
+      windowsHide: true,
+      timeoutMs: 3000,
+    });
+    assertScope();
+    options.signal?.throwIfAborted();
+    if (result.failure === "closed" || result.failure === "busy")
+      throw new Error("Headroom capability probes are unavailable");
+    if (!result.success) continue;
+    const match = result.stdout.trim().match(/(\d+)\.(\d+)/);
+    if (!match) continue;
+    const major = parseInt(match[1], 10),
+      minor = parseInt(match[2], 10);
+    if (major > MIN_VERSION[0] || (major === MIN_VERSION[0] && minor >= MIN_VERSION[1]))
+      return candidate;
+  }
+  return null;
+}
+
+export async function getHeadroomStatusAsync(
+  url: string,
+  options: AsyncHeadroomProbeOptions = {}
+): Promise<HeadroomStatus> {
+  const assertScope = captureHeadroomProbeScope();
+  const resolved = await Promise.allSettled([
+    findHeadroomBinaryAsync(options),
+    findPython310Async(options),
+  ]);
+  const failure = resolved.find((item) => item.status === "rejected");
+  if (failure?.status === "rejected") throw failure.reason;
+  const binaryPath = resolved[0].status === "fulfilled" ? resolved[0].value : null;
+  const python = resolved[1].status === "fulfilled" ? resolved[1].value : null;
+  assertScope();
+  options.signal?.throwIfAborted();
+  let proxyReachable = false;
+  if (url) {
+    try {
+      const timeout = AbortSignal.timeout(HEADROOM_HEALTH_TIMEOUT_MS);
+      const response = await fetch(`${String(url).replace(/\/$/, "")}/health`, {
+        signal: options.signal ? AbortSignal.any([options.signal, timeout]) : timeout,
+      });
+      proxyReachable = response.ok;
+      await response.body?.cancel();
+    } catch {
+      options.signal?.throwIfAborted();
+    }
+  }
+  assertScope();
   return buildHeadroomStatus({ url, binaryPath, python, proxyReachable });
 }

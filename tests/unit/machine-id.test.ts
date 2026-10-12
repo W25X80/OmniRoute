@@ -7,6 +7,7 @@ import { pathToFileURL } from "node:url";
 const require = createRequire(import.meta.url);
 const childProcess = require("node:child_process");
 const fs = require("node:fs");
+const os = require("node:os");
 
 const modulePath = path.join(process.cwd(), "src/shared/utils/machineId.ts");
 
@@ -17,6 +18,7 @@ const originalExecSync = childProcess.execSync;
 const originalExecFileSync = childProcess.execFileSync;
 const originalExistsSync = fs.existsSync;
 const originalReadFileSync = fs.readFileSync;
+const originalHostname = os.hostname;
 
 function setPlatform(value) {
   Object.defineProperty(process, "platform", {
@@ -34,6 +36,7 @@ test.afterEach(() => {
   childProcess.execFileSync = originalExecFileSync;
   fs.existsSync = originalExistsSync;
   fs.readFileSync = originalReadFileSync;
+  os.hostname = originalHostname;
 
   if (originalPlatformDescriptor) {
     Object.defineProperty(process, "platform", originalPlatformDescriptor);
@@ -59,7 +62,8 @@ test("machineId: reads the Windows MachineGuid via REG.exe when available", asyn
   setPlatform("win32");
   process.env.SystemRoot = "C:\\Windows";
 
-  fs.existsSync = (filePath) => filePath === "C:\\Windows\\System32\\REG.exe";
+  fs.existsSync = (filePath) =>
+    filePath === "C:\\Windows\\System32\\REG.exe" || originalExistsSync(filePath);
   childProcess.execFileSync = (command, args, options) => {
     assert.equal(command, "C:\\Windows\\System32\\REG.exe");
     assert.deepEqual(args, [
@@ -76,14 +80,43 @@ test("machineId: reads the Windows MachineGuid via REG.exe when available", asyn
   };
   syncBuiltinESMExports();
 
+  assert.equal(fs.existsSync(modulePath), true, "ordinary source files must remain visible");
   const machineId = await loadMachineIdModule("windows-guid");
   assert.equal(await machineId.getRawMachineId(), "abcdef12-3456-7890");
+});
+
+test("machineId: falls back when the Windows registry executable is missing", async () => {
+  setPlatform("win32");
+  process.env.SystemRoot = "C:\\Windows";
+  const regPath = "C:\\Windows\\System32\\REG.exe";
+  fs.existsSync = (filePath) => filePath !== regPath && originalExistsSync(filePath);
+  fs.readFileSync = (filePath, encoding) => {
+    if (filePath === "/etc/machine-id" || filePath === "/var/lib/dbus/machine-id") {
+      throw new Error("machine-id file unavailable");
+    }
+    return originalReadFileSync(filePath, encoding);
+  };
+  let registryCalls = 0;
+  childProcess.execFileSync = () => {
+    registryCalls++;
+    throw new Error("REG.exe unavailable");
+  };
+  childProcess.execSync = () => {
+    throw new Error("shell fallback should not run");
+  };
+  os.hostname = () => "FALLBACK-HOST";
+  syncBuiltinESMExports();
+
+  assert.equal(fs.existsSync(regPath), false);
+  assert.equal(fs.existsSync(modulePath), true, "ordinary source files must remain visible");
+  const machineId = await loadMachineIdModule("windows-missing-reg");
+  assert.equal(await machineId.getRawMachineId(), "fallback-host");
+  assert.equal(registryCalls, 0, "an absent REG.exe must not be executed");
 });
 
 test("machineId: falls back to Linux machine-id files before hostname", async () => {
   setPlatform("linux");
 
-  fs.existsSync = () => false;
   fs.readFileSync = (filePath, encoding) => {
     if (filePath !== "/etc/machine-id") {
       return originalReadFileSync(filePath, encoding);
@@ -104,7 +137,6 @@ test("machineId: falls back to Linux machine-id files before hostname", async ()
 test("machineId: reads the macOS IOPlatformUUID when ioreg is available", async () => {
   setPlatform("darwin");
 
-  fs.existsSync = () => false;
   childProcess.execSync = (command, options) => {
     assert.equal(command, "ioreg -rd1 -c IOPlatformExpertDevice");
     assert.equal(options.encoding, "utf8");
@@ -119,7 +151,6 @@ test("machineId: reads the macOS IOPlatformUUID when ioreg is available", async 
 test("machineId: hashes consistently by salt and reports browser/server mode", async () => {
   setPlatform("linux");
 
-  fs.existsSync = () => false;
   childProcess.execSync = (command, options) => {
     assert.equal(command, "hostname");
     assert.equal(options.encoding, "utf8");
@@ -144,7 +175,6 @@ test("machineId: hashes consistently by salt and reports browser/server mode", a
 test("machineId: falls back to the last available identifier when shell strategies fail", async () => {
   setPlatform("freebsd");
 
-  fs.existsSync = () => false;
   childProcess.execFileSync = () => {
     throw new Error("REG.exe unavailable");
   };

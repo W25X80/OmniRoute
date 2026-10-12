@@ -76,7 +76,7 @@ export async function getExcludedConnectionIds(
             (row) =>
               row.api_key_id === apiKeyId && row.auto_channel === autoChannel && row.excluded === 1
           )
-        : db
+        : db!
             .prepare(
               `SELECT connection_id FROM auto_candidate_overrides
        WHERE api_key_id = ? AND auto_channel = ? AND excluded = 1`
@@ -134,7 +134,7 @@ export async function setExcluded(
               row.auto_channel === autoChannel &&
               row.connection_id === connectionId
           )[0]
-        : db
+        : db!
             .prepare(
               `SELECT id, api_key_id, auto_channel, connection_id, excluded, created_at
        FROM auto_candidate_overrides
@@ -167,7 +167,7 @@ export async function listOverrides(
                 compareCatalogText(a.created_at, b.created_at) ||
                 Number(a.insertion_order) - Number(b.insertion_order)
             )
-        : db
+        : db!
             .prepare(
               `SELECT id, api_key_id, auto_channel, connection_id, excluded, created_at
        FROM auto_candidate_overrides

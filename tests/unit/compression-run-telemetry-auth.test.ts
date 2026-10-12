@@ -13,14 +13,14 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const ROUTE = join(
-  __dirname,
-  "../../src/app/api/settings/compression/run-telemetry/route.ts"
-);
+const ROUTE = join(__dirname, "../../src/app/api/settings/compression/run-telemetry/route.ts");
 
 test("run-telemetry GET imports isAuthenticated from the shared auth util", () => {
   const src = readFileSync(ROUTE, "utf8");
-  assert.match(src, /import\s*\{[^}]*\bisAuthenticated\b[^}]*\}\s*from\s*["']@\/shared\/utils\/apiAuth["']/);
+  assert.match(
+    src,
+    /import\s*\{[^}]*\bisAuthenticated\b[^}]*\}\s*from\s*["']@\/shared\/utils\/apiAuth["']/
+  );
 });
 
 test("run-telemetry GET gates on auth and returns 401 before reading telemetry", () => {
@@ -28,7 +28,7 @@ test("run-telemetry GET gates on auth and returns 401 before reading telemetry",
 
   const authIdx = src.indexOf("isAuthenticated(request)");
   const unauthorizedIdx = src.search(/status:\s*401/);
-  const dataIdx = src.indexOf("getCompressionRunTelemetrySummary(");
+  const dataIdx = src.search(/\bgetCompressionRunTelemetrySummary(?:Async)?\s*\(/);
 
   assert.ok(authIdx > 0, "must call isAuthenticated(request)");
   assert.ok(unauthorizedIdx > 0, "must return a 401 on failed auth");

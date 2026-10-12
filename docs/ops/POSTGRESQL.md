@@ -1,6 +1,6 @@
 ---
 title: "PostgreSQL operations"
-lastUpdated: 2026-10-11
+lastUpdated: 2026-10-12
 ---
 
 # PostgreSQL operations
@@ -23,7 +23,8 @@ Confirm availability in the target AWS Region before provisioning. PostgreSQL 17
 server feature level required by `transaction_timeout`; it is not the deployment recommendation
 or a claim that the current integration campaign tested version 17.
 
-Provide a writable local ephemeral `DATA_DIR` for scratch and workers. Set `APP_LOG_TO_FILE=false`
+Provide an explicit nonempty writable local ephemeral `DATA_DIR` for scratch and workers; native
+startup rejects an absent value. Set `APP_LOG_TO_FILE=false`
 and collect stdout/stderr through the task's logging configuration. Local scratch is not the
 application database or durable call-log object store. Optional host integrations may need separate
 files; OMP retains its own `~/.omp/agent/agent.db` capability.
@@ -56,7 +57,9 @@ The task IAM role must permit object PUT/GET/DELETE in that private prefix. If
 `OMNIROUTE_ARTIFACT_S3_KMS_KEY_ID` is configured, authorize the required KMS use too. Provision and
 verify private bucket/public-access policy separately. Startup validates configuration but does
 not test bucket access, IAM or KMS. Call artifacts have an 8 MiB limit; application file BLOBs
-have a separate 512 MiB bytea boundary.
+have a separate 512 MiB logical content boundary. New files use transactional 8 MiB PostgreSQL
+chunks with a final size/SHA marker; callers retain the logical file API. This size limit does not
+guarantee completion within the configured SQL deadlines.
 
 ## Offline SQLite cutover
 
@@ -131,6 +134,11 @@ node --import tsx/esm scripts/ops/postgres-migrate-storage.ts --action verify --
 
 Restore starts a fresh policy authority UUID/generation 0 and records the old authority/epoch as
 lineage. Business rows, identities and ciphertext are retained with declared receipt transformations.
+Private chunk tables are verified physical state, not portable row owners. NULL/empty content,
+tombstones and independent file metadata survive logical export/restore. Receipts bind the full
+physical schema; an older receipt is rejected rather than accepted under a different schema.
+For a schema transition, verify and export the current logical dataset, then restore to a fresh
+target and retain both recovery sets until cutover is verified.
 Logical export is bounded maintenance, not an RDS physical snapshot/PITR implementation. SQLite
 file backup, WAL/PRAGMA optimization, file import/export and legacy JSON repair are unavailable on
 PostgreSQL; guarded APIs report 501 `persistence_capability_unavailable`.
@@ -152,14 +160,17 @@ Run the existing local checks against the exact release inputs:
 ```sh
 npm run typecheck:core
 npm run test:postgres
-RUN_PG_IMPORT_MAX_BLOB=1 npm run test:postgres -- postgresApplicationMaxBlob.test.ts
+RUN_PG_IMPORT_MAX_BLOB=1 npm run test:postgres -- postgresApplicationMaxBlob.test.ts postgresFileContentStorage.test.ts
 npm run check:docs-all
 ```
 
 The PostgreSQL runner creates a disposable local TLS PostgreSQL 18.6 instance using Docker and
 OpenSSL, isolates suites and removes its resources. The explicit maximum-file test needs at least
-2 GiB scratch disk and a provisioned memory budget. It is skipped without its opt-in. Local SDK
-transport fixtures are not live S3 evidence.
+2 GiB scratch disk and a provisioned memory budget. It is skipped without its opt-in. The native
+maximum-file create/read witness has a separate explicit 60-second transaction budget; ordinary
+statement/query/lock/idle limits stay unchanged. The offline maximum-file restore witness uses
+the maintenance budgets above. Neither test promises maximum-file completion at the gateway's
+15-second default or under arbitrary load. Local SDK transport fixtures are not live S3 evidence.
 
 Before deployment, record pending exact-artifact qualification for packaged dependency/carrier
 availability; cold start, graceful stop and restart with stable credentials; full source migration

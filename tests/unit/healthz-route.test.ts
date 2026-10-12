@@ -60,11 +60,20 @@ test("/healthz follows the native server lifecycle without static caching", asyn
 test("native startup and shutdown hooks drive the health lifecycle", () => {
   const startupSource = fs.readFileSync("src/instrumentation-node.ts", "utf8");
   const registerStart = startupSource.indexOf("export async function registerNodejs");
-  const markStarting = startupSource.indexOf("markServerStarting();", registerStart);
-  const firstStartupAwait = startupSource.indexOf("await ", registerStart);
+  const selectedStart = startupSource.indexOf("async function registerNodejsSelectedBackend");
+  assert.ok(selectedStart > registerStart);
+  const wrapper = startupSource.slice(registerStart, selectedStart);
+  assert.match(
+    wrapper,
+    /if \(parseDatabaseBackend\(\) !== "postgres"\) return registerNodejsSelectedBackend\(false\);/
+  );
+  assert.match(wrapper, /await runPostgresBootstrap\(async \(\) => \{/);
+  assert.match(wrapper, /await registerNodejsSelectedBackend\(true\);/);
+  const markStarting = startupSource.indexOf("markServerStarting();", selectedStart);
+  const firstStartupAwait = startupSource.indexOf("await ", selectedStart);
   const markReady = startupSource.lastIndexOf("markServerReady();");
 
-  assert.ok(markStarting > registerStart && markStarting < firstStartupAwait);
+  assert.ok(markStarting > selectedStart && markStarting < firstStartupAwait);
   assert.ok(markReady > firstStartupAwait);
   assert.equal(startupSource.slice(markReady).trim(), "markServerReady();\n}");
 

@@ -1,4 +1,3 @@
-import { persistDiscoveryResultAsync } from "@/lib/discovery/index";
 /**
  * Discovery scan — POST /api/discovery/scan
  *
@@ -15,7 +14,11 @@ import { z } from "zod";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 import { createErrorResponse, createErrorResponseFromUnknown } from "@/lib/api/errorResponse";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
-import { scanProvider } from "@/lib/discovery/index";
+import {
+  persistDiscoveryResultAsync,
+  scanProvider,
+  type DiscoveryResult,
+} from "@/lib/discovery/index";
 
 const scanRequestSchema = z.object({
   providerId: z.string().min(1).max(200),
@@ -47,7 +50,10 @@ export async function POST(request: Request): Promise<Response> {
 
   try {
     const found = await scanProvider(validation.data.providerId);
-    const persisted = found.map(async (result) => await persistDiscoveryResultAsync(result));
+    const persisted: DiscoveryResult[] = [];
+    for (const result of found) {
+      persisted.push(await persistDiscoveryResultAsync(result));
+    }
     return Response.json({ results: persisted });
   } catch (error) {
     return createErrorResponseFromUnknown(error, "Failed to scan provider");

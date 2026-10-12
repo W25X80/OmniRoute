@@ -18,7 +18,7 @@ import {
   type SemanticCacheConfig,
   type SemanticCacheType,
   resolveSemanticCacheConfig,
-  resolveSemanticCacheConfigAsync,
+  resolveSemanticCacheRuntimeConfigAsync,
 } from "../../config/semanticCacheConfig.ts";
 import { type CacheEntry, type IVectorStore, type StoreFilter } from "./vectorStore.ts";
 import { MemoryVectorStore } from "./memoryVectorStore.ts";
@@ -30,6 +30,7 @@ import {
   type EmbeddingGenerator,
 } from "./embeddingClient.ts";
 import { synthesizeOpenAiSseFromJson } from "../../utils/jsonToSse.ts";
+import { embeddingEndpoint } from "./embeddingEndpoint.ts";
 import { conversationSignatureFields } from "../../utils/conversationSignatureFields.ts";
 import { isCompleteTextProjection } from "./semanticProjection";
 
@@ -524,13 +525,32 @@ let authorityManagers = new WeakMap<
 export async function getSemanticCacheManagerAsync(): Promise<SemanticCacheManager> {
   const authority = getSelectedSemanticCacheAuthority();
   if (!authority) return getSemanticCacheManager();
-  const config = await resolveSemanticCacheConfigAsync();
-  const fingerprint = crypto.createHash("sha256").update(JSON.stringify(config)).digest("hex");
+  const { config, storedCredential } = await resolveSemanticCacheRuntimeConfigAsync();
+  const fingerprint = crypto
+    .createHash("sha256")
+    .update(JSON.stringify({ config, connectionId: storedCredential?.connectionId }))
+    .digest("hex");
   let captured = authorityManagers.get(authority);
   if (!captured || captured.fingerprint !== fingerprint) {
     captured = {
       fingerprint,
-      manager: new SemanticCacheManager(config, undefined, undefined, true),
+      manager: new SemanticCacheManager(
+        config,
+        undefined,
+        storedCredential
+          ? createDefaultEmbeddingGenerator(config, async () => {
+              // Keep the selected key at its selected endpoint even after ENV/config merging.
+              if (
+                config.embeddingApiKey !== storedCredential.apiKey ||
+                !config.embeddingBaseUrl ||
+                embeddingEndpoint(config.embeddingBaseUrl) !== storedCredential.endpoint
+              )
+                throw new Error("Stored embedding credentials are unavailable");
+              await storedCredential.assertFresh();
+            })
+          : undefined,
+        true
+      ),
     };
     authorityManagers.set(authority, captured);
   }

@@ -5,6 +5,8 @@ import test from "node:test";
 import vm from "node:vm";
 
 import { createDbHealthCoordinator } from "../../src/lib/db/healthCheckRunner.ts";
+import { createPostgresOperationsRepository } from "../../src/lib/db/postgres/operationsRepository.ts";
+import { persistenceCapabilityResponse } from "../../src/lib/db/persistenceCapabilities.ts";
 
 // The managed health check is loaded from the REAL core.ts source (sliced, not
 // reimplemented) so this test cannot drift away from production. #13717 moved the
@@ -20,12 +22,43 @@ const route = readFileSync(new URL("../../src/app/api/db/health/route.ts", impor
   .replace(/^import .*;\n/gm, "")
   .replaceAll("export async function", "async function");
 
-function loadCheck(skipEnv, authenticated = true) {
+// Keep the selected facade itself in the fixture. Only its module loading is redirected
+// so the SQLite branch uses the real coordinator above, not a second implementation.
+const health = readFileSync(new URL("../../src/lib/db/healthCheck.ts", import.meta.url), "utf8");
+const facadeStart = health.indexOf("export async function runManagedDatabaseHealthCheck(");
+assert.ok(facadeStart >= 0, "the managed health facade must be present");
+const managedFacade = health
+  .slice(facadeStart)
+  .replace("export async function", "async function")
+  .replace(/import\(("\.\/(?:core|postgres\/operationsRepository)")\)/g, "loadHealthModule($1)");
+
+function loadCheck(skipEnv, authenticated = true, backend = "sqlite") {
   const calls = [];
+  const nativeQueries = [];
+  const database = {
+    transaction: async (body) =>
+      body({
+        query: async (text) => {
+          nativeQueries.push(text);
+          assert.ok(text === "SELECT 1" || text.includes("FROM omniroute.quota_snapshots"));
+          return { rows: [], rowCount: 0, command: "SELECT" };
+        },
+      }),
+  };
   const context = vm.createContext({
     process: { env: { OMNIROUTE_SKIP_DB_HEALTHCHECK: skipEnv } },
     AbortController,
     createDbHealthCoordinator,
+    createPostgresOperationsRepository,
+    persistenceCapabilityResponse,
+    getSelectedPostgresDatabase: () => (backend === "postgres" ? database : undefined),
+    loadHealthModule: async (specifier) => {
+      if (specifier === "./core") {
+        return { runManagedDbHealthCheck: context.runManagedDbHealthCheck };
+      }
+      assert.equal(specifier, "./postgres/operationsRepository");
+      return { createPostgresOperationsRepository };
+    },
     getPagerCorruption: () => null,
     invalidateDbCache: () => {},
     path: { join: (...parts) => parts.join("/") },
@@ -34,7 +67,10 @@ function loadCheck(skipEnv, authenticated = true) {
     writeManagedDbBackup: () => assert.fail("read-only polling must not create backups"),
     runDbHealthInChild: () => assert.fail("stub DB must stay on the owning-connection path"),
     // No `name`/`driver`: core takes the in-process branch, never forking a child.
-    getDbInstance: () => ({}),
+    getDbInstance: () => {
+      assert.equal(backend, "sqlite", "native health must not open SQLite");
+      return {};
+    },
     runDbHealthCheck: (_db, options) => {
       calls.push(options);
       return { status: "healthy", repairedCount: 0 };
@@ -44,8 +80,8 @@ function loadCheck(skipEnv, authenticated = true) {
     sanitizeErrorMessage: (message) => message,
     console,
   });
-  vm.runInContext(stripTypeScriptTypes(managedCheck + route), context);
-  return { context, calls };
+  vm.runInContext(stripTypeScriptTypes(managedCheck + managedFacade + route), context);
+  return { context, calls, nativeQueries };
 }
 
 test("dashboard GET skips integrity scans even without a deployment opt-out", async () => {
@@ -94,10 +130,41 @@ test("a full diagnosis is still cached, a skipped one is not", async () => {
 });
 
 test("unauthenticated polling and repair do not touch the database", async () => {
-  const { context, calls } = loadCheck(undefined, false);
-  for (const method of ["GET", "POST"]) {
-    const response = await vm.runInContext(`${method}({})`, context);
-    assert.equal(response.status, 401);
+  for (const backend of ["sqlite", "postgres"]) {
+    const { context, calls, nativeQueries } = loadCheck(undefined, false, backend);
+    for (const method of ["GET", "POST"]) {
+      const response = await vm.runInContext(`${method}({})`, context);
+      assert.equal(response.status, 401);
+    }
+    assert.equal(calls.length, 0);
+    assert.equal(nativeQueries.length, 0);
   }
+});
+
+test("native diagnosis uses its owning repository without SQLite integrity work", async () => {
+  const { context, calls, nativeQueries } = loadCheck(undefined, true, "postgres");
+  const response = await vm.runInContext("GET({})", context);
+  assert.equal(response.status, 200, JSON.stringify(response.body));
+  assert.equal(response.body.isHealthy, true);
+  assert.equal(response.body.driver.name, "postgresql");
+  assert.equal(response.body.integrityScope, "connectivity-and-application-references");
   assert.equal(calls.length, 0);
+  assert.equal(nativeQueries.length, 2);
+});
+
+test("native manual repair returns the canonical capability response before SQL", async () => {
+  const { context, calls, nativeQueries } = loadCheck(undefined, true, "postgres");
+  const response = await vm.runInContext("POST({})", context);
+  assert.equal(response.status, 501);
+  assert.deepEqual(response.body, {
+    error: {
+      message:
+        "PersistenceCapabilityError: The PostgreSQL backend does not support sqlite-integrity-repair",
+      code: "persistence_capability_unavailable",
+      backend: "postgresql",
+      capability: "sqlite-integrity-repair",
+    },
+  });
+  assert.equal(calls.length, 0);
+  assert.equal(nativeQueries.length, 0);
 });

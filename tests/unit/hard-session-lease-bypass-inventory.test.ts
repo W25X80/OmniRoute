@@ -10,6 +10,7 @@ const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..
 
 type InventoryKind = "connection" | "credential" | "executor";
 type BypassClass = "A" | "B" | "C";
+type BypassClassification = BypassClass | Readonly<{ postgres: BypassClass; sqlite: BypassClass }>;
 
 const EXPECTED: Record<InventoryKind, Record<string, number>> = {
   credential: {
@@ -208,6 +209,9 @@ const EXPECTED: Record<InventoryKind, Record<string, number>> = {
     "src/app/api/v1beta/models/route.ts": 1,
     "src/instrumentation-node.ts": 1,
     "src/lib/a2a/skills/providerDiscovery.ts": 1,
+    // Native selection plus final borrowed-key re-read. The native generator gates
+    // logical dispatch after DNS; the default SQLite resolver retains inherited behavior.
+    "src/lib/cache/semanticCacheDbBridge.ts": 2,
     "src/lib/chaos/chaosExecutor.ts": 1,
     "src/lib/cloudAgent/api.ts": 1,
     "src/lib/cloudSync.ts": 1,
@@ -250,6 +254,9 @@ const EXPECTED: Record<InventoryKind, Record<string, number>> = {
     "src/lib/providers/volcenginePlanBinding.ts": 1,
     "src/lib/proxyEgress.ts": 1,
     "src/lib/quota/connectionRecovery.ts": 2,
+    // Existing auxiliary ping adapter reads configured connections; its executor
+    // and eligibility guard remain unchanged, including the inherited pre-wait timing.
+    "src/lib/services/quotaAutoPing.ts": 1,
     "src/lib/sync/bundle.ts": 1,
     // #11495: verify-only sweep queries oauth + cookie connections
     // #13874: the health check re-reads the row inside the refresh lane to see whether
@@ -279,7 +286,7 @@ const EXPECTED: Record<InventoryKind, Record<string, number>> = {
   },
 };
 
-const CLASSIFICATION: Record<InventoryKind, Record<string, BypassClass>> = {
+const CLASSIFICATION: Record<InventoryKind, Record<string, BypassClassification>> = {
   credential: Object.fromEntries(
     Object.keys(EXPECTED.credential).map((file) => [
       file,
@@ -304,31 +311,33 @@ const CLASSIFICATION: Record<InventoryKind, Record<string, BypassClass>> = {
   connection: Object.fromEntries(
     Object.keys(EXPECTED.connection).map((file) => [
       file,
-      [
-        "open-sse/handlers/autoComboCandidates.ts",
-        "open-sse/handlers/chatCore.ts",
-        "open-sse/handlers/chatCore/streamingResponse.ts",
-        "open-sse/services/alibabaFreeTier.ts",
-        "open-sse/services/alibabaFreeTierQuotaFetcher.ts",
-        "open-sse/services/combo/executeTargetGates.ts",
-        "open-sse/services/tokenRefresh.ts",
-        "src/app/api/translator/send/route.ts",
-        "src/lib/credentialHealth/scheduler.ts",
-        "src/lib/modelValidation/runner.ts",
-        "src/lib/providers/volcPlanAutoSyncBackfill.ts",
-        "src/lib/providers/volcenginePlanBinding.ts",
-        "src/lib/services/quotaAutoPing.ts",
-        "src/lib/usage/codexResetCredits.ts",
-        "src/lib/usage/glmResetCards.ts",
-        "src/lib/usage/grokResetCredits.ts",
-        "src/lib/usage/providerLimits.ts",
-        "src/lib/vncSession/service.ts",
-        "src/lib/warmupScheduler.ts",
-        "src/shared/services/modelSyncScheduler.ts",
-        "src/sse/services/auth.ts",
-      ].includes(file)
-        ? "B"
-        : "C",
+      file === "src/lib/cache/semanticCacheDbBridge.ts"
+        ? { postgres: "B", sqlite: "C" }
+        : [
+              "open-sse/handlers/autoComboCandidates.ts",
+              "open-sse/handlers/chatCore.ts",
+              "open-sse/handlers/chatCore/streamingResponse.ts",
+              "open-sse/services/alibabaFreeTier.ts",
+              "open-sse/services/alibabaFreeTierQuotaFetcher.ts",
+              "open-sse/services/combo/executeTargetGates.ts",
+              "open-sse/services/tokenRefresh.ts",
+              "src/app/api/translator/send/route.ts",
+              "src/lib/credentialHealth/scheduler.ts",
+              "src/lib/modelValidation/runner.ts",
+              "src/lib/providers/volcPlanAutoSyncBackfill.ts",
+              "src/lib/providers/volcenginePlanBinding.ts",
+              "src/lib/services/quotaAutoPing.ts",
+              "src/lib/usage/codexResetCredits.ts",
+              "src/lib/usage/glmResetCards.ts",
+              "src/lib/usage/grokResetCredits.ts",
+              "src/lib/usage/providerLimits.ts",
+              "src/lib/vncSession/service.ts",
+              "src/lib/warmupScheduler.ts",
+              "src/shared/services/modelSyncScheduler.ts",
+              "src/sse/services/auth.ts",
+            ].includes(file)
+          ? "B"
+          : "C",
     ])
   ),
 };
@@ -406,10 +415,20 @@ function countCalls(): Record<InventoryKind, Record<string, number>> {
 test("hard-lease credential, executor, and connection-query inventory has no unclassified site", () => {
   const actual = countCalls();
   assert.deepEqual(actual, EXPECTED);
+  assert.deepEqual(CLASSIFICATION.connection["src/lib/cache/semanticCacheDbBridge.ts"], {
+    postgres: "B",
+    sqlite: "C",
+  });
   for (const kind of Object.keys(EXPECTED) as InventoryKind[]) {
     assert.deepEqual(Object.keys(CLASSIFICATION[kind]).sort(), Object.keys(EXPECTED[kind]).sort());
     for (const classification of Object.values(CLASSIFICATION[kind])) {
-      assert.match(classification, /^[ABC]$/);
+      if (typeof classification === "string") {
+        assert.match(classification, /^[ABC]$/);
+      } else {
+        assert.deepEqual(Object.keys(classification).sort(), ["postgres", "sqlite"]);
+        assert.match(classification.postgres, /^[ABC]$/);
+        assert.match(classification.sqlite, /^[ABC]$/);
+      }
     }
   }
 });

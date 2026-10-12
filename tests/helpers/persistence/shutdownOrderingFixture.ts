@@ -8,6 +8,7 @@ export const shutdownFixture = {
   logRows: [] as string[],
   logClosing: false,
   stopFailure: false,
+  onPhase: undefined as ((phase: string) => void) | undefined,
   reset() {
     writer.resetForTests();
     shutdownFixture.events = [];
@@ -15,6 +16,7 @@ export const shutdownFixture = {
     shutdownFixture.logRows = [];
     shutdownFixture.logClosing = false;
     shutdownFixture.stopFailure = false;
+    shutdownFixture.onPhase = undefined;
   },
 };
 const writer = new SpendBatchWriter({
@@ -44,12 +46,49 @@ export async function closeCallLogSaves(): Promise<void> {
   shutdownFixture.logClosing = true;
   shutdownFixture.events.push("logs:close");
 }
-async function stop(): Promise<void> {
+function recordShutdownPhase(phase: string): void {
   if (globalThis.__omniroutePersistenceRuntime?.owners.getStore()?.active !== true)
     throw new Error("Producer stop must own its shutdown scope");
   if (!getSelectedPersistenceIdentity()) throw new Error("Producer stop authority absent");
-  shutdownFixture.events.push("producer:stop");
+  shutdownFixture.events.push(phase);
+  shutdownFixture.onPhase?.(phase);
   if (shutdownFixture.stopFailure) throw new Error("Producer stop failed");
+}
+async function stop(): Promise<void> {
+  recordShutdownPhase("producer:stop");
+}
+export function beginNativeEmbeddedServicesClose(): void {
+  recordShutdownPhase("embedded:admission-close");
+}
+export async function stopRtkRawOutputPurgeScheduler(): Promise<void> {
+  recordShutdownPhase("rtk:admission-close");
+}
+export async function closeBlockedHistoryAsync(): Promise<void> {
+  recordShutdownPhase("history:close");
+}
+export async function closeRtkRawOutputPurgeScheduler(): Promise<void> {
+  recordShutdownPhase("rtk:close");
+}
+export async function stopChatGptWebCodexRuntime(): Promise<void> {
+  recordShutdownPhase("codex:close");
+}
+export async function closeNativeCompressionWorkerPool(): Promise<void> {
+  recordShutdownPhase("compression:close");
+}
+export async function closeNativeLlmlinguaWorker(): Promise<void> {
+  recordShutdownPhase("llmlingua:close");
+}
+export async function stopNativeEmbeddedServices(): Promise<void> {
+  recordShutdownPhase("embedded:stop");
+}
+export async function disposeNativeEmbeddedServiceBuffers(): Promise<void> {
+  recordShutdownPhase("embedded:buffers-close");
+}
+export async function stopNativeHostProbes(): Promise<void> {
+  recordShutdownPhase("host:close");
+}
+export async function closeNativeCodeGraphQueries(): Promise<void> {
+  recordShutdownPhase("codegraph:close");
 }
 export const stopPostgresLiveDashboard = stop;
 export const shutdownMcpHttp = stop;
@@ -85,4 +124,14 @@ export const shutdownPluginRuntime = async () => {};
 
 export async function closeNativeNotionThreadSessions(): Promise<void> {
   shutdownFixture.events.push("notion:close");
+}
+
+export function beginNativeHeadroomClose(): void {
+  recordShutdownPhase("headroom:admission-close");
+}
+export async function stopNativeHeadroomProcesses(): Promise<void> {
+  recordShutdownPhase("headroom:close");
+}
+export async function closeNativeOmpHostStorage(): Promise<void> {
+  recordShutdownPhase("omp:close");
 }

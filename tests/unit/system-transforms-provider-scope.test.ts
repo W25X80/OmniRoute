@@ -22,6 +22,23 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import ts from "typescript";
+function sourceNodes(root: ts.Node): ts.Node[] {
+  const nodes: ts.Node[] = [];
+  function visit(node: ts.Node) {
+    nodes.push(node);
+    ts.forEachChild(node, visit);
+  }
+  visit(root);
+  return nodes;
+}
+
+function namedCalls(root: ts.Node, name: string): ts.CallExpression[] {
+  return sourceNodes(root).filter(
+    (node): node is ts.CallExpression =>
+      ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === name
+  );
+}
 
 const {
   applyProviderSystemTransforms,
@@ -199,7 +216,36 @@ test("chatCore applies the per-provider pipeline on the pre-translation body", (
     "chatCore must pass the resolved provider key"
   );
 
-  const callSite = chatCore.indexOf("applyProviderSystemTransforms(");
-  const translateCall = chatCore.indexOf("translatedBody = translateRequest(", callSite);
-  assert.ok(callSite > -1 && translateCall > callSite, "call site must precede translateRequest");
+  const source = ts.createSourceFile("chatCore.ts", chatCore, ts.ScriptTarget.Latest, true);
+  const transforms = namedCalls(source, "applyProviderSystemTransforms");
+  assert.equal(transforms.length, 1);
+  assert.equal(transforms[0].arguments[0].getText(source), "provider");
+  assert.ok(ts.isAsExpression(transforms[0].arguments[1]));
+  assert.equal(transforms[0].arguments[1].expression.getText(source), "translatedBody");
+  const assignment = sourceNodes(source).find(
+    (node): node is ts.BinaryExpression =>
+      ts.isBinaryExpression(node) &&
+      node.left.getText(source) === "translatedBody" &&
+      node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+      ts.isAsExpression(node.right) &&
+      node.right.expression.getText(source) === "systemTransformResult.body"
+  );
+  assert.ok(assignment, "the transformed body must reach the translation carrier");
+  const translations = namedCalls(source, "translateRequestAsync");
+  assert.ok(translations.length > 0, "the awaited native-compatible translator must be called");
+  for (const translation of translations) {
+    assert.ok(ts.isAwaitExpression(translation.parent), "translation must settle before use");
+    assert.ok(
+      translation.getStart(source) > transforms[0].end,
+      "provider transforms must precede translation"
+    );
+  }
+  const generic = translations.filter(
+    (translation) => translation.arguments[3]?.getText(source) === "translatedBody"
+  );
+  assert.equal(generic.length, 1, "the generic path must translate the transformed carrier");
+  assert.ok(
+    generic[0].getStart(source) > assignment.end,
+    "the generic translation must consume the acknowledged transformed body"
+  );
 });

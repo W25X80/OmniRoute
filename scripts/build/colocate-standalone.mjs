@@ -113,6 +113,8 @@ function main() {
 
   const codeGraphWorkerDest = join(STANDALONE, "src/lib/copilot/codegraphQueryWorker.cjs");
   bundleCodeGraphWorker(codeGraphWorkerDest);
+  const ompHostWorkerDest = join(STANDALONE, "src/lib/db/ompHostWorker.cjs");
+  bundleOmpHostWorker(ompHostWorkerDest);
   colocateCodeGraphDependencies(join(ROOT, "node_modules"), join(STANDALONE, "node_modules"));
 
   const callLogWorkerDest = join(STANDALONE, CALL_LOG_WORKER_REL);
@@ -233,6 +235,24 @@ export function bundleCodeGraphWorker(workerDest, build = runBuildTool) {
       "--packages=external",
       "--format=cjs",
       `--outfile=${workerDest}`,
+    ],
+    { stdio: "inherit" }
+  );
+}
+
+/** Bundle the fixed external CLI database owner with the existing native addon boundary. */
+export function bundleOmpHostWorker(workerDest, build = runBuildTool) {
+  mkdirSync(dirname(workerDest), { recursive: true });
+  build(
+    "esbuild",
+    "esbuild",
+    [
+      join(ROOT, "src/lib/db/ompHostWorker.ts"),
+      "--bundle",
+      "--platform=node",
+      "--packages=external",
+      "--format=cjs",
+      "--outfile=" + workerDest,
     ],
     { stdio: "inherit" }
   );

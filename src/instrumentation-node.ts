@@ -8,6 +8,7 @@
 
 import { parseDatabaseBackend } from "@/lib/db/backendSelection";
 import { runPersistenceRequest } from "@/lib/db/persistenceRuntime";
+import type { NativeFileHttpTransport } from "@/lib/db/nativeFileWork";
 import {
   assertPostgresBootstrapActive,
   runPostgresBootstrap,
@@ -556,7 +557,11 @@ export async function startOptionalBootSubsystems(
 declare global {
   var __omniroutePersistenceTransportInstalled: boolean | undefined;
   var __omniroutePersistenceRequest:
-    | ((run: () => unknown | Promise<unknown>, httpLifetime: Promise<void>) => Promise<void>)
+    | ((
+        run: () => unknown | Promise<unknown>,
+        httpLifetime: Promise<void>,
+        fileTransport?: NativeFileHttpTransport
+      ) => Promise<void>)
     | undefined;
   var __omnirouteGetWebdavConfigurationAsync:
     (() => ReturnType<typeof import("@/lib/db/obsidian").getWebdavConfigurationAsync>) | undefined;
@@ -571,8 +576,26 @@ export async function registerNodejs(): Promise<void> {
   }
   try {
     await runPostgresBootstrap(async () => {
-      globalThis.__omniroutePersistenceRequest = async (run, httpLifetime) => {
+      globalThis.__omniroutePersistenceRequest = async (run, httpLifetime, fileTransport) => {
         await runPersistenceRequest(async () => {
+          if (fileTransport) {
+            const { runNativeFileHttpWork } = await import("@/lib/db/nativeFileWork");
+            const { getCachedSettings } = await import("@/lib/db/readCache");
+            const { getBodySizeLimit } = await import("@/shared/middleware/bodySizeGuard");
+            let settings: Record<string, unknown> | undefined;
+            try {
+              settings = await getCachedSettings();
+            } catch {
+              console.warn("[FILES] Request body limit settings unavailable; using defaults.");
+            }
+            await runNativeFileHttpWork(
+              run,
+              httpLifetime,
+              fileTransport,
+              getBodySizeLimit("/api/v1/files", settings)
+            );
+            return;
+          }
           await run();
           await httpLifetime;
         });

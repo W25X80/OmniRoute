@@ -6,6 +6,7 @@
 
 import type { SqliteAdapter, PreparedStatement } from "./adapters/types";
 import { assertSqliteBackendAllowed, getSelectedPostgresDatabase } from "./controlPlaneContext";
+import { parseDatabaseBackend, readNativeScratchDataDir } from "./backendSelection";
 import {
   tryOpenSync,
   getSqlJsAdapter,
@@ -115,7 +116,15 @@ export const isBuildPhase = isNextBuildPhase();
 
 // ──────────────── Paths ────────────────
 
-export const DATA_DIR = resolveWritableDataDir({ isCloud });
+const isPostgresBackend = parseDatabaseBackend() === "postgres";
+
+function resolveCoreDataDir(): string {
+  if (!isPostgresBackend) return resolveWritableDataDir({ isCloud });
+  const configured = readNativeScratchDataDir();
+  return isCloud ? "/tmp" : path.resolve(configured);
+}
+
+export const DATA_DIR = resolveCoreDataDir();
 const LEGACY_DATA_DIR = isCloud ? null : getLegacyDotDataDir();
 export const SQLITE_FILE = isCloud ? null : path.join(DATA_DIR, "storage.sqlite");
 const JSON_DB_FILE = isCloud ? null : path.join(DATA_DIR, "db.json");
@@ -202,7 +211,7 @@ function openSqliteDatabase(sqliteFile: string, options?: Record<string, unknown
 }
 
 // Ensure data directory exists — with fallback for restricted home directories (#133)
-if (!isCloud && !fs.existsSync(DATA_DIR)) {
+if (!isPostgresBackend && !isCloud && !fs.existsSync(DATA_DIR)) {
   try {
     fs.mkdirSync(DATA_DIR, { recursive: true });
   } catch (err: unknown) {

@@ -234,3 +234,68 @@ export async function drainPersistenceAcceptedWork(): Promise<void> {
 export async function closeNativeNotionThreadSessions(): Promise<void> {
   record("notion:close");
 }
+
+/** Mirror the real coordinator's producer admission and post-drain resource phases. */
+export function beginNativeEmbeddedServicesClose(): void {
+  assertScope();
+  record("stop:embeddedAdmission");
+}
+export async function stopRtkRawOutputPurgeScheduler(): Promise<void> {
+  assertScope();
+  await stop("rtk");
+}
+function closeResource(name: string): void {
+  assertScope();
+  if (!startupFixture.events.includes("accepted:drain")) {
+    throw new Error("Resource close must follow accepted work drain");
+  }
+  record("resource:" + name);
+}
+export async function closeBlockedHistoryAsync(): Promise<void> {
+  closeResource("history");
+}
+export async function closeRtkRawOutputPurgeScheduler(): Promise<void> {
+  closeResource("rtk");
+}
+export async function stopChatGptWebCodexRuntime(): Promise<void> {
+  closeResource("codex");
+}
+export async function closeNativeCompressionWorkerPool(): Promise<void> {
+  closeResource("compression");
+}
+export async function closeNativeLlmlinguaWorker(): Promise<void> {
+  closeResource("llmlingua");
+}
+export async function stopNativeEmbeddedServices(): Promise<void> {
+  closeResource("embedded");
+}
+export async function disposeNativeEmbeddedServiceBuffers(): Promise<void> {
+  closeResource("embeddedBuffers");
+}
+export async function stopNativeHostProbes(): Promise<void> {
+  closeResource("host");
+}
+export async function closeNativeCodeGraphQueries(): Promise<void> {
+  closeResource("codegraph");
+}
+export async function preparePostgresServingFileCaches(): Promise<void> {
+  assertScope();
+  if (!startupFixture.events.includes("server:starting")) {
+    throw new Error("Serving file caches require the startup phase");
+  }
+  if (startupFixture.events.some((event) => event.startsWith("start:"))) {
+    throw new Error("Serving file caches must precede producer activation");
+  }
+  record("prepare:fileCaches");
+}
+
+export function beginNativeHeadroomClose(): void {
+  assertScope();
+  record("stop:headroomAdmission");
+}
+export async function stopNativeHeadroomProcesses(): Promise<void> {
+  closeResource("headroom");
+}
+export async function closeNativeOmpHostStorage(): Promise<void> {
+  closeResource("omp");
+}

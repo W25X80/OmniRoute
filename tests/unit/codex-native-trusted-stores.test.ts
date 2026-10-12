@@ -63,7 +63,7 @@ function child(thread: string, parent: string, home: string, sandbox = "read-onl
   });
 }
 
-await test("native trusted store boundaries", async (t) => {
+test("native trusted store boundaries", async (t) => {
   const home = await fs.mkdtemp(join(tmpdir(), "codex-trusted-stores-"));
   t.after(async () => {
     await fs.rm(home, { recursive: true, force: true });
@@ -304,7 +304,7 @@ await test("native trusted store boundaries", async (t) => {
   );
 });
 
-await test("native registry initialization boundaries", async (t) => {
+test("native registry initialization boundaries", async (t) => {
   await t.test(
     "same-owner native no-hook starter and duplicate cannot bypass preparation",
     async () => {

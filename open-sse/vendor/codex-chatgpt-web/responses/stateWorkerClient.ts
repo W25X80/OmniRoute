@@ -37,7 +37,7 @@ export class ResponseStateWorkerUnavailableError extends Error {
 
 async function isFile(path: string): Promise<boolean> {
   try {
-    return (await Reflect.apply(stat, undefined, [path])).isFile();
+    return (await stat(path)).isFile();
   } catch {
     return false;
   }

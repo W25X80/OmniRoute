@@ -20,6 +20,7 @@ import { POSTGRES_CACHE_SCHEMA_STATEMENTS } from "./cacheRepository";
 import { POSTGRES_COMPRESSION_SCHEMA_STATEMENTS } from "./compressionRepository";
 import { POSTGRES_COMPRESSION_TELEMETRY_SCHEMA_STATEMENTS } from "./compressionTelemetryRepository";
 import { POSTGRES_SERVICE_SCHEMA_STATEMENTS } from "./serviceSchema";
+import { POSTGRES_FILE_CONTENT_SCHEMA_STATEMENTS } from "./fileContentSchema";
 import { POSTGRES_SPEND_RECEIPT_SCHEMA_STATEMENTS } from "./spendReceipts";
 import { POSTGRES_IMPORT_COMPAT_SCHEMA_STATEMENTS } from "./applicationImportSchema";
 import { POSTGRES_CONFIG_AUDIT_INDEX_STATEMENTS } from "./configAuditSchema";
@@ -118,6 +119,11 @@ const migrations: readonly Migration[] = [
       "CREATE INDEX idx_discovery_results_provider ON omniroute.discovery_results(provider_id)",
       "CREATE INDEX idx_discovery_results_status ON omniroute.discovery_results(status)",
     ],
+  },
+  {
+    version: 4,
+    name: "file_content_chunks",
+    statements: POSTGRES_FILE_CONTENT_SCHEMA_STATEMENTS,
   },
 ];
 

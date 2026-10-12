@@ -158,3 +158,6 @@ export const APPLICATION_IMPORT_SOURCE_METADATA = [
   "sqlite_stat1",
   "sqlite_stat4",
 ] as const;
+
+/** Physical file representation is accounted separately from portable logical tables. */
+export { POSTGRES_FILE_CONTENT_TABLES as APPLICATION_IMPORT_NATIVE_FILE_TABLES } from "./fileContentSchema";

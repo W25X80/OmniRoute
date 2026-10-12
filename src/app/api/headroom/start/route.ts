@@ -5,12 +5,14 @@ import {
   parsePortFromHeadroomUrl,
 } from "@/lib/headroom/detect";
 import { startHeadroomProxy, HeadroomError } from "@/lib/headroom/process";
+import { startHeadroomProxyAsync } from "@/lib/headroom/nativeProcess";
+import { usesNativeHostProfile } from "@/lib/nativeHostProbes";
 import { createErrorResponse } from "@/lib/api/errorResponse";
 import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
 
 export const dynamic = "force-dynamic";
 
-export async function POST(): Promise<Response> {
+export async function POST(request?: Request): Promise<Response> {
   try {
     const settings = await getCachedSettings();
     const url =
@@ -29,7 +31,9 @@ export async function POST(): Promise<Response> {
     }
 
     const port = parsePortFromHeadroomUrl(url) ?? 8787;
-    const result = await startHeadroomProxy({ port });
+    const result = await (usesNativeHostProfile()
+      ? startHeadroomProxyAsync({ port, signal: request?.signal })
+      : startHeadroomProxy({ port }));
     return Response.json({ success: true, ...result });
   } catch (error) {
     if (error instanceof HeadroomError && error.code === "NOT_INSTALLED") {

@@ -32,7 +32,16 @@ export async function GET(request: Request) {
         status: 400,
       });
     }
-    const limits = [];
+    const limits: Array<
+      Awaited<ReturnType<typeof listTokenLimitsAsync>>[number] &
+        Pick<
+          ReturnType<typeof resetWindowIfElapsed>,
+          "windowStart" | "periodStartAt" | "nextResetAt"
+        > & {
+          tokensUsed: number;
+          remaining: number;
+        }
+    > = [];
     for (const limit of await listTokenLimitsAsync(apiKeyId)) {
       const usage = await getWindowUsageAsync(limit);
       const window = resetWindowIfElapsed(limit);
