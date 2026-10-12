@@ -19,7 +19,8 @@ const environment = new Map(
 process.env.DATA_DIR = directory;
 process.env.APP_LOG_TO_FILE = "false";
 process.env.OMNIROUTE_DATABASE_BACKEND = "sqlite";
-const { fileRouteFixture } = await import("../../helpers/persistence/nativeFileRouteFixture");
+const { fileRouteFixture, withNativeFileFixtureAuthority } =
+  await import("../../helpers/persistence/nativeFileRouteFixture");
 const { CORS_HEADERS } = await import("../../../src/shared/utils/cors");
 const { getBodySizeLimit, MAX_BODY_BYTES_FILE } =
   await import("../../../src/shared/middleware/bodySizeGuard");
@@ -41,6 +42,7 @@ const hooks = registerHooks({
     return next(specifier, context);
   },
 });
+const { runNativeFileHttpWork } = await import("../../../src/lib/db/nativeFileWork");
 const { POST } = await import("../../../src/app/api/v1/files/route");
 hooks.deregister();
 test.after(async () => {
@@ -62,6 +64,8 @@ async function exchange(body: Buffer, delayed: boolean) {
   fileRouteFixture.records.length = 0;
   fileRouteFixture.paths.length = 0;
   fileRouteFixture.settingsCalls = 0;
+  fileRouteFixture.parserCalls = 0;
+  fileRouteFixture.parserErrors.length = 0;
   const sockets = new Set<Socket>();
   let handled!: () => void;
   const handlerDone = new Promise<void>((resolve) => {
@@ -71,20 +75,41 @@ async function exchange(body: Buffer, delayed: boolean) {
   let retirement: { complete: boolean; readableEnded: boolean; destroyed: boolean } | undefined;
   const server = http.createServer(async (incoming, outgoing) => {
     try {
-      const request = new Request("http://127.0.0.1/v1/files", {
-        method: "POST",
-        headers: { "content-type": String(incoming.headers["content-type"]) },
-        body: Readable.toWeb(incoming),
-        duplex: "half",
-      } as RequestInit & { duplex: "half" });
-      const response = await POST(request);
-      retirement = {
-        complete: incoming.complete,
-        readableEnded: incoming.readableEnded,
-        destroyed: incoming.destroyed,
-      };
-      outgoing.writeHead(response.status, Object.fromEntries(response.headers));
-      outgoing.end(Buffer.from(await response.arrayBuffer()));
+      const lifetime = new Promise<void>((resolve) => {
+        outgoing.once("finish", resolve);
+        outgoing.once("close", resolve);
+      });
+      await withNativeFileFixtureAuthority(() =>
+        runNativeFileHttpWork(
+          async () => {
+            const request = new Request("http://127.0.0.1/v1/files", {
+              method: "POST",
+              headers: { "content-type": String(incoming.headers["content-type"]) },
+              body: Readable.toWeb(incoming),
+              duplex: "half",
+            } as RequestInit & { duplex: "half" });
+            const response = await POST(request);
+            retirement = {
+              complete: incoming.complete,
+              readableEnded: incoming.readableEnded,
+              destroyed: incoming.destroyed,
+            };
+            outgoing.writeHead(response.status, Object.fromEntries(response.headers));
+            outgoing.end(Buffer.from(await response.arrayBuffer()));
+          },
+          lifetime,
+          {
+            req: incoming,
+            res: outgoing,
+            kind: "upload",
+            api: true,
+            onFailure() {
+              outgoing.destroy();
+            },
+          },
+          MAX_BODY_BYTES_FILE
+        )
+      );
     } catch (error) {
       failure = error;
       outgoing.destroy();
@@ -162,6 +187,7 @@ test("native actual HTTP multipart upload preserves file bytes, metadata, and th
   assert.equal(MAX_BODY_BYTES_FILE, 500 * 1024 * 1024);
   const response = await exchange(multipart('{"value":1}\n'), false);
   assert.equal(response.status, 200);
+  assert.equal(fileRouteFixture.parserCalls, 1);
   assert.deepEqual(fileRouteFixture.paths, ["/api/v1/files"]);
   const stored = fileRouteFixture.records[0];
   assert.equal(stored.content?.toString(), '{"value":1}\n');
@@ -175,6 +201,8 @@ test("native delayed chunked HTTP overflow retires an incomplete input and retur
   process.env.OMNIROUTE_DATABASE_BACKEND = "postgres";
   const response = await exchange(multipart("x".repeat(2048)), true);
   assert.equal(response.status, 413);
+  assert.equal(fileRouteFixture.parserCalls, 1);
+  assert.equal(fileRouteFixture.parserErrors.length, 1);
   assert.equal(JSON.parse(response.text).error.code, "PAYLOAD_TOO_LARGE");
   assert.deepEqual(response.retirement, { complete: false, readableEnded: false, destroyed: true });
   assert.equal(fileRouteFixture.records.length, 0);

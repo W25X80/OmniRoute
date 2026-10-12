@@ -12,7 +12,7 @@ import {
   getBatchAsync,
   getPendingBatchesAsync,
   getTerminalBatchesAsync,
-  isFileReferencedByOtherBatchAsync,
+  deleteExpiredBatchFilesAsync,
   listBatchItemCheckpointsAsync,
   markBatchItemErrorAsync,
   markBatchItemProcessingAsync,
@@ -22,6 +22,7 @@ import {
   completeBatchWithFilesAsync,
   type BatchOutputFile,
 } from "@/lib/db/batches";
+import { getBatchOutputExpiresAt } from "@/lib/db/batches/persistenceSemantics";
 import {
   deleteFileAsync,
   getFileContentAsync,
@@ -245,22 +246,6 @@ function parseBatchWindowSeconds(window: string | null | undefined): number {
   return DEFAULT_BATCH_WINDOW_SECONDS;
 }
 
-function getBatchOutputExpiresAt(batch: BatchRecord): number | null {
-  if (
-    batch.outputExpiresAfterAnchor === "created_at" &&
-    typeof batch.outputExpiresAfterSeconds === "number" &&
-    batch.outputExpiresAfterSeconds > 0
-  ) {
-    return batch.createdAt + batch.outputExpiresAfterSeconds;
-  }
-
-  const completionTime =
-    batch.completedAt || batch.failedAt || batch.cancelledAt || batch.expiredAt;
-  if (!completionTime) return null;
-  // Default: batch output files expire 30 days after completion
-  return completionTime + DEFAULT_BATCH_EXPIRATION_SECONDS;
-}
-
 function resolveBatchApiKeyValue(batch: Pick<BatchRecord, "apiKeyId">, apiKeyRow: any): any {
   if (typeof apiKeyRow?.key === "string" && apiKeyRow.key.length > 0) {
     return apiKeyRow.key;
@@ -327,45 +312,9 @@ async function cleanupExpiredBatches(): Promise<void> {
     const now = Math.floor(Date.now() / 1_000);
     const batches = await getTerminalBatchesAsync();
 
-    // Delete files for terminal batches that have exceeded their completion window
+    // Recheck terminal state, expiry and surviving references under the files/batches authority.
     for (const batch of batches) {
-      const completionTime =
-        batch.completedAt || batch.failedAt || batch.cancelledAt || batch.expiredAt;
-      // Input files expire 30 days after batch completion
-      const inputExpiresAt =
-        completionTime && batch.inputFileId
-          ? completionTime + DEFAULT_BATCH_EXPIRATION_SECONDS
-          : null;
-      const outputExpiresAt = getBatchOutputExpiresAt(batch);
-
-      // #13681: skip the soft-delete when some OTHER batch still references
-      // the same file id (e.g. one input file reused across batches) — a
-      // terminal batch's own expiry must not null a file a sibling still
-      // needs.
-      if (
-        batch.inputFileId &&
-        inputExpiresAt &&
-        now > inputExpiresAt &&
-        !(await isFileReferencedByOtherBatchAsync(batch.inputFileId, [batch.id]))
-      ) {
-        await deleteFileAsync(batch.inputFileId);
-      }
-      if (
-        batch.outputFileId &&
-        outputExpiresAt &&
-        now > outputExpiresAt &&
-        !(await isFileReferencedByOtherBatchAsync(batch.outputFileId, [batch.id]))
-      ) {
-        await deleteFileAsync(batch.outputFileId);
-      }
-      if (
-        batch.errorFileId &&
-        outputExpiresAt &&
-        now > outputExpiresAt &&
-        !(await isFileReferencedByOtherBatchAsync(batch.errorFileId, [batch.id]))
-      ) {
-        await deleteFileAsync(batch.errorFileId);
-      }
+      await deleteExpiredBatchFilesAsync(batch.id, now);
     }
 
     // Expire validating batches that have exceeded their completion window

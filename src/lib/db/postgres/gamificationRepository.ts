@@ -310,26 +310,34 @@ export function createPostgresGamificationRepository(database: PostgresDatabase)
       above: Array<{ apiKeyId: string; score: number }>;
       below: Array<{ apiKeyId: string; score: number }>;
     }> {
-      return database.transaction(async (tx) => {
-        const current = await tx.query<{ score: number }>(
-          "SELECT score FROM omniroute.leaderboard WHERE api_key_id=$1 AND scope=$2",
-          [key, scope]
-        );
-        if (!current.rows[0]) return { above: [], below: [] };
-        const values = [scope, current.rows[0].score, radius < 0 ? null : radius];
-        const above = await tx.query(
-          `SELECT api_key_id,score FROM omniroute.leaderboard WHERE scope=$1 AND score>$2 ORDER BY score ASC,api_key_id DESC LIMIT $3`,
-          values
-        );
-        const below = await tx.query(
-          `SELECT api_key_id,score FROM omniroute.leaderboard WHERE scope=$1 AND score<$2 ORDER BY score DESC,api_key_id ASC LIMIT $3`,
-          values
-        );
-        return {
-          above: above.rows.reverse().map((row) => camel<{ apiKeyId: string; score: number }>(row)),
-          below: below.rows.map((row) => camel<{ apiKeyId: string; score: number }>(row)),
-        };
-      });
+      // Anchor and neighbors share one statement snapshot. A concurrent score update
+      // cannot turn this user into their own neighbor or mix the two sides' epochs.
+      const neighbors = await rows<{
+        side: "above" | "below";
+        api_key_id: string;
+        score: number;
+      }>(
+        `WITH current_score AS (
+          SELECT score FROM omniroute.leaderboard WHERE api_key_id=$1 AND scope=$2
+        ), above AS (
+          SELECT api_key_id,score FROM omniroute.leaderboard
+          WHERE scope=$2 AND score>(SELECT score FROM current_score)
+          ORDER BY score ASC,api_key_id DESC LIMIT $3
+        ), below AS (
+          SELECT api_key_id,score FROM omniroute.leaderboard
+          WHERE scope=$2 AND score<(SELECT score FROM current_score)
+          ORDER BY score DESC,api_key_id ASC LIMIT $3
+        )
+        SELECT 'above' AS side,api_key_id,score FROM above
+        UNION ALL SELECT 'below' AS side,api_key_id,score FROM below
+        ORDER BY side ASC,score DESC,api_key_id ASC`,
+        [key, scope, radius < 0 ? null : radius]
+      );
+      const project = (side: "above" | "below") =>
+        neighbors
+          .filter((row) => row.side === side)
+          .map((row) => ({ apiKeyId: row.api_key_id, score: row.score }));
+      return { above: project("above"), below: project("below") };
     },
     rotateLeaderboardScope: (scope: "weekly" | "monthly") =>
       mutation(async (tx) => {

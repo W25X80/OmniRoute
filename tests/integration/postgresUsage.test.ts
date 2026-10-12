@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { createHash, randomUUID } from "node:crypto";
+import { prepareArtifactPublication } from "../../src/lib/db/postgres/artifactPublicationRepository.ts";
 import { setTimeout as delay } from "node:timers/promises";
 import type { PostgresDatabase } from "../../src/lib/db/postgres/database.ts";
 import { migratePostgresSchema } from "../../src/lib/db/postgres/migrations.ts";
@@ -365,11 +367,24 @@ test(
             "INSERT INTO omniroute.api_keys(id,name,key,created_at,no_log) VALUES('usage-private','private','usage-test-key','now',1)"
           );
         });
+        const checksum = createHash("sha256").update("payload").digest("hex");
+        const artifact = {
+          reference: `s3/${randomUUID()}_${checksum}.json`,
+          sizeBytes: Buffer.byteLength("payload"),
+          checksum,
+          storageScope: "a".repeat(64),
+          singleAttempt: true as const,
+        };
+        const publicationOwner = randomUUID();
+        await prepareArtifactPublication(database, artifact, publicationOwner);
         const result = await logs.insert({
           ...metadata("private-log"),
           apiKeyId: "usage-private",
           requestSummary: "payload",
-          artifactRelPath: "attempt-owned.json",
+          artifactRelPath: artifact.reference,
+          artifactSizeBytes: artifact.sizeBytes,
+          artifactSha256: artifact.checksum,
+          artifactPublicationOwner: publicationOwner,
           hasRequestBody: 1,
           detailState: "ready",
         });
@@ -383,7 +398,16 @@ test(
         const queue = await database.transaction((transaction) =>
           transaction.query("SELECT relpath FROM omniroute.artifact_deletion_queue")
         );
-        assert.deepEqual(queue.rows, [{ relpath: "attempt-owned.json" }]);
+        assert.deepEqual(queue.rows, [{ relpath: artifact.reference }]);
+        const lifecycle = await database.transaction((transaction) =>
+          transaction.query(
+            "SELECT publication_state,upload_state FROM omniroute.artifact_deletion_queue WHERE relpath=$1",
+            [artifact.reference]
+          )
+        );
+        assert.deepEqual(lifecycle.rows, [
+          { publication_state: "delete_pending", upload_state: "acknowledged" },
+        ]);
       });
       await context.test(
         "duplicate call ids report a known no-op and preserve the first row",
@@ -435,22 +459,41 @@ test(
         "retention queues a shared imported artifact only after its last reference",
         async () => {
           await reset(database);
-          await logs.insert({
-            ...metadata("older", "2026-01-01T00:00:00.000Z"),
-            artifactRelPath: "shared-legacy.json",
+          const checksum = createHash("sha256").update("shared imported payload").digest("hex");
+          const reference = `s3/${randomUUID()}_${checksum}.json`;
+          // Seed the offline import's retained shared state (applicationImport::artifactPublicationValues).
+          // Ordinary new-write insert deliberately accepts only exclusive publishing ownership.
+          await database.transaction(async (transaction) => {
+            await transaction.query("SELECT pg_advisory_xact_lock(18765,8)");
+            for (const [id, timestamp] of [
+              ["older", "2026-01-01T00:00:00.000Z"],
+              ["newer", "2026-02-01T00:00:00.000Z"],
+            ]) {
+              await transaction.query(
+                "INSERT INTO omniroute.call_logs(id,timestamp,artifact_relpath,artifact_size_bytes,artifact_sha256,detail_state) VALUES($1,$2,$3,$4,$5,'ready')",
+                [id, timestamp, reference, Buffer.byteLength("shared imported payload"), checksum]
+              );
+            }
+            await transaction.query(
+              "INSERT INTO omniroute.artifact_deletion_queue(relpath,publication_state,upload_state,publication_owner,store_scope,expected_size_bytes,expected_sha256) VALUES($1,'attached','legacy_unknown',NULL,$2,$3,$4)",
+              [reference, "a".repeat(64), Buffer.byteLength("shared imported payload"), checksum]
+            );
           });
-          await logs.insert({
-            ...metadata("newer", "2026-02-01T00:00:00.000Z"),
-            artifactRelPath: "shared-legacy.json",
-          });
+          assert.equal((await logs.byId("older"))?.artifact_relpath, reference);
+          assert.equal((await logs.byId("newer"))?.artifact_relpath, reference);
           assert.equal((await logs.deleteBefore("2026-01-02", 500)).paths.length, 0);
-          assert.deepEqual((await logs.deleteBefore("2026-03-01", 500)).paths, [
-            "shared-legacy.json",
-          ]);
+          const retained = await database.transaction((transaction) =>
+            transaction.query(
+              "SELECT publication_state FROM omniroute.artifact_deletion_queue WHERE relpath=$1",
+              [reference]
+            )
+          );
+          assert.deepEqual(retained.rows, [{ publication_state: "attached" }]);
+          assert.deepEqual((await logs.deleteBefore("2026-03-01", 500)).paths, [reference]);
           const rows = await database.transaction((transaction) =>
             transaction.query("SELECT relpath FROM omniroute.artifact_deletion_queue")
           );
-          assert.deepEqual(rows.rows, [{ relpath: "shared-legacy.json" }]);
+          assert.deepEqual(rows.rows, [{ relpath: reference }]);
         }
       );
       await context.test("provider and auto-routing analytics use native groups", async () => {

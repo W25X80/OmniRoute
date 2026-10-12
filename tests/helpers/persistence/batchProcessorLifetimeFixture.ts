@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { getSelectedControlPlane } from "../../../src/lib/db/controlPlaneContext.ts";
 import type { BatchItemCheckpoint, BatchRecord } from "../../../src/lib/db/batches.ts";
+import type { NativeFileWork } from "../../../src/lib/db/nativeFileWork.ts";
 import type { FileRecord } from "../../../src/lib/db/files.ts";
 import { fixture } from "./runtimeOwnedWorkFixture.ts";
 
@@ -149,6 +150,19 @@ export async function isFileReferencedByOtherBatchAsync() {
 export async function getFileContentAsync(id: string) {
   scoped("file-read");
   return batchFixture.files.get(id)?.content ?? null;
+}
+export async function getFileContentForConsumerAsync(id: string, consumer: NativeFileWork) {
+  scoped("file-consumer-read");
+  consumer.assertActive();
+  const content = batchFixture.files.get(id)?.content ?? null;
+  if (content) consumer.reserveDownload(content.byteLength);
+  scoped("file-consumer-reserved");
+  return content;
+}
+export async function deleteExpiredBatchFilesAsync(_id: string, _now?: number): Promise<void> {
+  scoped("file-expiry");
+  // This fixture exposes no terminal batches; no expiry candidate can reach a deletion.
+  assert.equal((await getTerminalBatchesAsync()).length, 0);
 }
 export async function listFilesAsync() {
   scoped("file-list");

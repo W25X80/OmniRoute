@@ -12,11 +12,12 @@ import {
   parseBatchItemCheckpoint,
   INSTANCE_SWEEP_CHUNK,
   MAX_CHUNKS_PER_REQUEST,
+  getExpiredBatchFileIds,
 } from "../batches/persistenceSemantics";
 import { objToSnake } from "../caseMapping";
 import type { PostgresDatabase, PostgresTransaction } from "./database";
 import { affected, first, rows, safeInteger, lockServices, placeholders } from "./serviceQuery";
-import { createFile, deleteFile, deleteFileOwnedBy } from "./serviceFiles";
+import { createFile, getFile, deleteFile, deleteFileOwnedBy } from "./serviceFiles";
 
 const BATCH_COLUMNS = new Set([
   "id",
@@ -68,6 +69,8 @@ export async function createBatch(
   batch: Parameters<typeof import("../batches").createBatch>[0]
 ): Promise<BatchRecord> {
   await lockServices(transaction);
+  // Recheck after acquiring the same authority used by expiry and explicit deletion.
+  if (!(await getFile(transaction, batch.inputFileId))) throw new Error("Input file not found");
   const record: BatchRecord = {
     ...batch,
     id: "batch_" + uuidv4().replaceAll("-", "").substring(0, 24),
@@ -321,6 +324,19 @@ export async function getTerminalBatches(transaction: PostgresTransaction): Prom
       "SELECT * FROM omniroute.batches WHERE status IN ('completed', 'failed', 'cancelled', 'expired') ORDER BY created_at ASC, insertion_order ASC"
     )
   ).map(mapBatch);
+}
+export async function deleteExpiredBatchFiles(
+  transaction: PostgresTransaction,
+  id: string,
+  now = Math.floor(Date.now() / 1000)
+): Promise<void> {
+  await lockServices(transaction);
+  const batch = await getBatch(transaction, id);
+  if (!batch) return;
+  for (const fileId of getExpiredBatchFileIds(batch, now)) {
+    if (!(await isFileReferencedByOtherBatch(transaction, fileId, [id])))
+      await deleteFile(transaction, fileId);
+  }
 }
 export async function isFileReferencedByOtherBatch(
   transaction: PostgresTransaction,

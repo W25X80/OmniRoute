@@ -33,6 +33,7 @@ async function stopPostgresApplication(): Promise<void> {
     await attempt(() =>
       runPersistenceShutdownWork(async () => {
         const loaded = await Promise.allSettled([
+          import("@/lib/proxyLogger").then((module) => () => module.beginNativeProxyLogClose()),
           import("@/lib/services/nativeLifecycle").then(
             (module) => () => module.beginNativeEmbeddedServicesClose()
           ),
@@ -142,6 +143,7 @@ async function stopPostgresApplication(): Promise<void> {
             await import("@omniroute/open-sse/services/compression/engines/rtk/rawOutput.ts")
           ).closeRtkRawOutputPurgeScheduler()
         );
+        await attempt(async () => (await import("@/lib/proxyLogger")).closeProxyLogSavesAsync());
         await attempt(async () => (await import("@/lib/usage/callLogs")).closeCallLogSaves());
         await attempt(async () =>
           (

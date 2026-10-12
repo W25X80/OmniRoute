@@ -32,6 +32,7 @@
  */
 
 import { createHmac, randomUUID } from "node:crypto";
+import { getSelectedPersistenceIdentity } from "../../src/lib/db/controlPlaneContext.ts";
 import {
   createAgenticConversationAsync,
   findAgenticConversationsByFingerprintAsync,
@@ -452,6 +453,44 @@ export function findReconnectMatch(
 
 const MAX_STORED_ID_LENGTH = 128;
 
+// Next can load this service in independent bundles. The supported single-writer
+// process must share the same fence across those copies and across request scopes.
+const fenceKey = Symbol.for("omniroute.conversation-fingerprint-fence.v1");
+const processState = globalThis as typeof globalThis & {
+  [fenceKey]?: {
+    sqliteIdentity: object;
+    tails: WeakMap<object, Map<string, Promise<void>>>;
+  };
+};
+const fingerprintFences = (processState[fenceKey] ??= {
+  sqliteIdentity: {},
+  tails: new WeakMap(),
+});
+
+async function withConversationFingerprint<T>(
+  fingerprint: string,
+  body: () => Promise<T>
+): Promise<T> {
+  const identity = getSelectedPersistenceIdentity() ?? fingerprintFences.sqliteIdentity;
+  let tails = fingerprintFences.tails.get(identity);
+  if (!tails) fingerprintFences.tails.set(identity, (tails = new Map()));
+  const previous = tails.get(fingerprint);
+  let release!: () => void;
+  const tail = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  tails.set(fingerprint, tail);
+  try {
+    if (previous) await previous;
+    // Read candidates and indexes only after the predecessor has settled. Each
+    // request classifies current durable state; a failed mutation is never replayed.
+    return await body();
+  } finally {
+    release();
+    if (tails.get(fingerprint) === tail) tails.delete(fingerprint);
+  }
+}
+
 export async function resolveConversationId(
   input: ResolveConversationIdInput
 ): Promise<ResolveConversationIdResult> {
@@ -489,77 +528,83 @@ export async function resolveConversationId(
   // text twice, which on long duplicate-heavy coding-agent histories blocked
   // the pre-routing request path for 10-130 s.
   const turnHashes = chainTurns.map(hashTurnContent);
-  const walkBudget: ReconnectWalkBudget = { stepsLeft: DEFAULT_RECONNECT_MAX_STEPS, stepsUsed: 0 };
 
-  const candidates = await findAgenticConversationsByFingerprintAsync(fingerprintHash);
-  for (const candidate of candidates) {
-    const index = await getConversationTurnIndexAsync(candidate.id);
-    if (index.nodeIds.size === 0) continue;
+  return withConversationFingerprint(fingerprintHash, async () => {
+    const walkBudget: ReconnectWalkBudget = {
+      stepsLeft: DEFAULT_RECONNECT_MAX_STEPS,
+      stepsUsed: 0,
+    };
 
-    const { match } = findReconnectMatch(chainTurns, index, {
-      turnHashes,
-      budget: walkBudget,
-    });
-    // No match anywhere in the chain means this candidate isn't actually
-    // this conversation's lineage — it only shares the coarse fingerprint
-    // bucket (apiKeyId/model/toolNames), which real traffic proves is not
-    // enough to assume overlap on its own (see computeFingerprintHash's doc
-    // comment) — try the next candidate rather than attaching a completely
-    // unrelated turn.
-    if (!match) continue;
+    const candidates = await findAgenticConversationsByFingerprintAsync(fingerprintHash);
+    for (const candidate of candidates) {
+      const index = await getConversationTurnIndexAsync(candidate.id);
+      if (index.nodeIds.size === 0) continue;
 
-    if (match.matchEndIndex === chainTurns.length) {
-      // Every turn from the reconnect point onward already exists on this
-      // chain (e.g. an exact retry, or the whole request is already fully
-      // recorded) — a real continuation, nothing new to insert.
-      await updateAgenticConversationAsync(candidate.id, { turnCount: candidate.turnCount + 1 });
-      return { conversationId: candidate.id, isNewConversation: false };
+      const { match } = findReconnectMatch(chainTurns, index, {
+        turnHashes,
+        budget: walkBudget,
+      });
+      // No match anywhere in the chain means this candidate isn't actually
+      // this conversation's lineage — it only shares the coarse fingerprint
+      // bucket (apiKeyId/model/toolNames), which real traffic proves is not
+      // enough to assume overlap on its own (see computeFingerprintHash's doc
+      // comment) — try the next candidate rather than attaching a completely
+      // unrelated turn.
+      if (!match) continue;
+
+      if (match.matchEndIndex === chainTurns.length) {
+        // Every turn from the reconnect point onward already exists on this
+        // chain (e.g. an exact retry, or the whole request is already fully
+        // recorded) — a real continuation, nothing new to insert.
+        await updateAgenticConversationAsync(candidate.id, { turnCount: candidate.turnCount + 1 });
+        return { conversationId: candidate.id, isNewConversation: false };
+      }
+
+      if (!match.anchorHasChild) {
+        // Genuine tail growth: the reconnect point has no recorded child yet,
+        // so turns[matchEndIndex:] are simply turns this conversation hasn't
+        // seen before — append them to this SAME chain. Turns before
+        // startIndex (a compacted-away prefix, if any) are never inserted —
+        // they don't represent new content, just the client's own context
+        // management.
+        const newNodes = buildNewNodes(
+          chainTurns,
+          match.matchEndIndex,
+          match.anchorNodeId,
+          candidate.id,
+          turnHashes
+        );
+        await insertConversationTurnNodesAsync(candidate.id, input.correlationId, newNodes);
+        await updateAgenticConversationAsync(candidate.id, { turnCount: candidate.turnCount + 1 });
+        return { conversationId: candidate.id, isNewConversation: false };
+      }
+
+      // The reconnect point already has a DIFFERENT recorded child — this
+      // request's turn at that position diverges from what's on file (a real
+      // OpenClaw cache-aware-context edit: turn `c` became `c'`). As of the
+      // 2026-08-06 redesign, an edited/duplicated turn no longer forks a
+      // branch inside this conversation's own chain — every OmniRoute
+      // conversation is now a single straight line, never a tree. The
+      // diverging history becomes its own independent conversation instead
+      // (built fresh below, from this request's full turn list) — distinct
+      // conversation ids for `a b c d` and `a b c' d'`, not one tree with two
+      // branches. This is both simpler to store/query and fixes a real UX
+      // problem the branching model had: real OpenClaw traffic accumulates
+      // dozens of edits per session, and indenting one more level per fork
+      // eventually left no horizontal space for content at all. Keep checking
+      // remaining candidates first, though — a later candidate may already BE
+      // that independent conversation from a previous edit at this same spot
+      // (e.g. a repeated retry of the edited turn), which should continue
+      // that one rather than minting yet another new id for it.
     }
 
-    if (!match.anchorHasChild) {
-      // Genuine tail growth: the reconnect point has no recorded child yet,
-      // so turns[matchEndIndex:] are simply turns this conversation hasn't
-      // seen before — append them to this SAME chain. Turns before
-      // startIndex (a compacted-away prefix, if any) are never inserted —
-      // they don't represent new content, just the client's own context
-      // management.
-      const newNodes = buildNewNodes(
-        chainTurns,
-        match.matchEndIndex,
-        match.anchorNodeId,
-        candidate.id,
-        turnHashes
-      );
-      await insertConversationTurnNodesAsync(candidate.id, input.correlationId, newNodes);
-      await updateAgenticConversationAsync(candidate.id, { turnCount: candidate.turnCount + 1 });
-      return { conversationId: candidate.id, isNewConversation: false };
-    }
-
-    // The reconnect point already has a DIFFERENT recorded child — this
-    // request's turn at that position diverges from what's on file (a real
-    // OpenClaw cache-aware-context edit: turn `c` became `c'`). As of the
-    // 2026-08-06 redesign, an edited/duplicated turn no longer forks a
-    // branch inside this conversation's own chain — every OmniRoute
-    // conversation is now a single straight line, never a tree. The
-    // diverging history becomes its own independent conversation instead
-    // (built fresh below, from this request's full turn list) — distinct
-    // conversation ids for `a b c d` and `a b c' d'`, not one tree with two
-    // branches. This is both simpler to store/query and fixes a real UX
-    // problem the branching model had: real OpenClaw traffic accumulates
-    // dozens of edits per session, and indenting one more level per fork
-    // eventually left no horizontal space for content at all. Keep checking
-    // remaining candidates first, though — a later candidate may already BE
-    // that independent conversation from a previous edit at this same spot
-    // (e.g. a repeated retry of the edited turn), which should continue
-    // that one rather than minting yet another new id for it.
-  }
-
-  const id = `conv_${randomUUID()}`;
-  await createAgenticConversationAsync({ id, apiKeyId: input.apiKeyId, fingerprintHash });
-  await insertConversationTurnNodesAsync(
-    id,
-    input.correlationId,
-    buildNewNodes(chainTurns, 0, id, id, turnHashes)
-  );
-  return { conversationId: id, isNewConversation: true };
+    const id = `conv_${randomUUID()}`;
+    await createAgenticConversationAsync({ id, apiKeyId: input.apiKeyId, fingerprintHash });
+    await insertConversationTurnNodesAsync(
+      id,
+      input.correlationId,
+      buildNewNodes(chainTurns, 0, id, id, turnHashes)
+    );
+    return { conversationId: id, isNewConversation: true };
+  });
 }

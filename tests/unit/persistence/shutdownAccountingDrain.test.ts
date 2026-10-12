@@ -147,6 +147,27 @@ test(
         childComplete.resolve();
         await Promise.all([tail, releasing, closing]);
         assert.equal(shutdownFixture.persistedCost, 3);
+        assert.equal(
+          shutdownFixture.events.filter((event) => event === "proxy:admission-close").length,
+          1
+        );
+        assert.equal(shutdownFixture.events.filter((event) => event === "proxy:close").length, 1);
+        assert.ok(
+          shutdownFixture.events.indexOf("proxy:admission-close") <
+            shutdownFixture.events.indexOf("tail:child-complete")
+        );
+        assert.ok(
+          shutdownFixture.events.indexOf("proxy:close") >
+            shutdownFixture.events.indexOf("tail:child-complete")
+        );
+        assert.equal(
+          shutdownFixture.events.filter((event) => event === "subscription:stop").length,
+          1
+        );
+        assert.ok(
+          shutdownFixture.events.indexOf("subscription:stopped") <
+            shutdownFixture.events.indexOf("cost:flush")
+        );
         assert.deepEqual(shutdownFixture.logRows, ["late-call"]);
         assert.ok(
           shutdownFixture.events.indexOf("tail:child-complete") <

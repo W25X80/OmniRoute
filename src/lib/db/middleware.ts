@@ -1,5 +1,6 @@
 import { getSelectedPostgresDatabase } from "./controlPlaneContext";
 import { createPostgresMiddlewareRepository } from "./postgres/middlewareRepository";
+import { MiddlewareHookNameConflictError } from "./middlewareErrors";
 /**
  * Middleware Hooks DB — CRUD operations for middleware_hooks table
  *
@@ -90,12 +91,16 @@ export function createMiddlewareHook(config: HookConfig): HookConfig {
   row.created_at = new Date().toISOString();
   row.updated_at = row.created_at;
 
-  db.prepare(
-    `
+  const inserted = db
+    .prepare(
+      `
     INSERT INTO middleware_hooks (name, description, priority, scope_type, combo_id, enabled, code, created_at, updated_at, run_count, last_error)
     VALUES (@name, @description, @priority, @scope_type, @combo_id, @enabled, @code, @created_at, @updated_at, @run_count, @last_error)
+    ON CONFLICT (name) DO NOTHING
   `
-  ).run(row);
+    )
+    .run(row);
+  if (inserted.changes === 0) throw new MiddlewareHookNameConflictError();
 
   return getMiddlewareHook(config.name)!;
 }

@@ -390,11 +390,34 @@ export class PostgresCatalogEffectsError extends Error {
   }
 }
 
+export interface PostgresCatalogVersion {
+  readonly identity: object;
+  readonly authority: string;
+  readonly generation: string;
+}
+
+/** Bind derived values before yielding; acknowledged writes may replace the scope's rows. */
+export function capturePostgresCatalogVersion(): PostgresCatalogVersion {
+  const database = getSelectedPostgresDatabase();
+  if (!database) throw new Error("PostgreSQL catalog owner is not selected");
+  const current = scope(database);
+  return Object.freeze({
+    identity: current.identity,
+    authority: current.rows.authority,
+    generation: current.rows.generation,
+  });
+}
+
 /** A long catalog build may yield; never return its stale view after policy publication. */
-export async function assertPostgresCatalogSnapshotCurrent(): Promise<void> {
+export async function assertPostgresCatalogSnapshotCurrent(
+  expected?: PostgresCatalogVersion
+): Promise<void> {
   const database = getSelectedPostgresDatabase();
   if (!database) return;
-  const captured = scope(database).rows;
+  const current = scope(database);
+  const captured = expected ?? capturePostgresCatalogVersion();
+  if (captured.identity !== current.identity || captured.authority !== current.rows.authority)
+    throw new Error("Catalog authority changed during request preparation");
   const version = await database.transaction(async (transaction) => {
     const result = await transaction.query<{
       authority_id: string;

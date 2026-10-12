@@ -6,14 +6,20 @@ import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
 import { Readable } from "node:stream";
+import vm from "node:vm";
 import test, { afterEach } from "node:test";
 import { fileURLToPath } from "node:url";
 import {
   bindPersistenceRequestCallback,
   isSqlitePersistenceRequested,
-  wrapRequestListenerWithPersistence,
+  wrapRequestListenerWithPersistence as wrapPersistenceOwner,
+  loadedStandaloneNextConfiguration,
 } from "../../scripts/dev/persistence-request-boundary.mjs";
 import { maybeHandleWebdav } from "../../scripts/dev/webdav-handler.mjs";
+
+const loadedConfiguration = { basePath: "", experimental: { caseSensitiveRoutes: false } };
+const wrapRequestListenerWithPersistence = (listener, config = loadedConfiguration) =>
+  wrapPersistenceOwner(listener, config);
 
 const initialBackend = process.env.OMNIROUTE_DATABASE_BACKEND;
 const initialBasePath = process.env.OMNIROUTE_BASE_PATH;
@@ -144,6 +150,16 @@ test("SQLite without a hook retains synchronous return, this, and body methods",
   assert.equal(isSqlitePersistenceRequested({ OMNIROUTE_DATABASE_BACKEND: "postgresql" }), false);
 });
 
+test("native construction rejects absent or incomplete loaded routing configuration", () => {
+  process.env.OMNIROUTE_DATABASE_BACKEND = "postgres";
+  for (const config of [undefined, {}, { basePath: "" }, { basePath: "", experimental: {} }]) {
+    assert.throws(
+      () => wrapPersistenceOwner(() => assert.fail("invalid transport dispatched"), config),
+      /Native file routing configuration unavailable/
+    );
+  }
+});
+
 test("PostgreSQL without admission fails closed and never calls the handler", () => {
   process.env.OMNIROUTE_DATABASE_BACKEND = "postgres";
   delete globalThis.__omniroutePersistenceRequest;
@@ -166,7 +182,10 @@ test("healthz bypasses snapshots, including a normalized configured base path", 
     assert.fail("health requested a snapshot");
   };
   let calls = 0;
-  const handler = wrapRequestListenerWithPersistence(() => ++calls);
+  const handler = wrapRequestListenerWithPersistence(() => ++calls, {
+    ...loadedConfiguration,
+    basePath: "/team/gateway",
+  });
   for (const url of ["/healthz", "/healthz?x=1", "/team/gateway/healthz?x=1"]) {
     const request = new FakeRequest();
     request.url = url;
@@ -598,5 +617,80 @@ test("transport markers precede Next startup, and the assembly includes the boun
   assert.ok(standalone.indexOf(marker) < standalone.indexOf('await import("./server.js")'));
   assert.ok(dev.indexOf(marker) < dev.indexOf("await prepareWithHeal()"));
   assert.match(assembly, /dest:\s*\["persistence-request-boundary\.mjs"\]/);
-  assert.equal((standalone.match(/wrapRequestListenerWithPersistence\(/g) || []).length, 3);
+  assert.ok(standalone.indexOf(marker) >= 0);
+  assert.ok(dev.indexOf(marker) >= 0);
+});
+
+test("standalone factory, on and addListener register persistence-aware native file handlers", async () => {
+  process.env.OMNIROUTE_DATABASE_BACKEND = "postgres";
+  const savedConfig = process.env.__NEXT_PRIVATE_STANDALONE_CONFIG;
+  const config = { basePath: "/team", experimental: { caseSensitiveRoutes: false } };
+  process.env.__NEXT_PRIVATE_STANDALONE_CONFIG = JSON.stringify(config);
+  const source = fs.readFileSync(path.join(devDirectory, "standalone-server-ws.mjs"), "utf8");
+  const start = source.indexOf("function wrapServingRequestListener(");
+  const end = source.indexOf("// The factory and request-registration paths", start);
+  assert.ok(start >= 0 && end > start, "actual serving registration owner must be present");
+  const httpFixture = {};
+  const pass = (listener) => listener;
+  const registered = [];
+  try {
+    vm.runInNewContext(source.slice(start, end), {
+      http: httpFixture,
+      isSqlitePersistenceRequested,
+      wrapRequestListenerWithPersistence: wrapPersistenceOwner,
+      loadedStandaloneNextConfiguration,
+      wrapRequestListenerWithHeadResponseGuard: pass,
+      wrapRequestListenerWithMethodGuard: pass,
+      wrapRequestListenerWithWebdav: pass,
+      wrapRequestListenerWithPeerStamp: pass,
+      wrapUpgradeListener: (_server, listener) => listener,
+      createServerListener(args) {
+        const server = new EventEmitter();
+        const listener = args.findLast((value) => typeof value === "function");
+        if (listener) server.on("request", listener);
+        registered.push(server);
+        return server;
+      },
+      originalCreateServer() {
+        assert.fail("unexpected alternate factory");
+      },
+      tlsOptions: undefined,
+      createdServers: new Set(),
+      getMainServerTimeoutConfig: () => ({ keepAliveTimeoutMs: 1, headersTimeoutMs: 2 }),
+    });
+    for (const mode of ["factory", "on", "addListener"]) {
+      const observed = [];
+      let called = 0;
+      globalThis.__omniroutePersistenceRequest = async (run, lifetime, transport) => {
+        observed.push(transport);
+        await run();
+        await lifetime;
+      };
+      const listener = (_req, res) => {
+        called++;
+        res.end("accepted");
+      };
+      const server =
+        mode === "factory" ? httpFixture.createServer(listener) : httpFixture.createServer();
+      if (mode !== "factory") server[mode]("request", listener);
+      const [handler] = server.listeners("request");
+      assert.equal(server.listeners("request").length, 1);
+      const req = new FakeRequest();
+      req.url = "/team/v1/files";
+      req.method = "POST";
+      const res = new FakeResponse();
+      await handler(req, res);
+      assert.equal(called, 1, mode);
+      assert.equal(observed.length, 1, mode);
+      assert.equal(observed[0]?.kind, "upload", mode);
+      assert.equal(observed[0]?.api, true, mode);
+      assert.equal(observed[0]?.req, req);
+      assert.equal(observed[0]?.res, res);
+      assert.equal(typeof observed[0]?.onFailure, "function");
+    }
+    assert.equal(registered.length, 3);
+  } finally {
+    if (savedConfig === undefined) delete process.env.__NEXT_PRIVATE_STANDALONE_CONFIG;
+    else process.env.__NEXT_PRIVATE_STANDALONE_CONFIG = savedConfig;
+  }
 });

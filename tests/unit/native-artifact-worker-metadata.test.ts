@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { createHash, randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import fs from "node:fs";
 import fsPromises from "node:fs/promises";
@@ -73,14 +74,21 @@ test("native artifact public writer waits for metadata, remains FIFO, evicts and
     assertReady() {},
   } as unknown as PostgresControlPlaneBinding);
   const stored: Uint8Array[] = [];
+  const prepared: string[] = [];
+  const preparation = deferred();
+  const preparedFirst = deferred();
   const store: NativeArtifactStore = {
-    async put(bytes) {
-      stored.push(bytes);
-      return {
-        reference: "native-fixture-reference",
+    async put(bytes, options) {
+      const checksum = createHash("sha256").update(bytes).digest("hex");
+      const artifact = {
+        reference: `s3/${randomUUID()}_${checksum}.json`,
         sizeBytes: bytes.length,
-        checksum: "fixture-checksum",
+        checksum,
       };
+      assert.ok(options?.onPrepared, "native storage requires acknowledged caller preparation");
+      await options.onPrepared({ ...artifact, storageScope: "a".repeat(64), singleAttempt: true });
+      stored.push(bytes);
+      return artifact;
     },
     async get() {
       return null;
@@ -138,9 +146,21 @@ test("native artifact public writer waits for metadata, remains FIFO, evicts and
   }
   syncBuiltinESMExports();
   const fixture = (id: string) => ({ summary: { id } }) as unknown as CallLogArtifact;
+  // Controlled preparation observes the writer protocol; real SQL journaling is a separate test.
+  const options = {
+    async onPrepared(
+      artifact: import("../../src/domain/persistence/artifactStore.ts").PreparedArtifact
+    ) {
+      prepared.push(artifact.reference);
+      if (prepared.length === 1) {
+        preparedFirst.resolve();
+        await preparation.promise;
+      }
+    },
+  };
   try {
-    const first = writer.writeCallArtifactAsync(fixture("first"));
-    const second = writer.writeCallArtifactAsync(fixture("second"));
+    const first = writer.writeCallArtifactAsync(fixture("first"), options);
+    const second = writer.writeCallArtifactAsync(fixture("second"), options);
     await until(() => probes === 1);
     await new Promise<void>((resolve) => setImmediate(resolve));
     assert.equal(workers.length, 0);
@@ -153,6 +173,9 @@ test("native artifact public writer waits for metadata, remains FIFO, evicts and
       id: workers[0].messages[0].id,
       bytes: new Uint8Array([1, 2]),
     });
+    await preparedFirst.promise;
+    assert.equal(stored.length, 0, "no bytes are accepted before preparation acknowledgement");
+    preparation.resolve();
     await first;
     await until(() => workers[0].messages.length === 2);
     assert.equal(workers[0].messages[1].artifact.summary.id, "second");
@@ -170,7 +193,7 @@ test("native artifact public writer waits for metadata, remains FIFO, evicts and
 
     // A completed native writer keeps the original 30 second idle eviction contract.
     t.mock.timers.enable({ apis: ["setTimeout"] });
-    const third = writer.writeCallArtifactAsync(fixture("third"));
+    const third = writer.writeCallArtifactAsync(fixture("third"), options);
     await until(() => workers[0].messages.length === 3);
     workers[0].emit("message", {
       kind: "serialize",
@@ -183,7 +206,7 @@ test("native artifact public writer waits for metadata, remains FIFO, evicts and
 
     gate = deferred();
     const previousProbes = probes;
-    const fourth = writer.writeCallArtifactAsync(fixture("fourth"));
+    const fourth = writer.writeCallArtifactAsync(fixture("fourth"), options);
     const outcome = fourth.catch((error: unknown) => error);
     await until(() => probes > previousProbes);
     await assert.rejects(writer.closeCallLogArtifactWriter(0), /still draining/);
@@ -193,8 +216,10 @@ test("native artifact public writer waits for metadata, remains FIFO, evicts and
     await new Promise<void>((resolve) => setImmediate(resolve));
     assert.equal(workers.length, 1, "metadata completion cannot construct a worker after close");
     assert.equal(stored.length, 3);
+    assert.equal(prepared.length, 3, "rejected late work cannot prepare an object");
     assert.equal(syncCount, 0);
   } finally {
+    preparation.resolve();
     gate.resolve();
     await writer.closeCallLogArtifactWriter(0).catch(() => undefined);
     uninstall();

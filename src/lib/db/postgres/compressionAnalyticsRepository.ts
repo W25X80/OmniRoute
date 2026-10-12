@@ -227,6 +227,9 @@ export async function getCompressionAnalyticsSummaryPostgres(
   since?: string
 ) {
   return database.transaction(async (tx) => {
+    // Every projection describes the same runs, even while producers commit new rows
+    // or attach receipts. Keep that snapshot local to this read-only summary.
+    await tx.query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY");
     let cutoff: string | null = null;
     if (since === "24h") {
       cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();

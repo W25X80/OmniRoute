@@ -221,21 +221,24 @@ server.listen(Number(process.argv[2]), "127.0.0.1", () => console.log("child-rea
       const executor = new NineRouterExecutor();
       frontend.on(
         "request",
-        wrapRequestListenerWithPersistence(async (request, response) => {
-          const chunks: Buffer[] = [];
-          for await (const chunk of request) chunks.push(Buffer.from(chunk));
-          const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-          const result = await executor.execute({
-            model: "9router/fixture-model",
-            body,
-            stream: false,
-            credentials: {},
-          });
-          const reply = await result.response.text();
-          fixture.events.push("accepted:reply");
-          response.statusCode = result.response.status;
-          response.end(reply);
-        })
+        wrapRequestListenerWithPersistence(
+          async (request, response) => {
+            const chunks: Buffer[] = [];
+            for await (const chunk of request) chunks.push(Buffer.from(chunk));
+            const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+            const result = await executor.execute({
+              model: "9router/fixture-model",
+              body,
+              stream: false,
+              credentials: {},
+            });
+            const reply = await result.response.text();
+            fixture.events.push("accepted:reply");
+            response.statusCode = result.response.status;
+            response.end(reply);
+          },
+          { basePath: "", experimental: { caseSensitiveRoutes: false } }
+        )
       );
       const frontendPort = await listen(frontend);
       const url = `http://127.0.0.1:${frontendPort}/v1/chat/completions`;
@@ -287,6 +290,22 @@ server.listen(Number(process.argv[2]), "127.0.0.1", () => console.log("child-rea
       assert.ok(fixture.events.indexOf("child:exit") < fixture.events.indexOf("buffers:closing"));
       assert.ok(fixture.events.indexOf("buffers:closed") < fixture.events.indexOf("pool-close"));
       assert.equal(fixture.poolCloses, 1);
+      assert.equal(fixture.events.filter((event) => event === "subscription:stop").length, 1);
+      assert.ok(
+        fixture.events.indexOf("subscription:stopped") < fixture.events.indexOf("cost:flush")
+      );
+      assert.ok(
+        fixture.events.indexOf("headroom:admission-close") <
+          fixture.events.indexOf("headroom:close")
+      );
+      assert.equal(fixture.events.filter((event) => event === "proxy:admission-close").length, 1);
+      assert.ok(
+        fixture.events.indexOf("proxy:admission-close") < fixture.events.indexOf("accepted:reply")
+      );
+      for (const event of ["headroom:close", "omp:close", "proxy:close"]) {
+        assert.ok(fixture.events.indexOf(event) > fixture.events.indexOf("accepted:reply"));
+        assert.ok(fixture.events.indexOf(event) < fixture.events.indexOf("pool-close"));
+      }
       assert.equal(runtime.getPersistenceRuntimeStatus().phase, "closed");
     } finally {
       fixture.releaseBarriers();

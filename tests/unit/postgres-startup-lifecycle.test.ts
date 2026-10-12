@@ -72,6 +72,7 @@ function resetFixture() {
   startupFixture.events.length = 0;
   startupFixture.modelGenerations.length = 0;
   startupFixture.stopBarrier = undefined;
+  startupFixture.subscriptionBarrier = undefined;
   startupFixture.modelBarrier = undefined;
   startupFixture.codexBarrier = undefined;
   startupFixture.readyFailure = false;
@@ -95,6 +96,8 @@ test("native shutdown closes every producer before drains and closes the pool la
   resetFixture();
   const barrier = deferred();
   startupFixture.stopBarrier = barrier.promise;
+  const subscriptionBarrier = deferred();
+  startupFixture.subscriptionBarrier = subscriptionBarrier.promise;
   let done = false;
   const closing = shutdown.shutdownPostgresApplication().then(() => {
     done = true;
@@ -108,11 +111,35 @@ test("native shutdown closes every producer before drains and closes the pool la
     false
   );
   barrier.resolve();
+  await turn();
+  assert.equal(done, false, "shutdown must also await the accepted subscription stop");
+  assert.equal(
+    startupFixture.events.some((event) => event.startsWith("flush:")),
+    false
+  );
+  subscriptionBarrier.resolve();
   await closing;
   assert.equal(startupFixture.events.at(-1), "pool:close");
   const firstFlush = startupFixture.events.findIndex((event) => event.startsWith("flush:"));
   const lastStop = startupFixture.events.findLastIndex((event) => event.startsWith("stop:"));
   assert.ok(firstFlush > lastStop);
+  for (const event of ["stop:proxyLogAdmission", "accepted:drain", "resource:proxyLogs"]) {
+    assert.equal(startupFixture.events.filter((observed) => observed === event).length, 1);
+  }
+  assert.ok(
+    startupFixture.events.indexOf("stop:proxyLogAdmission") <
+      startupFixture.events.indexOf("accepted:drain")
+  );
+  assert.ok(
+    startupFixture.events.indexOf("resource:proxyLogs") >
+      startupFixture.events.indexOf("accepted:drain")
+  );
+  assert.ok(
+    startupFixture.events.indexOf("resource:proxyLogs") <
+      startupFixture.events.indexOf("pool:close")
+  );
+  assert.equal(startupFixture.events.filter((event) => event === "stop:subscription").length, 1);
+  assert.ok(startupFixture.events.indexOf("stop:subscriptionSettled") < firstFlush);
   assert.ok(startupFixture.events.indexOf("shutdown:enter") < firstFlush);
   assert.deepEqual(
     startupFixture.events.filter((event) => event.startsWith("flush:")),

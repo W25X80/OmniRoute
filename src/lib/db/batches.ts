@@ -3,6 +3,7 @@ import {
   parseBatchItemCheckpoint,
   INSTANCE_SWEEP_CHUNK,
   MAX_CHUNKS_PER_REQUEST,
+  getExpiredBatchFileIds,
 } from "./batches/persistenceSemantics";
 export {
   parseBatchRow,
@@ -12,7 +13,7 @@ export {
 } from "./batches/persistenceSemantics";
 import { getSelectedPostgresDatabase } from "./controlPlaneContext";
 import { getDbInstance, objToSnake } from "./core";
-import { createFile, deleteFile, deleteFileOwnedBy } from "./files";
+import { createFile, getFile, deleteFile, deleteFileOwnedBy } from "./files";
 import { v4 as uuidv4 } from "uuid";
 import { logger } from "../../../open-sse/utils/logger.ts";
 
@@ -169,36 +170,40 @@ export function createBatch(
   > & { status?: BatchRecord["status"] }
 ): BatchRecord {
   const db = getDbInstance();
-  const id = "batch_" + uuidv4().replaceAll("-", "").substring(0, 24);
-  const createdAt = Math.floor(Date.now() / 1000);
-  const record: BatchRecord = {
-    ...batch,
-    id,
-    createdAt,
-    status: batch.status || "validating",
-    requestCountsTotal: 0,
-    requestCountsCompleted: 0,
-    requestCountsFailed: 0,
-    errors: batch.errors || null,
-    model: batch.model || null,
-    usage: batch.usage || null,
-    outputExpiresAfterSeconds: batch.outputExpiresAfterSeconds || null,
-    outputExpiresAfterAnchor: batch.outputExpiresAfterAnchor || null,
-  };
+  return db.transaction(() => {
+    // The route's metadata check can precede an awaited cleanup/delete operation.
+    if (!getFile(batch.inputFileId)) throw new Error("Input file not found");
+    const id = "batch_" + uuidv4().replaceAll("-", "").substring(0, 24);
+    const createdAt = Math.floor(Date.now() / 1000);
+    const record: BatchRecord = {
+      ...batch,
+      id,
+      createdAt,
+      status: batch.status || "validating",
+      requestCountsTotal: 0,
+      requestCountsCompleted: 0,
+      requestCountsFailed: 0,
+      errors: batch.errors || null,
+      model: batch.model || null,
+      usage: batch.usage || null,
+      outputExpiresAfterSeconds: batch.outputExpiresAfterSeconds || null,
+      outputExpiresAfterAnchor: batch.outputExpiresAfterAnchor || null,
+    };
 
-  const snakeRecord = objToSnake({
-    ...record,
-    metadata: record.metadata ? JSON.stringify(record.metadata) : null,
-    errors: record.errors ? JSON.stringify(record.errors) : null,
-    usage: record.usage ? JSON.stringify(record.usage) : null,
-  }) as any;
-  const keys = Object.keys(snakeRecord);
-  const values = Object.values(snakeRecord);
-  const placeholders = keys.map(() => "?").join(", ");
+    const snakeRecord = objToSnake({
+      ...record,
+      metadata: record.metadata ? JSON.stringify(record.metadata) : null,
+      errors: record.errors ? JSON.stringify(record.errors) : null,
+      usage: record.usage ? JSON.stringify(record.usage) : null,
+    }) as any;
+    const keys = Object.keys(snakeRecord);
+    const values = Object.values(snakeRecord);
+    const placeholders = keys.map(() => "?").join(", ");
 
-  db.prepare(`INSERT INTO batches (${keys.join(", ")}) VALUES (${placeholders})`).run(...values);
+    db.prepare(`INSERT INTO batches (${keys.join(", ")}) VALUES (${placeholders})`).run(...values);
 
-  return record;
+    return record;
+  })();
 }
 
 export function getBatch(id: string): BatchRecord | null {
@@ -424,6 +429,26 @@ export function getTerminalBatches(): BatchRecord[] {
     )
     .all();
   return rows.map((row) => parseBatchRow(row));
+}
+
+/** Terminal expiry is conditional cleanup, separate from explicit deletion and file TTL. */
+export function deleteExpiredBatchFiles(id: string, now = Math.floor(Date.now() / 1000)): void {
+  getDbInstance().transaction(() => {
+    const batch = getBatch(id);
+    if (!batch) return;
+    for (const fileId of getExpiredBatchFileIds(batch, now)) {
+      if (!isFileReferencedByOtherBatch(fileId, [id])) deleteFile(fileId);
+    }
+  })();
+}
+
+export async function deleteExpiredBatchFilesAsync(
+  ...args: Parameters<typeof deleteExpiredBatchFiles>
+): Promise<void> {
+  const postgres = getSelectedPostgresDatabase();
+  if (!postgres) return deleteExpiredBatchFiles(...args);
+  const native = await import("./postgres/serviceBatches");
+  await postgres.transaction((transaction) => native.deleteExpiredBatchFiles(transaction, ...args));
 }
 
 export function deleteBatch(id: string): boolean {

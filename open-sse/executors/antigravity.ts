@@ -177,12 +177,19 @@ type AntigravityRequestEnvelope = Record<string, unknown> & {
 const MAX_CREDIT_BALANCE_ENTRIES = 50;
 const CREDIT_BALANCE_TTL_MS = 5 * 60 * 1000;
 type CreditCache = Map<string, { balance: number; updatedAt: number }>;
+type CreditReadState = { active: number; observation: number };
 const sqliteCreditCache: CreditCache = new Map();
 const CREDIT_CACHES = Symbol.for("omniroute.postgres.antigravityCredits");
+const CREDIT_READS = Symbol.for("omniroute.postgres.antigravityCreditReads");
 const creditGlobal = globalThis as typeof globalThis & {
   [CREDIT_CACHES]?: WeakMap<object, CreditCache>;
+  [CREDIT_READS]?: WeakMap<CreditCache, Map<string, CreditReadState>>;
 };
 const postgresCreditCaches = (creditGlobal[CREDIT_CACHES] ??= new WeakMap<object, CreditCache>());
+const creditReads = (creditGlobal[CREDIT_READS] ??= new WeakMap<
+  CreditCache,
+  Map<string, CreditReadState>
+>());
 function getCreditCache(): CreditCache {
   const identity = getSelectedPersistenceIdentity();
   if (!identity) return sqliteCreditCache;
@@ -244,6 +251,8 @@ export function getAntigravityRemainingCredits(accountId: string): number | null
 }
 
 function updateCreditCache(cache: CreditCache, accountId: string, balance: number): void {
+  const reading = creditReads.get(cache)?.get(accountId);
+  if (reading) reading.observation++;
   if (cache.size >= MAX_CREDIT_BALANCE_ENTRIES && !cache.has(accountId)) {
     const oldestKey = cache.keys().next().value;
     if (oldestKey !== undefined) cache.delete(oldestKey);
@@ -1786,7 +1795,20 @@ export async function getAntigravityRemainingCreditsAsync(id: string): Promise<n
   if (!getSelectedPostgresDatabase()) return getAntigravityRemainingCredits(id);
   const current = getAntigravityRemainingCredits(id);
   if (current !== null) return current;
-  const balance = await getPersistedCreditBalanceAsync(id);
-  if (balance !== null) getCreditCache().set(id, { balance, updatedAt: Date.now() });
-  return balance;
+  const cache = getCreditCache();
+  let reads = creditReads.get(cache);
+  if (!reads) creditReads.set(cache, (reads = new Map()));
+  let reading = reads.get(id);
+  if (!reading) reads.set(id, (reading = { active: 0, observation: 0 }));
+  reading.active++;
+  const observed = reading.observation;
+  try {
+    const balance = await getPersistedCreditBalanceAsync(id);
+    // A provider observation is primary even if it was later expired or evicted.
+    if (reading.observation !== observed) return getAntigravityRemainingCredits(id);
+    if (balance !== null) cache.set(id, { balance, updatedAt: Date.now() });
+    return balance;
+  } finally {
+    if (--reading.active === 0) reads.delete(id);
+  }
 }

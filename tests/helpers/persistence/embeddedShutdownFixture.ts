@@ -62,3 +62,32 @@ export async function closeCallLogSaves(): Promise<void> {
   assertShutdownScope();
   fixture.events.push("logs:close");
 }
+
+export function beginNativeHeadroomClose(): void {
+  assertShutdownScope();
+  fixture.events.push("headroom:admission-close");
+}
+export async function stopNativeHeadroomProcesses(): Promise<void> {
+  assertShutdownScope();
+  fixture.events.push("headroom:close");
+}
+export async function closeNativeOmpHostStorage(): Promise<void> {
+  assertShutdownScope();
+  fixture.events.push("omp:close");
+}
+export async function stopSubscriptionSchedulerAsync(): Promise<void> {
+  assertShutdownScope();
+  fixture.events.push("subscription:stop");
+  await Promise.resolve();
+  assertShutdownScope();
+  fixture.events.push("subscription:stopped");
+}
+
+export function beginNativeProxyLogClose(): void {
+  assertShutdownScope();
+  fixture.events.push("proxy:admission-close");
+}
+export async function closeProxyLogSavesAsync(): Promise<void> {
+  assertShutdownScope();
+  fixture.events.push("proxy:close");
+}

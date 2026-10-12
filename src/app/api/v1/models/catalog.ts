@@ -4,6 +4,7 @@ import {
   hasPostgresCatalogSnapshot,
   withPostgresCatalogSnapshot,
   assertPostgresCatalogSnapshotCurrent,
+  capturePostgresCatalogVersion,
 } from "@/lib/db/postgres/catalogSnapshot";
 import { createCatalogConnectionExclusionFilter } from "@/lib/providerModels/copilotCatalogRejections";
 import { PROVIDER_MODELS, PROVIDER_ID_TO_ALIAS } from "@/shared/constants/models";
@@ -180,6 +181,15 @@ export type CatalogResponseOptions = {
 
 const BUILTIN_AUTO_YIELD_INTERVAL = 2;
 
+type OpenRouterCatalog = Awaited<ReturnType<typeof getOpenRouterCatalog>>;
+type CatalogBuildOptions = {
+  publishOpenRouterCapabilities?: boolean;
+  recordDiscoveryHit?: boolean;
+  refreshAiHordeCatalog?: boolean;
+  openRouterCatalog?: OpenRouterCatalog;
+  onOpenRouterCapabilitiesPublished?: (catalog: OpenRouterCatalog) => void;
+};
+
 function yieldCatalogBuildTurn(): Promise<void> {
   return new Promise((resolve) => setImmediate(resolve));
 }
@@ -201,8 +211,28 @@ export async function getUnifiedModelsResponse(
   const catalogDatabase = getSelectedPostgresDatabase();
   const execute = async () => {
     if (catalogDatabase) {
-      const response = await buildUnifiedModelsResponseCore(request, corsHeaders);
-      await assertPostgresCatalogSnapshotCurrent();
+      const version = capturePostgresCatalogVersion();
+      let publishedCatalog: OpenRouterCatalog | undefined;
+      const response = await buildUnifiedModelsResponseCore(request, corsHeaders, {
+        onOpenRouterCapabilitiesPublished: (catalog) => {
+          publishedCatalog = catalog;
+        },
+      });
+      if (publishedCatalog) {
+        // Acknowledged publication refreshed every SNAPSHOT_SQL operand in the parent
+        // scope. Rebuild derived values once, without replaying writes or request metrics.
+        // Failed/uncertain commits never reach the callback or authorize this rebuild.
+        const publishedVersion = capturePostgresCatalogVersion();
+        const rebuilt = await buildUnifiedModelsResponseCore(request, corsHeaders, {
+          publishOpenRouterCapabilities: false,
+          recordDiscoveryHit: false,
+          refreshAiHordeCatalog: false,
+          openRouterCatalog: publishedCatalog,
+        });
+        await assertPostgresCatalogSnapshotCurrent(publishedVersion);
+        return rebuilt;
+      }
+      await assertPostgresCatalogSnapshotCurrent(version);
       return response;
     }
     const diagnosticHeaders = getCatalogDiagnosticsHeaders({ request });
@@ -297,7 +327,8 @@ async function buildCatalogPayload(
  */
 async function buildUnifiedModelsResponseCore(
   request: Request,
-  corsHeaders: Record<string, string> = {}
+  corsHeaders: Record<string, string> = {},
+  options: CatalogBuildOptions = {}
 ) {
   const diagnosticHeaders = getCatalogDiagnosticsHeaders({ request });
   // #9147: this builder walks connections + model registries at catalog scale with no
@@ -337,7 +368,11 @@ async function buildUnifiedModelsResponseCore(
     });
     if (authRejection) return authRejection;
 
-    if (getSelectedPostgresDatabase() && isCcDiscoveryModelCatalogClient(request)) {
+    if (
+      options.recordDiscoveryHit !== false &&
+      getSelectedPostgresDatabase() &&
+      isCcDiscoveryModelCatalogClient(request)
+    ) {
       void incrementCcDiscoveryHitCountAsync();
     }
 
@@ -1394,7 +1429,7 @@ async function buildUnifiedModelsResponseCore(
       !providersWithSyncedModels.has("openrouter")
     ) {
       try {
-        const openRouterCatalog = await getOpenRouterCatalog();
+        const openRouterCatalog = options.openRouterCatalog ?? (await getOpenRouterCatalog());
         const openRouterCaps: Record<string, ModelCapabilityEntry> = {};
         for (const openRouterModel of openRouterCatalog.data || []) {
           await maybeYieldCatalogBuild();
@@ -1462,7 +1497,11 @@ async function buildUnifiedModelsResponseCore(
           );
           if (capEntry) openRouterCaps[openRouterModel.id] = capEntry;
         }
-        await upsertSyncedCapabilitiesAsync("openrouter", openRouterCaps);
+        if (options.publishOpenRouterCapabilities !== false) {
+          await upsertSyncedCapabilitiesAsync("openrouter", openRouterCaps);
+          if (Object.keys(openRouterCaps).length > 0)
+            options.onOpenRouterCapabilitiesPublished?.(openRouterCatalog);
+        }
       } catch (err) {
         console.error("[catalog] Error loading OpenRouter catalog:", err);
       }
@@ -1557,7 +1596,7 @@ async function buildUnifiedModelsResponseCore(
 
     // Add image models (filtered by active providers).
     // AI Horde image workers come and go — refresh the live detector first.
-    if (isProviderActive("aihorde")) {
+    if (options.refreshAiHordeCatalog !== false && isProviderActive("aihorde")) {
       try {
         await aiHordeImageCatalog.ensureFresh();
       } catch {

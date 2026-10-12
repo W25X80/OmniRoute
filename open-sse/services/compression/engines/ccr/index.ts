@@ -164,6 +164,33 @@ const lifecycleByPrincipal = new Map<string, CcrLifecycleCounters>();
 /** Sentinel used when no principalId is provided. */
 const ANON = "__anon__";
 
+type CcrBlockLifecycle = { generation: object; loads: number; deletes: number };
+const sqliteLifecycleAuthority = {};
+const blockLifecycles = new WeakMap<object, Map<string, CcrBlockLifecycle>>();
+
+function blockLifecycle(hash: string, principalId: string) {
+  const authority = ccrPersistenceAuthority() ?? sqliteLifecycleAuthority;
+  let states = blockLifecycles.get(authority);
+  if (!states) blockLifecycles.set(authority, (states = new Map()));
+  const key = buildStoreKey(hash, principalId);
+  let state = states.get(key);
+  if (!state) states.set(key, (state = { generation: {}, loads: 0, deletes: 0 }));
+  return { states, key, state };
+}
+
+function releaseBlockLifecycle(lifecycle: ReturnType<typeof blockLifecycle>): void {
+  const { states, key, state } = lifecycle;
+  if (state.loads === 0 && state.deletes === 0 && states.get(key) === state) states.delete(key);
+}
+
+function pendingBlockDeletion(hash: string, principalId: string): boolean {
+  return Boolean(
+    blockLifecycles
+      .get(ccrPersistenceAuthority() ?? sqliteLifecycleAuthority)
+      ?.get(buildStoreKey(hash, principalId))?.deletes
+  );
+}
+
 function buildStoreKey(hash: string, principalId?: string): string {
   return `${principalId ?? ANON} ${hash}`;
 }
@@ -238,7 +265,7 @@ function deferDurable(
   operation: string,
   work: () => void | Promise<void>,
   droppable = false
-): void {
+): Promise<void> | undefined {
   if (droppable && pendingDurableWrites >= MAX_PENDING_DURABLE_WRITES) {
     droppedDurableWrites = Math.min(Number.MAX_SAFE_INTEGER, droppedDurableWrites + 1);
     warnDurableError("queue", new Error(`Deferred cache writes dropped: ${droppedDurableWrites}`));
@@ -258,6 +285,7 @@ function deferDurable(
     .finally(() => {
       pendingDurableWrites--;
     });
+  return operationPromise;
 }
 
 function persistEntry(entry: CcrEntry): void {
@@ -271,9 +299,9 @@ function forgetEntry(
   hash: string,
   principalId: string,
   authority = ccrPersistenceAuthority()
-): void {
+): Promise<void> | undefined {
   if (!durableTierEnabled() || authority !== ccrPersistenceAuthority()) return;
-  deferDurable("delete", () => deleteCcrBlockRowAsync(principalId, hash));
+  return deferDurable("delete", () => deleteCcrBlockRowAsync(principalId, hash));
 }
 
 /**
@@ -284,6 +312,7 @@ function forgetEntry(
 function rehydrateEntry(hash: string, principalId: string, now: number): CcrEntry | null {
   if (isPostgresCcrStoreSelected()) return null;
   if (!durableTierEnabled()) return null;
+  if (pendingBlockDeletion(hash, principalId)) return null;
   let row: ReturnType<typeof loadCcrBlock>;
   try {
     row = loadCcrBlock(principalId, hash, now);
@@ -513,6 +542,11 @@ export function tryStoreBlock(
     return rejectStore(hash, owner, "global_budget_exceeded");
   }
 
+  const lifecycle = blockLifecycles
+    .get(ccrPersistenceAuthority() ?? sqliteLifecycleAuthority)
+    ?.get(key);
+  if (lifecycle) lifecycle.generation = {};
+
   const ttlSeconds = normalizeTtlSeconds(options.ttlSeconds);
   const entry: CcrEntry = {
     hash,
@@ -665,10 +699,19 @@ export function listCcrBlocks(
 }
 
 export function deleteCcrBlock(hash: string, principalId?: string, _now = Date.now()): boolean {
+  const lifecycle = blockLifecycle(hash, principalId ?? ANON);
+  lifecycle.state.generation = {};
+  lifecycle.state.deletes++;
   const removedFromCache = removeEntry(buildStoreKey(hash, principalId));
   // An explicit delete must reach the durable tier too, otherwise the next retrieve
   // rehydrates the block the caller just deleted.
-  forgetEntry(hash, principalId ?? ANON);
+  const deleting = forgetEntry(hash, principalId ?? ANON);
+  const finish = () => {
+    lifecycle.state.deletes--;
+    releaseBlockLifecycle(lifecycle);
+  };
+  if (deleting) void deleting.then(finish, finish);
+  else finish();
   return removedFromCache;
 }
 
@@ -1052,49 +1095,59 @@ async function rehydrateEntryAsync(
   now: number
 ): Promise<CcrEntry | null> {
   if (!durableTierEnabled()) return null;
-  let row: Awaited<ReturnType<typeof loadCcrBlockAsync>>;
+  const lifecycle = blockLifecycle(hash, principalId);
+  if (lifecycle.state.deletes > 0) return null;
+  lifecycle.state.loads++;
+  const generation = lifecycle.state.generation;
   try {
-    row = await loadCcrBlockAsync(principalId, hash, now);
-  } catch (error) {
-    warnDurableError("load", error);
-    return null;
-  }
-  if (!row) return null;
+    let row: Awaited<ReturnType<typeof loadCcrBlockAsync>>;
+    try {
+      row = await loadCcrBlockAsync(principalId, hash, now);
+    } catch (error) {
+      warnDurableError("load", error);
+      return null;
+    }
+    if (!row) return null;
+    if (lifecycle.state.generation !== generation || lifecycle.state.deletes > 0) return null;
 
-  const entry: CcrEntry = {
-    hash: row.hash,
-    principalId: row.principalId,
-    content: row.content,
-    bytes: row.bytes,
-    chars: row.chars,
-    lines: row.lines,
-    contentType: row.contentType,
-    source: row.source as CcrEntrySource,
-    createdAt: row.createdAt,
-    lastAccessedAt: now,
-    expiresAt: row.expiresAt,
-  };
+    const entry: CcrEntry = {
+      hash: row.hash,
+      principalId: row.principalId,
+      content: row.content,
+      bytes: row.bytes,
+      chars: row.chars,
+      lines: row.lines,
+      contentType: row.contentType,
+      source: row.source as CcrEntrySource,
+      createdAt: row.createdAt,
+      lastAccessedAt: now,
+      expiresAt: row.expiresAt,
+    };
 
-  // Re-admit through the same budgets a fresh store would face. If the block no longer
-  // fits, it stays on disk and is served straight from the row instead of being cached.
-  if (
-    enforcePrincipalBudget(entry.principalId, entry.bytes) &&
-    enforceGlobalBudget(entry.principalId, entry.bytes)
-  ) {
-    const key = buildStoreKey(hash, principalId === ANON ? undefined : principalId);
-    if (ccrStore.has(key)) removeEntry(key);
-    entry.persistenceAuthority = ccrPersistenceAuthority();
-    ccrStore.set(key, entry);
-    ccrTotalBytes += entry.bytes;
-    principalBytesMap.set(entry.principalId, principalBytes(entry.principalId) + entry.bytes);
-  }
+    // Re-admit through the same budgets a fresh store would face. If the block no longer
+    // fits, it stays on disk and is served straight from the row instead of being cached.
+    if (
+      enforcePrincipalBudget(entry.principalId, entry.bytes) &&
+      enforceGlobalBudget(entry.principalId, entry.bytes)
+    ) {
+      const key = buildStoreKey(hash, principalId === ANON ? undefined : principalId);
+      if (ccrStore.has(key)) removeEntry(key);
+      entry.persistenceAuthority = ccrPersistenceAuthority();
+      ccrStore.set(key, entry);
+      ccrTotalBytes += entry.bytes;
+      principalBytesMap.set(entry.principalId, principalBytes(entry.principalId) + entry.bytes);
+    }
 
-  try {
-    await touchCcrBlockAsync(entry.principalId, hash, now);
-  } catch (error) {
-    warnDurableError("touch", error);
+    try {
+      await touchCcrBlockAsync(entry.principalId, hash, now);
+    } catch (error) {
+      warnDurableError("touch", error);
+    }
+    return lifecycle.state.generation === generation ? entry : null;
+  } finally {
+    lifecycle.state.loads--;
+    releaseBlockLifecycle(lifecycle);
   }
-  return entry;
 }
 
 export async function retrieveBlockAsync(
@@ -1150,14 +1203,24 @@ export async function deleteCcrBlockAsync(
 ): Promise<boolean> {
   if (!isPostgresCcrStoreSelected()) return deleteCcrBlock(hash, principalId, now);
   const principal = principalId ?? ANON;
-  const persisted = await loadCcrBlockAsync(principal, hash, now);
+  const lifecycle = blockLifecycle(hash, principal);
+  lifecycle.state.generation = {};
+  lifecycle.state.deletes++;
   const entry = getActiveEntry(buildStoreKey(hash, principalId), now);
   const removed = entry ? removeEntry(buildStoreKey(hash, principalId)) : false;
-  // Serialize an explicit delete after queued persists before acknowledging it.
-  const previous = durableWriteTail;
-  await runPersistenceBackgroundWork(async () => {
-    await previous;
-    await deleteCcrBlockRowAsync(principal, hash);
-  });
-  return removed || persisted !== null;
+  const lookup = loadCcrBlockAsync(principal, hash, now);
+  // Observe early rejection while older writes finish; the queued await still propagates it.
+  void lookup.catch(() => {});
+  let persisted: Awaited<typeof lookup> = null;
+  try {
+    // Reserve the queue position now so a legitimate later store follows this delete.
+    await deferDurable("delete", async () => {
+      persisted = await lookup;
+      await deleteCcrBlockRowAsync(principal, hash);
+    });
+    return removed || persisted !== null;
+  } finally {
+    lifecycle.state.deletes--;
+    releaseBlockLifecycle(lifecycle);
+  }
 }

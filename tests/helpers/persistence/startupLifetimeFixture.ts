@@ -13,6 +13,7 @@ export const startupFixture = {
   flushFailure: false,
   importFailure: false,
   stopBarrier: undefined as Promise<void> | undefined,
+  subscriptionBarrier: undefined as Promise<void> | undefined,
   codexBarrier: undefined as Promise<void> | undefined,
   modelBarrier: undefined as Promise<void> | undefined,
   modelGenerations: [] as number[],
@@ -144,6 +145,13 @@ export async function stopFreeProxyAutoSyncAsync(): Promise<void> {
 }
 export async function stopProxyHealthCheckAsync(): Promise<void> {
   await stop("proxy");
+}
+export async function stopSubscriptionSchedulerAsync(): Promise<void> {
+  assertScope();
+  await stop("subscription");
+  await startupFixture.subscriptionBarrier;
+  assertScope();
+  record("stop:subscriptionSettled");
 }
 export async function stopPeriodicSyncAsync(): Promise<void> {
   await stop("periodic");
@@ -298,4 +306,12 @@ export async function stopNativeHeadroomProcesses(): Promise<void> {
 }
 export async function closeNativeOmpHostStorage(): Promise<void> {
   closeResource("omp");
+}
+
+export function beginNativeProxyLogClose(): void {
+  assertScope();
+  record("stop:proxyLogAdmission");
+}
+export async function closeProxyLogSavesAsync(): Promise<void> {
+  closeResource("proxyLogs");
 }

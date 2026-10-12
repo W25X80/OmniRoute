@@ -18,6 +18,7 @@ import { createA2AStream, SSE_HEADERS } from "@/lib/a2a/streaming";
 import { A2A_SKILL_HANDLERS, executeA2ATaskWithState } from "@/lib/a2a/taskExecution";
 import { getSettings } from "@/lib/db/settings";
 import { authenticateA2ARequest, resolveA2AOwner } from "@/lib/a2a/authenticate";
+import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
 
 // ============ A2A v1.0 ↔ v0.3 compatibility layer ============
 // A2A 1.0 renamed the JSON-RPC methods (message/send → SendMessage,
@@ -134,9 +135,13 @@ async function authenticate(req: NextRequest): Promise<boolean> {
 
 // ============ JSON-RPC Helpers ============
 
-function jsonRpcError(id: string | number | null, code: number, message: string, data?: unknown) {
+function jsonRpcError(id: string | number | null, code: number, message: unknown, data?: unknown) {
   return NextResponse.json(
-    { jsonrpc: "2.0", id, error: { code, message, data } },
+    {
+      jsonrpc: "2.0",
+      id,
+      error: { code, message: sanitizeErrorMessage(message) || "A2A request failed", data },
+    },
     { status: code === -32600 ? 400 : code === -32601 ? 404 : code === -32603 ? 500 : 200 }
   );
 }
@@ -182,154 +187,159 @@ export async function POST(req: NextRequest) {
     return jsonRpcError(id || null, -32600, "Invalid request: missing jsonrpc or method");
   }
 
-  const disabledResponse = await rejectIfA2ADisabled(id ?? null);
-  if (disabledResponse) return disabledResponse;
+  try {
+    const disabledResponse = await rejectIfA2ADisabled(id ?? null);
+    if (disabledResponse) return disabledResponse;
 
-  const tm = getTaskManager();
-  // GHSA-jcm5-6wpp-wjj8: scope every task read/mutation below to the caller's
-  // owner id (hashed API key; undefined under the keyless local-first posture).
-  const callerOwner = await resolveA2AOwner(req);
+    const tm = getTaskManager();
+    // GHSA-jcm5-6wpp-wjj8: scope every task read/mutation below to the caller's
+    // owner id (hashed API key; undefined under the keyless local-first posture).
+    const callerOwner = await resolveA2AOwner(req);
 
-  // A2A 1.0 method-name compatibility (SendMessage → message/send, etc.)
-  const isV1Method = method in V1_METHOD_ALIASES;
-  const normalizedMethod = V1_METHOD_ALIASES[method] ?? method;
+    // A2A 1.0 method-name compatibility (SendMessage → message/send, etc.)
+    const isV1Method = method in V1_METHOD_ALIASES;
+    const normalizedMethod = V1_METHOD_ALIASES[method] ?? method;
 
-  switch (normalizedMethod) {
-    // ── message/send ──────────────────────────────────────
-    case "message/send": {
-      const skill = params?.skill || "smart-routing";
-      const messages = toMessageArray(params?.messages) || toMessageArray(params?.message);
-      if (!messages) {
-        return jsonRpcError(
-          id,
-          -32602,
-          "Invalid params: provide `messages[]` or `message.content`"
-        );
+    switch (normalizedMethod) {
+      // ── message/send ──────────────────────────────────────
+      case "message/send": {
+        const skill = params?.skill || "smart-routing";
+        const messages = toMessageArray(params?.messages) || toMessageArray(params?.message);
+        if (!messages) {
+          return jsonRpcError(
+            id,
+            -32602,
+            "Invalid params: provide `messages[]` or `message.content`"
+          );
+        }
+
+        const handler = A2A_SKILL_HANDLERS[skill];
+        if (!handler) {
+          return jsonRpcError(id, -32601, `Unknown skill: ${skill}`);
+        }
+
+        const task = tm.createTask({ skill, messages, metadata: params?.metadata }, callerOwner);
+        await tm.flushPersistence(task.id);
+        try {
+          tm.updateTask(task.id, "working");
+          await tm.flushPersistence(task.id);
+          const result = await handler(task);
+          tm.updateTask(task.id, "completed", result.artifacts);
+          await tm.flushPersistence(task.id);
+
+          // Log routing decision
+          if (skill === "smart-routing" && result.metadata) {
+            const smartMetadata = result.metadata as {
+              routing_explanation?: string;
+              cost_envelope?: { actual?: number };
+            };
+            logRoutingDecision({
+              taskType: (params?.metadata?.role as string) || "general",
+              comboId: (params?.metadata?.combo as string) || "default",
+              providerSelected:
+                smartMetadata.routing_explanation?.match(/"([^"]+)"/)?.[1] || "unknown",
+              modelUsed: (params?.metadata?.model as string) || "auto",
+              score: 1,
+              factors: [],
+              fallbacksTriggered: [],
+              success: true,
+              latencyMs: 0,
+              cost: smartMetadata.cost_envelope?.actual || 0,
+            });
+          }
+
+          if (isV1Method) {
+            // A2A 1.0 SendMessageResponse — the reply text lives in
+            // task.status.message.parts (1.0 clients read it there; the v0.3
+            // top-level artifacts/metadata are not part of the 1.0 shape).
+            return jsonRpcResult(id, {
+              task: buildV1Task(task, result, params?.message?.contextId),
+            });
+          }
+
+          return jsonRpcResult(id, {
+            task: { id: task.id, state: "completed" },
+            artifacts: result.artifacts,
+            metadata: result.metadata,
+          });
+        } catch (err) {
+          console.error("A2A ERROR TRACE:", err);
+          const msg = err instanceof Error ? err.message : String(err);
+          if (!isNativeAgentPersistenceError(err)) {
+            tm.updateTask(task.id, "failed", [{ type: "error", content: msg }], msg);
+            await tm.flushPersistence(task.id);
+          }
+          return jsonRpcError(id, -32603, `Skill execution failed: ${msg}`);
+        }
       }
 
-      const handler = A2A_SKILL_HANDLERS[skill];
-      if (!handler) {
-        return jsonRpcError(id, -32601, `Unknown skill: ${skill}`);
-      }
+      // ── message/stream ────────────────────────────────────
+      case "message/stream": {
+        const skill = params?.skill || "smart-routing";
+        const messages = toMessageArray(params?.messages) || toMessageArray(params?.message);
+        if (!messages) {
+          return jsonRpcError(
+            id,
+            -32602,
+            "Invalid params: provide `messages[]` or `message.content`"
+          );
+        }
 
-      const task = tm.createTask({ skill, messages, metadata: params?.metadata }, callerOwner);
-      await tm.flushPersistence(task.id);
-      try {
+        const handler = A2A_SKILL_HANDLERS[skill];
+        if (!handler) {
+          return jsonRpcError(id, -32601, `Unknown skill: ${skill}`);
+        }
+
+        const task = tm.createTask({ skill, messages, metadata: params?.metadata }, callerOwner);
+        await tm.flushPersistence(task.id);
         tm.updateTask(task.id, "working");
         await tm.flushPersistence(task.id);
-        const result = await handler(task);
-        tm.updateTask(task.id, "completed", result.artifacts);
-        await tm.flushPersistence(task.id);
 
-        // Log routing decision
-        if (skill === "smart-routing" && result.metadata) {
-          const smartMetadata = result.metadata as {
-            routing_explanation?: string;
-            cost_envelope?: { actual?: number };
-          };
-          logRoutingDecision({
-            taskType: (params?.metadata?.role as string) || "general",
-            comboId: (params?.metadata?.combo as string) || "default",
-            providerSelected:
-              smartMetadata.routing_explanation?.match(/"([^"]+)"/)?.[1] || "unknown",
-            modelUsed: (params?.metadata?.model as string) || "auto",
-            score: 1,
-            factors: [],
-            fallbacksTriggered: [],
-            success: true,
-            latencyMs: 0,
-            cost: smartMetadata.cost_envelope?.actual || 0,
-          });
-        }
-
-        if (isV1Method) {
-          // A2A 1.0 SendMessageResponse — the reply text lives in
-          // task.status.message.parts (1.0 clients read it there; the v0.3
-          // top-level artifacts/metadata are not part of the 1.0 shape).
-          return jsonRpcResult(id, {
-            task: buildV1Task(task, result, params?.message?.contextId),
-          });
-        }
-
-        return jsonRpcResult(id, {
-          task: { id: task.id, state: "completed" },
-          artifacts: result.artifacts,
-          metadata: result.metadata,
-        });
-      } catch (err) {
-        console.error("A2A ERROR TRACE:", err);
-        const msg = err instanceof Error ? err.message : String(err);
-        if (!isNativeAgentPersistenceError(err)) {
-          tm.updateTask(task.id, "failed", [{ type: "error", content: msg }], msg);
-          await tm.flushPersistence(task.id);
-        }
-        return jsonRpcError(id, -32603, `Skill execution failed: ${msg}`);
-      }
-    }
-
-    // ── message/stream ────────────────────────────────────
-    case "message/stream": {
-      const skill = params?.skill || "smart-routing";
-      const messages = toMessageArray(params?.messages) || toMessageArray(params?.message);
-      if (!messages) {
-        return jsonRpcError(
-          id,
-          -32602,
-          "Invalid params: provide `messages[]` or `message.content`"
+        const stream = createA2AStream(
+          task,
+          async (t) => executeA2ATaskWithState(tm, t, handler),
+          req.signal,
+          {
+            onStart: () => tm.beginStream(),
+            onEnd: () => tm.endStream(),
+          }
         );
+
+        return new Response(stream, { headers: SSE_HEADERS });
       }
 
-      const handler = A2A_SKILL_HANDLERS[skill];
-      if (!handler) {
-        return jsonRpcError(id, -32601, `Unknown skill: ${skill}`);
+      // ── tasks/get ─────────────────────────────────────────
+      case "tasks/get": {
+        const taskId = params?.taskId || params?.id;
+        if (!taskId) return jsonRpcError(id, -32602, "Invalid params: taskId required");
+
+        const task = tm.getTask(taskId, callerOwner);
+        if (!task) return jsonRpcError(id, -32601, `Task not found: ${taskId}`);
+
+        return jsonRpcResult(id, { task });
       }
 
-      const task = tm.createTask({ skill, messages, metadata: params?.metadata }, callerOwner);
-      await tm.flushPersistence(task.id);
-      tm.updateTask(task.id, "working");
-      await tm.flushPersistence(task.id);
+      // ── tasks/cancel ──────────────────────────────────────
+      case "tasks/cancel": {
+        const taskId = params?.taskId || params?.id;
+        if (!taskId) return jsonRpcError(id, -32602, "Invalid params: taskId required");
 
-      const stream = createA2AStream(
-        task,
-        async (t) => executeA2ATaskWithState(tm, t, handler),
-        req.signal,
-        {
-          onStart: () => tm.beginStream(),
-          onEnd: () => tm.endStream(),
+        try {
+          const task = tm.cancelTask(taskId, callerOwner);
+          await tm.flushPersistence(task.id);
+          return jsonRpcResult(id, { task: { id: task.id, state: task.state } });
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          return jsonRpcError(id, -32603, msg);
         }
-      );
-
-      return new Response(stream, { headers: SSE_HEADERS });
-    }
-
-    // ── tasks/get ─────────────────────────────────────────
-    case "tasks/get": {
-      const taskId = params?.taskId || params?.id;
-      if (!taskId) return jsonRpcError(id, -32602, "Invalid params: taskId required");
-
-      const task = tm.getTask(taskId, callerOwner);
-      if (!task) return jsonRpcError(id, -32601, `Task not found: ${taskId}`);
-
-      return jsonRpcResult(id, { task });
-    }
-
-    // ── tasks/cancel ──────────────────────────────────────
-    case "tasks/cancel": {
-      const taskId = params?.taskId || params?.id;
-      if (!taskId) return jsonRpcError(id, -32602, "Invalid params: taskId required");
-
-      try {
-        const task = tm.cancelTask(taskId, callerOwner);
-        await tm.flushPersistence(task.id);
-        return jsonRpcResult(id, { task: { id: task.id, state: task.state } });
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        return jsonRpcError(id, -32603, msg);
       }
-    }
 
-    default:
-      return jsonRpcError(id, -32601, `Method not found: ${method}`);
+      default:
+        return jsonRpcError(id, -32601, `Method not found: ${method}`);
+    }
+  } catch (error) {
+    console.error("A2A request failed:", error);
+    return jsonRpcError(id ?? null, -32603, error);
   }
 }
 

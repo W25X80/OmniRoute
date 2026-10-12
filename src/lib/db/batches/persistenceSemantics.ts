@@ -1,6 +1,42 @@
 /** Shared batch row projection and sweep bounds; no database imports. */
 import { rowToCamel } from "../caseMapping";
 import type { BatchRecord, BatchItemCheckpoint } from "../batches";
+import { DEFAULT_BATCH_EXPIRATION_SECONDS } from "@/shared/constants/batch";
+
+export function getBatchOutputExpiresAt(batch: BatchRecord): number | null {
+  if (
+    batch.outputExpiresAfterAnchor === "created_at" &&
+    typeof batch.outputExpiresAfterSeconds === "number" &&
+    batch.outputExpiresAfterSeconds > 0
+  ) {
+    return batch.createdAt + batch.outputExpiresAfterSeconds;
+  }
+
+  const completionTime =
+    batch.completedAt || batch.failedAt || batch.cancelledAt || batch.expiredAt;
+  if (!completionTime) return null;
+  return completionTime + DEFAULT_BATCH_EXPIRATION_SECONDS;
+}
+
+/** Candidates only; the caller must fence the current batch, references and deletion. */
+export function getExpiredBatchFileIds(batch: BatchRecord, now: number): string[] {
+  if (!["completed", "failed", "cancelled", "expired"].includes(batch.status)) return [];
+  const completionTime =
+    batch.completedAt || batch.failedAt || batch.cancelledAt || batch.expiredAt;
+  const outputExpiresAt = getBatchOutputExpiresAt(batch);
+  const ids = new Set<string>();
+  if (
+    batch.inputFileId &&
+    completionTime &&
+    now > completionTime + DEFAULT_BATCH_EXPIRATION_SECONDS
+  )
+    ids.add(batch.inputFileId);
+  if (outputExpiresAt && now > outputExpiresAt) {
+    if (batch.outputFileId) ids.add(batch.outputFileId);
+    if (batch.errorFileId) ids.add(batch.errorFileId);
+  }
+  return [...ids];
+}
 
 export function parseBatchRow(row: any): BatchRecord {
   const camel = rowToCamel(row) as any;

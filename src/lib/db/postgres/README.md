@@ -169,8 +169,10 @@ Import/restore requires an empty target apart from recognized migration seeds, u
 locks and checks every copied row before COMMIT. A canonical-JSON SHA-256 receipt binds source,
 plan and target schema. Reusing the same bundle reconciles that receipt and verifies current rows;
 it does not replay writes. Unversioned experimental receipts from the former hash algorithm fail
-closed. Receipts also bind the exact physical schema. An older schema receipt is not silently
-reinterpreted: use a verified logical export and restore to a fresh target for a schema transition.
+closed. The schema fingerprint binds column definitions, primary/foreign-key topology,
+migration checksums, constraint definitions and trigger declarations. It does not include standalone
+index definitions or trigger-function bodies. A receipt with a different bound fingerprint is not
+silently reinterpreted: use a verified logical export and restore to a fresh target for a schema transition.
 A confirmed import followed by failed artifact readback reports `committed = true` with
 `artifact_readback`. Historical native restore creates a fresh authority UUID/generation 0 and
 retains source epoch lineage in the receipt. The older `postgres-import-routing.ts` remains a

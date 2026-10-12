@@ -14,7 +14,8 @@ const oldEnvironment = new Map(
 process.env.DATA_DIR = testDirectory;
 process.env.APP_LOG_TO_FILE = "false";
 process.env.OMNIROUTE_DATABASE_BACKEND = "sqlite";
-const { fileRouteFixture } = await import("../../helpers/persistence/nativeFileRouteFixture");
+const { fileRouteFixture, runNativeUploadRouteFixture } =
+  await import("../../helpers/persistence/nativeFileRouteFixture");
 const { CORS_HEADERS } = await import("../../../src/shared/utils/cors");
 const fixture = new URL("../../helpers/persistence/nativeFileRouteFixture.ts", import.meta.url)
   .href;
@@ -48,6 +49,8 @@ test.beforeEach(() => {
   fileRouteFixture.paths.length = 0;
   fileRouteFixture.policies.length = 0;
   fileRouteFixture.settingsCalls = 0;
+  fileRouteFixture.parserCalls = 0;
+  fileRouteFixture.parserErrors.length = 0;
 });
 function upload(text: string) {
   const boundary = "file-route-fixture";
@@ -77,7 +80,7 @@ test("native upload uses the canonical existing limit and retains file bytes/met
   process.env.OMNIROUTE_DATABASE_BACKEND = "postgres";
   t.mock.method(Date, "now", () => 1700000000000);
   const request = upload('{"value":1}\n');
-  const response = await POST(request);
+  const response = await runNativeUploadRouteFixture(request, () => POST(request));
   assert.equal(response.status, 200);
   assert.deepEqual(fileRouteFixture.paths, ["/api/v1/files"]);
   assert.equal(fileRouteFixture.settingsCalls, 1);
@@ -91,7 +94,8 @@ test("native upload uses the canonical existing limit and retains file bytes/met
 });
 test("native actual-byte overflow returns existing 413/CORS and never calls the file repository", async () => {
   process.env.OMNIROUTE_DATABASE_BACKEND = "postgres";
-  const response = await POST(upload("x".repeat(2048)));
+  const request = upload("x".repeat(2048));
+  const response = await runNativeUploadRouteFixture(request, () => POST(request));
   assert.equal(response.status, 413);
   assert.equal((await response.json()).error.code, "PAYLOAD_TOO_LARGE");
   for (const [name, value] of Object.entries(CORS_HEADERS))
@@ -109,13 +113,19 @@ test("default SQLite upload retains its parser path and performs no native limit
 test("native malformed MIME keeps source upload error status and sanitized body", async (t) => {
   process.env.OMNIROUTE_DATABASE_BACKEND = "postgres";
   t.mock.method(console, "error", () => {});
-  const response = await POST(
-    new Request("http://localhost/v1/files", {
-      method: "POST",
-      headers: { "content-type": "text/plain" },
-      body: "invalid multipart",
-    })
+  const request = new Request("http://localhost/v1/files", {
+    method: "POST",
+    headers: { "content-type": "text/plain" },
+    body: "invalid multipart",
+  });
+  const response = await runNativeUploadRouteFixture(request, () => POST(request));
+  assert.equal(
+    fileRouteFixture.parserCalls,
+    1,
+    "valid native scope must reach the real MIME parser"
   );
+  assert.equal(fileRouteFixture.parserErrors.length, 1);
+  assert.match(String(fileRouteFixture.parserErrors[0]), /Content-Type|multipart|form.?data/i);
   assert.equal(response.status, 500);
   assert.deepEqual(await response.json(), {
     error: { message: "Upload failed", type: "server_error" },

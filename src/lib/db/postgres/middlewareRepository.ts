@@ -1,4 +1,5 @@
 import type { HookConfig, HookConfigRow, HookLogEntry } from "@/lib/middleware/types";
+import { MiddlewareHookNameConflictError } from "../middlewareErrors";
 import type { PostgresDatabase, PostgresTransaction } from "./database";
 
 function decode(row: HookConfigRow): HookConfig {
@@ -42,13 +43,14 @@ export function createPostgresMiddlewareRepository(database: PostgresDatabase) {
       return database.transaction((transaction) => get(transaction, name));
     },
     async create(config: HookConfig): Promise<HookConfig> {
-      return database.transaction(async (transaction) => {
+      const saved = await database.transaction(async (transaction) => {
         const now = new Date().toISOString();
-        await transaction.query(
+        const inserted = await transaction.query<HookConfigRow>(
           `INSERT INTO omniroute.middleware_hooks
            (name, description, priority, scope_type, combo_id, enabled, code,
             created_at, updated_at, run_count, last_error)
-           VALUES($1,$2,$3,$4,$5,$6,$7,$8,$8,$9,$10)`,
+           VALUES($1,$2,$3,$4,$5,$6,$7,$8,$8,$9,$10)
+           ON CONFLICT (name) DO NOTHING RETURNING *`,
           [
             config.name,
             config.description,
@@ -62,8 +64,11 @@ export function createPostgresMiddlewareRepository(database: PostgresDatabase) {
             config.lastError ?? null,
           ]
         );
-        return (await get(transaction, config.name))!;
+        return inserted.rows[0] ? decode(inserted.rows[0]) : undefined;
       });
+      // Only the acknowledged name-conflict outcome authorizes an HTTP 409.
+      if (!saved) throw new MiddlewareHookNameConflictError();
+      return saved;
     },
     async update(name: string, updates: Partial<HookConfig>): Promise<HookConfig | undefined> {
       return database.transaction(async (transaction) => {

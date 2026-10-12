@@ -272,25 +272,41 @@ else {
           hangDetection = false;
         }
       );
-      await t.test("finite probe timeout joins a real hung executable", async () => {
-        await rm(ready, { force: true });
-        const work = runtime.runPersistenceRequest(() =>
-          probes.probeNativeHostCapability(process.execPath, [runner, "hang"], {
-            timeoutMs: 1000,
-            env: {
-              ...process.env,
-              HEADROOM_TEST_READY: ready,
-              HEADROOM_TEST_TERM: term,
-              HEADROOM_TEST_RELEASE: release,
-            },
-          })
-        );
-        await waitFor(() => exists(ready));
-        const result = await work;
-        assert.equal(result.failure, "timeout");
-        assert.equal(result.success, false);
-        assert.equal(closedChildren.has(children.at(-1)!), true);
-      });
+      await t.test(
+        "finite probe timeout joins its actual child without requiring userspace readiness",
+        async () => {
+          await rm(ready, { force: true });
+          const childIndex = children.length;
+          const work = runtime.runPersistenceRequest(() =>
+            probes.probeNativeHostCapability(process.execPath, [runner, "hang"], {
+              timeoutMs: 1000,
+              env: {
+                ...process.env,
+                HEADROOM_TEST_READY: ready,
+                HEADROOM_TEST_TERM: term,
+                HEADROOM_TEST_RELEASE: release,
+              },
+            })
+          );
+          const result = await work;
+          assert.equal(result.failure, "timeout");
+          assert.equal(result.success, false);
+          assert.equal(children.length, childIndex + 1, "the probe must spawn one actual child");
+          const child = children[childIndex];
+          assert.ok(
+            typeof child.pid === "number" && child.pid > 0,
+            "the child must have a real PID"
+          );
+          assert.equal(child.killed, true, "the timeout must request termination");
+          if (child.signalCode !== null) assert.equal(child.signalCode, "SIGKILL");
+          assert.equal(
+            closedChildren.has(child),
+            true,
+            "the probe must join the actual close event"
+          );
+          assert.equal(alive(child.pid), false);
+        }
+      );
       await t.test(
         "shared probe admission is capped before another executable can start",
         async () => {

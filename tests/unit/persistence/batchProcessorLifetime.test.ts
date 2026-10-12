@@ -152,6 +152,10 @@ test(
       deadline();
       for (let i = 0; i < 10 && batchFixture.batch?.status !== "completed"; i++) await settle();
       assert.equal(batchFixture.batch?.status, "completed");
+      assert.ok(batchFixture.events.some(({ operation }) => operation === "file-consumer-read"));
+      assert.ok(
+        batchFixture.events.some(({ operation }) => operation === "file-consumer-reserved")
+      );
       assert.equal(batchFixture.checkpoints.get(1)?.status, "errored");
       assert.equal(processorClosed, false, "a timeout does not settle the raw dispatch");
       assert.equal(runtimeClosed, false, "the accepted native worker remains owned");

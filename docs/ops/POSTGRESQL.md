@@ -135,8 +135,11 @@ node --import tsx/esm scripts/ops/postgres-migrate-storage.ts --action verify --
 Restore starts a fresh policy authority UUID/generation 0 and records the old authority/epoch as
 lineage. Business rows, identities and ciphertext are retained with declared receipt transformations.
 Private chunk tables are verified physical state, not portable row owners. NULL/empty content,
-tombstones and independent file metadata survive logical export/restore. Receipts bind the full
-physical schema; an older receipt is rejected rather than accepted under a different schema.
+tombstones and independent file metadata survive logical export/restore. Receipts bind a schema
+fingerprint covering column definitions, primary/foreign-key topology, migration checksums,
+constraint definitions and trigger declarations. Standalone index definitions and trigger-function
+bodies are outside this fingerprint; it is not a complete physical-schema integrity check. A receipt
+with a different bound fingerprint is rejected.
 For a schema transition, verify and export the current logical dataset, then restore to a fresh
 target and retain both recovery sets until cutover is verified.
 Logical export is bounded maintenance, not an RDS physical snapshot/PITR implementation. SQLite

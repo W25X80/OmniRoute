@@ -110,6 +110,11 @@ export const stopContextWindowReconcileAsync = stop;
 export const stopMemoryDecaySweepAsync = stop;
 export const stopFreeProxyAutoSyncAsync = stop;
 export const stopProxyHealthCheckAsync = stop;
+export async function stopSubscriptionSchedulerAsync(): Promise<void> {
+  recordShutdownPhase("subscription:stop");
+  await Promise.resolve();
+  recordShutdownPhase("subscription:stopped");
+}
 export const stopPeriodicSyncAsync = stop;
 export const stopOpenRouterProviderStatsSync = stop;
 export const stopArenaEloSyncAsync = stop;
@@ -134,4 +139,11 @@ export async function stopNativeHeadroomProcesses(): Promise<void> {
 }
 export async function closeNativeOmpHostStorage(): Promise<void> {
   recordShutdownPhase("omp:close");
+}
+
+export function beginNativeProxyLogClose(): void {
+  recordShutdownPhase("proxy:admission-close");
+}
+export async function closeProxyLogSavesAsync(): Promise<void> {
+  recordShutdownPhase("proxy:close");
 }

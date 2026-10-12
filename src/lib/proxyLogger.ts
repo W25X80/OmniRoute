@@ -350,11 +350,43 @@ export function getProxyLogBufferStatus(): ProxyLogBufferStatus | undefined {
 let batchTimer: NodeJS.Timeout | null = null;
 let nativeProxyFlushScheduled = false;
 
+type NativeProxyLogOwner = { stop(): void; close(): Promise<void> };
+const PROXY_LOG_OWNERS = Symbol.for("omniroute.nativeProxyLogOwners");
+const proxyGlobals = globalThis as typeof globalThis & {
+  [PROXY_LOG_OWNERS]?: {
+    phase: "open" | "stopping" | "closed";
+    owners: Set<NativeProxyLogOwner>;
+  };
+};
+const nativeProxyLogOwners = (proxyGlobals[PROXY_LOG_OWNERS] ??= {
+  phase: "open",
+  owners: new Set<NativeProxyLogOwner>(),
+});
+let nativeProxyLogClose: Promise<void> | undefined;
+const nativeProxyLogOwner: NativeProxyLogOwner = {
+  stop: stopProxyLogTimer,
+  close: () => (nativeProxyLogClose ??= flushProxyLogsAsync()),
+};
+
+function stopProxyLogTimer(): void {
+  if (batchTimer) {
+    clearInterval(batchTimer);
+    batchTimer = null;
+  }
+}
+
+/** Stop timers across bundle copies; accepted request tails can still enter their buffers. */
+export function beginNativeProxyLogClose(): void {
+  if (nativeProxyLogOwners.phase === "open") nativeProxyLogOwners.phase = "stopping";
+  for (const owner of nativeProxyLogOwners.owners) owner.stop();
+}
+
 function scheduleProxyLogFlush(): void {
   if (parseDatabaseBackend() !== "postgres") {
     void runPersistenceBackgroundWork(flushProxyLogsAsync).catch(reportProxyFlushFailure);
     return;
   }
+  if (nativeProxyLogOwners.phase !== "open") return;
   if (nativeProxyFlushScheduled || !nativeProxyLogBuffer.canScheduleFlush(Date.now())) return;
   nativeProxyFlushScheduled = true;
   void runPersistenceBackgroundWork(flushProxyLogsAsync)
@@ -365,6 +397,7 @@ function scheduleProxyLogFlush(): void {
 }
 
 function ensureBatchTimer() {
+  if (parseDatabaseBackend() === "postgres" && nativeProxyLogOwners.phase !== "open") return;
   if (batchTimer) return;
   batchTimer = setInterval(scheduleProxyLogFlush, BATCH_FLUSH_INTERVAL_MS);
   if (typeof batchTimer.unref === "function") {
@@ -374,6 +407,9 @@ function ensureBatchTimer() {
 
 function enqueueProxyLog(log: ProxyLogEntry, oversizedIdentity = false) {
   if (parseDatabaseBackend() === "postgres") {
+    if (nativeProxyLogOwners.phase === "closed") return;
+    // Every live module copy owns its own queue; bootstrap must drain all of them.
+    nativeProxyLogOwners.owners.add(nativeProxyLogOwner);
     // Projection above bounds serialization work; reservations include batches awaiting COMMIT.
     const bytes = oversizedIdentity
       ? nativeProxyLogBuffer.status().eventByteLimit + 1
@@ -796,9 +832,18 @@ type ProxyLogRow = Record<string, unknown> & {
 };
 
 export async function closeProxyLogSavesAsync(): Promise<void> {
-  if (batchTimer) {
-    clearInterval(batchTimer);
-    batchTimer = null;
+  stopProxyLogTimer();
+  if (parseDatabaseBackend() === "postgres") {
+    beginNativeProxyLogClose();
+    nativeProxyLogOwners.phase = "closed";
+    const closed = await Promise.allSettled(
+      Array.from(nativeProxyLogOwners.owners, (owner) => owner.close())
+    );
+    const failures = closed.flatMap((result) =>
+      result.status === "rejected" ? [result.reason] : []
+    );
+    if (failures.length) throw new AggregateError(failures, "Proxy telemetry shutdown failed");
+    return;
   }
   await flushProxyLogsAsync();
 }

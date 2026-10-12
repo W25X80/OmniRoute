@@ -11,6 +11,7 @@ import type { HookConfig, CreateHookRequest } from "@/lib/middleware/types";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
+import { isMiddlewareHookNameConflict } from "@/lib/db/middlewareErrors";
 
 const hookScopeSchema = z.union([
   z.object({ type: z.literal("global") }),
@@ -113,7 +114,10 @@ export async function POST(request: Request) {
     registerHook(saved);
 
     return NextResponse.json({ hook: saved }, { status: 201 });
-  } catch (error: any) {
+  } catch (error) {
+    if (isMiddlewareHookNameConflict(error)) {
+      return NextResponse.json({ error: sanitizeErrorMessage(error.message) }, { status: 409 });
+    }
     console.error("[API] POST /api/middleware/hooks error:", error);
     return NextResponse.json(
       { error: sanitizeErrorMessage(error) || "Failed to create hook" },
