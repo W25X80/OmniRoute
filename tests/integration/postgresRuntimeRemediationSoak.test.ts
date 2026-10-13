@@ -9,8 +9,14 @@ import { monitorEventLoopDelay, performance } from "node:perf_hooks";
 import { setImmediate as turn, setTimeout as delay } from "node:timers/promises";
 import test from "node:test";
 import { DeleteObjectCommand, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
-import { createS3ArtifactStore as nativeStore } from "../../src/lib/artifacts/s3ArtifactStore.ts";
-import type { NativeArtifactStore } from "../../src/domain/persistence/artifactStore.ts";
+import {
+  ARTIFACT_OPERATION_LIMIT,
+  createS3ArtifactStore as nativeStore,
+} from "../../src/lib/artifacts/s3ArtifactStore.ts";
+import {
+  isArtifactStorageErrorKind,
+  type NativeArtifactStore,
+} from "../../src/domain/persistence/artifactStore.ts";
 import type { PostgresControlPlaneOptions } from "../../src/lib/db/postgres/controlPlane.ts";
 import type { PostgresDatabase } from "../../src/lib/db/postgres/database.ts";
 import {
@@ -55,6 +61,7 @@ const effects = new Map<
   }
 >();
 const diagnostics: unknown[] = [];
+const artifactErrors: { operation: string; name?: string; kind?: string; sqlState?: string }[] = [];
 let capacityDiagnostics = 0;
 let expectedStorageWarnings = 0;
 const logger = {
@@ -97,7 +104,7 @@ export async function initializePostgresControlPlane(options: PostgresControlPla
 }
 /** Actual S3 store and checksums, deterministic transport only; never resolves AWS credentials. */
 export function createS3ArtifactStore(): NativeArtifactStore {
-  return nativeStore(configuration, {
+  const store = nativeStore(configuration, {
     loadClient: async () => ({
       async send(command) {
         const key = command.input.Key!;
@@ -144,6 +151,35 @@ export function createS3ArtifactStore(): NativeArtifactStore {
       destroy() {},
     }),
   });
+  async function observe<T>(operation: string, run: () => Promise<T>): Promise<T> {
+    try {
+      return await run();
+    } catch (error) {
+      const controlled =
+        isArtifactStorageErrorKind(error, "put_unknown") &&
+        error.diagnostic?.name === "TimeoutError";
+      if (!controlled && artifactErrors.length < 64) {
+        const value = error as { name?: string; kind?: string; sqlState?: string };
+        artifactErrors.push({
+          operation,
+          name: value?.name,
+          kind: value?.kind,
+          sqlState: value?.sqlState,
+        });
+      }
+      throw error;
+    }
+  }
+  return {
+    ...store,
+    warmup: () =>
+      observe("warmup", async () => {
+        await store.warmup?.();
+      }),
+    put: (bytes, options) => observe("put", () => store.put(bytes, options)),
+    get: (reference) => observe("get", () => store.get(reference)),
+    delete: (reference) => observe("delete", () => store.delete(reference)),
+  };
 }
 
 /** Component qualification: persistent logical clients are deliberately not HTTP requests. */
@@ -263,7 +299,9 @@ test(
     let running = false,
       actualOverlap = 0,
       currentAttempts = 0,
-      fileActive = 0;
+      fileActive = 0,
+      publicationActive = 0,
+      peakPublications = 0;
     let maxRss = 0,
       maxOwners = 0,
       sqlHeartbeats = 0,
@@ -287,6 +325,8 @@ test(
       counters,
       actualOverlap,
       fileActive,
+      publicationActive,
+      peakPublications,
       active: active.size,
       sqlHeartbeats,
       fileSqlOverlap,
@@ -796,8 +836,19 @@ test(
             await repository.loadCostTotal(keys[client], 0),
             [...spend.values()].filter((row) => row.apiKeyId === keys[client]).length * 0.125
           );
-        } else if (lane === "publication") await publication(database, id, client, sequence);
-        else if (lane === "cancelled") {
+        } else if (lane === "publication") {
+          if (publicationActive >= ARTIFACT_OPERATION_LIMIT) {
+            counters.publication.plannedThrottled++;
+            return false;
+          }
+          publicationActive++;
+          peakPublications = Math.max(peakPublications, publicationActive);
+          try {
+            await publication(database, id, client, sequence);
+          } finally {
+            publicationActive--;
+          }
+        } else if (lane === "cancelled") {
           const cancelled = new AbortController();
           let dispatched = false;
           const preparation = (async () => {
@@ -981,7 +1032,21 @@ test(
       await monitor;
       await Promise.all(active.values());
       loop.disable();
-      if (fatal.length) throw new AggregateError(fatal, "Unexplained mixed-soak failures");
+      if (fatal.length) {
+        t.diagnostic(
+          JSON.stringify({
+            ...snapshot(),
+            event: "runtime-mixed-soak-failed",
+            artifactErrors,
+            diagnostics,
+            failures: fatal.map((error) => {
+              const value = error as { name?: string; kind?: string; sqlState?: string };
+              return { name: value?.name, kind: value?.kind, sqlState: value?.sqlState };
+            }),
+          })
+        );
+        throw new AggregateError(fatal, "Unexplained mixed-soak failures");
+      }
       assert.ok(
         performance.now() - began >= durationMs,
         "the requested measured duration must actually elapse"
