@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { fileURLToPath } from "node:url";
 import type { PostgresDatabase, PostgresTransaction } from "../../src/lib/db/postgres/database.ts";
 import {
   createTestPostgresDatabase,
@@ -40,6 +43,25 @@ test(
       await first.transaction((tx) => tx.query("DROP SCHEMA omniroute CASCADE"));
       await Promise.all([migratePostgresSchema(first), migratePostgresSchema(second)]);
       await migratePostgresSchema(first);
+      const cli = await promisify(execFile)(
+        process.execPath,
+        ["--import", "tsx/esm", "scripts/ops/postgres-migrate-schema.ts", "--offline"],
+        {
+          cwd: fileURLToPath(new URL("../../", import.meta.url)),
+          env: {
+            ...process.env,
+            OMNIROUTE_POSTGRES_HOST: "localhost",
+            OMNIROUTE_POSTGRES_PORT: process.env.OMNIROUTE_TEST_POSTGRES_PORT,
+            OMNIROUTE_POSTGRES_DATABASE: "omniroute_test",
+            OMNIROUTE_POSTGRES_USER: "omniroute_test",
+            OMNIROUTE_POSTGRES_PASSWORD: "omniroute_test",
+            OMNIROUTE_POSTGRES_TLS: "verify-full",
+            OMNIROUTE_POSTGRES_CA_FILE: process.env.OMNIROUTE_TEST_POSTGRES_CA,
+          },
+          timeout: 30_000,
+        }
+      );
+      assert.match(cli.stdout, /schema and startup seed are current/);
       const { rows } = await first.transaction((tx) =>
         tx.query(
           "SELECT version,name,length(checksum) AS digest_length FROM omniroute.schema_migrations ORDER BY version"
@@ -52,6 +74,8 @@ test(
         { version: 4, name: "file_content_chunks", digest_length: 64 },
         { version: 5, name: "artifact_publication_ownership", digest_length: 64 },
         { version: 6, name: "fractional_compression_durations", digest_length: 64 },
+        { version: 7, name: "indexed_conversation_retention", digest_length: 64 },
+        { version: 8, name: "durable_artifact_recovery", digest_length: 64 },
       ]);
       // Commit the genuine migration prefix, stopping only after successful version-4 SQL.
       await first.transaction((tx) => tx.query("DROP SCHEMA omniroute CASCADE"));
@@ -125,7 +149,7 @@ test(
       assert.deepEqual(upgradedHistory.slice(0, 4), version4History);
       assert.deepEqual(
         upgradedHistory.map((row) => row.version),
-        [1, 2, 3, 4, 5, 6]
+        [1, 2, 3, 4, 5, 6, 7, 8]
       );
       assert.equal(upgradedHistory[4].name, "artifact_publication_ownership");
       assert.deepEqual(await oldQueue(), version4Queue);

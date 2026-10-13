@@ -17,7 +17,14 @@ import {
 import { objToSnake } from "../caseMapping";
 import type { PostgresDatabase, PostgresTransaction } from "./database";
 import { affected, first, rows, safeInteger, lockServices, placeholders } from "./serviceQuery";
-import { createFile, getFile, deleteFile, deleteFileOwnedBy } from "./serviceFiles";
+import type { PreparedFileContent } from "./serviceFileContent";
+import {
+  createPreparedFile,
+  prepareFileContent,
+  getFile,
+  deleteFile,
+  deleteFileOwnedBy,
+} from "./serviceFiles";
 
 const BATCH_COLUMNS = new Set([
   "id",
@@ -139,43 +146,69 @@ export async function transitionBatch(
   return { changed: true, batch: await getBatch(transaction, id) };
 }
 
-/** No provider I/O: both result files and their links commit with the terminal state. */
+/** Preparation and transfer precede the global publication fence; one transaction owns all rows. */
 export async function completeBatchWithFiles(
-  transaction: PostgresTransaction,
+  database: PostgresDatabase,
   id: string,
   completion: BatchCompletion,
   output: BatchOutputFile | null,
   error: BatchOutputFile | null
 ): Promise<BatchTransitionResult> {
-  await lockServices(transaction);
-  const current = await getBatch(transaction, id);
-  if (current?.status === "cancelling") {
-    return transitionBatch(transaction, id, ["cancelling"], {
-      status: "cancelled",
-      cancelledAt: Math.floor(Date.now() / 1000),
-    });
-  }
-  if (!current || current.status !== "finalizing") return { changed: false, batch: current };
-  const save = async (file: BatchOutputFile | null) =>
-    file
-      ? (
-          await createFile(transaction, {
-            ...file,
-            bytes: file.content.byteLength,
-            purpose: "batch_output",
-            apiKeyId: current.apiKeyId,
-          })
-        ).id
-      : null;
-  const outputFileId = await save(output);
-  const errorFileId = await save(error);
-  await updateBatch(transaction, id, {
-    ...completion,
-    status: "completed",
-    outputFileId,
-    errorFileId,
-  });
-  return { changed: true, batch: await getBatch(transaction, id) };
+  const inputs = [output, error];
+  const prepared: Array<PreparedFileContent | null> = [];
+  for (const file of inputs) prepared.push(file ? await prepareFileContent(file.content) : null);
+  return database.transaction(
+    async (transaction) => {
+      const staged: Array<string | null> = [];
+      // These fresh rows are invisible until this same transaction publishes the terminal links.
+      // No other batch or cleanup can acquire a reference to their generated IDs before COMMIT.
+      for (let index = 0; index < inputs.length; index++) {
+        const file = inputs[index];
+        staged.push(
+          file
+            ? (
+                await createPreparedFile(
+                  transaction,
+                  {
+                    ...file,
+                    bytes: file.content.byteLength,
+                    purpose: "batch_output",
+                    apiKeyId: null,
+                  },
+                  prepared[index]!
+                )
+              ).id
+            : null
+        );
+      }
+      await lockServices(transaction);
+      const current = await getBatch(transaction, id);
+      if (!current || current.status !== "finalizing") {
+        // Remove only our unpublished rows, preserving all previously linked/referenced files.
+        await transaction.query("DELETE FROM omniroute.files WHERE id=ANY($1::text[])", [
+          staged.filter((value): value is string => value !== null),
+        ]);
+        if (current?.status === "cancelling")
+          return transitionBatch(transaction, id, ["cancelling"], {
+            status: "cancelled",
+            cancelledAt: Math.floor(Date.now() / 1000),
+          });
+        return { changed: false, batch: current };
+      }
+      await transaction.query("UPDATE omniroute.files SET api_key_id=$1 WHERE id=ANY($2::text[])", [
+        current.apiKeyId ?? null,
+        staged.filter((value): value is string => value !== null),
+      ]);
+      await updateBatch(transaction, id, {
+        ...completion,
+        status: "completed",
+        outputFileId: staged[0],
+        errorFileId: staged[1],
+      });
+      return { changed: true, batch: await getBatch(transaction, id) };
+    },
+    { operation: "files.completeBatch" }
+  );
 }
 
 export async function ensureBatchItemCheckpoints(

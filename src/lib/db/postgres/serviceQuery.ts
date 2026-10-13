@@ -5,6 +5,7 @@ import {
   looksEncrypted,
   requireExplicitStorageEncryptionKey,
 } from "../encryption";
+import { acquirePostgresServiceLock, type PostgresServiceLockOwner } from "./locks";
 
 export function safeInteger(value: unknown): number {
   const number = Number(value);
@@ -40,11 +41,9 @@ export async function affected(
 /** Serialize read-modify-write operations within each service domain. */
 export async function lockServices(
   transaction: PostgresTransaction,
-  owner = "files-batches"
+  owner: PostgresServiceLockOwner = "files-batches"
 ): Promise<void> {
-  await transaction.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
-    `omniroute.services:${owner}`,
-  ]);
+  await acquirePostgresServiceLock(transaction, owner);
 }
 
 export function placeholders(count: number, offset = 0): string {

@@ -8,6 +8,7 @@ import type { ApiKeyAuditEvent } from "./apiKeyPolicyState";
 import type { ProviderDeletionInput } from "./providerRepository";
 import { lockRouting } from "./routingSemantics";
 import { lockPostgresKeyValueMutation } from "./keyValueRepository";
+import { acquirePostgresLock } from "./locks";
 
 /** Runs in the provider update transaction, preserving the SQLite identity predicate. */
 export async function reconcileCodexUsageHistory(
@@ -16,7 +17,7 @@ export async function reconcileCodexUsageHistory(
 ): Promise<void> {
   const change = getCodexUsageHistoryReconciliation(input);
   if (!change) return;
-  await transaction.query("SELECT pg_advisory_xact_lock(18765,19)");
+  await acquirePostgresLock(transaction, "usage");
   await transaction.query(
     `UPDATE omniroute.usage_history SET account_key=$1,
       account_label=CASE WHEN $3::integer > COALESCE(account_label_priority, 0)
@@ -52,7 +53,7 @@ export async function deleteApiKeyDependents(
   transaction: PostgresTransaction,
   id: string
 ): Promise<void> {
-  await transaction.query("SELECT pg_advisory_xact_lock(18765,8)");
+  await acquirePostgresLock(transaction, "accounting");
   await transaction.query("DELETE FROM omniroute.domain_budgets WHERE api_key_id=$1", [id]);
   await transaction.query("DELETE FROM omniroute.domain_cost_history WHERE api_key_id=$1", [id]);
   // The key FK cascade already deletes reasoning rules. Do not purge usage or historical logs.

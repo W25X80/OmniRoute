@@ -2,6 +2,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import { countExplicitAny } from "./explicitAnyCount.mjs";
 
 const cwd = process.cwd();
 
@@ -53,28 +54,15 @@ const budget = [
   { file: "open-sse/handlers/responseTranslator.ts", maxAny: 0 },
   { file: "open-sse/utils/stream.ts", maxAny: 0 },
   { file: "open-sse/translator/request/openai-responses.ts", maxAny: 0 },
-  // 2 FALSE POSITIVES: #4389 compares the Anthropic `tool_choice` value against the
-  // STRING literal "any" (`tb.tool_choice === "any"` and `.type === "any"`) to detect
-  // forced tool use. The checker strips comments but not strings, and there are zero
-  // actual TypeScript `any` types in this file. Budget set to the matched count.
-  { file: "open-sse/executors/base.ts", maxAny: 2 },
+  { file: "open-sse/executors/base.ts", maxAny: 0 },
   { file: "open-sse/executors/kiro.ts", maxAny: 0 },
-  // 3 FALSE POSITIVES: the word "any" appears in #3104's tool-commit / output-
-  // constraint prompt STRINGS ("not any other tool", "any text", "any of these
-  // sequences"). The checker strips comments but not strings, and there are zero
-  // actual TypeScript `any` types in this file. Budget set to the matched count.
-  { file: "open-sse/executors/cursor.ts", maxAny: 3 },
+  { file: "open-sse/executors/cursor.ts", maxAny: 0 },
   { file: "open-sse/executors/qoder.ts", maxAny: 0 },
   { file: "open-sse/utils/comfyuiClient.ts", maxAny: 0 },
   { file: "open-sse/utils/tlsClient.ts", maxAny: 0 },
   { file: "open-sse/utils/proxyFetch.ts", maxAny: 0 },
   { file: "open-sse/utils/error.ts", maxAny: 0 },
-  // 2 FALSE POSITIVES: convertOpenAIToolChoiceToGemini() compares the OpenAI
-  // `tool_choice` value against the STRING literal "any" (`choice === "any"` and
-  // `c.type === "any"`) — same tool_choice-detection pattern as the executors/base.ts
-  // entry above. The checker strips comments but not strings, and there are zero
-  // actual TypeScript `any` types in this file. Budget set to the matched count.
-  { file: "open-sse/translator/request/openai-to-gemini.ts", maxAny: 2 },
+  { file: "open-sse/translator/request/openai-to-gemini.ts", maxAny: 0 },
   { file: "open-sse/translator/request/antigravity-to-openai.ts", maxAny: 0 },
   { file: "open-sse/translator/request/claude-to-openai.ts", maxAny: 0 },
   { file: "open-sse/handlers/audioTranscription.ts", maxAny: 0 },
@@ -100,7 +88,7 @@ const budget = [
   { file: "open-sse/translator/helpers/responsesApiHelper.ts", maxAny: 0 },
   { file: "open-sse/translator/request/claude-to-gemini.ts", maxAny: 0 },
   { file: "open-sse/translator/request/gemini-to-openai.ts", maxAny: 0 },
-  { file: "open-sse/translator/request/openai-to-claude.ts", maxAny: 1 }, // 1 = string literal "any" (Claude tool_choice value, not a TS type) — #1072
+  { file: "open-sse/translator/request/openai-to-claude.ts", maxAny: 0 },
   { file: "open-sse/translator/request/openai-to-cursor.ts", maxAny: 0 },
   { file: "open-sse/translator/request/openai-to-kiro.ts", maxAny: 0 },
   { file: "open-sse/translator/response/claude-to-openai.ts", maxAny: 0 },
@@ -118,7 +106,6 @@ const budget = [
   { file: "open-sse/utils/usageTracking.ts", maxAny: 0 },
 ];
 
-const anyRegex = /\bany\b/g;
 let hasFailure = false;
 
 for (const item of budget) {
@@ -130,11 +117,7 @@ for (const item of budget) {
   }
 
   const content = fs.readFileSync(absolutePath, "utf8");
-  // Remove block and line comments to avoid false positives with the word "any" in comments
-  let cleanContent = content.replace(/\/\*[\s\S]*?\*\//g, "");
-  cleanContent = cleanContent.replace(/\/\/.*$/gm, "");
-  const matches = cleanContent.match(anyRegex);
-  const count = matches ? matches.length : 0;
+  const count = countExplicitAny(content, item.file);
   const status = count <= item.maxAny ? "OK" : "FAIL";
 
   if (status === "FAIL") {

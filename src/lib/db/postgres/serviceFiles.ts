@@ -2,11 +2,18 @@ import { v4 as uuidv4 } from "uuid";
 import { DEFAULT_BATCH_EXPIRATION_SECONDS } from "@/shared/constants/batch";
 import type { FileRecord } from "../files";
 import { rowToCamel } from "../core";
-import type { PostgresTransaction } from "./database";
+import type { PostgresDatabase, PostgresTransaction } from "./database";
 import { NATIVE_BLOB_LIMITS } from "./nativeBlobCarrier";
 import { first, rows, safeInteger, lockServices } from "./serviceQuery";
 
-import { openStoredFileContent, replaceStoredFileContent } from "./serviceFileContent";
+import {
+  prepareFileContent,
+  replacePreparedFileContent,
+  captureStoredFileContent,
+  materializeStoredFileContent,
+  type PreparedFileContent,
+} from "./serviceFileContent";
+export { prepareFileContent } from "./serviceFileContent";
 
 const METADATA =
   "id, bytes, created_at, filename, purpose, mime_type, api_key_id, expires_at, deleted_at";
@@ -19,14 +26,26 @@ function mapFile(row: Record<string, unknown>): FileRecord {
   return file;
 }
 
+/** Serving owner: preparation happens before leasing a transaction. */
 export async function createFile(
-  transaction: PostgresTransaction,
+  database: PostgresDatabase,
   file: Omit<FileRecord, "id" | "createdAt">
+): Promise<FileRecord> {
+  const prepared = await prepareFileContent(file.content ?? null);
+  return database.transaction((tx) => createPreparedFile(tx, file, prepared), {
+    operation: "files.create",
+  });
+}
+
+/** Fresh uncommitted parents cannot be referenced by another transaction before publication. */
+export async function createPreparedFile(
+  transaction: PostgresTransaction,
+  file: Omit<FileRecord, "id" | "createdAt">,
+  prepared: PreparedFileContent
 ): Promise<FileRecord> {
   if (file.content && file.content.byteLength > NATIVE_BLOB_LIMITS.fileBytes) {
     throw new Error("File content exceeds the supported size limit");
   }
-  await lockServices(transaction);
   const createdAt = Math.floor(Date.now() / 1000);
   const record: FileRecord = {
     bytes: file.bytes,
@@ -60,7 +79,7 @@ export async function createFile(
       record.deletedAt,
     ]
   );
-  await replaceStoredFileContent(transaction, record.id, record.content ?? null);
+  await replacePreparedFileContent(transaction, record.id, prepared);
   return record;
 }
 export async function getFile(
@@ -74,33 +93,16 @@ export async function getFile(
   );
   return row ? mapFile(row) : null;
 }
+/** Capture under the parent lock, then validate and materialize the owned snapshot after COMMIT. */
 export async function getFileContent(
-  transaction: PostgresTransaction,
+  database: PostgresDatabase,
   id: string,
   reserve?: (sizeBytes: number) => void
 ): Promise<Buffer | null> {
-  const stored = await openStoredFileContent(transaction, id, { includeDeleted: false });
-  if (!stored || stored.sizeBytes === null) return null;
-  // Private app-consumer admission is synchronous/fail-fast while the SQL lease is held.
-  // Its caller retains ownership through SQL settlement and response/body consumption.
-  reserve?.(stored.sizeBytes);
-  const content = Buffer.allocUnsafe(stored.sizeBytes);
-  const count = Math.ceil(stored.sizeBytes / NATIVE_BLOB_LIMITS.chunkBytes);
-  for (let index = 0; index < count; index++) {
-    const chunk = await stored.readChunk(index);
-    const offset = index * NATIVE_BLOB_LIMITS.chunkBytes;
-    if (
-      !Buffer.isBuffer(chunk) ||
-      chunk.byteLength !== Math.min(NATIVE_BLOB_LIMITS.chunkBytes, stored.sizeBytes - offset)
-    ) {
-      throw new Error("Stored file content is incomplete or invalid");
-    }
-    chunk.copy(content, offset);
-  }
-  if ((await stored.readChunk(count)) !== null) {
-    throw new Error("Stored file content is incomplete or invalid");
-  }
-  return content;
+  const snapshot = await database.transaction((tx) => captureStoredFileContent(tx, id, reserve), {
+    operation: "files.captureContent",
+  });
+  return materializeStoredFileContent(snapshot);
 }
 export async function listFiles(
   transaction: PostgresTransaction,

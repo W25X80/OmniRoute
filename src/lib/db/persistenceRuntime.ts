@@ -18,6 +18,7 @@ type Phase = "starting" | "ready" | "closing" | "closed" | "failed";
 type Work = Promise<unknown>;
 interface WorkOwner {
   active: boolean;
+  attempt?: Set<Work>;
 }
 interface Runtime {
   readonly backend: DatabaseBackend;
@@ -29,6 +30,9 @@ interface Runtime {
   applicationIdentity?: object;
   releaseApplication?: () => void;
   requests: Set<Work>;
+  attempts: Set<Work>;
+  attemptAdmissions: Set<Set<Work>>;
+  attemptCancellation: AbortController;
   background: Set<Work>;
   tails: Set<Work>;
   owners: AsyncLocalStorage<WorkOwner>;
@@ -70,6 +74,7 @@ export function isPersistenceStreamCapacityError(error: unknown): boolean {
 
 const BACKGROUND_LIMIT = 64;
 const TAIL_LIMIT = 64;
+const ATTEMPT_LIMIT = 64;
 
 function runtime(): Runtime {
   const backend = parseDatabaseBackend();
@@ -84,6 +89,9 @@ function runtime(): Runtime {
     backend,
     phase: "starting",
     requests: new Set(),
+    attempts: new Set(),
+    attemptAdmissions: new Set(),
+    attemptCancellation: new AbortController(),
     background: new Set(),
     tails: new Set(),
     owners: new AsyncLocalStorage<WorkOwner>(),
@@ -107,6 +115,15 @@ async function initializePostgres(state: Runtime): Promise<void> {
   state.plane = plane;
   try {
     state.artifacts = artifactFactory.createS3ArtifactStore(configuration);
+    try {
+      await state.artifacts.warmup?.();
+    } catch {
+      // Durable call metadata remains admissible; the publication journal records
+      // unavailable detail independently of the object client's startup state.
+      console.warn(
+        "[Persistence] Artifact client warmup unavailable; detail recovery remains pending"
+      );
+    }
     process.env.JWT_SECRET = plane.bootstrapSecrets.jwtSecret;
     process.env.API_KEY_SECRET = plane.bootstrapSecrets.apiKeySecret;
     let enter!: () => void;
@@ -164,8 +181,12 @@ export async function ensurePersistenceReady(): Promise<void> {
   return state.startup;
 }
 
-async function ownedScope<T>(state: Runtime, body: () => T | Promise<T>): Promise<T> {
-  const owner: WorkOwner = { active: true };
+async function ownedScope<T>(
+  state: Runtime,
+  body: () => T | Promise<T>,
+  attempt?: Set<Work>
+): Promise<T> {
+  const owner: WorkOwner = { active: true, attempt };
   try {
     return await state.owners.run(owner, body);
   } finally {
@@ -176,17 +197,30 @@ async function ownedScope<T>(state: Runtime, body: () => T | Promise<T>): Promis
 async function catalogScope<T>(
   state: Runtime,
   binding: PostgresControlPlaneBinding,
-  body: () => T | Promise<T>
+  body: () => T | Promise<T>,
+  attempt?: Set<Work>
 ): Promise<T> {
-  const { withPostgresCatalogSnapshot } = await import("./postgres/catalogSnapshot");
+  const { withPostgresCatalogSnapshot, hasPostgresCatalogSnapshot } =
+    await import("./postgres/catalogSnapshot");
   return withPostgresControlPlane(binding, () =>
-    ownedScope(state, () => withPostgresCatalogSnapshot(binding.database!, body))
+    ownedScope(
+      state,
+      () =>
+        attempt && hasPostgresCatalogSnapshot(binding.database!)
+          ? body()
+          : withPostgresCatalogSnapshot(binding.database!, body),
+      attempt
+    )
   );
 }
 
-async function freshScope<T>(state: Runtime, body: () => T | Promise<T>): Promise<T> {
+async function freshScope<T>(
+  state: Runtime,
+  body: () => T | Promise<T>,
+  attempt?: Set<Work>
+): Promise<T> {
   if (!state.plane) throw new Error("PostgreSQL persistence is unavailable");
-  return state.plane.run((binding) => catalogScope(state, binding, body));
+  return state.plane.run((binding) => catalogScope(state, binding, body, attempt));
 }
 
 async function tracked<T>(set: Set<Work>, work: Promise<T>): Promise<T> {
@@ -205,6 +239,57 @@ export async function runPersistenceRequest<T>(body: () => T | Promise<T>): Prom
   await ensurePersistenceReady();
   if (state.phase !== "ready") throw new Error("Application persistence is draining");
   return tracked(state.requests, freshScope(state, body));
+}
+
+/**
+ * Admit before preparation, and retain authority until the actual work settles.
+ * A race owner must request an independent child: its response-facing promise can
+ * settle while that child's preparation or cancellation cleanup is still running.
+ * This is not a background escape hatch: only a live admitted parent may create it.
+ */
+export async function runPersistenceAttempt<T>(
+  body: () => T | Promise<T>,
+  options: { independent?: boolean } = {}
+): Promise<T> {
+  if (parseDatabaseBackend() === "sqlite") return body();
+  const state = runtime();
+  const parent = state.owners.getStore();
+  if (!parent?.active || (state.phase !== "ready" && state.phase !== "closing")) {
+    throw new Error("Persistence attempt admission requires a live owner");
+  }
+  if (!isApplicationPersistenceIdentity(getSelectedPersistenceIdentity())) {
+    throw new UnsupportedPersistenceDomainError();
+  }
+  if (parent.attempt && !options.independent) return body();
+  const admission = parent.attempt ?? new Set<Work>();
+  if (!parent.attempt) {
+    if (state.attemptAdmissions.size >= ATTEMPT_LIMIT) throw new PersistenceStreamCapacityError();
+    state.attemptAdmissions.add(admission);
+  }
+  const work = freshScope(state, body, admission);
+  admission.add(work);
+  try {
+    return await tracked(state.attempts, work);
+  } finally {
+    admission.delete(work);
+    if (!admission.size) state.attemptAdmissions.delete(admission);
+  }
+}
+
+/** Cooperative cancellation is separate from authority: cleanup retains its live scope. */
+export function getPersistenceAttemptCancellationSignal(): AbortSignal | undefined {
+  const state = globalThis.__omniroutePersistenceRuntime;
+  return state?.backend === "postgres" ? state.attemptCancellation.signal : undefined;
+}
+
+export function cancelPersistenceAttempts(): void {
+  const state = globalThis.__omniroutePersistenceRuntime;
+  if (!state || state.backend === "sqlite") return;
+  assertDrainOutsideOwnedWork(state);
+  if (state.phase === "closed" || state.phase === "failed") return;
+  if (state.phase === "ready")
+    throw new Error("Persistence cancellation requires closed admission");
+  state.attemptCancellation.abort(new Error("Application shutdown drain deadline exceeded"));
 }
 
 /** Admit at enqueue time. During drain, only live admitted work can create descendants. */
@@ -309,8 +394,13 @@ export function getPersistenceArtifactStore(): NativeArtifactStore {
 }
 
 async function drain(state: Runtime): Promise<void> {
-  while (state.requests.size || state.background.size || state.tails.size) {
-    await Promise.allSettled([...state.requests, ...state.background, ...state.tails]);
+  while (state.requests.size || state.attempts.size || state.background.size || state.tails.size) {
+    await Promise.allSettled([
+      ...state.requests,
+      ...state.attempts,
+      ...state.background,
+      ...state.tails,
+    ]);
   }
 }
 
@@ -386,6 +476,8 @@ export function getPersistenceRuntimeStatus(): {
   backend: DatabaseBackend;
   phase: Phase;
   activeRequests: number;
+  activeAttempts: number;
+  attemptOperations: number;
   backgroundOperations: number;
   streamTails: number;
 } {
@@ -394,6 +486,8 @@ export function getPersistenceRuntimeStatus(): {
     backend: state.backend,
     phase: state.phase,
     activeRequests: state.requests.size,
+    activeAttempts: state.attemptAdmissions.size,
+    attemptOperations: state.attempts.size,
     backgroundOperations: state.background.size,
     streamTails: state.tails.size,
   };

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { AsyncResource } from "node:async_hooks";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -27,19 +28,27 @@ function afterFirstRead(
   const scheduled = new Proxy(database, {
     get(target, property, receiver) {
       if (property !== "transaction") return Reflect.get(target, property, receiver);
-      return <T>(body: (tx: PostgresTransaction) => Promise<T>) =>
-        target.transaction((tx) =>
-          body({
-            query: async <Row = Record<string, unknown>>(sql: string, values?: unknown[]) => {
-              const result = await tx.query<Row>(sql, values);
-              if (!committed && matches(sql)) {
-                await write();
-                committed = true;
-              }
-              return result;
-            },
-          })
-        );
+      return async <T>(body: (tx: PostgresTransaction) => Promise<T>) => {
+        // Capture the independent request before entering the reader's SQL scope.
+        // Its real write commits while delivery of the reader's result is paused.
+        const writerRequest = new AsyncResource("compound-read-independent-writer");
+        try {
+          return await target.transaction((tx) =>
+            body({
+              query: async <Row = Record<string, unknown>>(sql: string, values?: unknown[]) => {
+                const result = await tx.query<Row>(sql, values);
+                if (!committed && matches(sql)) {
+                  await writerRequest.runInAsyncScope(write);
+                  committed = true;
+                }
+                return result;
+              },
+            })
+          );
+        } finally {
+          writerRequest.emitDestroy();
+        }
+      };
     },
   });
   return { database: scheduled, wasCommitted: () => committed };

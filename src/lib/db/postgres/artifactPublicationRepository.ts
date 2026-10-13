@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { acquirePostgresLock } from "./locks";
 import type { PreparedArtifact } from "@/domain/persistence/artifactStore";
 import type { PostgresDatabase, PostgresTransaction } from "./database";
 
@@ -11,6 +12,8 @@ export interface ArtifactPublicationRow {
   store_scope: string | null;
   expected_size_bytes: string | null;
   expected_sha256: string | null;
+  call_log_id?: string | null;
+  call_log_order?: string | null;
 }
 const ownerSchema = z.string().uuid();
 const preparedSchema = z
@@ -40,7 +43,7 @@ export function isArtifactPublicationConflict(error: unknown): boolean {
   );
 }
 export function lockArtifactPublication(transaction: PostgresTransaction) {
-  return transaction.query("SELECT pg_advisory_xact_lock(18765,8)");
+  return acquirePostgresLock(transaction, "accounting");
 }
 export async function artifactHasSqlOwner(
   transaction: PostgresTransaction,
@@ -174,6 +177,15 @@ export async function claimArtifactDeletion(
     await lockArtifactPublication(transaction);
     const row = await readArtifactPublication(transaction, reference);
     if (!row) return null;
+    // Durable recovery owns this un-attached logical call until publication or
+    // revocation. Cleanup cannot turn a pending metadata row into an orphan.
+    if (row.publication_state === "publishing" && row.call_log_id) {
+      const owner = await transaction.query(
+        "SELECT 1 FROM omniroute.call_logs WHERE id=$1 AND insertion_order=$2",
+        [row.call_log_id, row.call_log_order]
+      );
+      if (owner.rowCount === 1) return undefined;
+    }
     if (isLive()) {
       await transaction.query(
         `UPDATE omniroute.artifact_deletion_queue SET
@@ -191,7 +203,7 @@ export async function claimArtifactDeletion(
       return { ...row, publication_state: "attached" };
     }
     await transaction.query(
-      "UPDATE omniroute.artifact_deletion_queue SET publication_state='delete_pending' WHERE relpath=$1",
+      "UPDATE omniroute.artifact_deletion_queue SET publication_state='delete_pending',staged_payload=NULL,staged_bytes=0 WHERE relpath=$1",
       [reference]
     );
     return { ...row, publication_state: "delete_pending" };

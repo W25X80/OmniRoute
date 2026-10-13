@@ -43,6 +43,7 @@ const SIBLINGS: Array<[string, string]> = [
 // initGracefulShutdown() registers it.
 const FAKE_NEXT_SERVER = String.raw`
 const http = require("node:http");
+process.env.__NEXT_PRIVATE_STANDALONE_CONFIG = JSON.stringify({ basePath: "", experimental: { caseSensitiveRoutes: false } });
 const log = (msg) => process.stdout.write("EVENT " + msg + "\n");
 const mode = process.env.FAKE_MODE || "normal";
 const server = http.createServer((req, res) => res.end("ok"));
@@ -63,6 +64,7 @@ server.on("listening", () => {
     if (mode !== "no-instrumentation") {
       const requestShutdown = async (signal) => {
         log("cleanup-start " + signal + " listening=" + server.listening);
+        if (mode === "reject") throw new Error("Controlled cleanup failure");
         if (mode === "hang") {
           setInterval(() => {}, 1000); // like the real app's timers/handles: the loop stays alive
           return new Promise(() => {});
@@ -99,7 +101,11 @@ async function runAndSignal(
   env: Record<string, string>,
   signals: NodeJS.Signals[] = ["SIGTERM"]
 ): Promise<RunResult> {
-  const childEnv: NodeJS.ProcessEnv = { ...process.env, ...env };
+  const childEnv: NodeJS.ProcessEnv = {
+    ...process.env,
+    OMNIROUTE_DATABASE_BACKEND: "sqlite",
+    ...env,
+  };
   delete childEnv.NEXT_MANUAL_SIG_HANDLE;
   delete childEnv.NOTIFY_SOCKET;
   // Lets a test pass an explicit (possibly empty) value through the delete above.
@@ -208,7 +214,7 @@ test("SIGTERM before instrumentation registered cleanup still exits promptly", a
   }
 });
 
-test("a cleanup that never settles is bounded by the force-exit timer", async () => {
+test("a cleanup that never settles is bounded and exits unsuccessfully", async () => {
   const dir = makeStandaloneDir();
   try {
     // Force exit = SHUTDOWN_TIMEOUT_MS (the in-flight request drain budget) + 5 s cleanup margin.
@@ -218,8 +224,26 @@ test("a cleanup that never settles is bounded by the force-exit timer", async ()
       `${r.events}`
     );
     assert.ok(!r.events.includes("cleanup-done"));
-    assert.equal(r.code, 0, `expected exit 0, got ${r.code}/${r.signal}: ${r.events.join(", ")}`);
+    assert.equal(
+      r.code,
+      1,
+      `expected unsuccessful exit, got ${r.code}/${r.signal}: ${r.events.join(", ")}`
+    );
     assert.ok(r.ms >= 4_000 && r.ms < 9_000, `force exit expected at ~5.1 s, took ${r.ms} ms`);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("native cleanup rejection cannot masquerade as a clean process exit", async () => {
+  const dir = makeStandaloneDir();
+  try {
+    const result = await runAndSignal(dir, {
+      FAKE_MODE: "reject",
+      OMNIROUTE_DATABASE_BACKEND: "postgres",
+    });
+    assert.equal(result.code, 1);
+    assert.equal(result.events.includes("cleanup-done"), false);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

@@ -1,4 +1,5 @@
 import type { PostgresTransaction } from "./database";
+import { acquirePostgresLock } from "./locks";
 
 export interface ApiKeyAuditEvent {
   action: string;
@@ -35,7 +36,7 @@ export class PostgresApiKeyEffectsError extends Error {
 }
 
 export function lockApiKeyPolicy(transaction: PostgresTransaction, shared = false) {
-  return transaction.query(`SELECT pg_advisory_xact_lock${shared ? "_shared" : ""}(18765, 5)`);
+  return acquirePostgresLock(transaction, "keyPolicy", shared ? "shared" : "exclusive");
 }
 
 export interface ApiKeyPolicyVersion {

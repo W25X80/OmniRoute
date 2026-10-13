@@ -10,6 +10,7 @@ import type {
 import { rowToCamel } from "../caseMapping";
 import { calculateLevel } from "../../gamification/xp";
 import type { PostgresDatabase, PostgresTransaction } from "./database";
+import { acquirePostgresLock } from "./locks";
 
 const NOW = "to_char(statement_timestamp() AT TIME ZONE 'UTC','YYYY-MM-DD HH24:MI:SS')";
 const TODAY = "to_char(statement_timestamp() AT TIME ZONE 'UTC','YYYY-MM-DD')";
@@ -75,7 +76,7 @@ export function createPostgresGamificationRepository(database: PostgresDatabase)
   }
   async function mutation<T>(body: (tx: PostgresTransaction) => Promise<T>): Promise<T> {
     return database.transaction(async (tx) => {
-      await tx.query("SELECT pg_advisory_xact_lock(18765,17)");
+      await acquirePostgresLock(tx, "gamification");
       return body(tx);
     });
   }

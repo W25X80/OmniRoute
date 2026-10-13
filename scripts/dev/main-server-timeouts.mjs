@@ -10,6 +10,25 @@
 export const DEFAULT_MAIN_SERVER_KEEPALIVE_TIMEOUT_MS = 65_000;
 export const DEFAULT_MAIN_SERVER_HEADERS_TIMEOUT_MS = 66_000;
 
+// Keep in parity with runtimeTimeouts.ts; native shutdown stays below ECS's 120 s limit.
+export function getShutdownBudgetConfig(env = process.env) {
+  const backend = env.OMNIROUTE_DATABASE_BACKEND ?? "postgres";
+  if (backend !== "sqlite" && backend !== "postgres") {
+    throw new Error("OMNIROUTE_DATABASE_BACKEND must be sqlite or postgres");
+  }
+  const native = backend === "postgres";
+  const parsed = Number(env.SHUTDOWN_TIMEOUT_MS);
+  const requested =
+    env.SHUTDOWN_TIMEOUT_MS?.trim() && Number.isFinite(parsed) && parsed >= 0
+      ? Math.floor(parsed)
+      : native
+        ? 90_000
+        : 30_000;
+  const drainMs = native ? Math.min(requested, 90_000) : requested;
+  const cleanupMs = native ? 20_000 : 5_000;
+  return { drainMs, cleanupMs, forceExitMs: drainMs + cleanupMs };
+}
+
 function readTimeoutMs(env, name, defaultValue, { allowZero = false, logger } = {}) {
   const raw = env[name];
   if (raw == null || raw.trim() === "") return defaultValue;

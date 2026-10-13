@@ -9,7 +9,11 @@ import {
   createTestPostgresDatabase,
   postgresTestsEnabled,
 } from "../helpers/persistence/postgresTestDatabase.ts";
-import { fixture, barrier } from "../helpers/persistence/artifactPublicationFixture.ts";
+import {
+  fixture,
+  barrier,
+  configuration,
+} from "../helpers/persistence/artifactPublicationFixture.ts";
 import {
   PostgresDatabase,
   PostgresError,
@@ -71,11 +75,15 @@ test(
     const database = await createTestPostgresDatabase(),
       prefix = "artifact-owner-" + randomUUID();
     let rejectId: string | undefined, loseCommitId: string | undefined;
+    let loseDispatchCommit = false,
+      loseAttachCommit = false;
     const original = PostgresDatabase.prototype.transaction;
     t.mock.method(PostgresDatabase.prototype, "transaction", async function <
       T,
     >(this: PostgresDatabase, body: (tx: PostgresTransaction) => Promise<T>): Promise<T> {
       let insertedId: string | undefined;
+      let dispatchClaim = false,
+        attachment = false;
       const value = await original.call(this, async (tx: PostgresTransaction) =>
         body({
           async query<Row>(text: string, values?: unknown[]) {
@@ -83,10 +91,19 @@ test(
               insertedId = String(values?.[0]);
               if (insertedId === rejectId) await tx.query("SELECT 1/0");
             }
+            dispatchClaim ||= text.includes("SET upload_state='uncertain',dispatch_owner=");
+            attachment ||= text.includes(
+              "SET detail_state='ready',detail_reason=NULL,artifact_relpath="
+            );
             return tx.query<Row>(text, values);
           },
         })
       );
+      if ((dispatchClaim && loseDispatchCommit) || (attachment && loseAttachCommit)) {
+        loseDispatchCommit = false;
+        loseAttachCommit = false;
+        throw new PostgresError("commit_unknown");
+      }
       if (insertedId && insertedId === loseCommitId) {
         loseCommitId = undefined;
         throw new PostgresError("commit_unknown");
@@ -148,6 +165,9 @@ test(
       );
       logs = await import("../../src/lib/usage/callLogs.ts");
       const publication = await import("../../src/lib/usage/nativeArtifactPublication.ts");
+      const recovery = await import("../../src/lib/usage/nativeArtifactRecovery.ts");
+      const recover = (reference: string) =>
+        runtime!.runPersistenceRequest(() => recovery.recoverNativeArtifact(reference));
       const remove = (paths: readonly string[]) =>
         runtime!.runPersistenceRequest(() => publication.deleteNativeCallArtifacts(paths));
       const save = (entry: Parameters<NonNullable<typeof logs>["saveCallLog"]>[0]) =>
@@ -173,7 +193,8 @@ test(
           assert.equal(before[0].publication_state, "publishing");
           assert.equal(before[0].upload_state, "uncertain");
           assert.match(before[0].publication_owner!, /^[0-9a-f-]{36}$/);
-          assert.equal((await rows(id)).length, 0);
+          assert.equal((await rows(id)).length, 1);
+          assert.equal((await rows(id))[0].detail_state, "missing");
           fixture.writeGate.resolve();
           await pending;
           fixture.writeGate = undefined;
@@ -204,7 +225,7 @@ test(
         }
       );
       await t.test(
-        "lost PUT ACK then positive GET and acknowledged DELETE retire only unowned identity",
+        "lost PUT ACK preserves metadata and positive GET attaches exactly one logical artifact",
         async () => {
           const id = prefix + "-lost",
             key = prefix + "-lost-key";
@@ -212,21 +233,22 @@ test(
           fixture.putMode = "lost";
           await save(entry(id, key));
           fixture.putMode = "ack";
-          assert.equal((await rows(id)).length, 0);
+          assert.equal((await rows(id)).length, 1);
+          assert.equal((await rows(id))[0].detail_state, "missing");
           const row = (await collect()).find(
-            (item) =>
-              item.publication_state === "delete_pending" && item.upload_state === "uncertain"
+            (item) => item.publication_state === "publishing" && item.upload_state === "uncertain"
           )!;
           assert.ok(row);
+          const puts = fixture.requests.filter((request) => request.method === "PUT").length;
+          assert.equal(await recover(row.relpath), true);
+          assert.equal(await recover(row.relpath), true);
+          assert.equal((await rows(id))[0].artifact_relpath, row.relpath);
+          assert.equal(fixture.requests.filter((request) => request.method === "PUT").length, puts);
           assert.deepEqual(await remove([row.relpath]), {
-            deletedArtifacts: 1,
+            deletedArtifacts: 0,
             pendingArtifactDeletions: 0,
             errors: 0,
           });
-          assert.equal(
-            (await collect()).some((item) => item.relpath === row.relpath),
-            false
-          );
         }
       );
       await t.test(
@@ -239,54 +261,37 @@ test(
           fixture.writeGate = barrier();
           await save(entry(id, key));
           const row = (await collect()).find(
-            (item) =>
-              item.publication_state === "delete_pending" && item.upload_state === "uncertain"
+            (item) => item.publication_state === "publishing" && item.upload_state === "uncertain"
           )!;
           assert.ok(row);
-          assert.equal(
-            await runtime!.runPersistenceRequest(() =>
-              runtime!.getPersistenceArtifactStore().isPutActive!(row.relpath)
-            ),
-            false
-          );
+          const puts = fixture.requests.filter((request) => request.method === "PUT").length;
+          assert.equal(await recover(row.relpath), false);
+          assert.equal((await rows(id))[0].artifact_relpath, null);
           assert.deepEqual(await remove([row.relpath]), {
             deletedArtifacts: 0,
             pendingArtifactDeletions: 1,
             errors: 0,
           });
-          assert.equal(
-            (await collect()).some((item) => item.relpath === row.relpath),
-            true
-          );
           fixture.writeGate.resolve();
           await fixture.remoteEffect;
           fixture.writeGate = undefined;
           fixture.putMode = "ack";
-          assert.deepEqual(await remove([row.relpath]), {
-            deletedArtifacts: 1,
-            pendingArtifactDeletions: 0,
-            errors: 0,
-          });
+          assert.equal(await recover(row.relpath), true);
+          assert.equal((await rows(id))[0].artifact_relpath, row.relpath);
+          assert.equal(fixture.requests.filter((request) => request.method === "PUT").length, puts);
         }
       );
-      await t.test(
-        "acknowledged PUT plus actual SQL rejection retains cleanup ownership",
-        async () => {
-          const id = prefix + "-reject",
-            key = prefix + "-reject-key";
-          await seed(key);
-          rejectId = id;
-          await save(entry(id, key));
-          rejectId = undefined;
-          assert.equal((await rows(id)).length, 0);
-          const row = (await collect()).find(
-            (item) =>
-              item.publication_state === "delete_pending" && item.upload_state === "acknowledged"
-          )!;
-          assert.ok(row);
-          assert.equal((await remove([row.relpath])).deletedArtifacts, 1);
-        }
-      );
+      await t.test("metadata transaction rejection dispatches no PUT", async () => {
+        const id = prefix + "-reject",
+          key = prefix + "-reject-key";
+        await seed(key);
+        rejectId = id;
+        const puts = fixture.requests.filter((request) => request.method === "PUT").length;
+        await save(entry(id, key));
+        rejectId = undefined;
+        assert.equal((await rows(id)).length, 0);
+        assert.equal(fixture.requests.filter((request) => request.method === "PUT").length, puts);
+      });
       await t.test(
         "lost actual COMMIT acknowledgment retains both current and legacy ownership fences",
         async () => {
@@ -295,6 +300,12 @@ test(
           await seed(key);
           loseCommitId = id;
           await save(entry(id, key));
+          const pending = (await collect()).find(
+            (item) => item.publication_state === "publishing" && item.upload_state === "not_sent"
+          )!;
+          assert.ok(pending);
+          assert.equal((await rows(id))[0].artifact_relpath, null);
+          assert.equal(await recover(pending.relpath), true);
           const committed = (await rows(id))[0];
           assert.ok(committed?.artifact_relpath);
           changedRefs.add(committed.artifact_relpath!);
@@ -320,6 +331,131 @@ test(
           );
         }
       );
+      await t.test(
+        "unknown dispatch COMMIT never authorizes PUT, even after restart-shaped recovery",
+        async () => {
+          const id = prefix + "-dispatch-unknown",
+            key = id + "-key";
+          await seed(key);
+          const puts = fixture.requests.filter((request) => request.method === "PUT").length;
+          loseDispatchCommit = true;
+          await save(entry(id, key));
+          const pending = (await collect()).find(
+            (row) => row.publication_state === "publishing" && row.upload_state === "uncertain"
+          )!;
+          assert.ok(pending);
+          assert.equal((await rows(id))[0].detail_state, "missing");
+          assert.equal(await recover(pending.relpath), false);
+          assert.equal(fixture.requests.filter((request) => request.method === "PUT").length, puts);
+          assert.ok((await collect()).some((row) => row.relpath === pending.relpath));
+          // This row intentionally remains unresolved: 404 is not non-dispatch proof.
+        }
+      );
+      await t.test(
+        "unknown attachment COMMIT is read back without another PUT or duplicate log",
+        async () => {
+          const id = prefix + "-attach-unknown",
+            key = id + "-key";
+          await seed(key);
+          const puts = fixture.requests.filter((request) => request.method === "PUT").length;
+          loseAttachCommit = true;
+          await save(entry(id, key));
+          const saved = (await rows(id))[0];
+          assert.equal(saved.detail_state, "ready");
+          assert.equal(await recover(saved.artifact_relpath!), true);
+          assert.equal((await rows(id)).length, 1);
+          assert.equal(
+            fixture.requests.filter((request) => request.method === "PUT").length,
+            puts + 1
+          );
+          const staged = await database.transaction((tx) =>
+            tx.query<{ staged_payload: string | null; staged_bytes: number }>(
+              "SELECT staged_payload,staged_bytes FROM omniroute.artifact_deletion_queue WHERE relpath=$1",
+              [saved.artifact_relpath]
+            )
+          );
+          assert.deepEqual(staged.rows[0], { staged_payload: null, staged_bytes: 0 });
+        }
+      );
+      await t.test(
+        "128 MiB staging exhaustion retains metadata with explicit reason and no PUT",
+        async () => {
+          const id = prefix + "-pressure",
+            key = id + "-key",
+            pressure = prefix + "-capacity-";
+          await seed(key);
+          const puts = fixture.requests.filter((request) => request.method === "PUT").length;
+          try {
+            await database.transaction((tx) =>
+              tx.query(
+                `INSERT INTO omniroute.artifact_deletion_queue
+              (relpath,publication_state,call_log_id,call_log_order,staged_payload,staged_bytes)
+             SELECT $1||n,'publishing',$1||n,0,'enc:v1:'||repeat('a',16777209),16777216 FROM generate_series(1,8) n`,
+                [pressure]
+              )
+            );
+            await save(entry(id, key));
+            const saved = await database.transaction((tx) =>
+              tx.query<{ detail_state: string; detail_reason: string }>(
+                "SELECT detail_state,detail_reason FROM omniroute.call_logs WHERE id=$1",
+                [id]
+              )
+            );
+            assert.deepEqual(saved.rows[0], {
+              detail_state: "missing",
+              detail_reason: "staging_capacity",
+            });
+            assert.equal(
+              fixture.requests.filter((request) => request.method === "PUT").length,
+              puts
+            );
+          } finally {
+            await database.transaction((tx) =>
+              tx.query("DELETE FROM omniroute.artifact_deletion_queue WHERE relpath LIKE $1", [
+                pressure + "%",
+              ])
+            );
+          }
+        }
+      );
+      await t.test(
+        "deleting metadata revokes pending bytes and leaves uncertain late-PUT cleanup authority",
+        async () => {
+          const id = prefix + "-delete-pending",
+            key = id + "-key";
+          await seed(key);
+          fixture.putMode = "lost_before_effect";
+          fixture.writeGate = barrier();
+          await save(entry(id, key));
+          const pending = await database.transaction((tx) =>
+            tx.query<{ relpath: string; staged_payload: string | null }>(
+              "SELECT relpath,staged_payload FROM omniroute.artifact_deletion_queue WHERE call_log_id=$1",
+              [id]
+            )
+          );
+          assert.ok(pending.rows[0].staged_payload?.startsWith("enc:v1:"));
+          const ref = pending.rows[0].relpath;
+          changedRefs.add(ref);
+          await database.transaction((tx) =>
+            tx.query("DELETE FROM omniroute.call_logs WHERE id=$1", [id])
+          );
+          const tombstone = await database.transaction((tx) =>
+            tx.query<{ staged_payload: string | null; staged_bytes: number }>(
+              "SELECT staged_payload,staged_bytes FROM omniroute.artifact_deletion_queue WHERE relpath=$1",
+              [ref]
+            )
+          );
+          assert.deepEqual(tombstone.rows[0], { staged_payload: null, staged_bytes: 0 });
+          assert.equal(await recover(ref), false);
+          assert.equal((await remove([ref])).pendingArtifactDeletions, 1);
+          fixture.writeGate.resolve();
+          await fixture.remoteEffect;
+          fixture.writeGate = undefined;
+          fixture.putMode = "ack";
+          assert.equal((await remove([ref])).deletedArtifacts, 1);
+          assert.equal((await rows(id)).length, 0);
+        }
+      );
       for (const revoke of [false, true])
         await t.test(
           "privacy mutation during PUT omits payload and immediately drains terminal claimed deletion " +
@@ -334,9 +470,14 @@ test(
               pending = save(entry(id, key));
             void pending.catch(() => {});
             await fixture.putEntered.promise;
-            const ref = (await collect()).find(
-              (item) => item.publication_state === "publishing"
-            )!.relpath;
+            const ref = (
+              await database.transaction((tx) =>
+                tx.query<{ relpath: string }>(
+                  "SELECT relpath FROM omniroute.artifact_deletion_queue WHERE call_log_id=$1",
+                  [id]
+                )
+              )
+            ).rows[0].relpath;
             changedRefs.add(ref);
             await database.transaction(async (tx) => {
               await tx.query("SELECT pg_advisory_xact_lock(18765,5)");
@@ -364,6 +505,176 @@ test(
             );
           }
         );
+      for (const outcome of ["acknowledged", "unknown", "revoked"] as const) {
+        await t.test(
+          `deadline retains claim lifetime before late ${outcome} COMMIT acknowledgement`,
+          async () => {
+            const id = prefix + "-claim-deadline-" + outcome,
+              key = id + "-key";
+            await seed(key);
+            loseCommitId = id;
+            await save(entry(id, key));
+            const pending = (
+              await database.transaction((tx) =>
+                tx.query<{ relpath: string }>(
+                  "SELECT relpath FROM omniroute.artifact_deletion_queue WHERE call_log_id=$1",
+                  [id]
+                )
+              )
+            ).rows[0];
+            changedRefs.add(pending.relpath);
+            const claimEntered = barrier(),
+              releaseClaim = barrier(),
+              deadlineSeen = barrier();
+            const boundedStore = store.createS3ArtifactStore(configuration, { deadlineMs: 30 });
+            await boundedStore.warmup!();
+            let claimHeld = false,
+              finished = false;
+            const heldDatabase = {
+              async transaction<T>(
+                body: (tx: PostgresTransaction) => Promise<T>,
+                options: { operation?: string } = {}
+              ) {
+                const result = await database.transaction(body, options);
+                if (options.operation === "artifact.claim" && !claimHeld) {
+                  claimHeld = true;
+                  claimEntered.resolve();
+                  await releaseClaim.promise;
+                  if (outcome === "unknown") throw new PostgresError("commit_unknown");
+                }
+                return result;
+              },
+            } as unknown as PostgresDatabase;
+            const observedStore = {
+              ...boundedStore,
+              async put(bytes: Uint8Array, options: Parameters<typeof boundedStore.put>[1]) {
+                try {
+                  return await boundedStore.put(bytes, options);
+                } catch (error) {
+                  deadlineSeen.resolve();
+                  throw error;
+                }
+              },
+            };
+            const puts = fixture.requests.filter((request) => request.method === "PUT").length;
+            const recovering = runtime!.runPersistenceRequest(() =>
+              recovery.recoverNativeArtifact(pending.relpath, heldDatabase, observedStore)
+            );
+            void recovering.finally(() => {
+              finished = true;
+            });
+            try {
+              await claimEntered.promise;
+              await deadlineSeen.promise;
+              // Join a real SQL read after the store deadline; this cannot release
+              // the held claim acknowledgement or authorize a second send.
+              assert.equal((await rows(id))[0].detail_state, "missing");
+              assert.equal(finished, false, "recovery retains ownership until claim settlement");
+              if (outcome === "revoked")
+                await database.transaction((tx) =>
+                  tx.query("UPDATE omniroute.api_keys SET no_log=1 WHERE id=$1", [key])
+                );
+              releaseClaim.resolve();
+              assert.equal(await recovering, false);
+              const current = (
+                await database.transaction((tx) =>
+                  tx.query<{
+                    upload_state: string;
+                    publication_state: string;
+                    staged_payload: string | null;
+                  }>(
+                    "SELECT upload_state,publication_state,staged_payload FROM omniroute.artifact_deletion_queue WHERE relpath=$1",
+                    [pending.relpath]
+                  )
+                )
+              ).rows[0];
+              assert.equal(
+                fixture.requests.filter((request) => request.method === "PUT").length,
+                puts
+              );
+              assert.equal(
+                current.upload_state,
+                outcome === "acknowledged" ? "not_sent" : "uncertain"
+              );
+              if (outcome === "revoked") {
+                assert.equal(current.publication_state, "delete_pending");
+                assert.equal(current.staged_payload, null);
+                assert.equal(await recover(pending.relpath), false);
+              } else if (outcome === "unknown") {
+                assert.equal(await recover(pending.relpath), false);
+                assert.equal(
+                  fixture.requests.filter((request) => request.method === "PUT").length,
+                  puts
+                );
+              } else {
+                await boundedStore.close();
+                assert.equal(await recover(pending.relpath), true);
+                assert.equal(
+                  fixture.requests.filter((request) => request.method === "PUT").length,
+                  puts + 1
+                );
+                assert.equal((await rows(id))[0].detail_state, "ready");
+              }
+            } finally {
+              releaseClaim.resolve();
+              await recovering;
+              await boundedStore.close();
+            }
+          }
+        );
+      }
+      await t.test(
+        "committed not-sent intent survives runtime restart and concurrent recovery performs one PUT",
+        async () => {
+          const id = prefix + "-restart",
+            key = id + "-key";
+          await seed(key);
+          loseCommitId = id;
+          await save(entry(id, key));
+          const pending = (
+            await database.transaction((tx) =>
+              tx.query<{ relpath: string; staged_payload: string }>(
+                "SELECT relpath,staged_payload FROM omniroute.artifact_deletion_queue WHERE call_log_id=$1",
+                [id]
+              )
+            )
+          ).rows[0];
+          assert.ok(pending.staged_payload.startsWith("enc:v1:"));
+          assert.equal(pending.staged_payload.includes("retained identity"), false);
+          changedRefs.add(pending.relpath);
+          const puts = fixture.requests.filter((request) => request.method === "PUT").length;
+          await runtime!.closePersistenceRuntime();
+          delete globalThis.__omniroutePersistenceRuntime;
+          await runtime!.ensurePersistenceReady();
+          // SDK/client preparation can fail without consuming the durable one-PUT claim.
+          await runtime!.runPersistenceRequest(async () => {
+            const selected = await import("../../src/lib/db/controlPlaneContext.ts");
+            const native = runtime!.getPersistenceArtifactStore();
+            assert.equal(
+              await recovery.recoverNativeArtifact(
+                pending.relpath,
+                selected.getSelectedPostgresDatabase()!,
+                {
+                  ...native,
+                  async warmup() {
+                    throw new Error("synthetic local preparation failure");
+                  },
+                }
+              ),
+              false
+            );
+          });
+          assert.equal(fixture.requests.filter((request) => request.method === "PUT").length, puts);
+          const results = await Promise.all([recover(pending.relpath), recover(pending.relpath)]);
+          assert.ok(results.includes(true));
+          assert.equal(
+            fixture.requests.filter((request) => request.method === "PUT").length,
+            puts + 1
+          );
+          assert.equal((await rows(id)).length, 1);
+          assert.equal((await rows(id))[0].detail_state, "ready");
+        }
+      );
     } finally {
       fixture.writeGate?.resolve();
       await fixture.remoteEffect?.catch(() => {});

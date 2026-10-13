@@ -60,11 +60,17 @@ import {
   type CallLogArtifact,
   type CallLogDetailState,
 } from "./callLogArtifacts";
+import { deleteNativeCallArtifacts } from "./nativeArtifactPublication";
 import {
-  createNativeArtifactPublication,
-  deleteNativeCallArtifacts,
-} from "./nativeArtifactPublication";
-import { closeCallLogArtifactWriter, writeCallArtifactAsync } from "./callLogArtifactWriter";
+  closeCallLogArtifactWriter,
+  writeCallArtifactAsync,
+  serializeCallArtifactAsync,
+} from "./callLogArtifactWriter";
+import {
+  prepareNativeArtifactRecovery,
+  publishNativeArtifactIntent,
+} from "./nativeArtifactRecovery";
+import type { ArtifactRecoveryIntent } from "../db/postgres/artifactRecoveryRepository";
 import {
   toNumber,
   toStringOrNull,
@@ -137,6 +143,7 @@ type CallLogSummaryRow = {
   combo_execution_key: string | null;
   error_summary: string | null;
   detail_state: string | null;
+  detail_reason?: string | null;
   artifact_relpath: string | null;
   artifact_size_bytes: number | null;
   artifact_sha256: string | null;
@@ -523,6 +530,7 @@ function mapSummaryRow(row: CallLogSummaryRow) {
     comboExecutionKey: row.combo_execution_key,
     error: row.error_summary,
     detailState,
+    detailReason: row.detail_reason ?? null,
     artifactRelPath: row.artifact_relpath,
     artifactSizeBytes: row.artifact_size_bytes,
     artifactSha256: row.artifact_sha256,
@@ -566,7 +574,7 @@ function reportCallLogSaveFailure(error: unknown): void {
 }
 
 async function saveCallLogOperation(entry: any, captured?: NativeCallLogContext): Promise<void> {
-  let nativePublication: ReturnType<typeof createNativeArtifactPublication> | undefined;
+  let nativeIntent: ArtifactRecoveryIntent | undefined;
   let nativeArtifactToDelete: string | undefined;
   try {
     // Bind the DB instance up front, before any await (resolveAccountName,
@@ -783,6 +791,7 @@ async function saveCallLogOperation(entry: any, captured?: NativeCallLogContext)
         protectedPipelinePayloads !== null);
 
     let detailState: CallLogDetailState = "none";
+    let detailReason: string | null = null;
     let artifactRelPath: string | null = null;
     let artifactSizeBytes: number | null = null;
     let artifactSha256: string | null = null;
@@ -795,20 +804,23 @@ async function saveCallLogOperation(entry: any, captured?: NativeCallLogContext)
         protectedError,
         protectedPipelinePayloads
       );
-      if (postgres) nativePublication = createNativeArtifactPublication();
-      const artifactResult = await writeCallArtifactAsync(artifact, nativePublication?.options);
-      if (artifactResult) {
-        nativePublication?.acknowledge({
-          reference: artifactResult.relPath,
-          sizeBytes: artifactResult.sizeBytes,
-          checksum: artifactResult.sha256,
-        });
-        detailState = "ready";
-        artifactRelPath = artifactResult.relPath;
-        artifactSizeBytes = artifactResult.sizeBytes;
-        artifactSha256 = artifactResult.sha256;
-      } else {
+      if (postgres) {
         detailState = "missing";
+        detailReason = "publication_pending";
+        try {
+          nativeIntent = prepareNativeArtifactRecovery(await serializeCallArtifactAsync(artifact));
+        } catch (error) {
+          detailReason = "preparation_failed";
+          reportCallLogSaveFailure(error);
+        }
+      } else {
+        const artifactResult = await writeCallArtifactAsync(artifact);
+        if (artifactResult) {
+          detailState = "ready";
+          artifactRelPath = artifactResult.relPath;
+          artifactSizeBytes = artifactResult.sizeBytes;
+          artifactSha256 = artifactResult.sha256;
+        } else detailState = "missing";
       }
     }
 
@@ -855,12 +867,10 @@ async function saveCallLogOperation(entry: any, captured?: NativeCallLogContext)
       ...logEntry,
       errorSummary: toStoredErrorSummary(protectedError),
       detailState,
+      detailReason,
       artifactRelPath,
       artifactSizeBytes,
       artifactSha256,
-      ...(postgres && artifactRelPath
-        ? { artifactPublicationOwner: nativePublication?.owner }
-        : {}),
       hasRequestBody: protectedRequestBody !== null ? 1 : 0,
       hasResponseBody: protectedResponseBody !== null ? 1 : 0,
       resilienceActions,
@@ -872,12 +882,17 @@ async function saveCallLogOperation(entry: any, captured?: NativeCallLogContext)
     for (let attempt = 0; ; attempt++) {
       try {
         if (postgres) {
-          const result = await postgres.insert(insertParams);
+          const result = await postgres.insert(insertParams, nativeIntent);
           if (!result.inserted) {
             if (attempt >= CALL_LOG_ID_RETRY_LIMIT)
               throw new Error("Call log id collision limit exceeded");
             insertParams.id = generateLogId();
             continue;
+          }
+          if (result.intentAccepted && nativeIntent) {
+            if (await publishNativeArtifactIntent(nativeIntent)) detailState = "ready";
+          } else if (nativeIntent && result.payloadAccepted) {
+            console.warn("[callLogs] Artifact staging capacity exhausted; metadata retained");
           }
           if (!result.payloadAccepted && artifactRelPath) {
             // The SQL transaction retained deletion ownership; no catch-driven S3 action.
@@ -908,16 +923,8 @@ async function saveCallLogOperation(entry: any, captured?: NativeCallLogContext)
     if (String((error as Error)?.message ?? error).includes("no such column")) {
       invalidateCallLogsColumnCache();
     }
-    if (nativePublication) {
-      try {
-        await nativePublication.fail(error);
-      } catch (reconciliationError) {
-        reportCallLogSaveFailure(reconciliationError);
-      }
-    }
     reportCallLogSaveFailure(error);
   } finally {
-    nativePublication?.release();
     // Metadata-only COMMIT is terminal; release the publisher before the claimed delete.
     if (nativeArtifactToDelete) {
       try {

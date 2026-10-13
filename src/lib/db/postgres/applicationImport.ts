@@ -1,3 +1,4 @@
+import { acquirePostgresLock } from "./locks";
 import { randomUUID } from "node:crypto";
 import {
   applicationImportDigest as canonical,
@@ -893,8 +894,8 @@ function blobReferences(snapshot: ApplicationStorageSnapshot): NativeBlobReferen
   return [...references.values()];
 }
 async function lockedSchema(transaction: PostgresTransaction): Promise<TargetSchema> {
-  await transaction.query("SELECT pg_advisory_xact_lock(18765, 1)");
-  await transaction.query("SELECT pg_advisory_xact_lock(18765, 31)");
+  await acquirePostgresLock(transaction, "schema");
+  await acquirePostgresLock(transaction, "applicationImport");
   const schema = await readTargetSchema(transaction);
   // Offline import excludes writers for every known durable target, including initial seed rows.
   await transaction.query(
@@ -1256,7 +1257,14 @@ export async function capturePostgresApplicationSnapshot(
           ],
         });
       }
-      const columns = table.columns.filter((column) => !column.generated),
+      // The retention timestamp is a trigger-maintained index projection of the
+      // original text (including offsets, microseconds and infinity). Recompute
+      // it on restore instead of serializing it through the driver's Date type.
+      const columns = table.columns.filter(
+          (column) =>
+            !column.generated &&
+            !(table.name === "conversation_turn_nodes" && column.name === "last_seen_at_retention")
+        ),
         order = columnOrder(table),
         rows: ApplicationSnapshotTable["rows"] = [];
       const fileContent = (column: TargetColumn) =>

@@ -2,8 +2,8 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { parseDatabaseBackend } from "../../../src/lib/db/backendSelection.ts";
 
-test("SQLite remains the default and both explicit backend selections are admitted", () => {
-  assert.equal(parseDatabaseBackend({}), "sqlite");
+test("PostgreSQL is the default and SQLite requires an explicit selection", () => {
+  assert.equal(parseDatabaseBackend({}), "postgres");
   assert.equal(parseDatabaseBackend({ OMNIROUTE_DATABASE_BACKEND: "sqlite" }), "sqlite");
   assert.equal(parseDatabaseBackend({ OMNIROUTE_DATABASE_BACKEND: "postgres" }), "postgres");
 });

@@ -55,6 +55,9 @@ export class SpendBatchWriter {
   private discardedApiKeyIds = new Set<string>();
   private timer: NodeJS.Timeout | null = null;
   private started = false;
+  private nativeClosing = false;
+  private nativeSealed = false;
+  private nativeClosePromise: Promise<void> | null = null;
   private flushPromise: Promise<FlushResult> | null = null;
   private persistEntries: (entries: BufferedCostEntry[]) => Promise<void> | void;
   private logger: Pick<Console, "log" | "error">;
@@ -73,7 +76,7 @@ export class SpendBatchWriter {
   }
 
   start() {
-    if (this.started) return;
+    if (this.started || this.nativeClosing) return;
     this.started = true;
     this.timer = setInterval(() => {
       void this.flush();
@@ -84,6 +87,7 @@ export class SpendBatchWriter {
   increment(apiKeyId: string, cost: number, timestamp = Date.now()) {
     const entry = normalizeEntry({ apiKeyId, cost, timestamp });
     if (!entry) return;
+    if (this.nativeSealed) throw new Error("Native spend writer is closed");
 
     this.start();
     this.discardedApiKeyIds.delete(entry.apiKeyId);
@@ -92,7 +96,7 @@ export class SpendBatchWriter {
       : entry;
     this.buffer.push(accepted);
 
-    if (this.buffer.length >= this.maxBufferSize) {
+    if (!this.nativeClosing && this.buffer.length >= this.maxBufferSize) {
       void this.flush();
     }
   }
@@ -199,6 +203,45 @@ export class SpendBatchWriter {
     return this.flush();
   }
 
+  /** Stop producers now; already admitted request/stream owners may still account. */
+  beginNativeClose(): void {
+    this.nativeClosing = true;
+    if (this.timer) clearInterval(this.timer);
+    this.timer = null;
+    this.started = false;
+  }
+
+  private incompleteNativeDrain(): Error {
+    return new Error(
+      "Native spend writer has unsettled cost entries " +
+        `(buffered=${this.buffer.length}, inFlight=${this.inFlightEntries.length}, uncertain=${this.uncertainEntries.length})`
+    );
+  }
+
+  /** Call after accepted work drains. Never replay a failed/uncertain final flush. */
+  closeNative(): Promise<void> {
+    if (this.nativeClosePromise) return this.nativeClosePromise;
+    this.beginNativeClose();
+    this.nativeSealed = true;
+    this.nativeClosePromise = (async () => {
+      // A prior successful batch can finish while later admitted increments wait
+      // in the buffer. Join it first, then flush that distinct final batch once.
+      if (this.flushPromise && (await this.flushPromise).requeued) {
+        throw this.incompleteNativeDrain();
+      }
+      const result = await this.flush();
+      if (
+        result.requeued ||
+        this.buffer.length ||
+        this.inFlightEntries.length ||
+        this.uncertainEntries.length
+      ) {
+        throw this.incompleteNativeDrain();
+      }
+    })();
+    return this.nativeClosePromise;
+  }
+
   getUncertainEntries(): readonly BufferedCostEntry[] {
     return this.uncertainEntries.map((entry) => ({ ...entry }));
   }
@@ -219,6 +262,9 @@ export class SpendBatchWriter {
       this.timer = null;
     }
     this.started = false;
+    this.nativeClosing = false;
+    this.nativeSealed = false;
+    this.nativeClosePromise = null;
     this.buffer = [];
     this.inFlightEntries = [];
     this.uncertainEntries = [];
@@ -282,6 +328,14 @@ export async function flushSpendBatchWriter() {
 
 export async function stopSpendBatchWriter() {
   return spendBatchWriter.stop();
+}
+
+export function beginNativeSpendBatchWriterClose(): void {
+  if (getSelectedPersistenceIdentity()) spendBatchWriter.beginNativeClose();
+}
+
+export async function closeNativeSpendBatchWriter(): Promise<void> {
+  if (getSelectedPersistenceIdentity()) await spendBatchWriter.closeNative();
 }
 
 export function resetSpendBatchWriterForTests() {

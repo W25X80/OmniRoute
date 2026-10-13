@@ -10,6 +10,7 @@ import {
   type PostgresResult,
   type PostgresTransaction,
 } from "../../../src/lib/db/postgres/database.ts";
+import { acquirePostgresLock } from "../../../src/lib/db/postgres/locks.ts";
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -335,5 +336,96 @@ test("checked-out and idle errors are handled without logging driver details", a
   );
   assert.match(JSON.stringify(f.warnings), /57P01/);
   assert.doesNotMatch(JSON.stringify(f.warnings), /private credentials/);
+  await f.database.close();
+});
+
+test("an independent nested transaction is rejected before leasing another client", async () => {
+  const f = fixture();
+  let nestedBody = 0;
+  await assert.rejects(
+    f.database.transaction(async () => {
+      await f.database.transaction(async () => {
+        nestedBody++;
+      });
+    }),
+    (error: unknown) => error instanceof PostgresError && error.kind === "nested_transaction"
+  );
+  assert.equal(nestedBody, 0);
+  assert.equal(f.connections(), 1);
+  assert.deepEqual(f.calls, ["BEGIN", "ROLLBACK"]);
+  assert.equal(await f.database.transaction(async () => 42), 42);
+  await f.database.close();
+});
+
+test("a caught nested transaction violation cannot acknowledge the outer transaction", async () => {
+  const f = fixture();
+  await assert.rejects(
+    f.database.transaction(async () => {
+      await f.database.transaction(async () => 0).catch(() => {});
+      return "not committed";
+    }),
+    (error: unknown) => error instanceof PostgresError && error.kind === "nested_transaction"
+  );
+  assert.equal(f.calls.includes("COMMIT"), false);
+  await f.database.close();
+});
+
+test("transaction diagnostics identify the failed SQL phase without values or driver details", async () => {
+  const f = fixture(async (text) => {
+    if (text.startsWith("SELECT pg_advisory"))
+      throw Object.assign(new Error("credential-sentinel"), { code: "55P03", severity: "ERROR" });
+    return result(text);
+  });
+  await assert.rejects(
+    f.database.transaction(
+      (tx) => tx.query("SELECT pg_advisory_xact_lock($1,$2)", [18765, "parameter-sentinel"]),
+      { operation: "compression.readSnapshot" }
+    ),
+    errorKind("query_failed")
+  );
+  const serialized = JSON.stringify(f.warnings);
+  assert.match(serialized, /compression.readSnapshot/);
+  assert.match(serialized, /55P03/);
+  assert.match(serialized, /statementId/);
+  assert.match(serialized, /callbackGapMs/);
+  assert.doesNotMatch(serialized, /credential-sentinel|parameter-sentinel|SELECT pg_advisory/);
+  await f.database.close();
+});
+
+test("diagnostics cannot mask transaction outcomes", async () => {
+  const f = fixture();
+  const database = new PostgresDatabase(
+    f.pool,
+    { maxConnections: 1, transactionTimeoutMs: 500 },
+    {
+      warn() {
+        throw new Error("logger unavailable");
+      },
+    }
+  );
+  await assert.rejects(
+    database.transaction(async () => {
+      throw new PostgresError("query_failed", "55P03");
+    }),
+    errorKind("query_failed")
+  );
+  assert.equal(await database.transaction(async () => 42), 42);
+  await database.close();
+});
+
+test("failed advisory acquisition reports its semantic owner without an entity key", async () => {
+  const f = fixture(async (text) => {
+    if (text.startsWith("SELECT"))
+      throw Object.assign(new Error("private row detail"), { code: "55P03", severity: "ERROR" });
+    return result(text);
+  });
+  await assert.rejects(
+    f.database.transaction((tx) => acquirePostgresLock(tx, "skills", "shared")),
+    errorKind("query_failed")
+  );
+  const serialized = JSON.stringify(f.warnings);
+  assert.match(serialized, /"lockOwner":"skills"/);
+  assert.match(serialized, /"lockMode":"shared"/);
+  assert.doesNotMatch(serialized, /private row detail/);
   await f.database.close();
 });

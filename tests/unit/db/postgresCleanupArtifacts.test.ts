@@ -51,7 +51,8 @@ test("retention returns/queues classified last references, not every removed row
     "2026-01-01"
   );
   assert.deepEqual(result, { deleted: 4, artifacts: ["retired"] });
-  assert.equal(fixture.statements[0].sql, "SELECT pg_advisory_xact_lock(18765,8)");
+  assert.equal(fixture.statements[0].sql, "SELECT pg_advisory_xact_lock(18765,$1)");
+  assert.deepEqual(fixture.statements[0].values, [8]);
   const classification = fixture.statements.findIndex((statement) =>
     statement.sql.startsWith("SELECT DISTINCT relpath")
   );
@@ -73,8 +74,10 @@ test("partial reset retains reset fencing and adds history fencing before call-l
     "2026-01-01"
   );
   assert.deepEqual(result, { counts: { logs: 2 }, artifacts: ["retired"] });
-  assert.equal(fixture.statements[0].sql, "SELECT pg_advisory_xact_lock(18765, 7)");
-  assert.equal(fixture.statements[1].sql, "SELECT pg_advisory_xact_lock(18765,8)");
+  assert.equal(fixture.statements[0].sql, "SELECT pg_advisory_xact_lock(18765,$1)");
+  assert.deepEqual(fixture.statements[0].values, [7]);
+  assert.equal(fixture.statements[1].sql, "SELECT pg_advisory_xact_lock(18765,$1)");
+  assert.deepEqual(fixture.statements[1].values, [8]);
   const queue = fixture.statements.find((statement) =>
     statement.sql.startsWith("INSERT INTO omniroute.artifact_deletion_queue")
   );
@@ -90,7 +93,8 @@ test("metadata-only and skipped allOnly resets do not acquire the new history fe
     await createPostgresCleanupRepository(fixture.database).reset(targets, "2026-01-01");
     assert.equal(
       fixture.statements.some(
-        (statement) => statement.sql === "SELECT pg_advisory_xact_lock(18765,8)"
+        (statement) =>
+          statement.sql === "SELECT pg_advisory_xact_lock(18765,$1)" && statement.values?.[0] === 8
       ),
       false
     );

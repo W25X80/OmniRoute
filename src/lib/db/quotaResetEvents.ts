@@ -1,5 +1,6 @@
 import { getDbInstance } from "./core";
 import { getSelectedPostgresDatabase } from "./controlPlaneContext";
+import { acquirePostgresLock } from "./postgres/locks";
 
 interface StatementLike<TRow = unknown> {
   all: (...params: unknown[]) => TRow[];
@@ -343,7 +344,7 @@ export async function recordProviderQuotaResetEventIfChangedAsync(
   const currentResetIso = parseResetIso(input.currentResetAt);
   if (!currentResetIso) return;
   await database.transaction(async (tx) => {
-    await tx.query("SELECT pg_advisory_xact_lock(18765,8)");
+    await acquirePostgresLock(tx, "accounting");
     const row = input.previousObservation
       ? null
       : (

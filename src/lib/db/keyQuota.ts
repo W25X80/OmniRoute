@@ -17,6 +17,7 @@ import { aggregateLedgerThisMonth } from "./costLedger";
 import { toNumber } from "@/shared/utils/numeric";
 import { getSelectedPostgresDatabase } from "./controlPlaneContext";
 import type { PostgresDatabase, PostgresTransaction } from "./postgres/database";
+import { acquirePostgresLock } from "./postgres/locks";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -328,7 +329,7 @@ export async function upsertKeyQuotaLimitsAsync(
   };
   if (!apiKeyId) return empty;
   return database.transaction(async (tx) => {
-    await tx.query("SELECT pg_advisory_xact_lock(18765,9)");
+    await acquirePostgresLock(tx, "quota");
     const row = (
       await tx.query("SELECT * FROM omniroute.api_key_quota_limits WHERE api_key_id=$1", [apiKeyId])
     ).rows[0];
@@ -358,7 +359,7 @@ export async function clearKeyQuotaLimitsAsync(id: string): Promise<void> {
   if (!database) return clearKeyQuotaLimits(id);
   if (!id) return;
   await database.transaction(async (tx) => {
-    await tx.query("SELECT pg_advisory_xact_lock(18765,9)");
+    await acquirePostgresLock(tx, "quota");
     await tx.query("DELETE FROM omniroute.api_key_quota_limits WHERE api_key_id=$1", [id]);
     await tx.query("DELETE FROM omniroute.api_key_quota_counters WHERE api_key_id=$1", [id]);
   });
@@ -415,7 +416,6 @@ async function readNativeKeyQuotaState(
     date = new Date(now);
   const month = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), 1)).toISOString();
   const row = await database.transaction(async (tx) => {
-    await tx.query("SELECT pg_advisory_xact_lock(18765,9)");
     return (
       await tx.query(
         `SELECT q.tpm_limit,q.rpm_limit,q.monthly_amount_usd,

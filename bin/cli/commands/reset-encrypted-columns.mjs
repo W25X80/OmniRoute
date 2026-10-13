@@ -1,6 +1,7 @@
 import { existsSync } from "node:fs";
 import { resolveDataDir } from "../data-dir.mjs";
 import { join } from "node:path";
+import { assertSqliteCliBackend } from "../sqlite.mjs";
 
 const ENCRYPTED_PATTERN = "enc:v1:%";
 const ENCRYPTED_COLUMNS = ["api_key", "access_token", "refresh_token", "id_token"];
@@ -10,6 +11,7 @@ const ENCRYPTED_COLUMNS = ["api_key", "access_token", "refresh_token", "id_token
  * Uses better-sqlite3 directly to avoid TypeScript source dependencies in production builds.
  */
 export async function runResetEncryptedColumns(argv) {
+  assertSqliteCliBackend();
   const dataDir = resolveDataDir();
   const dbPath = join(dataDir, "storage.sqlite");
 

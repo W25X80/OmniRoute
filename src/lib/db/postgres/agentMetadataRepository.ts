@@ -14,6 +14,7 @@ import type {
 import type { PluginMetricRow } from "../pluginMetrics";
 import type { SkillPatch } from "../skills";
 import type { PostgresDatabase, PostgresTransaction } from "./database";
+import { acquirePostgresLock } from "./locks";
 
 function encodeContextToken(token: string): string {
   requireExplicitStorageEncryptionKey();
@@ -75,9 +76,13 @@ function plugin(row: Record<string, unknown>): PluginRow {
 }
 
 export function createPostgresAgentMetadataRepository(database: PostgresDatabase) {
-  function operation<T>(write: boolean, body: (tx: PostgresTransaction) => Promise<T>) {
+  function operation<T>(
+    write: boolean,
+    body: (tx: PostgresTransaction) => Promise<T>,
+    owner: "agentMetadata" | "skills" = "agentMetadata"
+  ) {
     return database.transaction(async (tx) => {
-      await tx.query(`SELECT pg_advisory_xact_lock${write ? "" : "_shared"}(18765,12)`);
+      await acquirePostgresLock(tx, owner, write ? "exclusive" : "shared");
       return body(tx);
     });
   }
@@ -454,28 +459,34 @@ export function createPostgresAgentMetadataRepository(database: PostgresDatabase
           ).rowCount ?? 0
       ),
     updateSkill: (id: string, patch: SkillPatch) =>
-      operation(true, async (tx) => {
-        const values: unknown[] = [id],
-          sets: string[] = [];
-        let timestampProvided = false;
-        for (const [field, value] of Object.entries(patch)) {
-          if (!["enabled", "mode", "updated_at"].includes(field)) continue;
-          if (field === "updated_at") {
-            timestampProvided = true;
-            continue;
+      operation(
+        true,
+        async (tx) => {
+          const values: unknown[] = [id],
+            sets: string[] = [];
+          let timestampProvided = false;
+          for (const [field, value] of Object.entries(patch)) {
+            if (!["enabled", "mode", "updated_at"].includes(field)) continue;
+            if (field === "updated_at") {
+              timestampProvided = true;
+              continue;
+            }
+            values.push(
+              field === "enabled" && typeof value === "boolean" ? (value ? 1 : 0) : value
+            );
+            sets.push(`${field}=$${values.length}`);
           }
-          values.push(field === "enabled" && typeof value === "boolean" ? (value ? 1 : 0) : value);
-          sets.push(`${field}=$${values.length}`);
-        }
-        if (!sets.length && !timestampProvided) return 0;
-        sets.push(
-          "updated_at=to_char(CURRENT_TIMESTAMP AT TIME ZONE 'UTC','YYYY-MM-DD HH24:MI:SS')"
-        );
-        return (
-          (await tx.query(`UPDATE omniroute.skills SET ${sets.join(",")} WHERE id=$1`, values))
-            .rowCount ?? 0
-        );
-      }),
+          if (!sets.length && !timestampProvided) return 0;
+          sets.push(
+            "updated_at=to_char(CURRENT_TIMESTAMP AT TIME ZONE 'UTC','YYYY-MM-DD HH24:MI:SS')"
+          );
+          return (
+            (await tx.query(`UPDATE omniroute.skills SET ${sets.join(",")} WHERE id=$1`, values))
+              .rowCount ?? 0
+          );
+        },
+        "skills"
+      ),
   };
   return repository;
 }

@@ -1,5 +1,6 @@
 import { getSelectedPostgresDatabase } from "./controlPlaneContext";
 import { getDbInstance } from "./core";
+import { acquirePostgresLock } from "./postgres/locks";
 
 type DbInstance = ReturnType<typeof getDbInstance>;
 
@@ -53,7 +54,7 @@ export async function resetEncryptedColumnsAsync({
   const database = getSelectedPostgresDatabase();
   if (!database) return resetEncryptedColumns({ dryRun });
   return database.transaction(async (transaction) => {
-    await transaction.query("SELECT pg_advisory_xact_lock(18765, 4)");
+    await acquirePostgresLock(transaction, "providers");
     const count = await transaction.query<{ count: string }>(
       "SELECT COUNT(*)::text AS count FROM omniroute.provider_connections WHERE " +
         buildWhereClause()

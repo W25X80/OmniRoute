@@ -10,6 +10,7 @@ import {
   getReasoningTokens,
 } from "@/lib/usage/tokenAccounting";
 import { MAX_PROVIDER_SPECIFIC_TIMEOUT_MS } from "@/shared/validation/providerSpecificData";
+import { runPersistenceAttempt } from "@/lib/db/persistenceRuntime";
 
 export function createBodyTimeoutError(timeoutMs: number): Error {
   const err = new Error(`Response body read timeout after ${timeoutMs}ms`);
@@ -266,8 +267,8 @@ export async function executeWithUpstreamStartTimeout<T>({
   execute: (signal: AbortSignal) => Promise<T>;
 }): Promise<T> {
   const timeoutMs = getExecutorTimeoutMs(executor, provider, model, connectionTimeoutMs);
-  if (timeoutMs <= 0) return execute(signal);
   if (signal.aborted) throw createAbortError(signal);
+  if (timeoutMs <= 0) return execute(signal);
 
   const timeoutController = new AbortController();
   const combinedController = new AbortController();
@@ -315,7 +316,20 @@ export async function executeWithUpstreamStartTimeout<T>({
   let keepClientAbortLink = false;
   try {
     const result = await Promise.race([
-      execute(combinedController.signal),
+      runPersistenceAttempt(
+        async () => {
+          if (combinedController.signal.aborted) throw createAbortError(combinedController.signal);
+          const result = await execute(combinedController.signal);
+          if (combinedController.signal.aborted && settledResultHasLiveBody(result)) {
+            const response = isResponseLike(result)
+              ? result
+              : (result as { response: Response }).response;
+            await (response as Response).body?.cancel();
+          }
+          return result;
+        },
+        { independent: true }
+      ),
       timeoutPromise,
       abortPromise,
     ]);

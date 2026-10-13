@@ -13,6 +13,7 @@ import { getClaudeCodeVersion, fetchClaudeBootstrap } from "../../executors/clau
 import { isClaudeOauthUsageCoolingDown, markClaudeOauthUsage429 } from "../claudeUsageCooldown.ts";
 import { toRecord } from "./scalars.ts";
 import { normalizeClaudeUsageQuotas } from "./claudeQuota.ts";
+import { withOperationDeadline } from "../../utils/operationDeadline.ts";
 
 // Claude API config
 const CLAUDE_CONFIG = {
@@ -41,41 +42,56 @@ export function getClaudePlanLabel(...candidates: Array<string | null | undefine
 /**
  * Claude Usage - Try to fetch from Anthropic API
  */
+const pendingUsage = new Map<
+  string,
+  Promise<Awaited<ReturnType<typeof fetchClaudeUsage>> | { message: string; bootstrap: null }>
+>();
+
 export async function getClaudeUsage(accessToken?: string) {
   if (!accessToken) {
     return { message: "Claude connected. Access token not available.", bootstrap: null };
   }
+  const existing = pendingUsage.get(accessToken);
+  if (existing) return existing;
+  const work = withOperationDeadline(10_000, (signal) =>
+    fetchClaudeUsage(accessToken, signal)
+  ).catch(() => ({
+    message: "Claude connected. Usage operation deadline exceeded.",
+    bootstrap: null,
+  }));
+  pendingUsage.set(accessToken, work);
+  try {
+    return await work;
+  } finally {
+    if (pendingUsage.get(accessToken) === work) pendingUsage.delete(accessToken);
+  }
+}
 
+async function fetchClaudeUsage(accessToken: string, signal: AbortSignal) {
   // Refresh bootstrap in parallel; best-effort, failure non-fatal.
-  const bootstrapPromise = fetchClaudeBootstrap(accessToken).catch(() => null);
+  const bootstrapPromise = fetchClaudeBootstrap(accessToken, signal).catch(() => null);
   // Skip OAuth usage call while this token is cooling down from a recent 429
   // (chat with the same token still works — only the quota endpoint is throttled).
   if (isClaudeOauthUsageCoolingDown(accessToken)) {
-    const legacy = await getClaudeUsageLegacy(accessToken);
+    const legacy = await getClaudeUsageLegacy(accessToken, signal);
     return { ...legacy, bootstrap: await bootstrapPromise };
   }
   try {
     // Real CLI uses axios here, not Stainless — UA is `claude-code/<version>`
     // (not `claude-cli/...`) and the shape is simpler than /v1/messages.
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 10_000);
-    let oauthResponse;
-    try {
-      oauthResponse = await fetch(CLAUDE_CONFIG.oauthUsageUrl, {
-        method: "GET",
-        headers: {
-          Accept: "application/json, text/plain, */*",
-          "Accept-Encoding": "gzip, compress, deflate, br",
-          Authorization: `Bearer ${accessToken}`,
-          "Content-Type": "application/json",
-          "User-Agent": `claude-code/${getClaudeCodeVersion()}`,
-          "anthropic-beta": "oauth-2025-04-20",
-        },
-        signal: ctrl.signal,
-      });
-    } finally {
-      clearTimeout(timer);
-    }
+    signal.throwIfAborted();
+    const oauthResponse = await fetch(CLAUDE_CONFIG.oauthUsageUrl, {
+      method: "GET",
+      headers: {
+        Accept: "application/json, text/plain, */*",
+        "Accept-Encoding": "gzip, compress, deflate, br",
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+        "User-Agent": `claude-code/${getClaudeCodeVersion()}`,
+        "anthropic-beta": "oauth-2025-04-20",
+      },
+      signal,
+    });
 
     if (oauthResponse.ok) {
       const data = toRecord(await oauthResponse.json());
@@ -101,14 +117,24 @@ export async function getClaudeUsage(accessToken?: string) {
 
     // Cool down OAuth usage polling after a 429 (quota endpoint only — chat is unaffected).
     if (oauthResponse.status === 429) {
-      markClaudeOauthUsage429(accessToken);
+      const retryAfter = oauthResponse.headers.get("retry-after");
+      const seconds = retryAfter === null ? NaN : Number(retryAfter);
+      const milliseconds = Number.isFinite(seconds)
+        ? seconds * 1000
+        : Date.parse(retryAfter ?? "") - Date.now();
+      markClaudeOauthUsage429(
+        accessToken,
+        Date.now(),
+        Number.isFinite(milliseconds) && milliseconds > 0 ? milliseconds : undefined
+      );
     }
 
     // Fallback: OAuth endpoint returned non-OK, try legacy settings/org endpoint
     console.warn(
       `[Claude Usage] OAuth endpoint returned ${oauthResponse.status}, falling back to legacy`
     );
-    const legacy = await getClaudeUsageLegacy(accessToken);
+    await oauthResponse.body?.cancel();
+    const legacy = await getClaudeUsageLegacy(accessToken, signal);
     return { ...legacy, bootstrap: await bootstrapPromise };
   } catch (error) {
     return {
@@ -122,10 +148,12 @@ export async function getClaudeUsage(accessToken?: string) {
  * Legacy Claude usage fetcher for API key / org admin users.
  * Uses /v1/settings + /v1/organizations/{org_id}/usage endpoints.
  */
-async function getClaudeUsageLegacy(accessToken?: string) {
+async function getClaudeUsageLegacy(accessToken: string, signal: AbortSignal) {
   try {
+    signal.throwIfAborted();
     const settingsResponse = await fetch(CLAUDE_CONFIG.settingsUrl, {
       method: "GET",
+      signal,
       headers: {
         Authorization: `Bearer ${accessToken}`,
         "anthropic-version": CLAUDE_CONFIG.apiVersion,
@@ -138,10 +166,12 @@ async function getClaudeUsageLegacy(accessToken?: string) {
       const organizationId =
         typeof settings.organization_id === "string" ? settings.organization_id : "";
       if (organizationId) {
+        signal.throwIfAborted();
         const usageResponse = await fetch(
           CLAUDE_CONFIG.usageUrl.replace("{org_id}", organizationId),
           {
             method: "GET",
+            signal,
             headers: {
               Authorization: `Bearer ${accessToken}`,
               "anthropic-version": CLAUDE_CONFIG.apiVersion,
@@ -157,6 +187,7 @@ async function getClaudeUsageLegacy(accessToken?: string) {
             quotas: usage,
           };
         }
+        await usageResponse.body?.cancel();
       }
 
       return {
@@ -166,6 +197,7 @@ async function getClaudeUsageLegacy(accessToken?: string) {
       };
     }
 
+    await settingsResponse.body?.cancel();
     return { message: "Claude connected. Usage API requires admin permissions." };
   } catch (error) {
     return { message: `Claude connected. Unable to fetch usage: ${(error as Error).message}` };

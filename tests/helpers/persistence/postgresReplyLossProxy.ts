@@ -6,6 +6,8 @@ export interface PostgresReplyLossProxyOptions {
   certificate: string;
   key: string;
   dropCommit?: number;
+  /** Arm only the transaction whose SQL contains this test-owned semantic marker. */
+  dropCommitAfterQuery?: string;
 }
 
 /**
@@ -20,7 +22,8 @@ export async function createPostgresReplyLossProxy(options: PostgresReplyLossPro
     options.upstreamPort < 1 ||
     options.upstreamPort > 65_535 ||
     !Number.isInteger(dropCommit) ||
-    dropCommit < 1
+    dropCommit < 1 ||
+    (options.dropCommitAfterQuery !== undefined && !options.dropCommitAfterQuery.trim())
   ) {
     throw new Error("Invalid PostgreSQL reply-loss proxy options");
   }
@@ -37,6 +40,9 @@ export async function createPostgresReplyLossProxy(options: PostgresReplyLossPro
     let request = Buffer.alloc(0);
     let frames = Buffer.alloc(0);
     let backpressured = false;
+    let frontend = Buffer.alloc(0);
+    let startupPending = true;
+    let markedTransaction = false;
 
     function disconnect() {
       if (disconnected) return;
@@ -69,12 +75,17 @@ export async function createPostgresReplyLossProxy(options: PostgresReplyLossPro
         frames = frames.subarray(frameLength);
         if (frame[0] === 67 && frame.subarray(5).equals(commitTag)) {
           commits++;
-          if (!dropped && commits === dropCommit) {
+          if (
+            !dropped &&
+            (options.dropCommitAfterQuery ? markedTransaction : commits === dropCommit)
+          ) {
             dropped = true;
             disconnect();
             return;
           }
         }
+        if (frame[0] === 67 && frame.subarray(5).equals(Buffer.from("ROLLBACK\0")))
+          markedTransaction = false;
         if (!secureClient.write(frame)) {
           backpressured = true;
           upstream.pause();
@@ -85,6 +96,36 @@ export async function createPostgresReplyLossProxy(options: PostgresReplyLossPro
           });
           return;
         }
+      }
+    }
+
+    function observeFrontend(chunk: Buffer) {
+      // Observation never replaces, delays or modifies the bytes sent upstream.
+      // StartupMessage has no type byte; later Parse/Query messages contain SQL.
+      frontend = Buffer.concat([frontend, chunk]);
+      while (frontend.length >= (startupPending ? 4 : 5)) {
+        const payloadLength = frontend.readInt32BE(startupPending ? 0 : 1);
+        if (payloadLength < 4) {
+          disconnect();
+          return;
+        }
+        const length = payloadLength + (startupPending ? 0 : 1);
+        if (frontend.length < length) return;
+        const frame = frontend.subarray(0, length);
+        frontend = frontend.subarray(length);
+        if (startupPending) {
+          startupPending = false;
+          continue;
+        }
+        // P = Parse(statement-name\0, SQL\0, parameter-types); Q = simple Query(SQL\0).
+        const start = frame[0] === 80 ? frame.indexOf(0, 5) + 1 : frame[0] === 81 ? 5 : -1;
+        if (start < 5) continue;
+        const end = frame.indexOf(0, start);
+        if (
+          end >= start &&
+          frame.toString("utf8", start, end).includes(options.dropCommitAfterQuery!)
+        )
+          markedTransaction = true;
       }
     }
 
@@ -107,6 +148,7 @@ export async function createPostgresReplyLossProxy(options: PostgresReplyLossPro
       upstream = createConnection({ host: "127.0.0.1", port: options.upstreamPort });
       own(upstream);
       // TLS decryption yields the StartupMessage; the direct upstream sees no SSLRequest.
+      if (options.dropCommitAfterQuery) secureClient.on("data", observeFrontend);
       secureClient.pipe(upstream);
       upstream.on("data", (data: Buffer) => {
         frames = Buffer.concat([frames, data]);

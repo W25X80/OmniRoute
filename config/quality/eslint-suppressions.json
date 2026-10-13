@@ -1241,11 +1241,6 @@
       "count": 1
     }
   },
-  "src/lib/db/files.ts": {
-    "@typescript-eslint/no-unused-vars": {
-      "count": 1
-    }
-  },
   "src/lib/db/healthCheck.ts": {
     "@typescript-eslint/no-unused-vars": {
       "count": 2

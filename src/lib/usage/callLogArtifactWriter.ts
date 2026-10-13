@@ -334,17 +334,7 @@ function writeNativeArtifact(
   if (!options?.onPrepared) {
     return Promise.reject(new Error("Native call-log artifact preparation is required"));
   }
-  const serialized = new Promise<Uint8Array>((resolve, reject) => {
-    queue.push({
-      id: nextId++,
-      kind: "serialize",
-      artifact,
-      environment: environmentSnapshot(),
-      resolve,
-      reject,
-    });
-    pump();
-  });
+  const serialized = serializeCallArtifactAsync(artifact);
   const operation = serialized.then(async (value) => {
     const { writeCallArtifactToNativeStore } = await import("./callLogArtifacts.ts");
     return writeCallArtifactToNativeStore(value, options);
@@ -357,6 +347,24 @@ function writeNativeArtifact(
     )
     .then(notifyCloseWaiters);
   return operation;
+}
+
+/** Serialize for durable intent admission without starting external object I/O. */
+export function serializeCallArtifactAsync(artifact: CallLogArtifact): Promise<Uint8Array> {
+  getPersistenceArtifactStore();
+  if (closing || queue.length >= MAX_QUEUED_JOBS)
+    return Promise.reject(new CallLogArtifactSerializationError());
+  return new Promise<Uint8Array>((resolve, reject) => {
+    queue.push({
+      id: nextId++,
+      kind: "serialize",
+      artifact,
+      environment: environmentSnapshot(),
+      resolve,
+      reject,
+    });
+    pump();
+  });
 }
 
 /** Same bounded CPU actor as writes; failed workers never parse on the serving thread. */

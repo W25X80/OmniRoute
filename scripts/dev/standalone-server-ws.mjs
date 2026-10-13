@@ -12,7 +12,7 @@ import { maybeHandleWebdav, WEBDAV_PREFIX } from "./webdav-handler.mjs";
 import methodGuard from "./http-method-guard.cjs";
 import headResponseGuard from "./head-response-guard.cjs";
 import { resolveTlsOptions, createServerListener } from "./tls-options.mjs";
-import { getMainServerTimeoutConfig } from "./main-server-timeouts.mjs";
+import { getMainServerTimeoutConfig, getShutdownBudgetConfig } from "./main-server-timeouts.mjs";
 import { createSystemdNotifier } from "./systemd-notify.mjs";
 import { installProcessCrashGuard } from "./httpClientAbortGuard.mjs";
 
@@ -60,10 +60,8 @@ globalThis.__omnirouteCustomServerOwnsShutdown = true;
 
 // Bounded: gracefulShutdown waits up to SHUTDOWN_TIMEOUT_MS for in-flight requests, then cleans
 // up; the margin covers the flush/checkpoint work.
-const SHUTDOWN_CLEANUP_MARGIN_MS = 5000;
 function resolveForceExitMs() {
-  const drainMs = Number.parseInt(process.env.SHUTDOWN_TIMEOUT_MS || "30000", 10);
-  return (Number.isFinite(drainMs) && drainMs >= 0 ? drainMs : 30000) + SHUTDOWN_CLEANUP_MARGIN_MS;
+  return getShutdownBudgetConfig().forceExitMs;
 }
 
 let shutdownStarted = false;
@@ -75,10 +73,11 @@ async function shutdown(signal) {
   const forceExitMs = resolveForceExitMs();
   const forceExitTimer = setTimeout(() => {
     console.warn(`[Shutdown] Cleanup still running after ${forceExitMs}ms; forcing exit.`);
-    process.exit(0);
+    process.exit(1);
   }, forceExitMs);
   forceExitTimer.unref?.();
   systemdNotifier.stopping();
+  let exitCode = 0;
   try {
     // Stop accepting connections; in-flight requests keep running until the drain below.
     for (const server of createdServers) {
@@ -86,17 +85,19 @@ async function shutdown(signal) {
       server.closeIdleConnections?.();
     }
   } catch (error) {
+    exitCode = 1;
     console.error("[Shutdown] Closing HTTP servers failed:", error?.message ?? error);
   }
   try {
     // Undefined when instrumentation never got that far (signal during boot): just exit.
     await globalThis.__omnirouteRequestShutdown?.(signal);
   } catch (error) {
+    exitCode = 1;
     console.error("[Shutdown] Cleanup failed during", signal, error?.message ?? error);
   } finally {
     clearTimeout(forceExitTimer);
     // One macrotask before exit (#13306: let sql.js/libuv teardown settle on Windows).
-    setTimeout(() => process.exit(0), 0);
+    setTimeout(() => process.exit(exitCode), 0);
   }
 }
 

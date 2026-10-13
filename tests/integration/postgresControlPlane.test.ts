@@ -335,7 +335,9 @@ test(
             upstreamPort: options.connection.port!,
             certificate: await readFile(process.env.OMNIROUTE_TEST_POSTGRES_CA!, "utf8"),
             key: await readFile(process.env.OMNIROUTE_TEST_POSTGRES_KEY!, "utf8"),
-            dropCommit: 2,
+            // Target the secret owner, independent of migration/initialization transactions.
+            dropCommitAfterQuery:
+              "INSERT INTO omniroute.key_value(namespace, key, value) VALUES ('secrets',",
           });
           try {
             await assert.rejects(

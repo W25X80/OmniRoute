@@ -1,6 +1,7 @@
 import type { EmbeddingResolution } from "@/lib/memory/embedding/types";
 import type { VectorStore, VectorSearchHit, HybridRrfHit } from "@/lib/memory/vectorStore";
 import type { PostgresDatabase, PostgresTransaction } from "./database";
+import { acquirePostgresLock } from "./locks";
 
 const MAX_DIMENSION = 65536;
 
@@ -19,7 +20,7 @@ function checkedLimit(limit: number): number {
 }
 
 async function lock(transaction: PostgresTransaction, shared = false): Promise<void> {
-  await transaction.query(`SELECT pg_advisory_xact_lock${shared ? "_shared" : ""}(18765, 9)`);
+  await acquirePostgresLock(transaction, "memory", shared ? "shared" : "exclusive");
 }
 
 interface MetadataRow {

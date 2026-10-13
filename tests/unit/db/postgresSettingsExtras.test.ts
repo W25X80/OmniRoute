@@ -73,7 +73,8 @@ test("KV absent-row mutation uses one leased transaction, lock 20 and parameteri
     false
   );
   assert.equal(f.calls[0].text, "BEGIN");
-  assert.equal(f.calls[1].text, "SELECT pg_advisory_xact_lock(18765, 20)");
+  assert.equal(f.calls[1].text, "SELECT pg_advisory_xact_lock(18765,$1)");
+  assert.deepEqual(f.calls[1].values, [20]);
   assert.deepEqual(f.calls[2].values, [namespace, key]);
   assert.deepEqual(f.calls[3].values, [namespace, key, value]);
   assert.deepEqual(f.calls[4].values, [namespace, key]);

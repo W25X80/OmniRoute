@@ -77,6 +77,17 @@ test("native ready scope can import two cold core copies without application syn
   assert.deepEqual((await run("native-configured")).operations, []);
 });
 
+test("an unset backend follows native cold-import and missing-scratch refusal", async () => {
+  assert.deepEqual((await run("native-default-configured")).operations, []);
+  assert.deepEqual((await run("native-default-missing")).operations, []);
+  assert.deepEqual((await run("native-default-blank")).operations, []);
+  assert.deepEqual((await run("native-default-no-config")).operations, []);
+});
+
+test("default PostgreSQL build imports use only explicit scratch without starting SQL or PostgreSQL", async () => {
+  assert.deepEqual((await run("native-default-build")).operations, []);
+});
+
 test("native configured scratch preserves literal tilde and relative path normalization", async () => {
   assert.deepEqual((await run("native-configured", " ~/scratch ")).operations, []);
 });
@@ -91,7 +102,7 @@ test("native SQLite migration carrier is resolved once only when its explicit ow
   assert.ok(result.operations.some((entry) => entry.method === "readdirSync"));
 });
 
-test("default SQLite keeps its eager directory creation policy", async () => {
+test("explicit SQLite keeps its eager directory creation policy", async () => {
   const result = await run("sqlite-configured");
   assert.ok(result.operations.some((entry) => entry.method === "mkdirSync"));
 });
@@ -101,6 +112,6 @@ test("operation-scoped native factory under envsqlite retains default module ini
   assert.ok(result.operations.some((entry) => entry.method === "mkdirSync"));
 });
 
-test("default SQLite keeps the migration directory snapshot from module evaluation", async () => {
+test("explicit SQLite keeps the migration directory snapshot from module evaluation", async () => {
   await run("sqlite-migration-snapshot");
 });

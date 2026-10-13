@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { z } from "zod";
 import type { SqliteAdapter } from "../adapters/types";
 import type { PostgresDatabase } from "./database";
+import { acquirePostgresLock } from "./locks";
 
 // This manifest is the declared routing slice, not a complete OmniRoute backup.
 const tables = {
@@ -194,7 +195,7 @@ export async function importRoutingSnapshot(
   const sourceDigest = digest(snapshot);
   const rowCount = tableNames.reduce((sum, name) => sum + snapshot.tables[name].length, 0);
   return database.transaction(async (transaction) => {
-    await transaction.query("SELECT pg_advisory_xact_lock(18765, 2)");
+    await acquirePostgresLock(transaction, "routing");
     const { rows: previous } = await transaction.query<{ digest: string; row_count: number }>(
       "SELECT digest,row_count FROM omniroute.routing_imports"
     );

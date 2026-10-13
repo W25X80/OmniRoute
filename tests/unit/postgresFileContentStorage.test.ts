@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
 import test from "node:test";
-import type { PostgresResult, PostgresTransaction } from "../../src/lib/db/postgres/database";
+import type {
+  PostgresDatabase,
+  PostgresResult,
+  PostgresTransaction,
+} from "../../src/lib/db/postgres/database";
 import { PostgresError } from "../../src/lib/db/postgres/database";
 import {
   NATIVE_BLOB_LIMITS,
@@ -44,7 +48,10 @@ function controlled(handle: (call: Call) => Reply | Promise<Reply>) {
       };
     },
   };
-  return { transaction, calls };
+  const database = {
+    transaction: <T>(body: (tx: PostgresTransaction) => Promise<T>) => body(transaction),
+  } as unknown as PostgresDatabase;
+  return { transaction, database, calls };
 }
 function reader(
   bytes: Buffer,
@@ -113,7 +120,7 @@ test("mapped binary content is exact and admission precedes bytes reads", async 
   const input = Buffer.from([0, 255, 93, 1]);
   const f = reader(input);
   let reserved = -1;
-  const out = await getFileContent(f.transaction, "file-id", (size) => {
+  const out = await getFileContent(f.database, "file-id", (size) => {
     reserved = size;
     assert.equal(
       f.calls.some((c) => c.text.includes("encode(content")),
@@ -129,7 +136,7 @@ test("rejected synchronous admission performs no content read", async () => {
   const f = reader(Buffer.from([1]));
   const denied = new Error("admission");
   await assert.rejects(
-    getFileContent(f.transaction, "file-id", () => {
+    getFileContent(f.database, "file-id", () => {
       throw denied;
     }),
     (e) => e === denied
@@ -141,20 +148,20 @@ test("rejected synchronous admission performs no content read", async () => {
 });
 test("NULL, empty, missing and legacy binary preserve distinct logical values", async () => {
   const empty = reader(Buffer.alloc(0));
-  assert.deepEqual(await getFileContent(empty.transaction, "file-id"), Buffer.alloc(0));
+  assert.deepEqual(await getFileContent(empty.database, "file-id"), Buffer.alloc(0));
   const nil = reader(Buffer.alloc(0), { mapped: false, header: { inline_length: null } });
-  assert.equal(await getFileContent(nil.transaction, "file-id"), null);
+  assert.equal(await getFileContent(nil.database, "file-id"), null);
   const missing = reader(Buffer.alloc(0), { missing: true });
-  assert.equal(await getFileContent(missing.transaction, "file-id"), null);
+  assert.equal(await getFileContent(missing.database, "file-id"), null);
   const legacy = reader(Buffer.from([2, 0, 255]), { mapped: false });
-  assert.deepEqual(await getFileContent(legacy.transaction, "file-id"), Buffer.from([2, 0, 255]));
+  assert.deepEqual(await getFileContent(legacy.database, "file-id"), Buffer.from([2, 0, 255]));
 });
 test("mapped and legacy SQL emits canonical base64 across padding and line boundaries", async () => {
   for (const mapped of [true, false]) {
     for (const length of [1, 2, 3, 56, 57, 58]) {
       const bytes = Buffer.alloc(length, 253);
       const f = reader(bytes, { mapped });
-      assert.deepEqual(await getFileContent(f.transaction, "file-id"), bytes);
+      assert.deepEqual(await getFileContent(f.database, "file-id"), bytes);
       const query = f.calls.find((call) => call.text.includes(" AS content"));
       assert.ok(query);
       assert.ok(query.text.includes("replace(encode("));
@@ -169,7 +176,7 @@ test("rejects PostgreSQL line-wrapped base64 instead of normalizing it on the ow
   assert.deepEqual(Buffer.from(wrapped, "base64"), bytes);
   for (const mapped of [true, false]) {
     const f = reader(bytes, { mapped, chunk: { content: wrapped } });
-    await assert.rejects(getFileContent(f.transaction, "file-id"));
+    await assert.rejects(getFileContent(f.database, "file-id"));
   }
 });
 test("rejects same-length base64 linefeed that a permissive decoder silently ignores", async () => {
@@ -179,7 +186,7 @@ test("rejects same-length base64 linefeed that a permissive decoder silently ign
   assert.deepEqual(Buffer.from(value, "base64"), bytes);
   for (const mapped of [true, false]) {
     const f = reader(bytes, { mapped, chunk: { content: value } });
-    await assert.rejects(getFileContent(f.transaction, "file-id"));
+    await assert.rejects(getFileContent(f.database, "file-id"));
   }
 });
 test("maintenance includes deleted content and uses captured file ID", async () => {
@@ -201,7 +208,7 @@ for (const [name, header] of Object.entries({
     const f = reader(Buffer.alloc(4), { header });
     let admitted = false;
     await assert.rejects(
-      getFileContent(f.transaction, "file-id", () => {
+      getFileContent(f.database, "file-id", () => {
         admitted = true;
       })
     );
@@ -219,7 +226,7 @@ for (const [name, stats] of Object.entries({
     const f = reader(Buffer.alloc(4), { stats });
     let admitted = false;
     await assert.rejects(
-      getFileContent(f.transaction, "file-id", () => {
+      getFileContent(f.database, "file-id", () => {
         admitted = true;
       })
     );
@@ -245,7 +252,7 @@ for (const [name, chunk] of Object.entries({
 })) {
   test(`rejects invalid chunk ${name}`, async () => {
     const f = reader(Buffer.alloc(4), { chunk });
-    await assert.rejects(getFileContent(f.transaction, "file-id"));
+    await assert.rejects(getFileContent(f.database, "file-id"));
   });
 }
 for (const [name, chunkRows] of Object.entries({
@@ -254,7 +261,7 @@ for (const [name, chunkRows] of Object.entries({
 })) {
   test(`rejects ${name} physical bytes row`, async () => {
     const f = reader(Buffer.alloc(4), { chunkRows });
-    await assert.rejects(getFileContent(f.transaction, "file-id"));
+    await assert.rejects(getFileContent(f.database, "file-id"));
   });
 }
 test("whole checksum is verified before final chunk is returned", async () => {
@@ -267,7 +274,7 @@ test("multi-chunk read is sequential and exact across a nonzero offset", async (
   const bytes = Buffer.alloc(NATIVE_BLOB_LIMITS.chunkBytes + 113, 253);
   bytes[NATIVE_BLOB_LIMITS.chunkBytes] = 17;
   const f = reader(bytes);
-  assert.deepEqual(await getFileContent(f.transaction, "file-id"), bytes);
+  assert.deepEqual(await getFileContent(f.database, "file-id"), bytes);
   const again = reader(bytes);
   const stored = await openStoredFileContent(again.transaction, "file-id");
   assert.ok(stored);
@@ -368,7 +375,7 @@ test("metadata bytes stay literal and no whole file Buffer is sent in metadata I
   const f = controlled(({ text, values }) =>
     text.includes("FOR UPDATE") ? { rows: [{ id: values[0] }] } : { rowCount: 1 }
   );
-  const file = await createFile(f.transaction, {
+  const file = await createFile(f.database, {
     bytes: 0,
     filename: "source",
     purpose: "batch",
@@ -392,7 +399,7 @@ test("oversize writer rejects before any query without allocating max input", as
   const f = controlled(() => ({ rowCount: 1 }));
   await assert.rejects(replaceStoredFileContent(f.transaction, "file-id", bytes));
   await assert.rejects(
-    createFile(f.transaction, { bytes: 0, filename: "source", purpose: "batch", content: bytes })
+    createFile(f.database, { bytes: 0, filename: "source", purpose: "batch", content: bytes })
   );
   assert.equal(f.calls.length, 0);
 });

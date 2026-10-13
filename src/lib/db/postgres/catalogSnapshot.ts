@@ -6,6 +6,7 @@ import {
 import { invalidateModelCatalogCache } from "../readCache";
 import type { PostgresDatabase, PostgresTransaction, PostgresResult } from "./database";
 import { advanceApiKeyPolicyEpoch, lockApiKeyPolicy } from "./apiKeyPolicyState";
+import { acquirePostgresLock } from "./locks";
 
 export type CatalogRow = Record<string, unknown>;
 export interface CatalogValueRow {
@@ -244,12 +245,12 @@ export async function mutatePostgresCatalog<T>(
   }
   const parent = snapshots.getStore();
   const receipt = await database.transaction(async (transaction) => {
-    if (options.routing) await transaction.query("SELECT pg_advisory_xact_lock(18765,2)");
+    if (options.routing) await acquirePostgresLock(transaction, "routing");
     if (options.validation || options.providers)
-      await transaction.query("SELECT pg_advisory_xact_lock(18765,4)");
-    if (options.validation) await transaction.query("SELECT pg_advisory_xact_lock(18765,7)");
-    await transaction.query("SELECT pg_advisory_xact_lock(18765,18)");
-    await transaction.query("SELECT pg_advisory_xact_lock(18765,20)");
+      await acquirePostgresLock(transaction, "providers");
+    if (options.validation) await acquirePostgresLock(transaction, "validation");
+    await acquirePostgresLock(transaction, "catalog");
+    await acquirePostgresLock(transaction, "catalogKeyValue");
     await lockApiKeyPolicy(transaction);
     const current: MutationScope = {
       database,

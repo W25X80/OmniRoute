@@ -25,6 +25,9 @@ import { POSTGRES_FILE_CONTENT_SCHEMA_STATEMENTS } from "./fileContentSchema";
 import { POSTGRES_SPEND_RECEIPT_SCHEMA_STATEMENTS } from "./spendReceipts";
 import { POSTGRES_IMPORT_COMPAT_SCHEMA_STATEMENTS } from "./applicationImportSchema";
 import { POSTGRES_CONFIG_AUDIT_INDEX_STATEMENTS } from "./configAuditSchema";
+import { POSTGRES_RETENTION_SCHEMA_STATEMENTS } from "./retentionSchema";
+import { POSTGRES_ARTIFACT_RECOVERY_SCHEMA_STATEMENTS } from "./artifactRecoverySchema";
+import { acquirePostgresLock } from "./locks";
 
 interface Migration {
   version: number;
@@ -139,6 +142,16 @@ const migrations: readonly Migration[] = [
       "ALTER TABLE omniroute.compression_engine_breakdown ALTER COLUMN duration_ms TYPE double precision USING duration_ms::double precision",
     ],
   },
+  {
+    version: 7,
+    name: "indexed_conversation_retention",
+    statements: POSTGRES_RETENTION_SCHEMA_STATEMENTS,
+  },
+  {
+    version: 8,
+    name: "durable_artifact_recovery",
+    statements: POSTGRES_ARTIFACT_RECOVERY_SCHEMA_STATEMENTS,
+  },
 ];
 
 function checksum(migration: Migration): string {
@@ -158,8 +171,7 @@ export class PostgresMigrationError extends Error {
 
 async function applyMigrations(transaction: PostgresTransaction): Promise<void> {
   // Bootstrap and history validation share a transaction lock across all application instances.
-  // Lock namespaces: migrations1, routing2, settings3, providers4, key policy5, secrets6.
-  await transaction.query("SELECT pg_advisory_xact_lock(18765, 1)");
+  await acquirePostgresLock(transaction, "schema");
   await transaction.query("CREATE SCHEMA IF NOT EXISTS omniroute");
   await transaction.query(`CREATE TABLE IF NOT EXISTS omniroute.schema_migrations (
     version integer PRIMARY KEY, name text NOT NULL, checksum text NOT NULL,
@@ -191,5 +203,5 @@ async function applyMigrations(transaction: PostgresTransaction): Promise<void> 
 
 /** Offline/bootstrap operation. Never runs from a request or mutates SQLite migration history. */
 export function migratePostgresSchema(database: PostgresDatabase): Promise<void> {
-  return database.transaction(applyMigrations);
+  return database.transaction(applyMigrations, { operation: "schema.migrate" });
 }

@@ -1,6 +1,7 @@
 import type { ComboRecord } from "@/domain/persistence/comboRepositories";
 import { normalizeComboRecord } from "@/lib/combos/steps";
 import type { PostgresTransaction } from "./database";
+import { acquirePostgresLock } from "./locks";
 
 export interface ComboRow extends Record<string, unknown> {
   id: string;
@@ -23,11 +24,7 @@ export const COMBO_ORDER_SQL = `sort_order ASC NULLS FIRST, ${asciiFoldSql("name
  * one routing state. Acquire this lock before row locks; transaction end releases it.
  */
 export async function lockRouting(transaction: PostgresTransaction, shared = false): Promise<void> {
-  await transaction.query(
-    shared
-      ? "SELECT pg_advisory_xact_lock_shared(18765, 2)"
-      : "SELECT pg_advisory_xact_lock(18765, 2)"
-  );
+  await acquirePostgresLock(transaction, "routing", shared ? "shared" : "exclusive");
 }
 
 /** Preserve the SQLite JSON parser: empty payload is absent; invalid JSON throws. */

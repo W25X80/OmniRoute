@@ -108,6 +108,25 @@ test("resolveNextBuildEnv forces stable build worker mode unless already provide
   assert.equal(preservedEnv.NODE_ENV, "production");
 });
 
+test("build-only scratch supplies the native default without changing an explicit DATA_DIR", () => {
+  const env = resolveNextBuildEnv({});
+  assert.equal(env.OMNIROUTE_BUILDING, "1");
+  assert.equal(
+    env.OMNIROUTE_DATABASE_BACKEND,
+    undefined,
+    "the build must retain the production backend default"
+  );
+  assert.equal(path.basename(env.DATA_DIR), "scratch");
+  assert.match(
+    path.basename(path.dirname(env.DATA_DIR)),
+    new RegExp(`^omniroute-build-isolated-${process.pid}-`)
+  );
+  assert.equal(env.DATA_DIR, resolveNextBuildEnv({}).DATA_DIR);
+  for (const value of ["", " \t ", "/explicit/scratch", "relative/scratch"]) {
+    assert.equal(resolveNextBuildEnv({ DATA_DIR: value }).DATA_DIR, value);
+  }
+});
+
 // Escalated bug (WhatsApp BR, cmqiuhd7600): a local `npm run build` stalls/OOMs
 // during the webpack production pass ("Compiling instrumentation" bundles the whole
 // server graph). #4076/#4104 raised the heap only in the Docker builder stage; the

@@ -142,7 +142,7 @@ export async function completeBatchWithFilesAsync(
   const database = getSelectedPostgresDatabase();
   if (!database) return completeBatchWithFiles(...args);
   const native = await import("./postgres/serviceBatches");
-  return database.transaction((transaction) => native.completeBatchWithFiles(transaction, ...args));
+  return native.completeBatchWithFiles(database, ...args);
 }
 
 export type BatchItemCheckpointStatus = "pending" | "processing" | "completed" | "errored";

@@ -1,9 +1,11 @@
 import { AsyncResource } from "node:async_hooks";
 
 export function isSqlitePersistenceRequested(env = process.env) {
-  return (
-    env.OMNIROUTE_DATABASE_BACKEND === undefined || env.OMNIROUTE_DATABASE_BACKEND === "sqlite"
-  );
+  const backend = env.OMNIROUTE_DATABASE_BACKEND ?? "postgres";
+  if (backend !== "sqlite" && backend !== "postgres") {
+    throw new Error("OMNIROUTE_DATABASE_BACKEND must be sqlite or postgres");
+  }
+  return backend === "sqlite";
 }
 
 function isPureHealthRequest(req) {

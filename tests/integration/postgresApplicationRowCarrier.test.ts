@@ -78,7 +78,7 @@ test(
         assert.deepEqual(rows, [{ id: "node-1", insertion_order: "-7" }]);
         const next = (
           await tx.query<{ insertion_order: string }>(
-            "INSERT INTO omniroute.conversation_turn_nodes(id,conversation_id,role,first_seen_at,last_seen_at) VALUES('new','c','user','a','b') RETURNING insertion_order"
+            "INSERT INTO omniroute.conversation_turn_nodes(id,conversation_id,role,first_seen_at,last_seen_at) VALUES('new','c','user','2026-10-12','2026-10-12') RETURNING insertion_order"
           )
         ).rows[0];
         assert.equal(next.insertion_order, String(5002 * 3 - 10 + 1));
@@ -119,7 +119,7 @@ test(
       source.exec(`CREATE TABLE key_value(namespace TEXT,key TEXT,value TEXT);
       CREATE TABLE conversation_turn_nodes(id TEXT PRIMARY KEY,conversation_id TEXT NOT NULL,parent_id TEXT,
         role TEXT NOT NULL,content_hash TEXT NOT NULL DEFAULT '',last_correlation_id TEXT,first_seen_at TEXT NOT NULL,last_seen_at TEXT NOT NULL);
-      INSERT INTO conversation_turn_nodes(id,conversation_id,role,first_seen_at,last_seen_at)VALUES('one','c','user','a','b');`);
+      INSERT INTO conversation_turn_nodes(id,conversation_id,role,first_seen_at,last_seen_at)VALUES('one','c','user','2026-10-12','2026-10-12');`);
       source.pragma("query_only=ON");
       const snapshot = captureSqliteApplicationSnapshot(source, {
         rowSink: {

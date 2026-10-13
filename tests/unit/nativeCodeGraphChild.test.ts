@@ -164,7 +164,7 @@ test("actual CJS readonly child preserves all six tool projections and closes wi
   makeDatabase(file);
   const before = hash(file);
   (globalThis as { require?: NodeRequire }).require = require;
-  delete process.env.OMNIROUTE_DATABASE_BACKEND;
+  process.env.OMNIROUTE_DATABASE_BACKEND = "sqlite";
   setCodeGraphPathForTest(file);
   const cases: Array<[string, Record<string, unknown>]> = [
     ["searchCodeGraph", { query: "symbol1" }],

@@ -49,25 +49,21 @@ test(
   options,
   async () => {
     const body = Buffer.from([0, 1, 255, 9]);
-    const owned = await database.transaction((tx) =>
-      files.createFile(tx, {
-        bytes: body.length,
-        filename: "owned.jsonl",
-        purpose: "batch",
-        content: body,
-        apiKeyId: "services-owner",
-      })
-    );
-    const foreign = await database.transaction((tx) =>
-      files.createFile(tx, {
-        bytes: 1,
-        filename: "foreign",
-        purpose: "batch",
-        content: Buffer.from("x"),
-        apiKeyId: "services-foreign",
-      })
-    );
-    assert.deepEqual(await database.transaction((tx) => files.getFileContent(tx, owned.id)), body);
+    const owned = await files.createFile(database, {
+      bytes: body.length,
+      filename: "owned.jsonl",
+      purpose: "batch",
+      content: body,
+      apiKeyId: "services-owner",
+    });
+    const foreign = await files.createFile(database, {
+      bytes: 1,
+      filename: "foreign",
+      purpose: "batch",
+      content: Buffer.from("x"),
+      apiKeyId: "services-foreign",
+    });
+    assert.deepEqual(await files.getFileContent(database, owned.id), body);
     const meta = await database.transaction((tx) => files.getFile(tx, owned.id));
     assert.equal(Object.hasOwn(meta!, "content"), false);
     assert.equal(typeof meta!.bytes, "number");
@@ -82,10 +78,7 @@ test(
       await database.transaction((tx) => files.deleteFileOwnedBy(tx, foreign.id, "services-owner")),
       false
     );
-    assert.deepEqual(
-      await database.transaction((tx) => files.getFileContent(tx, foreign.id)),
-      Buffer.from("x")
-    );
+    assert.deepEqual(await files.getFileContent(database, foreign.id), Buffer.from("x"));
     await assert.rejects(database.transaction((tx) => files.deleteFileOwnedBy(tx, owned.id, "")));
   }
 );
@@ -94,15 +87,13 @@ test(
   "batch cleanup preserves a shared file until every referencing batch is removed",
   options,
   async () => {
-    const file = await database.transaction((tx) =>
-      files.createFile(tx, {
-        bytes: 2,
-        filename: "shared",
-        purpose: "batch",
-        content: Buffer.from("ok"),
-        apiKeyId: "batch-owner",
-      })
-    );
+    const file = await files.createFile(database, {
+      bytes: 2,
+      filename: "shared",
+      purpose: "batch",
+      content: Buffer.from("ok"),
+      apiKeyId: "batch-owner",
+    });
     const complete = await database.transaction((tx) =>
       batches.createBatch(tx, {
         endpoint: "/v1/chat/completions",
@@ -135,12 +126,9 @@ test(
     );
     const removed = await batches.deleteCompletedBatches(database, { apiKeyId: "batch-owner" });
     assert.deepEqual(removed, { deletedBatches: 1, deletedFiles: 0, hasMore: false });
-    assert.deepEqual(
-      await database.transaction((tx) => files.getFileContent(tx, file.id)),
-      Buffer.from("ok")
-    );
+    assert.deepEqual(await files.getFileContent(database, file.id), Buffer.from("ok"));
     await database.transaction((tx) => batches.deleteBatch(tx, pending.id));
-    assert.equal(await database.transaction((tx) => files.getFileContent(tx, file.id)), null);
+    assert.equal(await files.getFileContent(database, file.id), null);
     await assert.rejects(
       batches.deleteCompletedBatches(database, { allTenants: true, apiKeyId: "" } as never)
     );

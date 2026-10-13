@@ -14,7 +14,7 @@ const environmentNames = [
 ];
 const previous = new Map(environmentNames.map((name) => [name, process.env[name]]));
 process.env.DATA_DIR = directory;
-delete process.env.OMNIROUTE_DATABASE_BACKEND;
+process.env.OMNIROUTE_DATABASE_BACKEND = "sqlite";
 process.env.JWT_SECRET = "test-only-model-mutation-jwt-secret";
 process.env.API_KEY_SECRET = "test-only-model-mutation-api-key-secret";
 process.env.STORAGE_ENCRYPTION_KEY = "test-only-model-mutation-encryption-key";
@@ -31,7 +31,7 @@ test.after(() => {
   }
 });
 
-test("default SQLite preserves actual model mutation caller behavior", async (t) => {
+test("explicit SQLite preserves actual model mutation caller behavior", async (t) => {
   core.resetDbInstance();
   await runModelMutationCallerBehavior(t, {
     prefix: "l65-sqlite",

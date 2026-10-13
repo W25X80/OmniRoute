@@ -22,6 +22,7 @@ import {
 } from "../cacheSecrets";
 import { PersistenceCapabilityError } from "../persistenceCapabilities";
 import type { PostgresDatabase, PostgresTransaction } from "./database";
+import { acquirePostgresLock } from "./locks";
 
 type StoredRow = { namespace: string; key: string; value: string };
 
@@ -172,7 +173,7 @@ export function createPostgresOperationsRepository(database: PostgresDatabase) {
       }
       if (updates.backup !== undefined) throw new PersistenceCapabilityError("sqlite-file-backup");
       return database.transaction(async (transaction) => {
-        await transaction.query("SELECT pg_advisory_xact_lock(18765, 3)");
+        await acquirePostgresLock(transaction, "settings");
         await lockApiKeyPolicy(transaction);
         const settings = await readSettings(transaction);
         assertCacheCredentialEndpoint(settings.cache, updates.cache);

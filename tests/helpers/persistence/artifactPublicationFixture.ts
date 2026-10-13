@@ -38,7 +38,12 @@ type Request = {
   headers: Record<string, string>;
   body?: unknown;
 };
-type Intent = ArtifactPublicationRow & { nextDue: number };
+type Intent = ArtifactPublicationRow & {
+  nextDue: number;
+  staged_payload?: string | null;
+  staged_bytes?: number;
+  dispatch_owner?: string | null;
+};
 export const configuration = {
   bucket: "artifact-publication-test",
   region: "eu-central-1",
@@ -187,6 +192,26 @@ async function query<Row>(
           fixture.legacy.has(ref),
       },
     ]);
+  if (sql.startsWith("SELECT COALESCE(SUM(staged_bytes)"))
+    return result<Row>([
+      {
+        used: String(
+          [...fixture.intents.values()].reduce((sum, row) => sum + (row.staged_bytes ?? 0), 0)
+        ),
+      },
+    ]);
+  if (sql.startsWith("SELECT 1 FROM omniroute.call_logs")) {
+    const row = fixture.logs.get(ref);
+    return result<Row>(row && String(row.insertion_order) === String(values[1]) ? [{}] : []);
+  }
+  if (sql.startsWith("SELECT (NULLIF(c.api_key_id")) {
+    const row = fixture.logs.get(ref);
+    return result<Row>(
+      row && String(row.insertion_order) === String(values[1]) && !row.artifact_relpath
+        ? [{ allowed: fixture.keyExists && !fixture.noLog }]
+        : []
+    );
+  }
   if (sql.startsWith("SELECT no_log"))
     return result<Row>(fixture.keyExists ? [{ no_log: fixture.noLog ? 1 : 0 }] : []);
   if (sql.startsWith("SELECT * FROM omniroute.artifact_deletion_queue"))
@@ -228,6 +253,16 @@ async function query<Row>(
           expected_sha256: String(values[4]),
           nextDue: Date.now() + 300000,
         };
+    if (sql.includes("staged_payload"))
+      Object.assign(row, {
+        upload_state: "not_sent",
+        call_log_id: String(values[5]),
+        call_log_order: String(values[6]),
+        staged_payload: String(values[7]),
+        staged_bytes: Number(values[8]),
+        dispatch_owner: null,
+        nextDue: Date.now(),
+      });
     fixture.intents.set(ref, row);
     fixture.events.push(abandon ? "abandon" : "prepare-insert");
     if (!abandon) {
@@ -241,16 +276,49 @@ async function query<Row>(
     if (fixture.sqlFailure === "definite") throw new PostgresError("query_failed");
     const columns = /call_logs\(([^)]+)\)/.exec(sql)![1].split(","),
       row = Object.fromEntries(columns.map((column, at) => [column, values[at]]));
+    row.insertion_order = fixture.logs.size + 1;
     fixture.logs.set(String(row.id), row);
     fixture.events.push("log-insert");
-    return result<Row>([{ id: row.id }], 1);
+    return result<Row>([{ id: row.id, insertion_order: String(row.insertion_order) }], 1);
+  }
+  if (sql.startsWith("UPDATE omniroute.call_logs")) {
+    if (sql.includes("SET detail_state='ready'")) {
+      const log = fixture.logs.get(ref);
+      if (!log || String(log.insertion_order) !== String(values[1])) return result<Row>([], 0);
+      Object.assign(log, {
+        detail_state: "ready",
+        detail_reason: null,
+        artifact_relpath: values[2],
+        artifact_size_bytes: values[3],
+        artifact_sha256: values[4],
+      });
+    } else if (sql.includes("FROM omniroute.artifact_deletion_queue")) {
+      const intent = fixture.intents.get(ref),
+        log = intent?.call_log_id ? fixture.logs.get(intent.call_log_id) : undefined;
+      if (log && intent?.publication_state === "publishing")
+        log.detail_reason =
+          intent.upload_state === "uncertain" ? "upload_unknown" : "publication_pending";
+    }
+    return result<Row>([], 1);
   }
   const row = fixture.intents.get(ref);
   if (sql.startsWith("UPDATE omniroute.artifact_deletion_queue")) {
     if (!row) return result<Row>([], 0);
     if (sql.includes("publication_owner=$2") && row.publication_owner !== values[1])
       return result<Row>([], 0);
-    if (sql.includes("publication_state=CASE")) {
+    if (sql.includes("staged_payload=NULL")) {
+      row.staged_payload = null;
+      row.staged_bytes = 0;
+    }
+    if (sql.includes("SET upload_state='uncertain'")) {
+      row.upload_state = "uncertain";
+      row.dispatch_owner = String(values[1]);
+    } else if (sql.includes("upload_state=CASE WHEN $3")) {
+      if (values[2] && row.dispatch_owner === values[1]) {
+        row.upload_state = "not_sent";
+        row.dispatch_owner = null;
+      }
+    } else if (sql.includes("publication_state=CASE")) {
       if (!values[1]) row.publication_state = "attached";
       row.nextDue = Date.now() + 300000;
     } else if (sql.includes("publication_state='attached'")) {
@@ -395,6 +463,9 @@ export function scheduleCallLogRotationAsync() {
   fixture.events.push("rotation-scheduled");
 }
 export async function closeCallLogArtifactWriter() {}
+export async function serializeCallArtifactAsync(artifact: unknown) {
+  return Buffer.from(JSON.stringify(artifact));
+}
 /** CPU serialization is excluded from this composition oracle; domain/SDK/SQL owners are real. */
 export async function writeCallArtifactAsync(
   artifact: unknown,

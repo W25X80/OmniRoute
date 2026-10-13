@@ -4,20 +4,12 @@ import {
   buildComboPayload,
   rowToCompressionCombo,
   rowToAssignment,
-  normalizePipeline,
-  defaultCompressionComboPipeline,
-  isLegacySeededDefaultPipeline,
-  isPreviousLossySeedPipeline,
-  DEFAULT_COMPRESSION_COMBO_ID,
-  DEFAULT_COMPRESSION_COMBO_NAME,
-  DEFAULT_COMPRESSION_COMBO_DESCRIPTION,
-  LEGACY_DEFAULT_COMPRESSION_COMBO_DESCRIPTION,
-  LEGACY_RTK_CAVEMAN_DESCRIPTION,
   KNOWN_ENGINE_IDS,
   ENGINE_STACK_PRIORITY,
 } from "../compressionCombos/persistenceSemantics";
 import type { CompressionEngineId } from "@omniroute/open-sse/services/compression/types.ts";
 import type { PostgresDatabase, PostgresTransaction } from "./database";
+import { acquirePostgresLock } from "./locks";
 
 export const POSTGRES_COMPRESSION_SCHEMA_STATEMENTS = [
   `CREATE TABLE omniroute.compression_combos (id text PRIMARY KEY, name text NOT NULL,
@@ -34,37 +26,7 @@ export const POSTGRES_COMPRESSION_SCHEMA_STATEMENTS = [
 ] as const;
 
 async function lock(tx: PostgresTransaction): Promise<void> {
-  await tx.query("SELECT pg_advisory_xact_lock(18765,12)");
-}
-
-async function upgradeSeed(tx: PostgresTransaction): Promise<void> {
-  const row = (
-    await tx.query<{ name: string; description: string; pipeline: string }>(
-      "SELECT name,description,pipeline FROM omniroute.compression_combos WHERE id=$1 FOR UPDATE",
-      [DEFAULT_COMPRESSION_COMBO_ID]
-    )
-  ).rows[0];
-  if (
-    !row ||
-    row.name !== DEFAULT_COMPRESSION_COMBO_NAME ||
-    ![
-      LEGACY_DEFAULT_COMPRESSION_COMBO_DESCRIPTION,
-      LEGACY_RTK_CAVEMAN_DESCRIPTION,
-      DEFAULT_COMPRESSION_COMBO_DESCRIPTION,
-    ].includes(row.description)
-  )
-    return;
-  const pipeline = normalizePipeline(row.pipeline);
-  if (!isLegacySeededDefaultPipeline(pipeline) && !isPreviousLossySeedPipeline(pipeline)) return;
-  await tx.query(
-    "UPDATE omniroute.compression_combos SET description=$1,pipeline=$2,updated_at=$3 WHERE id=$4",
-    [
-      DEFAULT_COMPRESSION_COMBO_DESCRIPTION,
-      JSON.stringify(defaultCompressionComboPipeline()),
-      new Date().toISOString(),
-      DEFAULT_COMPRESSION_COMBO_ID,
-    ]
-  );
+  await acquirePostgresLock(tx, "compression");
 }
 
 async function find(tx: PostgresTransaction, id: string): Promise<CompressionCombo | null> {
@@ -84,24 +46,49 @@ async function defaultCombo(tx: PostgresTransaction): Promise<CompressionCombo |
 }
 
 export function createPostgresCompressionRepository(database: PostgresDatabase) {
-  const operation = <T>(body: (tx: PostgresTransaction) => Promise<T>) =>
-    database.transaction(async (tx) => {
-      await lock(tx);
-      await upgradeSeed(tx);
-      return body(tx);
-    });
+  const operation = <T>(body: (tx: PostgresTransaction) => Promise<T>, name: string) =>
+    database.transaction(
+      async (tx) => {
+        await lock(tx);
+        return body(tx);
+      },
+      { operation: name }
+    );
   return {
-    list: () =>
-      operation(async (tx) =>
-        (
-          await tx.query(`SELECT * FROM omniroute.compression_combos
+    list: async () =>
+      (
+        await database.transaction(
+          async (tx) =>
+            (
+              await tx.query(`SELECT * FROM omniroute.compression_combos
       ORDER BY is_default DESC, translate(name,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz') COLLATE "C" ASC,id ASC`)
-        ).rows
-          .map(rowToCompressionCombo)
-          .filter((c): c is CompressionCombo => c !== null)
+            ).rows,
+          { operation: "compression.list" }
+        )
+      )
+        .map(rowToCompressionCombo)
+        .filter((c): c is CompressionCombo => c !== null),
+    findById: async (id: string) =>
+      rowToCompressionCombo(
+        await database.transaction(
+          async (tx) =>
+            (await tx.query("SELECT * FROM omniroute.compression_combos WHERE id=$1", [id]))
+              .rows[0],
+          { operation: "compression.findById" }
+        )
       ),
-    findById: (id: string) => operation((tx) => find(tx, id)),
-    findDefault: () => operation(defaultCombo),
+    findDefault: async () =>
+      rowToCompressionCombo(
+        await database.transaction(
+          async (tx) =>
+            (
+              await tx.query(
+                "SELECT * FROM omniroute.compression_combos WHERE is_default=1 ORDER BY updated_at DESC,id ASC LIMIT 1"
+              )
+            ).rows[0],
+          { operation: "compression.findDefault" }
+        )
+      ),
     create: (data: Partial<CompressionCombo>) =>
       operation(async (tx) => {
         const combo = buildComboPayload(data);
@@ -124,7 +111,7 @@ export function createPostgresCompressionRepository(database: PostgresDatabase) 
           ]
         );
         return (await find(tx, combo.id))!;
-      }),
+      }, "compression.create"),
     update: (id: string, data: Partial<CompressionCombo>) =>
       operation(async (tx) => {
         const existing = await find(tx, id);
@@ -147,7 +134,7 @@ export function createPostgresCompressionRepository(database: PostgresDatabase) 
           ]
         );
         return find(tx, id);
-      }),
+      }, "compression.update"),
     delete: (id: string) =>
       operation(
         async (tx) =>
@@ -156,7 +143,8 @@ export function createPostgresCompressionRepository(database: PostgresDatabase) 
               "DELETE FROM omniroute.compression_combos WHERE id=$1 AND is_default<>1",
               [id]
             )
-          ).rowCount === 1
+          ).rowCount === 1,
+        "compression.delete"
       ),
     setDefault: (id: string) =>
       operation(async (tx) => {
@@ -167,28 +155,34 @@ export function createPostgresCompressionRepository(database: PostgresDatabase) 
           [new Date().toISOString(), id]
         );
         return true;
-      }),
-    assignments: (id: string) =>
-      operation(async (tx) =>
-        (
-          await tx.query(
-            'SELECT * FROM omniroute.compression_combo_assignments WHERE compression_combo_id=$1 ORDER BY routing_combo_id COLLATE "C" ASC',
-            [id]
-          )
-        ).rows
-          .map(rowToAssignment)
-          .filter((a): a is CompressionComboAssignment => a !== null)
-      ),
-    forRoutingCombo: (id: string) =>
-      operation(async (tx) =>
-        rowToCompressionCombo(
-          (
-            await tx.query(
-              `SELECT c.* FROM omniroute.compression_combos c JOIN omniroute.compression_combo_assignments a
-       ON a.compression_combo_id=c.id WHERE a.routing_combo_id=$1`,
-              [id]
-            )
-          ).rows[0]
+      }, "compression.setDefault"),
+    assignments: async (id: string) =>
+      (
+        await database.transaction(
+          async (tx) =>
+            (
+              await tx.query(
+                'SELECT * FROM omniroute.compression_combo_assignments WHERE compression_combo_id=$1 ORDER BY routing_combo_id COLLATE "C" ASC',
+                [id]
+              )
+            ).rows,
+          { operation: "compression.assignments" }
+        )
+      )
+        .map(rowToAssignment)
+        .filter((a): a is CompressionComboAssignment => a !== null),
+    forRoutingCombo: async (id: string) =>
+      rowToCompressionCombo(
+        await database.transaction(
+          async (tx) =>
+            (
+              await tx.query(
+                `SELECT c.* FROM omniroute.compression_combos c JOIN omniroute.compression_combo_assignments a
+          ON a.compression_combo_id=c.id WHERE a.routing_combo_id=$1`,
+                [id]
+              )
+            ).rows[0],
+          { operation: "compression.forRoutingCombo" }
         )
       ),
     assign: (compressionId: string, routingId: string) =>
@@ -201,24 +195,30 @@ export function createPostgresCompressionRepository(database: PostgresDatabase) 
           [randomUUID(), compressionId, routingId.trim(), new Date().toISOString()]
         );
         return true;
-      }),
-    updateAssignments: (id: string, routingIds: string[]) =>
-      operation(async (tx) => {
+      }, "compression.assign"),
+    updateAssignments: (id: string, routingIds: string[]) => {
+      const rows = [...new Set(routingIds.map((r) => r.trim()).filter(Boolean))].map((routing) => ({
+        id: randomUUID(),
+        routing,
+        created: new Date().toISOString(),
+      }));
+      const payload = JSON.stringify(rows);
+      return operation(async (tx) => {
         if (!(await find(tx, id))) return false;
         await tx.query(
           "DELETE FROM omniroute.compression_combo_assignments WHERE compression_combo_id=$1",
           [id]
         );
-        for (const routing of [...new Set(routingIds.map((r) => r.trim()).filter(Boolean))]) {
-          await tx.query(
-            `INSERT INTO omniroute.compression_combo_assignments(id,compression_combo_id,routing_combo_id,created_at)
-          VALUES($1,$2,$3,$4) ON CONFLICT(routing_combo_id) DO UPDATE SET id=EXCLUDED.id,
+        await tx.query(
+          `INSERT INTO omniroute.compression_combo_assignments(id,compression_combo_id,routing_combo_id,created_at)
+          SELECT r.id,$1,r.routing,r.created FROM jsonb_to_recordset($2::jsonb) AS r(id text,routing text,created text)
+          ON CONFLICT(routing_combo_id) DO UPDATE SET id=EXCLUDED.id,
           compression_combo_id=EXCLUDED.compression_combo_id,created_at=EXCLUDED.created_at`,
-            [randomUUID(), id, routing, new Date().toISOString()]
-          );
-        }
+          [id, payload]
+        );
         return true;
-      }),
+      }, "compression.updateAssignments");
+    },
     setEngine: (engineId: string, enabled: boolean, config?: Record<string, unknown>) =>
       operation(async (tx) => {
         if (!KNOWN_ENGINE_IDS.includes(engineId)) return null;
@@ -244,34 +244,43 @@ export function createPostgresCompressionRepository(database: PostgresDatabase) 
           [JSON.stringify(pipeline), new Date().toISOString(), existing.id]
         );
         return find(tx, existing.id);
-      }),
-    readConfigSnapshot: () =>
-      operation(async (tx) => ({
-        rows: (
-          await tx.query<{ key: string; value: string }>(
-            "SELECT key,value FROM omniroute.key_value WHERE namespace='compression'"
-          )
-        ).rows,
-        combo: await defaultCombo(tx),
-      })),
+      }, "compression.setEngine"),
+    readConfigSnapshot: async () => {
+      // One statement supplies one MVCC snapshot for BOTH default and config rows.
+      const snapshot = await database.transaction(
+        async (tx) =>
+          (
+            await tx.query<{ config_rows: { key: string; value: string }[]; combo: unknown }>(`
+          SELECT COALESCE((SELECT jsonb_agg(jsonb_build_object('key',key,'value',value))
+            FROM omniroute.key_value WHERE namespace='compression'),'[]'::jsonb) AS config_rows,
+            (SELECT to_jsonb(c) FROM omniroute.compression_combos c WHERE is_default=1
+             ORDER BY updated_at DESC,id ASC LIMIT 1) AS combo
+        `)
+          ).rows[0],
+        { operation: "compression.snapshot" }
+      );
+      return { rows: snapshot.config_rows, combo: rowToCompressionCombo(snapshot.combo) };
+    },
     readConfigRows: () =>
-      operation(
+      database.transaction(
         async (tx) =>
           (
             await tx.query<{ key: string; value: string }>(
               "SELECT key,value FROM omniroute.key_value WHERE namespace='compression'"
             )
-          ).rows
+          ).rows,
+        { operation: "compression.readConfigRows" }
       ),
     readConfigValue: (key: string) =>
-      operation(
+      database.transaction(
         async (tx) =>
           (
             await tx.query<{ value: string }>(
               "SELECT value FROM omniroute.key_value WHERE namespace='compression' AND key=$1",
               [key]
             )
-          ).rows[0]?.value
+          ).rows[0]?.value,
+        { operation: "compression.readConfigValue" }
       ),
     updateConfig: (
       transform: (
@@ -286,14 +295,15 @@ export function createPostgresCompressionRepository(database: PostgresDatabase) 
           )
         ).rows;
         const updates = transform(rows, await defaultCombo(tx));
-        for (const [key, value] of Object.entries(updates)) {
-          if (value === undefined) continue;
-          await tx.query(
-            `INSERT INTO omniroute.key_value(namespace,key,value) VALUES('compression',$1,$2)
+        const values = Object.entries(updates)
+          .filter(([, value]) => value !== undefined)
+          .map(([key, value]) => ({ key, value: JSON.stringify(value) }));
+        await tx.query(
+          `INSERT INTO omniroute.key_value(namespace,key,value)
+          SELECT 'compression',r.key,r.value FROM jsonb_to_recordset($1::jsonb) AS r(key text,value text)
           ON CONFLICT(namespace,key) DO UPDATE SET value=EXCLUDED.value`,
-            [key, JSON.stringify(value)]
-          );
-        }
-      }),
+          [JSON.stringify(values)]
+        );
+      }, "compression.updateConfig"),
   };
 }

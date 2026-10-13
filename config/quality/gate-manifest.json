@@ -239,6 +239,11 @@
       "disposition": "separately-invoked"
     },
     {
+      "name": "check:postgres-lock-owners",
+      "command": "node scripts/check/check-postgres-lock-owners.mjs",
+      "disposition": "separately-invoked"
+    },
+    {
       "name": "check:node-runtime",
       "command": "node --import tsx scripts/check/check-supported-node-runtime.ts",
       "disposition": "separately-invoked"
@@ -713,6 +718,7 @@
         "check:api-docs-refs",
         "check:deps",
         "check:db-rules",
+        "check:postgres-lock-owners",
         "check:file-size",
         "check:complexity-ratchets",
         "check:known-symbols",
@@ -741,6 +747,7 @@
         "check:api-docs-refs",
         "check:deps",
         "check:db-rules",
+        "check:postgres-lock-owners",
         "check:file-size",
         "check:complexity-ratchets",
         "check:known-symbols",

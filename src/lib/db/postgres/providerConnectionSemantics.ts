@@ -26,6 +26,7 @@ import {
   webSessionCredentialKey,
 } from "../webSessionDedup";
 import type { PostgresTransaction } from "./database";
+import { acquirePostgresLock } from "./locks";
 
 export const PROVIDER_CONNECTION_ORDER =
   "priority ASC NULLS FIRST, updated_at DESC NULLS LAST, insertion_order ASC";
@@ -52,7 +53,7 @@ export const PROVIDER_CONNECTION_PROJECTION_COLUMNS = new Set(
 );
 
 export function lockProviders(transaction: PostgresTransaction): Promise<unknown> {
-  return transaction.query("SELECT pg_advisory_xact_lock(18765, 4)");
+  return acquirePostgresLock(transaction, "providers");
 }
 
 export function normalizeConnectionResult(record: JsonRecord): JsonRecord {

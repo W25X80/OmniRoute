@@ -14,6 +14,7 @@ import {
   parseComboRow,
   type ComboRow,
 } from "./routingSemantics";
+import { acquirePostgresLock } from "./locks";
 
 /** Required application callbacks; isolated tests supply explicit inert callbacks. */
 export interface PostgresComboEffects {
@@ -137,7 +138,7 @@ export function createPostgresComboRepository(
         if (data.models !== undefined) {
           // Lock order: routing -> key-value -> policy -> session history. Session
           // writers/fences take only the last lock, before touching history rows.
-          await transaction.query("SELECT pg_advisory_xact_lock(18765,13)");
+          await acquirePostgresLock(transaction, "sessions");
         }
         const { rows } = await transaction.query<ComboRow>(
           `SELECT id, data, sort_order, context_cache_protection FROM omniroute.combos

@@ -252,6 +252,7 @@ export async function runServe(opts = {}) {
     "better_sqlite3.node"
   );
   if (
+    process.env.OMNIROUTE_DATABASE_BACKEND === "sqlite" &&
     !process.versions.bun &&
     existsSync(sqliteBinary) &&
     !isNativeBinaryCompatible(sqliteBinary)

@@ -15,7 +15,7 @@ import headResponseGuard from "./head-response-guard.cjs";
 import { ensureNativeSqlite } from "./ensure-native-sqlite.mjs";
 import { isTurbopackCacheCorruption, purgeAllTurbopackCaches } from "./turbopackCacheHeal.mjs";
 import { randomUUID } from "node:crypto";
-import { getMainServerTimeoutConfig } from "./main-server-timeouts.mjs";
+import { getMainServerTimeoutConfig, getShutdownBudgetConfig } from "./main-server-timeouts.mjs";
 import { createSystemdNotifier } from "./systemd-notify.mjs";
 import { attachRequestStreamGuards, installProcessCrashGuard } from "./httpClientAbortGuard.mjs";
 import { listenWithRetry } from "./listen-with-retry.mjs";
@@ -54,11 +54,7 @@ const dev = mode === "dev";
 
 // Self-heal a stale better-sqlite3 native binary after a Node version switch
 // (nvm 22 <-> 24) before bootstrap touches the DB. No-op when the ABI matches.
-if (dev) {
-  ensureNativeSqlite();
-}
-
-const bootstrappedEnv = bootstrapEnv();
+const bootstrappedEnv = bootstrapEnv({ prepareSqlite: dev ? ensureNativeSqlite : undefined });
 const runtimePorts = resolveRuntimePorts(bootstrappedEnv);
 const mergedEnv = withRuntimePortEnv(bootstrappedEnv, runtimePorts);
 
@@ -261,24 +257,32 @@ async function start() {
     }
     isShuttingDown = true;
 
-    // Safety net: force exit after 2s if keep-alive sockets or Next.js app close hangs
+    const native = !isSqlitePersistenceRequested();
+    const forceExitMs = native ? getShutdownBudgetConfig().forceExitMs : 2000;
     const forceExitTimer = setTimeout(() => {
-      process.exit(0);
-    }, 2000);
+      console.error(
+        `[Shutdown] Cleanup still running after ${forceExitMs}ms; forcing unsuccessful exit.`
+      );
+      process.exit(1);
+    }, forceExitMs);
     forceExitTimer.unref?.();
 
     systemdNotifier.stopping();
+    let exitCode = 0;
     try {
       server.closeIdleConnections?.();
-      server.closeAllConnections?.();
-      await new Promise((resolve) => server.close(resolve));
+      if (!native) server.closeAllConnections?.();
+      const serverClosed = new Promise((resolve) => server.close(resolve));
+      if (!native) await serverClosed;
       await globalThis.__omnirouteRequestShutdown?.(signal);
+      await serverClosed;
       await nextApp.close();
     } catch (error) {
+      exitCode = 1;
       console.error("[SHUTDOWN] Failed during signal:", signal, error);
     } finally {
       clearTimeout(forceExitTimer);
-      process.exit(0);
+      process.exit(exitCode);
     }
   };
 

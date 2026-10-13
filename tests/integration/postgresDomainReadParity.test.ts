@@ -28,7 +28,7 @@ test(
     };
     const directory = mkdtempSync(join(tmpdir(), "omniroute-domain-read-parity-"));
     process.env.DATA_DIR = directory;
-    delete process.env.OMNIROUTE_DATABASE_BACKEND;
+    process.env.OMNIROUTE_DATABASE_BACKEND = "sqlite";
     process.env.STORAGE_ENCRYPTION_KEY = "postgres-domain-read-parity-fixture-key";
     let database: PostgresDatabase | undefined;
     let core: typeof import("../../src/lib/db/core.ts") | undefined;

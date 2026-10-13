@@ -63,6 +63,9 @@ export async function ensureCloudSyncInitialized(): Promise<boolean> {
 export function startReasoningCacheCleanupJob(): void {
   record("start:reasoning");
 }
+export function startNativeArtifactRecovery(): void {
+  record("start:artifactRecovery");
+}
 export function initProxyHealthCheck(): void {
   record("start:proxy");
 }

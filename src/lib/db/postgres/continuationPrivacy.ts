@@ -1,5 +1,6 @@
 import { getSelectedPostgresDatabase } from "../controlPlaneContext";
 import { interpretSettingsRows } from "../settings/persistenceSemantics";
+import { acquirePostgresLock } from "./locks";
 
 /** Runs only a synchronous in-memory projection while the current policy is authoritative. */
 export async function withSelectedContinuationPrivacy<T>(
@@ -12,7 +13,7 @@ export async function withSelectedContinuationPrivacy<T>(
   if (apiKeyId !== null && (typeof apiKeyId !== "string" || apiKeyId.length === 0))
     throw new Error("Invalid continuation principal");
   return database.transaction(async (transaction) => {
-    await transaction.query("SELECT pg_advisory_xact_lock_shared(18765,5)");
+    await acquirePostgresLock(transaction, "keyPolicy", "shared");
     if (apiKeyId !== null) {
       const row = (
         await transaction.query<{ no_log: number }>(

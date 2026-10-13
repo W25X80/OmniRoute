@@ -1,13 +1,15 @@
 ---
 title: "PostgreSQL operations"
-lastUpdated: 2026-10-12
+lastUpdated: 2026-10-13
 ---
 
 # PostgreSQL operations
 
-This runbook describes the current native server implementation. SQLite remains the default.
-`OMNIROUTE_DATABASE_BACKEND=postgres` selects a different durable authority at startup; changing
-it requires migration and restart. There is no fallback to SQLite after a PostgreSQL failure.
+This fork uses native PostgreSQL by default when `OMNIROUTE_DATABASE_BACKEND` is absent.
+Explicit `postgres` selects the same authority; only `OMNIROUTE_DATABASE_BACKEND=sqlite` selects
+legacy SQLite. Empty or invalid values fail startup. Changing authority requires migration and
+restart; existing SQLite data is never imported automatically. Missing PostgreSQL configuration
+or a PostgreSQL failure never opens SQLite or generates replacement local secrets.
 Implementation details and limits are in the
 [native persistence README](../../src/lib/db/postgres/README.md).
 
@@ -172,6 +174,11 @@ target and retain both recovery sets until cutover is verified.
 Logical export is bounded maintenance, not an RDS physical snapshot/PITR implementation. SQLite
 file backup, WAL/PRAGMA optimization, file import/export and legacy JSON repair are unavailable on
 PostgreSQL; guarded APIs report 501 `persistence_capability_unavailable`.
+Legacy local CLI commands (`auth export --force`, local provider/key/setup operations,
+`reset-encrypted-columns`, `backup`, `restore`, and `backup auto enable/disable/status`) require
+explicit `OMNIROUTE_DATABASE_BACKEND=sqlite`. They refuse PostgreSQL/default-native execution
+instead of opening a local database or reporting a successful local backup. Use the native offline
+export/restore procedure above for PostgreSQL maintenance.
 
 Send graceful termination and inspect cleanup completion. Producer stop, durable buffer flush,
 request/background/SSE drain and pool/object-client close have explicit owners. The wrappers force
@@ -184,6 +191,35 @@ writes. Preserve the native dataset/objects and explicitly reconcile those write
 that must retain them. No PostgreSQL-to-SQLite data conversion command is provided here.
 
 ## Qualification pending for the release artifact
+
+### Offline schema upgrade for indexed history retention
+
+Stop all application writers before upgrading this lock protocol. Migration 7 adds a derived
+`timestamptz` column, validates and backfills existing `conversation_turn_nodes.last_seen_at`
+values, and creates an ordered retention index in one transaction. Public timestamp text stays
+unchanged; a trigger maintains the indexed value. Invalid timestamps and relative literals such
+as `now` or `today` reject the migration atomically and require an explicit data repair. Retention
+duration and the strict cutoff remain unchanged. Cleanup admits at most 100 batches of 1,000
+rows per pass and stops admitting batches after one second; a batch already running can extend
+that duration up to its SQL deadline. Locked rows are revisited by later passes.
+
+For a populated database, run the schema-only command during the maintenance window with
+explicitly measured offline timeout budgets:
+
+```sh
+node --import tsx/esm scripts/ops/postgres-migrate-schema.ts --offline
+```
+
+The command reads the documented PostgreSQL environment, applies checksummed migrations and
+the legacy compression seed upgrade, then closes the pool. It starts no application producers
+and uses no object store. `--offline` acknowledges that the operator has stopped writers; the
+command cannot itself establish ECS quiescence. Configure statement/query/transaction deadlines
+for the measured backfill and index duration, preserving their ordering, and restore live
+deadlines for the gateway. Migration 8 adds durable encrypted artifact staging and privacy
+revocation. Verify migration history and restart behavior before allowing traffic. Do not roll
+back to a binary that rejects the newer schema; retain a verified pre-upgrade recovery set.
+
+### Local code qualification
 
 Run the existing local checks against the exact release inputs:
 

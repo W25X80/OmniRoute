@@ -9,7 +9,55 @@ interface CreditOwner {
   getAntigravityRemainingCreditsAsync(id: string): Promise<number | null>;
   getAntigravityRemainingCredits(id: string): number | null;
   updateAntigravityRemainingCredits(id: string, balance: number): void;
+  stopAntigravityCreditSweep(): void;
 }
+
+test("credit sweep has no import-time producer, binds its cache and stops explicitly", async () => {
+  let now = 1000,
+    reads = 0,
+    cleared = 0;
+  const callbacks: Array<() => void> = [];
+  const identity = {};
+  const owner = await controlledOwnerModule<CreditOwner>(
+    new URL("../../../open-sse/executors/antigravity.ts", import.meta.url),
+    {},
+    {
+      Date: class extends Date {
+        static now() {
+          return now;
+        }
+      },
+      getSelectedPostgresDatabase: () => ({}),
+      getSelectedPersistenceIdentity: () => {
+        reads++;
+        return identity;
+      },
+      setInterval: (callback: () => void) => {
+        callbacks.push(callback);
+        return { unref() {} };
+      },
+      clearInterval: () => {
+        cleared++;
+      },
+    },
+    (source) =>
+      source.slice(
+        source.indexOf("const MAX_CREDIT_BALANCE_ENTRIES"),
+        source.indexOf("/**\n * Pass-through TransformStream")
+      )
+  );
+  assert.equal(callbacks.length, 0, "import alone must not schedule work");
+  assert.equal(owner.getAntigravityRemainingCredits("cache-key"), null);
+  assert.equal(callbacks.length, 1);
+  const admittedReads = reads;
+  now += 600_000;
+  callbacks[0]();
+  assert.equal(reads, admittedReads, "eviction must not re-enter a native catalog/request scope");
+  owner.stopAntigravityCreditSweep();
+  assert.equal(cleared, 1);
+  owner.getAntigravityRemainingCredits("cache-key");
+  assert.equal(callbacks.length, 1, "closing is monotonic");
+});
 
 async function fixture(balance: number | null) {
   const read = controlledBarrier();

@@ -27,7 +27,9 @@ function fixture() {
   const identity = Object.freeze({});
   const transaction: PostgresTransaction = {
     async query<Row>(text: string, parameters: unknown[] = []) {
-      events.push(text.startsWith("SELECT pg_advisory") ? text : "query");
+      events.push(
+        text.startsWith("SELECT pg_advisory") ? `${text}:${JSON.stringify(parameters)}` : "query"
+      );
       let rows: unknown[] = [];
       let rowCount = 0;
       if (text.includes("AS tables")) {
@@ -221,9 +223,7 @@ test("validation mutation uses canonical lock order and one policy epoch advance
   );
   assert.deepEqual(
     f.events.filter((event) => event.startsWith("SELECT pg_advisory")),
-    [4, 7, 18, 20, 5].map(
-      (lock) => `SELECT pg_advisory_xact_lock(18765,${lock === 5 ? " 5" : lock})`
-    )
+    [4, 7, 18, 20, 5].map((lock) => `SELECT pg_advisory_xact_lock(18765,$1):[${lock}]`)
   );
 });
 
@@ -332,9 +332,7 @@ test("routing validation reads use their current transaction without a nested ch
   );
   assert.deepEqual(
     f.events.filter((event) => event.startsWith("SELECT pg_advisory")),
-    [2, 4, 7, 18, 20, 5].map(
-      (lock) => `SELECT pg_advisory_xact_lock(18765,${lock === 5 ? " 5" : lock})`
-    )
+    [2, 4, 7, 18, 20, 5].map((lock) => `SELECT pg_advisory_xact_lock(18765,$1):[${lock}]`)
   );
   assert.equal(f.events.filter((event) => event === "COMMIT").length, 1);
 });

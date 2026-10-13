@@ -247,16 +247,17 @@ function bootstrapPostgresEnv(configured, dataDirOverride) {
   const env = Object.fromEntries(
     Object.entries(configured).filter(([, value]) => typeof value === "string")
   );
+  env.OMNIROUTE_DATABASE_BACKEND = "postgres";
   if (dataDirOverride?.trim()) env.DATA_DIR = resolve(dataDirOverride);
   return env;
 }
 
 // ── Main bootstrap function ──────────────────────────────────────────────────
 /**
- * @param {{ dataDirOverride?: string; quiet?: boolean }} options
+ * @param {{ dataDirOverride?: string; quiet?: boolean; prepareSqlite?: () => void }} options
  * @returns {Record<string, string>} merged env to pass to child process
  */
-export function bootstrapEnv({ dataDirOverride, quiet = false } = {}) {
+export function bootstrapEnv({ dataDirOverride, quiet = false, prepareSqlite } = {}) {
   const log = quiet ? () => {} : (msg) => process.stderr.write(`[bootstrap] ${msg}\n`);
 
   const selectedBackend = process.env.OMNIROUTE_DATABASE_BACKEND;
@@ -271,13 +272,17 @@ export function bootstrapEnv({ dataDirOverride, quiet = false } = {}) {
 
   const preferredEnvPath = getPreferredEnvFilePath(process.env);
   const preferredEnv = preferredEnvPath ? parseEnvFile(preferredEnvPath) : {};
-  const configuredBackend = selectedBackend ?? preferredEnv.OMNIROUTE_DATABASE_BACKEND;
+  const configuredBackend =
+    selectedBackend ?? preferredEnv.OMNIROUTE_DATABASE_BACKEND ?? "postgres";
   if (configuredBackend === "postgres") {
     return bootstrapPostgresEnv({ ...preferredEnv, ...process.env }, dataDirOverride);
   }
-  if (configuredBackend !== undefined && configuredBackend !== "sqlite") {
+  if (configuredBackend !== "sqlite") {
     throw new Error("OMNIROUTE_DATABASE_BACKEND must be sqlite or postgres");
   }
+  // The dev ABI repair belongs only to the explicit SQLite profile and must
+  // run before inspecting its encrypted legacy database during secret recovery.
+  prepareSqlite?.();
   const dataDir = resolveDataDir(dataDirOverride, {
     ...preferredEnv,
     ...process.env,

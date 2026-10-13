@@ -11,6 +11,8 @@ export interface PreparedArtifact extends Readonly<StoredArtifact> {
 }
 
 export interface ArtifactPutOptions {
+  /** Existing durable identity; the caller must claim its sole dispatch in onPrepared. */
+  prepared?: PreparedArtifact;
   /** Durable caller ownership must be acknowledged before any external PUT. */
   onPrepared?(artifact: PreparedArtifact): Promise<void>;
 }
@@ -18,6 +20,10 @@ export interface ArtifactPutOptions {
 /** Binary object storage only; application serialization remains with its owning domain. */
 export interface NativeArtifactStore {
   put(bytes: Uint8Array, options?: ArtifactPutOptions): Promise<StoredArtifact>;
+  /** Pure allocation: no external effect. */
+  prepare?(bytes: Uint8Array): PreparedArtifact;
+  /** Bounded SDK/client preparation before serving. */
+  warmup?(): Promise<void>;
   /** Optional on non-native test adapters; native publication fails closed if absent. */
   readonly storageScope?: string;
   /** Actual raw PUT/preparation lifetime, independent from the deadline-facing promise. */
@@ -60,7 +66,9 @@ export class ArtifactStorageError extends Error {
     /** Internal reconciliation identity; never include it or the SDK error in HTTP error bodies. */
     readonly reference?: string,
     /** False proves dispatch never began; absence provides no such guarantee. */
-    readonly putStarted?: boolean
+    readonly putStarted?: boolean,
+    /** Safe internal diagnostics only: never SDK messages, headers, credentials or paths. */
+    readonly diagnostic?: Readonly<{ name?: string; status?: number; requestId?: string }>
   ) {
     super(MESSAGES[kind]);
     this.name = "ArtifactStorageError";

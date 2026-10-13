@@ -1,4 +1,5 @@
 import { artifactHasSqlOwner, lockArtifactPublication } from "./artifactPublicationRepository";
+import { acquirePostgresLock } from "./locks";
 import type { DeleteByPeriodTarget } from "../cleanup/usagePurge";
 import type { PostgresDatabase, PostgresTransaction } from "./database";
 
@@ -26,6 +27,8 @@ const RETENTION_COLUMNS: Readonly<Record<string, string>> = {
   conversation_turn_nodes: "last_seen_at",
   agentic_conversations: "last_seen_at",
 };
+
+const RETENTION_PASS_MS = 1000;
 
 function qualify(table: string, column?: string): string {
   if (!(table in RETENTION_COLUMNS) || (column && RETENTION_COLUMNS[table] !== column)) {
@@ -122,14 +125,35 @@ export function createPostgresCleanupRepository(database: PostgresDatabase) {
       const table = qualify(target.table, target.column);
       const value = cutoffValue(target, cutoff);
       let deleted = 0;
+      const started = performance.now();
       // Each statement is atomic and independently bounded by the database timeout.
       // A backlog exceeding this pass is resumed by the next scheduled cleanup.
       for (let batch = 0; batch < 100; batch++) {
+        // Stop admitting new batches at the pass deadline. An already admitted
+        // transaction is still bounded by the database statement/transaction limits.
+        if (batch > 0 && performance.now() - started >= RETENTION_PASS_MS) break;
         const count = await database.transaction(async (transaction) => {
           if (target.table === "domain_cost_history") {
-            await transaction.query("SELECT pg_advisory_xact_lock(18765,8)");
+            await acquirePostgresLock(transaction, "accounting");
           }
           if (!(await exists(transaction, target.table))) return 0;
+          if (target.table === "conversation_turn_nodes") {
+            // Deleting the ordered prefix makes the remaining index a durable
+            // resume position. Always restart there: skipped locks and backdated
+            // arrivals are revisited on later passes rather than lost behind a cursor.
+            // Consume physical tuple addresses only inside this statement while
+            // their row locks are held. A TID-array lookup avoids an id join whose
+            // cost-based plan can scan the whole history for each bounded batch.
+            const result = await transaction.query(
+              `WITH expired AS MATERIALIZED (
+                 SELECT ctid FROM ${table}
+                 WHERE last_seen_at_retention < $1::timestamptz
+                 ORDER BY last_seen_at_retention,id LIMIT 1000 FOR UPDATE SKIP LOCKED)
+               DELETE FROM ${table} WHERE ctid=ANY(ARRAY(SELECT ctid FROM expired))`,
+              [value]
+            );
+            return result.rowCount ?? 0;
+          }
           const result = await transaction.query(
             `WITH expired AS (SELECT ctid FROM ${table} WHERE ${target.cutoff === "iso" ? `"${target.column}"::timestamptz < $1::timestamptz` : `"${target.column}" < $1`} LIMIT 1000)
              DELETE FROM ${table} WHERE ctid IN (SELECT ctid FROM expired)`,
@@ -172,7 +196,7 @@ export function createPostgresCleanupRepository(database: PostgresDatabase) {
       const artifacts: string[] = [];
       for (let batch = 0; batch < 100; batch++) {
         const result = await database.transaction(async (transaction) => {
-          await transaction.query("SELECT pg_advisory_xact_lock(18765,8)");
+          await acquirePostgresLock(transaction, "accounting");
           const rows = await transaction.query<{ artifact_relpath: string | null }>(
             `WITH expired AS (SELECT ctid FROM omniroute.call_logs
                ${cutoff ? "WHERE timestamp::timestamptz < $1::timestamptz" : ""} LIMIT 1000)
@@ -206,11 +230,11 @@ export function createPostgresCleanupRepository(database: PostgresDatabase) {
       cutoff?: string
     ): Promise<{ counts: Record<string, number>; artifacts: string[] }> {
       return database.transaction(async (transaction) => {
-        await transaction.query("SELECT pg_advisory_xact_lock(18765, 7)");
+        await acquirePostgresLock(transaction, "validation");
         if (
           targets.some((target) => target.table === "call_logs" && (!cutoff || !target.allOnly))
         ) {
-          await transaction.query("SELECT pg_advisory_xact_lock(18765,8)");
+          await acquirePostgresLock(transaction, "accounting");
         }
         const counts: Record<string, number> = {};
         const artifacts: string[] = [];

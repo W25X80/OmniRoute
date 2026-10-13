@@ -204,3 +204,7 @@ export async function withPostgresCatalogSnapshot<T>(
   }
   return catalog.run(generation, body);
 }
+
+export function hasPostgresCatalogSnapshot(): boolean {
+  return catalog.getStore() !== undefined;
+}

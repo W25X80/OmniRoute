@@ -139,7 +139,14 @@ async function openSqliteDatabase(dbPath, options = {}) {
   }
 }
 
+export function assertSqliteCliBackend() {
+  if (process.env.OMNIROUTE_DATABASE_BACKEND !== "sqlite") {
+    throw new Error("This CLI command requires explicit OMNIROUTE_DATABASE_BACKEND=sqlite");
+  }
+}
+
 export async function openOmniRouteDb() {
+  assertSqliteCliBackend();
   const dataDir = resolveDataDir();
   const dbPath = resolveStoragePath(dataDir);
   fs.mkdirSync(dataDir, { recursive: true });

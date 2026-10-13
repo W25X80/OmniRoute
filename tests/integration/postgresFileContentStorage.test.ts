@@ -37,15 +37,15 @@ test(
   options,
   async () => {
     const input = randomBytes(NATIVE_BLOB_LIMITS.chunkBytes + 113);
-    const file = await database.transaction((tx) =>
-      files.createFile(tx, { bytes: 41, filename: "content.bin", purpose: "batch", content: input })
-    );
+    const file = await files.createFile(database, {
+      bytes: 41,
+      filename: "content.bin",
+      purpose: "batch",
+      content: input,
+    });
     try {
       assert.equal(file.bytes, 41);
-      assert.deepEqual(
-        await database.transaction((tx) => files.getFileContent(tx, file.id)),
-        input
-      );
+      assert.deepEqual(await files.getFileContent(database, file.id), input);
       const shape = await database.transaction(async (tx) => ({
         parent: (
           await tx.query<{ bytes: string; inline_length: number | null }>(
@@ -85,33 +85,25 @@ test(
   options,
   async () => {
     for (const content of [null, Buffer.alloc(0)]) {
-      const file = await database.transaction((tx) =>
-        files.createFile(tx, {
-          bytes: 0,
-          filename: "empty",
-          purpose: "batch",
-          content,
-          apiKeyId: "owner",
-        })
-      );
+      const file = await files.createFile(database, {
+        bytes: 0,
+        filename: "empty",
+        purpose: "batch",
+        content,
+        apiKeyId: "owner",
+      });
       try {
-        assert.deepEqual(
-          await database.transaction((tx) => files.getFileContent(tx, file.id)),
-          content
-        );
+        assert.deepEqual(await files.getFileContent(database, file.id), content);
         assert.equal(
           await database.transaction((tx) => files.deleteFileOwnedBy(tx, file.id, "foreign")),
           false
         );
-        assert.deepEqual(
-          await database.transaction((tx) => files.getFileContent(tx, file.id)),
-          content
-        );
+        assert.deepEqual(await files.getFileContent(database, file.id), content);
         assert.equal(
           await database.transaction((tx) => files.deleteFileOwnedBy(tx, file.id, "owner")),
           true
         );
-        assert.equal(await database.transaction((tx) => files.getFileContent(tx, file.id)), null);
+        assert.equal(await files.getFileContent(database, file.id), null);
         assert.equal(
           (
             await database.transaction((tx) =>
@@ -181,7 +173,7 @@ test("legacy deleted inline bytes remain portable and replacement is atomic", op
     )
   );
   try {
-    assert.equal(await database.transaction((tx) => files.getFileContent(tx, id)), null);
+    assert.equal(await files.getFileContent(database, id), null);
     await database.transaction(async (tx) => {
       const stored = await openStoredFileContent(tx, id);
       assert.ok(stored);
@@ -216,15 +208,13 @@ test(
   options,
   async () => {
     const input = Buffer.from([0, 255, 19]),
-      file = await database.transaction((tx) =>
-        files.createFile(tx, {
-          bytes: 3,
-          filename: "corrupt",
-          purpose: "batch_output",
-          content: input,
-          expiresAt: 10,
-        })
-      );
+      file = await files.createFile(database, {
+        bytes: 3,
+        filename: "corrupt",
+        purpose: "batch_output",
+        content: input,
+        expiresAt: 10,
+      });
     try {
       await database.transaction((tx) =>
         tx.query("UPDATE omniroute.files_content_chunks SET checksum=$1 WHERE file_id=$2", [
@@ -232,12 +222,9 @@ test(
           file.id,
         ])
       );
-      await assert.rejects(
-        database.transaction((tx) => files.getFileContent(tx, file.id)),
-        /incomplete or invalid/
-      );
+      await assert.rejects(files.getFileContent(database, file.id), /incomplete or invalid/);
       assert.equal(await database.transaction((tx) => files.pruneExpiredFiles(tx, 20)), 1);
-      assert.equal(await database.transaction((tx) => files.getFileContent(tx, file.id)), null);
+      assert.equal(await files.getFileContent(database, file.id), null);
       assert.equal(
         (
           await database.transaction((tx) =>
@@ -260,9 +247,12 @@ test(
   options,
   async () => {
     const input = Buffer.from([1, 2, 3]),
-      file = await database.transaction((tx) =>
-        files.createFile(tx, { bytes: 3, filename: "rollback", purpose: "batch", content: input })
-      );
+      file = await files.createFile(database, {
+        bytes: 3,
+        filename: "rollback",
+        purpose: "batch",
+        content: input,
+      });
     try {
       const failure = new Error("controlled partial write failure");
       await assert.rejects(
@@ -282,10 +272,7 @@ test(
         }),
         (error) => error === failure
       );
-      assert.deepEqual(
-        await database.transaction((tx) => files.getFileContent(tx, file.id)),
-        input
-      );
+      assert.deepEqual(await files.getFileContent(database, file.id), input);
     } finally {
       await remove(file.id);
     }
@@ -293,15 +280,13 @@ test(
 );
 test("a complete mapped reader holds the parent lock until settlement", options, async (t) => {
   const input = Buffer.from([0, 255, 19, 73]);
-  const file = await database.transaction((tx) =>
-    files.createFile(tx, {
-      bytes: input.length,
-      filename: "locked.bin",
-      purpose: "batch",
-      content: input,
-      apiKeyId: "lock-owner",
-    })
-  );
+  const file = await files.createFile(database, {
+    bytes: input.length,
+    filename: "locked.bin",
+    purpose: "batch",
+    content: input,
+    apiKeyId: "lock-owner",
+  });
   let release!: () => void;
   const gate = new Promise<void>((resolve) => {
     release = resolve;
@@ -331,14 +316,14 @@ test("a complete mapped reader holds the parent lock until settlement", options,
     const preserved = await database.transaction((tx) => files.getFile(tx, file.id));
     assert.ok(preserved);
     assert.equal(preserved.deletedAt, null);
-    assert.deepEqual(await database.transaction((tx) => files.getFileContent(tx, file.id)), input);
+    assert.deepEqual(await files.getFileContent(database, file.id), input);
     release();
     assert.deepEqual(await reader, input);
     assert.equal(
       await database.transaction((tx) => files.deleteFileOwnedBy(tx, file.id, "lock-owner")),
       true
     );
-    assert.equal(await database.transaction((tx) => files.getFileContent(tx, file.id)), null);
+    assert.equal(await files.getFileContent(database, file.id), null);
     assert.equal(
       (
         await database.transaction((tx) =>
@@ -382,22 +367,20 @@ test(
       assert.equal(input.byteOffset, backing.byteOffset + 1);
       const expected = sha(input);
       const writeStarted = performance.now();
-      const file = await maximumDatabase.transaction((tx) =>
-        files.createFile(tx, {
-          bytes: input.length,
-          filename: "max-explicit-budget.bin",
-          purpose: "batch",
-          content: input,
-        })
-      );
+      const file = await files.createFile(maximumDatabase, {
+        bytes: input.length,
+        filename: "max-explicit-budget.bin",
+        purpose: "batch",
+        content: input,
+      });
       id = file.id;
       t.diagnostic(
-        `60-second maximum write COMMIT ACK: ${(performance.now() - writeStarted).toFixed(1)} ms`
+        `60-second maximum prepare/write completion: ${(performance.now() - writeStarted).toFixed(1)} ms`
       );
       const readStarted = performance.now();
-      const content = await maximumDatabase.transaction((tx) => files.getFileContent(tx, file.id));
+      const content = await files.getFileContent(maximumDatabase, file.id);
       t.diagnostic(
-        `60-second maximum read COMMIT ACK: ${(performance.now() - readStarted).toFixed(1)} ms`
+        `60-second maximum capture/verified-read completion: ${(performance.now() - readStarted).toFixed(1)} ms`
       );
       assert.ok(Buffer.isBuffer(content));
       assert.equal(content.length, NATIVE_BLOB_LIMITS.fileBytes);

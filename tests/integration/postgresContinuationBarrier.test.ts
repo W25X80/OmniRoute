@@ -874,8 +874,28 @@ test(
       await eventually(() => optionalStarted >= 1);
       assert.equal(
         (await continueFrom(0)).found,
-        true,
-        "durable artifact remains the current authorized source"
+        false,
+        "revoked pending content cannot reappear after no-log is disabled"
+      );
+
+      const revokedIntent = await verification.transaction((tx) =>
+        tx.query<{
+          publication_state: string;
+          staged_payload: string | null;
+          artifact_relpath: string | null;
+        }>(
+          `SELECT q.publication_state,q.staged_payload,c.artifact_relpath FROM omniroute.call_logs c
+         LEFT JOIN omniroute.artifact_deletion_queue q ON q.call_log_id=c.id AND q.call_log_order=c.insertion_order
+         WHERE c.response_id=$1`,
+          [`resp_${tag}_0`]
+        )
+      );
+      assert.equal(revokedIntent.rows.length, 1);
+      assert.equal(revokedIntent.rows[0].artifact_relpath, null);
+      assert.equal(revokedIntent.rows[0].staged_payload, null);
+      assert.ok(
+        revokedIntent.rows[0].publication_state === null ||
+          revokedIntent.rows[0].publication_state === "delete_pending"
       );
 
       fixtureStage = "index4_prepare";
@@ -902,7 +922,7 @@ test(
           (
             await verification!.transaction((tx) =>
               tx.query<{ waiting: boolean }>(
-                "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query='SELECT pg_advisory_xact_lock_shared(18765,5)') AS waiting"
+                "SELECT EXISTS(SELECT 1 FROM pg_locks l JOIN pg_stat_activity a ON a.pid=l.pid WHERE a.datname=current_database() AND l.locktype='advisory' AND l.classid=18765 AND l.objid=5 AND l.mode='ShareLock' AND NOT l.granted) AS waiting"
               )
             )
           ).rows[0].waiting
@@ -963,6 +983,22 @@ test(
           )
         ).rows,
       }));
+      await eventually(
+        async () =>
+          (
+            await verification!.transaction((tx) =>
+              tx.query<{ detail_state: string }>(
+                "SELECT detail_state FROM omniroute.call_logs WHERE response_id=$1",
+                [`resp_${tag}_5`]
+              )
+            )
+          ).rows[0]?.detail_state === "ready"
+      );
+      assert.equal(
+        (await continueFrom(5)).found,
+        true,
+        "authorized completed artifact remains readable"
+      );
       assert.equal(terminalAccounting.usage.length, 1);
       assert.equal(String(terminalAccounting.usage[0].status), "200");
       assert.equal(Number(terminalAccounting.usage[0].success), 1);
@@ -996,7 +1032,7 @@ test(
           (
             await verification!.transaction((tx) =>
               tx.query<{ waiting: boolean }>(
-                "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query='SELECT pg_advisory_xact_lock_shared(18765,5)') AS waiting"
+                "SELECT EXISTS(SELECT 1 FROM pg_locks l JOIN pg_stat_activity a ON a.pid=l.pid WHERE a.datname=current_database() AND l.locktype='advisory' AND l.classid=18765 AND l.objid=5 AND l.mode='ShareLock' AND NOT l.granted) AS waiting"
               )
             )
           ).rows[0].waiting

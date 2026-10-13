@@ -63,6 +63,11 @@ import { executeTargetAttempt } from "./executeTargetAttempt.ts";
 import { buildComboDiag } from "./executeTargetClassify.ts";
 import type { AttemptLoopDeps, AttemptLoopState, ExecuteTargetResult } from "./attemptLoopTypes.ts";
 import { getStrategyTraits } from "./strategyRegistry.ts";
+import {
+  runPersistenceAttempt,
+  isPersistenceStreamCapacityError,
+  PERSISTENCE_STREAM_CAPACITY_CODE,
+} from "@/lib/db/persistenceRuntime";
 
 /** A second in-flight copy of a body larger than this sits in the TLS send buffer. */
 const HEDGE_MAX_BODY_BYTES = 256 * 1024;
@@ -309,27 +314,36 @@ export async function dispatchWithCooldownRetry(opts: {
         state.abortControllers.set(i, abortController);
         const onClientAbort = () => abortController.abort();
         deps.signal?.addEventListener("abort", onClientAbort);
+        if (deps.signal?.aborted) onClientAbort();
 
-        const task = (async () => {
-          try {
-            const res = await executeTarget(i);
-            if (res && !anySuccess) {
-              if (res.ok) {
-                anySuccess = true;
-                globalResolve!(res.response!);
-                for (const [idx, ac] of state.abortControllers.entries()) {
-                  if (idx !== i) ac.abort();
+        const task = runPersistenceAttempt(
+          async () => {
+            try {
+              const res = await executeTarget(i);
+              if (res && !anySuccess) {
+                if (res.ok) {
+                  anySuccess = true;
+                  globalResolve!(res.response!);
+                  for (const [idx, ac] of state.abortControllers.entries()) {
+                    if (idx !== i) ac.abort();
+                  }
+                } else if (res.response) {
+                  // Fatal error, abort combo
+                  anySuccess = true;
+                  globalResolve!(res.response);
+                  for (const [idx, ac] of state.abortControllers.entries()) {
+                    if (idx !== i) ac.abort();
+                  }
                 }
-              } else if (res.response) {
-                // Fatal error, abort combo
-                anySuccess = true;
-                globalResolve!(res.response);
+              } else if (res?.response) {
+                await res.response.body?.cancel();
               }
+            } finally {
+              deps.signal?.removeEventListener("abort", onClientAbort);
             }
-          } finally {
-            deps.signal?.removeEventListener("abort", onClientAbort);
-          }
-        })().catch((err) => {
+          },
+          { independent: true }
+        ).catch((err) => {
           const logError = deps.log.error ?? deps.log.warn;
           logError("COMBO", `Speculative task error for target ${i}`, err);
           // G2 (silent-stop fix): never leave the speculative loop waiting on an
@@ -339,7 +353,16 @@ export async function dispatchWithCooldownRetry(opts: {
           // 502 so the request terminates with an actionable error.
           if (!anySuccess && globalResolve) {
             anySuccess = true;
-            globalResolve(errorResponse(502, `Combo target ${i} failed with an unexpected error`));
+            for (const ac of state.abortControllers.values()) ac.abort();
+            globalResolve(
+              isPersistenceStreamCapacityError(err)
+                ? errorResponse(
+                    503,
+                    "Gateway attempt capacity is unavailable. Please retry later.",
+                    { code: PERSISTENCE_STREAM_CAPACITY_CODE, type: "local_queue_capacity" }
+                  )
+                : errorResponse(502, `Combo target ${i} failed with an unexpected error`)
+            );
           }
         });
 

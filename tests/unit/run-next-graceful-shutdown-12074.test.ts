@@ -21,7 +21,7 @@ test("the custom Next runner owns exit and awaits application cleanup before clo
     "await globalThis.__omnirouteRequestShutdown?.(signal)"
   );
   const nextClose = runNextSource.indexOf("await nextApp.close()", applicationCleanup);
-  const processExit = runNextSource.indexOf("process.exit(0)", nextClose);
+  const processExit = runNextSource.indexOf("process.exit(exitCode)", nextClose);
 
   assert.ok(serverClose < applicationCleanup, "stop accepting requests before application cleanup");
   assert.ok(applicationCleanup < nextClose, "application cleanup must finish before Next closes");
@@ -41,7 +41,9 @@ test("custom Next runner closes existing connections and supports force exit on 
   );
   assert.match(
     runNextSource,
-    /setTimeout\(\(\)\s*=>\s*\{\s*process\.exit\(0\);?\s*\},\s*\d+\)/,
+    /setTimeout\(\(\)\s*=>\s*\{.*?process\.exit\(1\);?\s*\},\s*forceExitMs\)/s,
     "must have fallback force exit timer"
   );
+  assert.match(runNextSource, /if \(!native\) server\.closeAllConnections/);
+  assert.match(runNextSource, /native \? getShutdownBudgetConfig\(\)\.forceExitMs : 2000/);
 });

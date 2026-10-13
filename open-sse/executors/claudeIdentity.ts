@@ -9,6 +9,7 @@
  */
 
 import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { withOperationDeadline } from "../utils/operationDeadline.ts";
 
 import {
   CLAUDE_CODE_CLIENT_VERSION,
@@ -151,39 +152,47 @@ export type ClaudeBootstrap = {
 };
 
 /** GET /api/claude_cli/bootstrap with the same headers real CLI uses. */
-export async function fetchClaudeBootstrap(accessToken: string): Promise<ClaudeBootstrap | null> {
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), BOOTSTRAP_FETCH_TIMEOUT_MS);
+export async function fetchClaudeBootstrap(
+  accessToken: string,
+  signal?: AbortSignal
+): Promise<ClaudeBootstrap | null> {
   try {
-    const res = await fetch("https://api.anthropic.com/api/claude_cli/bootstrap", {
-      method: "GET",
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        Accept: "application/json",
-        "User-Agent": `claude-cli/${getClaudeCodeVersion()} (external, cli)`,
-        "anthropic-beta": "oauth-2025-04-20",
+    return await withOperationDeadline(
+      BOOTSTRAP_FETCH_TIMEOUT_MS,
+      async (deadlineSignal) => {
+        const res = await fetch("https://api.anthropic.com/api/claude_cli/bootstrap", {
+          method: "GET",
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            Accept: "application/json",
+            "User-Agent": `claude-cli/${getClaudeCodeVersion()} (external, cli)`,
+            "anthropic-beta": "oauth-2025-04-20",
+          },
+          signal: deadlineSignal,
+        });
+        if (!res.ok) {
+          await res.body?.cancel();
+          return null;
+        }
+        const data: unknown = await res.json().catch(() => null);
+        const acct =
+          data && typeof data === "object" ? (data as Record<string, unknown>).oauth_account : null;
+        if (!acct || typeof acct !== "object") return null;
+        const account = acct as Record<string, unknown>;
+        const stringOrNull = (value: unknown) => (typeof value === "string" ? value : null);
+        return {
+          account_uuid: stringOrNull(account.account_uuid),
+          account_email: stringOrNull(account.account_email),
+          organization_uuid: stringOrNull(account.organization_uuid),
+          organization_name: stringOrNull(account.organization_name),
+          organization_type: stringOrNull(account.organization_type),
+          organization_rate_limit_tier: stringOrNull(account.organization_rate_limit_tier),
+        };
       },
-      signal: ctrl.signal,
-    });
-    if (!res.ok) return null;
-    const data: unknown = await res.json().catch(() => null);
-    const acct =
-      data && typeof data === "object" ? (data as Record<string, unknown>).oauth_account : null;
-    if (!acct || typeof acct !== "object") return null;
-    const account = acct as Record<string, unknown>;
-    const stringOrNull = (value: unknown) => (typeof value === "string" ? value : null);
-    return {
-      account_uuid: stringOrNull(account.account_uuid),
-      account_email: stringOrNull(account.account_email),
-      organization_uuid: stringOrNull(account.organization_uuid),
-      organization_name: stringOrNull(account.organization_name),
-      organization_type: stringOrNull(account.organization_type),
-      organization_rate_limit_tier: stringOrNull(account.organization_rate_limit_tier),
-    };
+      signal
+    );
   } catch {
     return null;
-  } finally {
-    clearTimeout(timer);
   }
 }
 

@@ -1,4 +1,5 @@
 import { getSelectedPostgresDatabase, getSelectedPersistenceIdentity } from "./controlPlaneContext";
+import { acquirePostgresLock } from "./postgres/locks";
 
 /** Opaque cache authority, never a SQL/driver handle at the consumer boundary. */
 export function postgresSignatureCacheAuthority(): object | undefined {
@@ -35,7 +36,7 @@ export async function writePersistedGeminiThoughtSignature(
   const database = getSelectedPostgresDatabase();
   if (!database) return;
   await database.transaction(async (transaction) => {
-    await transaction.query("SELECT pg_advisory_xact_lock(18765,15)");
+    await acquirePostgresLock(transaction, "thoughtSignatures");
     await transaction.query(
       `INSERT INTO omniroute.key_value(namespace,key,value)
        VALUES('gemini_thought_signatures',$1,$2)
@@ -60,7 +61,7 @@ export async function clearPersistedGeminiThoughtSignatures(): Promise<void> {
   const database = getSelectedPostgresDatabase();
   if (!database) return;
   await database.transaction(async (transaction) => {
-    await transaction.query("SELECT pg_advisory_xact_lock(18765,15)");
+    await acquirePostgresLock(transaction, "thoughtSignatures");
     await transaction.query(
       `DELETE FROM omniroute.key_value WHERE namespace='gemini_thought_signatures'`
     );

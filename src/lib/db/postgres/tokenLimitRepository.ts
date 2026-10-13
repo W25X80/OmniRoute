@@ -6,6 +6,7 @@ import {
 } from "../tokenLimits/persistenceSemantics";
 import type { TokenLimit, UpsertTokenLimitInput } from "../tokenLimits";
 import type { PostgresDatabase, PostgresTransaction } from "./database";
+import { acquirePostgresLock } from "./locks";
 
 function tokenCount(value: unknown): number {
   const count = Number(value);
@@ -34,7 +35,7 @@ export class PostgresTokenLimitRepository {
 
   private async locked<T>(body: (tx: PostgresTransaction) => Promise<T>): Promise<T> {
     return this.database.transaction(async (tx) => {
-      await tx.query("SELECT pg_advisory_xact_lock(18765,9)");
+      await acquirePostgresLock(tx, "quota");
       return body(tx);
     });
   }

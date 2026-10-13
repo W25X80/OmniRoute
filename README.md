@@ -7,6 +7,13 @@
 
 # 🚀 OmniRoute — The Free AI Gateway
 
+> **Fork persistence profile:** native PostgreSQL is the default. Before starting this fork,
+> configure PostgreSQL, private S3 artifacts, `STORAGE_ENCRYPTION_KEY` and an explicit scratch
+> `DATA_DIR` as described in [PostgreSQL operations](docs/ops/POSTGRESQL.md).
+> Missing configuration fails startup; it does not open a local SQLite database.
+> Legacy SQLite requires explicit `OMNIROUTE_DATABASE_BACKEND=sqlite`.
+> Existing SQLite installations need an offline migration before changing authority.
+
 <img src="./docs/diagrams/readme-hero.svg" width="100%" alt="OmniRoute — Never stop coding. Every AI tool → 372 providers — 150+ free — through one endpoint. Claude Code, Codex, Cursor, Cline, Copilot & Antigravity into FREE Claude / GPT / Gemini with auto-fallback. RTK + Caveman stacked compression saves 15–95% tokens (~89% avg) — never hit limits. 372 AI providers · 150+ free tiers · ~1.62B free tokens/mo · 19 routing strategies · $0 to start."/>
 
 </div>
@@ -1006,6 +1013,10 @@ Auto-trigger by token threshold, flip on the adaptive dial, pin a named profile,
 
 </div>
 
+> **This fork defaults to PostgreSQL.** Complete the [PostgreSQL setup](docs/ops/POSTGRESQL.md)
+> before starting it. To retain the legacy SQLite mode, explicitly set
+> `OMNIROUTE_DATABASE_BACKEND=sqlite`.
+
 **1) Install & run**
 
 ```bash
@@ -1105,7 +1116,7 @@ Full table: [Docker Guide — runtime RAM](docs/guides/DOCKER_GUIDE.md#runtime-r
 
 Standard `bun install` and global installation (`bun install -g omniroute`) are supported via Bun runtime detection:
 
-- **Built-in `bun:sqlite`**: OmniRoute uses Bun's built-in `bun:sqlite` driver when running under Bun, falling back to `better-sqlite3` on Node.js or `sql.js`.
+- **Optional SQLite profile**: with `OMNIROUTE_DATABASE_BACKEND=sqlite`, OmniRoute uses Bun's built-in `bun:sqlite` driver under Bun, or `better-sqlite3` / `sql.js` under Node.js.
 - **Automatic Webpack bundler selection in dev**: Development (`bun run dev`) automatically detects Bun and disables Turbopack in favor of Webpack to prevent native V8 binding incompatibilities. Production builds (`bun run build`) follow `OMNIROUTE_USE_TURBOPACK` exactly as on Node: Turbopack by default, `OMNIROUTE_USE_TURBOPACK=0` to build with Webpack (`Dockerfile.bun` exposes it as a `--build-arg`).
 - **Dedicated Bun Dockerfile**: Multi-stage `Dockerfile.bun` for native Bun production deployments (`docker build -f Dockerfile.bun -t omniroute:bun .`).
 
@@ -1296,7 +1307,7 @@ Métricas canônicas em 2026-08-24: **1.029 vídeos únicos** · **11.132.922 vi
   <tr><td nowrap><b>Runtime</b></td><td>Node.js 22.x / 24.x LTS — <code>&gt;=22.22.2 &lt;23 || &gt;=24.0.0 &lt;27</code></td></tr>
   <tr><td nowrap><b>Language</b></td><td>TypeScript 6.0 — <b>100% TypeScript</b> across <code>src/</code> and <code>open-sse/</code> (zero <code>any</code> in core since v2.0)</td></tr>
   <tr><td nowrap><b>Framework</b></td><td>Next.js 16 + React 19 + Tailwind CSS 4</td></tr>
-  <tr><td nowrap><b>Database</b></td><td>better-sqlite3 (SQLite, WAL journaling) + LowDB (JSON legacy) — 137 domain modules, 202 migrations</td></tr>
+  <tr><td nowrap><b>Database</b></td><td>Native PostgreSQL by default; explicit SQLite legacy profile with WAL journaling</td></tr>
   <tr><td nowrap><b>Memory</b></td><td>SQLite FTS5 full-text + int8-quantized vector embeddings, typed decay</td></tr>
   <tr><td nowrap><b>Schemas</b></td><td>Zod 4 — MCP tool I/O validation + API contracts</td></tr>
   <tr><td nowrap><b>Protocols</b></td><td>MCP (stdio / HTTP / SSE) + A2A v0.3 (JSON-RPC 2.0 + SSE)</td></tr>

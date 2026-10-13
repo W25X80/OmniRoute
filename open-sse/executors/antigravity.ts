@@ -192,12 +192,16 @@ const creditReads = (creditGlobal[CREDIT_READS] ??= new WeakMap<
 >());
 function getCreditCache(): CreditCache {
   const identity = getSelectedPersistenceIdentity();
-  if (!identity) return sqliteCreditCache;
+  if (!identity) {
+    startAntigravityCreditSweep(sqliteCreditCache);
+    return sqliteCreditCache;
+  }
   let cache = postgresCreditCaches.get(identity);
   if (!cache) {
     cache = new Map();
     postgresCreditCaches.set(identity, cache);
   }
+  startAntigravityCreditSweep(cache);
   return cache;
 }
 let creditCacheHydrated = false;
@@ -216,27 +220,38 @@ function hydrateCreditCacheFromDb(): void {
   } catch {}
 }
 
-function evictStaleCreditBalanceEntries(): void {
+function evictStaleCreditBalanceEntries(cache: CreditCache): void {
   const now = Date.now();
-  for (const [key, entry] of getCreditCache()) {
+  for (const [key, entry] of cache) {
     if (now - entry.updatedAt > CREDIT_BALANCE_TTL_MS) {
-      getCreditCache().delete(key);
+      cache.delete(key);
     }
   }
-  while (getCreditCache().size > MAX_CREDIT_BALANCE_ENTRIES) {
-    const oldestKey = getCreditCache().keys().next().value;
-    if (oldestKey !== undefined) getCreditCache().delete(oldestKey);
+  while (cache.size > MAX_CREDIT_BALANCE_ENTRIES) {
+    const oldestKey = cache.keys().next().value;
+    if (oldestKey !== undefined) cache.delete(oldestKey);
     else break;
   }
 }
 
-const _creditBalanceSweep = setInterval(() => {
-  void runPersistenceBackgroundWork(async () => evictStaleCreditBalanceEntries()).catch((error) =>
-    console.error("[Antigravity] Credit cache sweep failed", error)
-  );
-}, 60_000);
-if (typeof _creditBalanceSweep === "object" && "unref" in _creditBalanceSweep) {
-  (_creditBalanceSweep as { unref?: () => void }).unref?.();
+const CREDIT_SWEEPS = Symbol.for("omniroute.antigravity.creditSweeps");
+const creditSweepGlobal = globalThis as typeof globalThis & {
+  [CREDIT_SWEEPS]?: { stopped: boolean; timers: Map<CreditCache, ReturnType<typeof setInterval>> };
+};
+const creditSweeps = (creditSweepGlobal[CREDIT_SWEEPS] ??= { stopped: false, timers: new Map() });
+
+/** Bind the selected cache once; pure eviction never reads SQL or inherits a request scope. */
+function startAntigravityCreditSweep(cache: CreditCache): void {
+  if (creditSweeps.stopped || creditSweeps.timers.has(cache)) return;
+  const timer = setInterval(() => evictStaleCreditBalanceEntries(cache), 60_000);
+  timer.unref?.();
+  creditSweeps.timers.set(cache, timer);
+}
+
+export function stopAntigravityCreditSweep(): void {
+  creditSweeps.stopped = true;
+  for (const timer of creditSweeps.timers.values()) clearInterval(timer);
+  creditSweeps.timers.clear();
 }
 
 export function getAntigravityRemainingCredits(accountId: string): number | null {

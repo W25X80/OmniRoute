@@ -5,6 +5,7 @@ import {
   requireExplicitStorageEncryptionKey,
 } from "../encryption";
 import type { PostgresDatabase } from "./database";
+import { acquirePostgresLock } from "./locks";
 
 export type KnowledgeNamespace = "notion" | "obsidian" | "local_corpus" | "conductor" | "sync";
 
@@ -66,7 +67,7 @@ export function createPostgresKnowledgeRepository(database: PostgresDatabase) {
     const encoded = JSON.stringify(value);
     if (encoded === undefined) throw new Error("Knowledge metadata value is not serializable");
     await database.transaction(async (transaction) => {
-      await transaction.query("SELECT pg_advisory_xact_lock(18765,16)");
+      await acquirePostgresLock(transaction, "knowledge");
       await transaction.query(
         `INSERT INTO omniroute.key_value(namespace,key,value) VALUES($1,$2,$3)
          ON CONFLICT(namespace,key) ${firstOnly ? "DO NOTHING" : "DO UPDATE SET value=EXCLUDED.value"}`,
@@ -89,7 +90,7 @@ export function createPostgresKnowledgeRepository(database: PostgresDatabase) {
   }
   async function remove(namespace: KnowledgeNamespace, key: string): Promise<void> {
     await database.transaction(async (transaction) => {
-      await transaction.query("SELECT pg_advisory_xact_lock(18765,16)");
+      await acquirePostgresLock(transaction, "knowledge");
       await transaction.query("DELETE FROM omniroute.key_value WHERE namespace=$1 AND key=$2", [
         namespace,
         key,
@@ -115,7 +116,7 @@ export function createPostgresKnowledgeRepository(database: PostgresDatabase) {
       return { key: entry.key, encoded };
     });
     await database.transaction(async (tx) => {
-      await tx.query("SELECT pg_advisory_xact_lock(18765,16)");
+      await acquirePostgresLock(tx, "knowledge");
       for (const entry of prepared)
         await tx.query(
           "INSERT INTO omniroute.key_value(namespace,key,value) VALUES($1,$2,$3) ON CONFLICT(namespace,key) DO UPDATE SET value=EXCLUDED.value",
@@ -125,7 +126,7 @@ export function createPostgresKnowledgeRepository(database: PostgresDatabase) {
   }
   async function removeMany(namespace: KnowledgeNamespace, keys: readonly string[]): Promise<void> {
     await database.transaction(async (tx) => {
-      await tx.query("SELECT pg_advisory_xact_lock(18765,16)");
+      await acquirePostgresLock(tx, "knowledge");
       await tx.query("DELETE FROM omniroute.key_value WHERE namespace=$1 AND key=ANY($2::text[])", [
         namespace,
         keys,

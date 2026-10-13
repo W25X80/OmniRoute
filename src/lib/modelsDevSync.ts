@@ -316,22 +316,24 @@ export function getModelsDevPricing(): PricingByProvider {
  */
 export async function saveModelsDevPricingAsync(data: PricingByProvider): Promise<void> {
   const catalogDatabase = getSelectedPostgresDatabase();
-  if (catalogDatabase)
+  if (catalogDatabase) {
+    const rows = Object.entries(data).map(([key, models]) => ({
+      key,
+      value: JSON.stringify(models),
+    }));
+    const payload = JSON.stringify(rows);
     return mutatePostgresCatalog(catalogDatabase, async () => {
       await writePostgresCatalog("DELETE FROM omniroute.key_value WHERE namespace=$1", [
         "models_dev_pricing",
       ]);
-      const rows = Object.entries(data).map(([key, models]) => ({
-        key,
-        value: JSON.stringify(models),
-      }));
       if (rows.length)
         await writePostgresCatalog(
           "INSERT INTO omniroute.key_value(namespace,key,value) SELECT $1, key,value FROM json_to_recordset($2::json) AS data(key text,value text)",
-          ["models_dev_pricing", JSON.stringify(rows)]
+          ["models_dev_pricing", payload]
         );
       afterPostgresCatalogCommit(() => invalidateDbCache("pricing"));
     });
+  }
 
   const db = getDbInstance();
   const del = db.prepare("DELETE FROM key_value WHERE namespace = 'models_dev_pricing'");
@@ -602,12 +604,14 @@ export function getSyncedCapability(
  */
 export async function saveModelsDevCapabilitiesAsync(data: CapabilitiesByProvider): Promise<void> {
   const catalogDatabase = getSelectedPostgresDatabase();
-  if (catalogDatabase)
+  if (catalogDatabase) {
+    const prepared = prepareNativeCapabilityRows(data, false);
     return mutatePostgresCatalog(catalogDatabase, async () => {
       await writePostgresCatalog("DELETE FROM omniroute.model_capabilities");
-      await insertNativeCapabilityRows(data, false);
+      if (prepared) await writePostgresCatalog(prepared.sql, [prepared.payload]);
       afterPostgresCatalogCommit(() => invalidateDbCache("model-capabilities"));
     });
+  }
 
   const db = getDbInstance();
   ensureCapabilitiesTable();
@@ -674,8 +678,9 @@ export async function upsertSyncedCapabilitiesAsync(
   const catalogDatabase = getSelectedPostgresDatabase();
   if (catalogDatabase) {
     if (!provider || Object.keys(models).length === 0) return;
+    const prepared = prepareNativeCapabilityRows({ [provider]: models }, true);
     return mutatePostgresCatalog(catalogDatabase, async () => {
-      await insertNativeCapabilityRows({ [provider]: models }, true);
+      if (prepared) await writePostgresCatalog(prepared.sql, [prepared.payload]);
       afterPostgresCatalogCommit(() => invalidateDbCache("model-capabilities"));
     });
   }
@@ -1092,10 +1097,10 @@ const NATIVE_CAPABILITY_COLUMNS = [
   "reasoning_efforts",
   "last_synced",
 ] as const;
-async function insertNativeCapabilityRows(
+function prepareNativeCapabilityRows(
   data: CapabilitiesByProvider,
   upsert: boolean
-): Promise<void> {
+): { sql: string; payload: string } | null {
   const now = new Date().toISOString();
   const rows = Object.entries(data).flatMap(([provider, models]) =>
     Object.entries(models).map(([model_id, cap]) => ({
@@ -1128,7 +1133,7 @@ async function insertNativeCapabilityRows(
       last_synced: now,
     }))
   );
-  if (!rows.length) return;
+  if (!rows.length) return null;
   const columns = NATIVE_CAPABILITY_COLUMNS.join(",");
   const definitions = NATIVE_CAPABILITY_COLUMNS.map(
     (column) =>
@@ -1153,8 +1158,9 @@ async function insertNativeCapabilityRows(
         .map((column) => column + "=EXCLUDED." + column)
         .join(",")
     : "";
-  await writePostgresCatalog(
-    "INSERT INTO omniroute.model_capabilities(" +
+  return {
+    sql:
+      "INSERT INTO omniroute.model_capabilities(" +
       columns +
       ") SELECT " +
       columns +
@@ -1162,8 +1168,8 @@ async function insertNativeCapabilityRows(
       definitions +
       ")" +
       conflict,
-    [JSON.stringify(rows)]
-  );
+    payload: JSON.stringify(rows),
+  };
 }
 
 export function saveModelsDevPricing(data: PricingByProvider): void {

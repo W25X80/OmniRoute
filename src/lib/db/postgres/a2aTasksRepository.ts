@@ -5,6 +5,7 @@ import type {
   UpsertA2ATaskInput,
 } from "../a2aTasks";
 import type { PostgresDatabase, PostgresTransaction } from "./database";
+import { acquirePostgresLock } from "./locks";
 
 const COLUMNS =
   "id,state,skill_id,input_json,output_json,api_key_id,created_at,updated_at,completed_at";
@@ -34,7 +35,7 @@ function historyFilter(
 export function createPostgresA2ATasksRepository(database: PostgresDatabase) {
   function operation<T>(write: boolean, body: (tx: PostgresTransaction) => Promise<T>) {
     return database.transaction(async (tx) => {
-      await tx.query(`SELECT pg_advisory_xact_lock${write ? "" : "_shared"}(18765,12)`);
+      await acquirePostgresLock(tx, "a2a", write ? "exclusive" : "shared");
       return body(tx);
     });
   }

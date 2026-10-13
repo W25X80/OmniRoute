@@ -31,6 +31,9 @@ let startupImports = 0;
 const hooks = registerHooks({
   resolve(specifier, context, nextResolve) {
     if (context.parentURL === runtimeUrl && bootDependencies.has(specifier)) {
+      if (scenario === "native-default-no-config" && specifier === "./postgres/environment") {
+        return nextResolve(specifier, context);
+      }
       startupImports++;
       return { url: fixtureUrl, shortCircuit: true };
     }
@@ -98,23 +101,33 @@ async function migrationStatusAfterImport() {
 }
 
 const native = scenario.startsWith("native-");
+const defaultNative = scenario.startsWith("native-default");
+const building = scenario === "native-default-build";
+const missingPostgresConfig = scenario === "native-default-no-config";
 const contextOnly = scenario === "context-only";
-process.env.OMNIROUTE_DATABASE_BACKEND = native ? "postgres" : "sqlite";
+if (defaultNative) delete process.env.OMNIROUTE_DATABASE_BACKEND;
+else process.env.OMNIROUTE_DATABASE_BACKEND = native ? "postgres" : "sqlite";
+if (building) process.env.OMNIROUTE_BUILDING = "1";
+if (missingPostgresConfig) {
+  for (const key of Object.keys(process.env)) {
+    if (key.startsWith("OMNIROUTE_POSTGRES_")) delete process.env[key];
+  }
+}
 process.env.STORAGE_ENCRYPTION_KEY = "native-cold-core-source-fixture-key";
 delete process.env.OMNIROUTE_MIGRATIONS_DIR;
 if (scenario === "sqlite-migration-snapshot") {
   process.env.OMNIROUTE_MIGRATIONS_DIR = firstCarrier;
 }
-if (scenario === "native-missing") delete process.env.DATA_DIR;
-if (scenario === "native-blank") process.env.DATA_DIR = " \t ";
+if (native && scenario.endsWith("-missing")) delete process.env.DATA_DIR;
+if (native && scenario.endsWith("-blank")) process.env.DATA_DIR = " \t ";
 fixture.reset();
 let close: (() => Promise<void>) | undefined;
 let selected: <T>(body: () => Promise<T>) => Promise<T> = (body) => body();
-const missingScratch = scenario === "native-missing" || scenario === "native-blank";
+const missingScratch = native && (scenario.endsWith("-missing") || scenario.endsWith("-blank"));
 const observation = observeApplicationFileWork();
 let core: typeof import("../../../src/lib/db/core.ts") | undefined;
 try {
-  if (native) {
+  if (native && !building) {
     const runtime = await import(runtimeUrl);
     close = runtime.closePersistenceRuntime;
     if (missingScratch) {
@@ -126,6 +139,15 @@ try {
       assert.equal(fixture.environmentReads, 0);
       assert.equal(fixture.planeCreates, 0);
       assert.equal(fixture.artifactCreates, 0);
+    } else if (missingPostgresConfig) {
+      await assert.rejects(runtime.ensurePersistenceReady(), /Invalid PostgreSQL configuration/);
+      assert.equal(runtime.getPersistenceRuntimeStatus().phase, "failed");
+      assert.equal(fixture.planeCreates, 0);
+      assert.equal(fixture.artifactCreates, 0);
+      await assert.rejects(
+        runtime.runPersistenceRequest(async () => assert.fail("failed native startup dispatched")),
+        /unavailable/
+      );
     } else {
       await runtime.ensurePersistenceReady();
       assert.equal(runtime.getPersistenceRuntimeStatus().phase, "ready");
@@ -137,7 +159,7 @@ try {
     close = () => plane.close();
     selected = (body) => plane.run(body);
   }
-  if (missingScratch) {
+  if (missingScratch || missingPostgresConfig) {
     assert.deepEqual(observation.operations, []);
   } else {
     core = await selected(() => import(`${coreUrl}?core-cold=one`));
@@ -148,9 +170,17 @@ try {
     if (native) {
       assert.deepEqual(observation.operations, []);
       assert.equal(core.getDriverInfo(), null);
-      await selected(async () => {
-        assert.throws(() => core!.getDbInstance(), UnsupportedPersistenceDomainError);
-      });
+      if (!building) {
+        await selected(async () => {
+          assert.throws(() => core!.getDbInstance(), UnsupportedPersistenceDomainError);
+        });
+      } else {
+        assert.equal(startupImports, 0);
+        assert.equal(fixture.planeCreates, 0);
+        assert.equal(fixture.environmentReads, 0);
+        assert.equal(fixture.artifactCreates, 0);
+        assert.equal(globalThis.__omniroutePersistenceRuntime, undefined);
+      }
       assert.deepEqual(observation.operations, []);
       const duplicate = await selected(() => import(`${coreUrl}?core-cold=two`));
       assert.notEqual(

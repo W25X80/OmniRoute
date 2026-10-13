@@ -25,6 +25,9 @@ export const closeCloudSyncScheduler = stop;
 export const stopProviderLimitsSyncScheduler = stop;
 export const stopConnectionRecoveryScheduler = stop;
 export const stopBackgroundRefresh = stop;
+export const stopNativeArtifactRecovery = stop;
+export const stopAntigravityCreditSweep = stop;
+export const beginNativeSpendBatchWriterClose = stop;
 export const stopSessionAccountAffinityCleanup = stop;
 export const stopCleanupSchedulerAsync = stop;
 export const stopCredentialHealthCheckAsync = stop;
@@ -58,6 +61,7 @@ export async function flushSpendBatchWriter(): Promise<void> {
   assertShutdownScope();
   fixture.events.push("cost:flush");
 }
+export const closeNativeSpendBatchWriter = flushSpendBatchWriter;
 export async function closeCallLogSaves(): Promise<void> {
   assertShutdownScope();
   fixture.events.push("logs:close");

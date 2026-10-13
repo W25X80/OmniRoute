@@ -43,6 +43,7 @@ import {
   recordPostgresApiKeyAuditEvent,
 } from "./controlPlaneEffects";
 import { migratePostgresSchema } from "./migrations";
+import { initializePostgresCompressionSeed } from "./compressionSeedUpgrade";
 import { hasPostgresCatalogSnapshot, refreshPostgresCatalogSnapshot } from "./catalogSnapshot";
 
 type ControlPlaneState = "ready" | "closing" | "closed";
@@ -92,6 +93,7 @@ export async function initializePostgresControlPlane(
   const database = await createPostgresDatabase(options.connection, options.logger);
   try {
     await migratePostgresSchema(database);
+    await initializePostgresCompressionSeed(database);
     const secrets = createPostgresSecretRepository(database);
     const jwtSecret = explicitJwt?.trim()
       ? explicitJwt

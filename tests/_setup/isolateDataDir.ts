@@ -21,6 +21,10 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+// The legacy suite explicitly exercises SQLite. Production never imports this
+// setup; native/default-selection tests preserve or deliberately unset their own value.
+process.env.OMNIROUTE_DATABASE_BACKEND ??= "sqlite";
+
 // File logger worker threads can outlive a test's temporary DATA_DIR cleanup and then
 // raise ENOENT/ENOTEMPTY after the test has already passed. Keep the global test default
 // console-only; tests that cover file logging explicitly set APP_LOG_TO_FILE themselves.

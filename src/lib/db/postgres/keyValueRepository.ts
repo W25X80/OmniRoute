@@ -1,4 +1,5 @@
 import type { PostgresDatabase, PostgresTransaction } from "./database";
+import { acquirePostgresLock } from "./locks";
 
 export interface PostgresKeyValueRow {
   key: string;
@@ -68,7 +69,7 @@ export async function deletePostgresKeyValueNamespace(
 export async function lockPostgresKeyValueMutation(
   transaction: PostgresTransaction
 ): Promise<void> {
-  await transaction.query("SELECT pg_advisory_xact_lock(18765, 20)");
+  await acquirePostgresLock(transaction, "catalogKeyValue");
 }
 
 export function withPostgresKeyValueMutation<T>(

@@ -1,6 +1,7 @@
 import { captureSpendEntries, assertNewSpendReceipts, appendSpendReceipts } from "./spendReceipts";
 import type { PostgresDatabase, PostgresTransaction } from "./database";
 import type * as Source from "../domainState";
+import { acquirePostgresLock } from "./locks";
 
 type Budget = NonNullable<ReturnType<typeof Source.loadBudget>>;
 type Lockout = NonNullable<ReturnType<typeof Source.loadLockoutState>>;
@@ -81,7 +82,7 @@ export class PostgresDomainStateRepository {
 
   async withDomainLock<T>(body: (tx: PostgresTransaction) => Promise<T>): Promise<T> {
     return this.database.transaction(async (tx) => {
-      await tx.query("SELECT pg_advisory_xact_lock(18765,8)");
+      await acquirePostgresLock(tx, "accounting");
       return body(tx);
     });
   }

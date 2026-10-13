@@ -23,14 +23,12 @@ test.after(async () => {
 });
 
 async function saved(content: Buffer | null) {
-  return database.transaction((transaction) =>
-    files.createFile(transaction, {
-      bytes: 0,
-      filename: "content.bin",
-      purpose: "batch",
-      content,
-    })
-  );
+  return files.createFile(database, {
+    bytes: 0,
+    filename: "content.bin",
+    purpose: "batch",
+    content,
+  });
 }
 async function remove(id: string) {
   await database.transaction((transaction) =>
@@ -47,25 +45,14 @@ test(
     for (const expected of [null, Buffer.alloc(0), payload]) {
       const file = await saved(expected);
       try {
-        assert.deepEqual(
-          await database.transaction((transaction) => files.getFileContent(transaction, file.id)),
-          expected
-        );
+        assert.deepEqual(await files.getFileContent(database, file.id), expected);
         await database.transaction((transaction) => files.deleteFile(transaction, file.id));
-        assert.equal(
-          await database.transaction((transaction) => files.getFileContent(transaction, file.id)),
-          null
-        );
+        assert.equal(await files.getFileContent(database, file.id), null);
       } finally {
         await remove(file.id);
       }
     }
-    assert.equal(
-      await database.transaction((transaction) =>
-        files.getFileContent(transaction, "missing-content-fixture")
-      ),
-      null
-    );
+    assert.equal(await files.getFileContent(database, "missing-content-fixture"), null);
   }
 );
 
@@ -93,21 +80,29 @@ test(
     let writer: Promise<boolean> | undefined;
     t.after(() => release());
     try {
-      reader = database.transaction(async (transaction) => {
-        readerPid = (await transaction.query<{ pid: number }>("SELECT pg_backend_pid() AS pid"))
-          .rows[0].pid;
-        const observed: PostgresTransaction = {
-          async query<Row>(text: string, values?: unknown[]) {
-            const result = await transaction.query<Row>(text, values);
-            if (text.includes("octet_length")) {
-              locked();
-              await gate;
-            }
-            return result;
-          },
-        };
-        return files.getFileContent(observed, file.id);
+      const observedDatabase = new Proxy(database, {
+        get(target, property, receiver) {
+          if (property !== "transaction") return Reflect.get(target, property, receiver);
+          return <T>(body: (tx: PostgresTransaction) => Promise<T>) =>
+            target.transaction(async (transaction) => {
+              readerPid = (
+                await transaction.query<{ pid: number }>("SELECT pg_backend_pid() AS pid")
+              ).rows[0].pid;
+              const observed: PostgresTransaction = {
+                async query<Row>(text: string, values?: unknown[]) {
+                  const result = await transaction.query<Row>(text, values);
+                  if (text.includes("octet_length")) {
+                    locked();
+                    await gate;
+                  }
+                  return result;
+                },
+              };
+              return body(observed);
+            });
+        },
       });
+      reader = files.getFileContent(observedDatabase, file.id);
       void reader.catch(() => {});
       await hasLock;
       writer = database.transaction(async (transaction) => {
@@ -135,13 +130,37 @@ test(
       release();
       assert.deepEqual(await reader, payload);
       assert.equal(await writer, true);
-      assert.equal(
-        await database.transaction((transaction) => files.getFileContent(transaction, file.id)),
-        null
-      );
+      assert.equal(await files.getFileContent(database, file.id), null);
     } finally {
       release();
       await Promise.allSettled([reader, writer].filter((work) => work !== undefined));
+      await remove(file.id);
+    }
+  }
+);
+
+test(
+  "a committed raw snapshot is owned even when deletion commits before materialization",
+  options,
+  async () => {
+    const original = Buffer.from([19, 0, 255]);
+    const file = await saved(original);
+    let removed = false;
+    const captured = new Proxy(database, {
+      get(target, property, receiver) {
+        if (property !== "transaction") return Reflect.get(target, property, receiver);
+        return async <T>(body: (tx: PostgresTransaction) => Promise<T>) => {
+          const snapshot = await target.transaction(body);
+          removed = await database.transaction((tx) => files.deleteFile(tx, file.id));
+          return snapshot;
+        };
+      },
+    });
+    try {
+      assert.deepEqual(await files.getFileContent(captured, file.id), original);
+      assert.equal(removed, true);
+      assert.equal(await files.getFileContent(database, file.id), null);
+    } finally {
       await remove(file.id);
     }
   }
@@ -168,18 +187,32 @@ test(
     let id: string | undefined;
     try {
       const input = Buffer.alloc(NATIVE_BLOB_LIMITS.fileBytes);
-      const file = await writer.transaction((transaction) =>
-        files.createFile(transaction, {
-          bytes: input.byteLength,
-          filename: "maximum-content.bin",
-          purpose: "batch",
-          content: input,
-        })
-      );
+      const file = await files.createFile(writer, {
+        bytes: input.byteLength,
+        filename: "maximum-content.bin",
+        purpose: "batch",
+        content: input,
+      });
       id = file.id;
       const expected = createHash("sha256").update(input).digest("hex");
-      const content = await reader.transaction((transaction) =>
-        files.getFileContent(transaction, file.id)
+      let turns = 0,
+        running = true;
+      const heartbeat = (async () => {
+        while (running) {
+          await settle();
+          turns++;
+        }
+      })();
+      let content: Buffer | null;
+      try {
+        content = await files.getFileContent(reader, file.id);
+      } finally {
+        running = false;
+        await heartbeat;
+      }
+      assert.ok(
+        turns >= NATIVE_BLOB_LIMITS.fileBytes / NATIVE_BLOB_LIMITS.chunkBytes,
+        "maximum read must allow other event-loop owners to progress between chunks"
       );
       assert.ok(Buffer.isBuffer(content));
       assert.equal(content.byteLength, NATIVE_BLOB_LIMITS.fileBytes);

@@ -149,8 +149,11 @@ try {
     "POSTGRES_DB=omniroute_test",
     "--env",
     "POSTGRES_PASSWORD=omniroute_test",
-    "--tmpfs",
-    "/var/lib/postgresql",
+    // Scale and soak runs need data/index/WAL headroom beyond Docker's tmpfs.
+    // The anonymous volume is owned by this container and removed in cleanup().
+    ...(process.env.RUN_PG_RETENTION_SCALE === "1" || process.env.RUN_PG_RUNTIME_SOAK === "1"
+      ? ["--mount", "type=volume,destination=/var/lib/postgresql"]
+      : ["--tmpfs", "/var/lib/postgresql"]),
     image,
     "sh",
     "-c",

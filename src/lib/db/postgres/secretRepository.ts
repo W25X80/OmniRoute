@@ -5,6 +5,7 @@ import {
   requireExplicitStorageEncryptionKey,
 } from "../encryption";
 import type { PostgresDatabase, PostgresTransaction } from "./database";
+import { acquirePostgresLock } from "./locks";
 
 export interface SecretRepository {
   get(key: string): Promise<string | null>;
@@ -47,7 +48,7 @@ export function createPostgresSecretRepository(database: PostgresDatabase): Secr
       database.transaction(async (tx) => {
         requireExplicitStorageEncryptionKey();
         // Serialize even the absent-row case before generating candidate secrets.
-        await tx.query("SELECT pg_advisory_xact_lock(18765, 6)");
+        await acquirePostgresLock(tx, "secrets");
         const existing = await read(tx, key);
         if (existing !== null) return existing;
         const candidate = generate();

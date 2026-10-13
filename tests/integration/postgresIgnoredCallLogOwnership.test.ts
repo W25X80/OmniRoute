@@ -146,7 +146,10 @@ test(
               )
             );
             assert.equal(idle.rows[0].count, "0", "the S3 wait must not reserve a SQL transaction");
-            assert.equal((await rows(id)).length, 0);
+            const [pendingMetadata] = await rows(id);
+            assert.ok(pendingMetadata, "metadata is durable before object dispatch");
+            assert.equal(pendingMetadata.detail_state, "missing");
+            assert.equal(pendingMetadata.artifact_relpath, null);
             gate.release();
             assert.equal(await callLogs.waitForCallLogSaves(10000), true);
             const [row] = await rows(id);

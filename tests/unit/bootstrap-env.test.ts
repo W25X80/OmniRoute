@@ -20,6 +20,7 @@ import { bootstrapEnv } from "../../scripts/build/bootstrap-env.mjs";
 function withTempEnv(fn) {
   const originalCwd = process.cwd();
   const originalEnv = { ...process.env };
+  process.env.OMNIROUTE_DATABASE_BACKEND = "sqlite";
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "omniroute-bootstrap-test-"));
   const tempCwd = path.join(tempRoot, "cwd");
   const tempHome = path.join(tempRoot, "home");

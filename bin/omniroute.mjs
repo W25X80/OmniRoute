@@ -124,14 +124,22 @@ function migrateElectronServerEnv(dataDir) {
     const envPath = join(dataDir, ".env");
     const serverEnvPath = join(dataDir, "server.env");
     if (existsSync(envPath) || !existsSync(serverEnvPath)) return;
-    writePrivateFile(envPath, readFileSync(serverEnvPath, "utf-8"));
+    // Legacy secrets cannot establish backend authority on this or a later run.
+    const content = readFileSync(serverEnvPath, "utf-8")
+      .split("\n")
+      .filter((line) => !/^\s*OMNIROUTE_DATABASE_BACKEND\s*=/.test(line))
+      .join("\n");
+    writePrivateFile(envPath, content);
     console.log(`  \x1b[2m♻ Migrated Electron secrets from ${serverEnvPath} to ${envPath}\x1b[0m`);
   } catch {
     // Ignore errors migrating server.env — fall back to normal env loading below.
   }
 }
 
-function loadEnvFile() {
+function loadEnvFile({ selectBackendOnly = false } = {}) {
+  if (selectBackendOnly && process.env.OMNIROUTE_DATABASE_BACKEND !== undefined) {
+    return process.env.OMNIROUTE_DATABASE_BACKEND;
+  }
   const envPaths = [];
   const loadedEnvPaths = [];
   const seenEnvPaths = new Set();
@@ -140,8 +148,6 @@ function loadEnvFile() {
     seenEnvPaths.add(envPath);
     envPaths.push(envPath);
   };
-
-  migrateElectronServerEnv(process.env.DATA_DIR || getDefaultDataDir());
 
   if (process.env.DATA_DIR) {
     addEnvPath(join(process.env.DATA_DIR, ".env"));
@@ -174,6 +180,12 @@ function loadEnvFile() {
           const eqIdx = trimmed.indexOf("=");
           if (eqIdx > 0) {
             const key = trimmed.slice(0, eqIdx).trim();
+            if (selectBackendOnly) {
+              if (key === "OMNIROUTE_DATABASE_BACKEND") {
+                return parseEnvValue(trimmed.slice(eqIdx + 1));
+              }
+              continue;
+            }
             if (process.env[key] === undefined) {
               process.env[key] = parseEnvValue(trimmed.slice(eqIdx + 1));
               keyOrigin.set(key, envPath);
@@ -192,6 +204,8 @@ function loadEnvFile() {
       console.warn(`  \x1b[33m⚠ Could not read ${envPath}: ${err?.message ?? err}\x1b[0m`);
     }
   }
+
+  if (selectBackendOnly) return undefined;
 
   for (const envPath of loadedEnvPaths) {
     console.log(`  \x1b[2m📋 Loaded env from ${envPath}\x1b[0m`);
@@ -218,6 +232,19 @@ function loadEnvFile() {
   }
 }
 
+// Discover only the selector before legacy migration: loading all cwd values now
+// would let them shadow the higher-priority DATA_DIR/.env restored by migration.
+const configuredBackend = loadEnvFile({ selectBackendOnly: true });
+// Keep the CLI carrier self-contained; parity with the server selector is tested.
+const databaseBackend = configuredBackend ?? "postgres";
+if (databaseBackend !== "sqlite" && databaseBackend !== "postgres") {
+  throw new Error("OMNIROUTE_DATABASE_BACKEND must be sqlite or postgres");
+}
+// Legacy server.env can restore secrets, but cannot choose a different backend.
+process.env.OMNIROUTE_DATABASE_BACKEND = databaseBackend;
+if (databaseBackend === "sqlite") {
+  migrateElectronServerEnv(process.env.DATA_DIR || getDefaultDataDir());
+}
 loadEnvFile();
 
 // Next.js has no android branch in getCacheDirectory(): if ~/.cache (and tmp)
@@ -229,7 +256,7 @@ loadEnvFile();
   ensureAndroidCacheDir();
 }
 
-// Generate STORAGE_ENCRYPTION_KEY if not set (persisted to DATA_DIR or getDefaultDataDir()/.env)
+// Explicit SQLite profile: generate STORAGE_ENCRYPTION_KEY if not set.
 // This ensures the key survives across upgrades and is not regenerated on each install.
 // See: https://github.com/diegosouzapw/OmniRoute/issues/1622
 //
@@ -237,7 +264,7 @@ loadEnvFile();
 // informational invocations (`--version`, `--help`, `help`) must not create a
 // key or write ~/.omniroute/.env — running a read-only command should never
 // mutate the data dir.
-if (shouldProvisionStorageKey(process.argv)) {
+if (databaseBackend === "sqlite" && shouldProvisionStorageKey(process.argv)) {
   const { randomBytes } = await import("node:crypto");
   const { existsSync, readFileSync } = await import("node:fs");
   const { join } = await import("node:path");

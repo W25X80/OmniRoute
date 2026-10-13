@@ -85,6 +85,9 @@ export async function withNativeFileFixtureAuthority<T>(body: () => Promise<T>):
     applicationIdentity: identity,
     owners,
     requests: new Set(),
+    attempts: new Set(),
+    attemptAdmissions: new Set(),
+    attemptCancellation: new AbortController(),
     background: new Set(),
     tails: new Set(),
   } as NonNullable<typeof globalThis.__omniroutePersistenceRuntime>;

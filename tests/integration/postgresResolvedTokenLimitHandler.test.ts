@@ -218,79 +218,80 @@ test(
             let warning = 0;
             // The live native transaction and all other statements use actual PostgreSQL.
             // Only this counter-read rejection is injected; this does not prove transport failover.
-            const intercepted = new Proxy(database, {
-              get(target, property, receiver) {
-                if (property !== "transaction") return Reflect.get(target, property, receiver);
-                return <T>(body: (tx: PostgresTransaction) => Promise<T>) =>
-                  target.transaction((tx) =>
-                    body({
-                      query: async <Row = Record<string, unknown>>(
-                        sql: string,
-                        values?: unknown[]
-                      ) => {
-                        if (
-                          sql.includes(
-                            "SELECT * FROM omniroute.api_key_token_limits WHERE api_key_id=$1"
-                          ) &&
-                          values?.[0] === keyId
-                        ) {
-                          injected++;
-                          throw new PostgresError("query_failed", "08006");
-                        }
-                        return tx.query<Row>(sql, values);
-                      },
-                    })
-                  );
-              },
-            });
+            // Fresh attempt scopes intentionally recreate the binding. Inject at the
+            // shared database owner, so the real failure follows those scopes too.
+            const originalTransaction = database.transaction.bind(database);
+            const intercepted = t.mock.method(
+              database,
+              "transaction",
+              <T>(body: (tx: PostgresTransaction) => Promise<T>) =>
+                originalTransaction((tx) =>
+                  body({
+                    query: async <Row = Record<string, unknown>>(
+                      sql: string,
+                      values?: unknown[]
+                    ) => {
+                      if (
+                        sql.includes(
+                          "SELECT * FROM omniroute.api_key_token_limits WHERE api_key_id=$1"
+                        ) &&
+                        values?.[0] === keyId
+                      ) {
+                        injected++;
+                        throw new PostgresError("query_failed", "08006");
+                      }
+                      return tx.query<Row>(sql, values);
+                    },
+                  })
+                )
+            );
             const body = {
               model: "isolated-client-read-fault-alias",
               messages: [{ role: "user", content: "hi" }],
               max_tokens: 8,
               stream: false,
             };
-            const result = await withPostgresControlPlane(
-              { ...binding, database: intercepted },
-              () =>
-                invokeHandler({
-                  body,
-                  modelInfo: {
-                    provider: "openai",
-                    model: "isolated-resolved-read-fault",
-                    extendedContext: false,
-                  },
-                  credentials: {
-                    apiKey: "fixture-only-credential",
-                    connectionId,
-                    providerSpecificData: {},
-                  },
-                  log: {
-                    debug() {},
-                    info() {},
-                    error() {},
-                    warn(tag: string, message: string) {
-                      if (
-                        tag === "TOKEN_LIMIT" &&
-                        message === "Tier 2 token-limit check failed; allowing request"
-                      )
-                        warning++;
-                    },
-                  },
-                  clientRawRequest: {
-                    endpoint: "/v1/chat/completions",
-                    body,
-                    headers: new Headers(),
-                  },
-                  apiKeyInfo: { id: keyId, noLog: true },
+            const result = await withPostgresControlPlane({ ...binding, database }, () =>
+              invokeHandler({
+                body,
+                modelInfo: {
+                  provider: "openai",
+                  model: "isolated-resolved-read-fault",
+                  extendedContext: false,
+                },
+                credentials: {
+                  apiKey: "fixture-only-credential",
                   connectionId,
-                  userAgent: "native-resolved-limit-fault-test",
-                  comboName: undefined,
-                  onCredentialsRefreshed: undefined,
-                  onRequestSuccess: undefined,
-                  onStreamFailure: undefined,
-                  onDisconnect: undefined,
-                })
+                  providerSpecificData: {},
+                },
+                log: {
+                  debug() {},
+                  info() {},
+                  error() {},
+                  warn(tag: string, message: string) {
+                    if (
+                      tag === "TOKEN_LIMIT" &&
+                      message === "Tier 2 token-limit check failed; allowing request"
+                    )
+                      warning++;
+                  },
+                },
+                clientRawRequest: {
+                  endpoint: "/v1/chat/completions",
+                  body,
+                  headers: new Headers(),
+                },
+                apiKeyInfo: { id: keyId, noLog: true },
+                connectionId,
+                userAgent: "native-resolved-limit-fault-test",
+                comboName: undefined,
+                onCredentialsRefreshed: undefined,
+                onRequestSuccess: undefined,
+                onStreamFailure: undefined,
+                onDisconnect: undefined,
+              })
             );
+            intercepted.mock.restore();
             assert.equal(injected, 1);
             assert.equal(warning, 1);
             assert.equal(upstreamCalls, 1);

@@ -1,6 +1,7 @@
 import { getDbInstance } from "./core";
 import { getSelectedPostgresDatabase, getSelectedPersistenceIdentity } from "./controlPlaneContext";
 import type { PostgresTransaction } from "./postgres/database";
+import { acquirePostgresLock } from "./postgres/locks";
 
 export interface SkillStorageRow {
   id: string;
@@ -46,7 +47,7 @@ async function native<T>(
   const database = getSelectedPostgresDatabase();
   if (!database) throw new Error("PostgreSQL skill storage is not selected");
   return database.transaction(async (tx) => {
-    await tx.query(`SELECT pg_advisory_xact_lock${write ? "" : "_shared"}(18765,12)`);
+    await acquirePostgresLock(tx, "skills", write ? "exclusive" : "shared");
     return body(tx);
   });
 }

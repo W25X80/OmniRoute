@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import vm from "node:vm";
+import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
 import { isPostgresErrorKind, PostgresError } from "../../../src/lib/db/postgres/database.ts";
@@ -20,6 +21,7 @@ test("ambiguous commits retain their classification across independently bundled
   vm.runInNewContext(result.outputFiles[0].text, {
     module: independent,
     exports: independent.exports,
+    require: createRequire(import.meta.url),
   });
   const error = new independent.exports.PostgresError("commit_unknown");
   assert.notEqual(independent.exports.PostgresError, PostgresError);

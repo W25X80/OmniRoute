@@ -15,6 +15,20 @@ import {
   COMBO_PER_MODEL_TIMEOUT_REASON,
 } from "./comboAbortReasons.ts";
 import type { HandleSingleModel, SingleModelTarget, ComboLogger } from "./types.ts";
+import {
+  runPersistenceAttempt,
+  isPersistenceStreamCapacityError,
+  PERSISTENCE_STREAM_CAPACITY_CODE,
+} from "@/lib/db/persistenceRuntime";
+
+function attemptErrorResponse(error: unknown): Response {
+  if (isPersistenceStreamCapacityError(error))
+    return errorResponse(503, "Gateway attempt capacity is unavailable. Please retry later.", {
+      code: PERSISTENCE_STREAM_CAPACITY_CODE,
+      type: "local_queue_capacity",
+    });
+  return errorResponse(502, error instanceof Error ? error.message : "Upstream model error");
+}
 
 /** Stable internal classification for OmniRoute's own combo per-target timer. */
 export const COMBO_TARGET_TIMEOUT_CODE = "combo_target_timeout";
@@ -121,9 +135,9 @@ export function buildTargetTimeoutRunner(deps: {
         "COMBO",
         `Per-model combo timeout is DISABLED (effectiveTimeoutMs=${effectiveTimeoutMs}) for ${modelStr} — a hung upstream will hang this target until the combo loop safety timeout`
       );
-      return handleSingleModel(b, modelStr, target).catch((err) =>
-        errorResponse(502, err?.message ?? "Upstream model error")
-      );
+      return runPersistenceAttempt(() => handleSingleModel(b, modelStr, target), {
+        independent: true,
+      }).catch(attemptErrorResponse);
     }
 
     const timeoutController = new AbortController();
@@ -189,21 +203,33 @@ export function buildTargetTimeoutRunner(deps: {
       // this, such a throw would surface as an unhandledRejection tagged
       // "combo-per-model-timeout" in production logs.
       return await Promise.race([
-        handleSingleModel(b, modelStr, targetWithSignal).catch((err) => {
+        runPersistenceAttempt(
+          async () => {
+            const response = await handleSingleModel(b, modelStr, targetWithSignal);
+            // A late response is never handed off; cancel its body so any stream tail
+            // releases its own permit. Await cleanup under the actual-work owner.
+            if (timedOut || parentHedgeSignal?.aborted) await response.body?.cancel();
+            return response;
+          },
+          { independent: true }
+        ).catch((err) => {
           if (timedOut) {
             // Inner call rejected because we aborted it. The synthetic 504 from
             // timeoutPromise already wins the race; return an empty response so
             // the loser branch resolves cleanly without leaking err.message.
             return new Response(null, { status: 599 });
           }
-          return errorResponse(502, err?.message ?? "Upstream model error");
+          return attemptErrorResponse(err);
         }),
         timeoutPromise,
       ]).catch((raceErr) => {
         // Defensive: should never fire — both race branches always resolve.
         // Include the error message so the root cause is not masked.
         const detail = raceErr instanceof Error ? raceErr.message : String(raceErr);
-        log.error?.("COMBO", `Unexpected rejection in combo timeout race for ${modelStr}: ${detail}`);
+        log.error?.(
+          "COMBO",
+          `Unexpected rejection in combo timeout race for ${modelStr}: ${detail}`
+        );
         return errorResponse(502, `Combo timeout dispatch error: ${detail}`);
       });
     } finally {

@@ -145,9 +145,12 @@ test("SQLite without a hook retains synchronous return, this, and body methods",
   assert.equal(request.pauses, 0);
   assert.equal(request.on, originalOn);
   assert.equal(response.listenerCount("finish"), 0);
-  assert.equal(isSqlitePersistenceRequested({}), true);
+  assert.equal(isSqlitePersistenceRequested({}), false);
   assert.equal(isSqlitePersistenceRequested({ OMNIROUTE_DATABASE_BACKEND: "postgres" }), false);
-  assert.equal(isSqlitePersistenceRequested({ OMNIROUTE_DATABASE_BACKEND: "postgresql" }), false);
+  assert.throws(
+    () => isSqlitePersistenceRequested({ OMNIROUTE_DATABASE_BACKEND: "postgresql" }),
+    /must be sqlite or postgres/
+  );
 });
 
 test("native construction rejects absent or incomplete loaded routing configuration", () => {
@@ -158,6 +161,18 @@ test("native construction rejects absent or incomplete loaded routing configurat
       /Native file routing configuration unavailable/
     );
   }
+});
+
+test("an unset backend requires the native request owner before dispatch", () => {
+  delete process.env.OMNIROUTE_DATABASE_BACKEND;
+  delete globalThis.__omniroutePersistenceRequest;
+  const response = new FakeResponse();
+  const handler = wrapRequestListenerWithPersistence(() =>
+    assert.fail("unowned default native request dispatched")
+  );
+  handler(new FakeRequest(), response);
+  assert.equal(response.status, 503);
+  assert.match(response.body, /persistence_not_ready/);
 });
 
 test("PostgreSQL without admission fails closed and never calls the handler", () => {

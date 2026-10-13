@@ -5,7 +5,10 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import type { PostgresTransaction } from "../../../src/lib/db/postgres/database.ts";
+import type {
+  PostgresDatabase,
+  PostgresTransaction,
+} from "../../../src/lib/db/postgres/database.ts";
 
 const directory = fs.mkdtempSync(path.join(os.tmpdir(), "omniroute-file-content-"));
 process.env.DATA_DIR = directory;
@@ -84,7 +87,18 @@ function readerFixture(
       return { rows: rows as Row[], rowCount: rows.length, command: "SELECT" };
     },
   };
-  return { transaction, queries, chunkQueries };
+  let active = false;
+  const database = {
+    async transaction<T>(body: (tx: PostgresTransaction) => Promise<T>) {
+      active = true;
+      try {
+        return await body(transaction);
+      } finally {
+        active = false;
+      }
+    },
+  } as unknown as PostgresDatabase;
+  return { transaction, database, active: () => active, queries, chunkQueries };
 }
 
 test.after(() => {
@@ -102,7 +116,7 @@ test("legacy inline native bytes match the SQLite Buffer contract across a chunk
     content: input,
   });
   const fixture = readerFixture(input);
-  const actual = await native.getFileContent(fixture.transaction, saved.id);
+  const actual = await native.getFileContent(fixture.database, saved.id);
   assert.deepEqual(actual, legacy.getFileContent(saved.id));
   assert.ok(Buffer.isBuffer(actual));
   assert.match(fixture.queries[0].text, /FOR SHARE/);
@@ -122,7 +136,7 @@ test("legacy inline native bytes match the SQLite Buffer contract across a chunk
 
 test("empty content remains a Buffer and does not issue a chunk query", async () => {
   const fixture = readerFixture(Buffer.alloc(0));
-  const actual = await native.getFileContent(fixture.transaction, "empty");
+  const actual = await native.getFileContent(fixture.database, "empty");
   assert.ok(Buffer.isBuffer(actual));
   assert.equal(actual?.byteLength, 0);
   assert.equal(fixture.queries.length, 2);
@@ -135,7 +149,7 @@ test("missing, deleted and SQL-null content preserve null semantics", async () =
     [readerFixture(Buffer.from("x"), { absent: true }), 1],
     [readerFixture(Buffer.from("x"), { deleted: true }), 1],
   ] as const) {
-    assert.equal(await native.getFileContent(fixture.transaction, "missing"), null);
+    assert.equal(await native.getFileContent(fixture.database, "missing"), null);
     assert.equal(fixture.queries.length, queries);
     assert.equal(fixture.chunkQueries.length, 0);
   }
@@ -147,10 +161,7 @@ test("an incomplete final decoded chunk rejects instead of returning partial byt
     decoded: (text, index) =>
       index ? Buffer.from(text, "base64").subarray(0, 1).toString("base64") : text,
   });
-  await assert.rejects(
-    native.getFileContent(fixture.transaction, "partial"),
-    /incomplete or invalid/
-  );
+  await assert.rejects(native.getFileContent(fixture.database, "partial"), /incomplete or invalid/);
   assert.equal(fixture.chunkQueries.length, 2);
   assert.equal(fixture.chunkQueries[1].values[3], 1);
 });
@@ -159,7 +170,7 @@ test("an unexpected base64 TEXT decoder result fails closed", async () => {
   for (const value of [null, Buffer.from([1]), new Uint8Array([1]), "\\x01"]) {
     const fixture = readerFixture(Buffer.from([1]), { decoded: () => value });
     await assert.rejects(
-      native.getFileContent(fixture.transaction, "decoder"),
+      native.getFileContent(fixture.database, "decoder"),
       /incomplete or invalid/
     );
     assert.equal(fixture.chunkQueries.length, 1);
@@ -168,13 +179,13 @@ test("an unexpected base64 TEXT decoder result fails closed", async () => {
 
 test("invalid length metadata cannot allocate or return an uninitialized Buffer", async () => {
   const control = readerFixture(Buffer.from([1]), { size: 1 });
-  assert.deepEqual(await native.getFileContent(control.transaction, "length"), Buffer.from([1]));
+  assert.deepEqual(await native.getFileContent(control.database, "length"), Buffer.from([1]));
   assert.equal(control.chunkQueries.length, 1);
   for (const size of [-1, 1.5, "invalid", Number.MAX_SAFE_INTEGER + 1]) {
     const fixture = readerFixture(Buffer.from([1]), { size });
     let reserved = false;
     await assert.rejects(
-      native.getFileContent(fixture.transaction, "length", () => {
+      native.getFileContent(fixture.database, "length", () => {
         reserved = true;
       }),
       {

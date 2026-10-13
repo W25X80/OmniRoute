@@ -42,6 +42,9 @@ async function fixture(body: (identity: object, state: Runtime) => Promise<void>
     phase: "ready",
     applicationIdentity: identity,
     requests: new Set(),
+    attempts: new Set(),
+    attemptAdmissions: new Set(),
+    attemptCancellation: new AbortController(),
     background: new Set(),
     tails: new Set(),
     owners: new AsyncLocalStorage(),
@@ -141,7 +144,7 @@ test("native file source profile has independent finite count and byte caps with
     a.release();
     b.release();
     c.release();
-    assert.equal(nativeFileDownloadReservation(512 * 1024 ** 2), 1536 * 1024 ** 2);
+    assert.equal(nativeFileDownloadReservation(512 * 1024 ** 2), 2048 * 1024 ** 2);
   }));
 
 test("native file consumers reject foreign, ended, unadmitted and invalid authority without changing budget", async () =>

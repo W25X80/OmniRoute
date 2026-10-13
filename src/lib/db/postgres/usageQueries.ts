@@ -1,5 +1,6 @@
 import { getSelectedPostgresDatabase, getSelectedControlPlane } from "../controlPlaneContext";
 import type { PostgresDatabase, PostgresTransaction } from "./database";
+import { acquirePostgresLock } from "./locks";
 
 export function getPostgresUsageDatabase(): PostgresDatabase | undefined {
   return getSelectedPostgresDatabase();
@@ -64,7 +65,7 @@ export async function queryNamedUsageRows<Row>(
 }
 
 export async function lockUsage(transaction: PostgresTransaction): Promise<void> {
-  await transaction.query("SELECT pg_advisory_xact_lock(18765, 19)");
+  await acquirePostgresLock(transaction, "usage");
 }
 
 export const USAGE_NUMERIC_FIELDS = [

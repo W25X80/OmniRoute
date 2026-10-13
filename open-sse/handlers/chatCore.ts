@@ -56,6 +56,8 @@ import { runStreamingTail } from "./chatCore/streamingTail.ts";
 import {
   isPersistenceStreamCapacityError,
   PERSISTENCE_STREAM_CAPACITY_CODE,
+  runPersistenceAttempt,
+  getPersistenceAttemptCancellationSignal,
 } from "@/lib/db/persistenceRuntime";
 import { sanitizeChatRequestBody } from "./chatCore/sanitization.ts";
 import {
@@ -371,7 +373,32 @@ type VideoBridgeLogParam = { observed: boolean; redaction: VideoBridgeLogRedacti
 export async function handleChatCore(args: Parameters<typeof handleChatCoreInner>[0]) {
   // one implicit resilience store per attempt (combo legs each run
   // handleChatCore, so each leg gets its own isolated store).
-  return withResilienceActionsContext([args], (forwarded) => handleChatCoreInner(forwarded));
+  try {
+    const shutdownSignal = getPersistenceAttemptCancellationSignal();
+    if (shutdownSignal) {
+      args = {
+        ...args,
+        clientRawRequest: {
+          ...args.clientRawRequest,
+          signal: args.clientRawRequest?.signal
+            ? AbortSignal.any([args.clientRawRequest.signal, shutdownSignal])
+            : shutdownSignal,
+        },
+      };
+    }
+    return await runPersistenceAttempt(() =>
+      withResilienceActionsContext([args], (forwarded) => handleChatCoreInner(forwarded))
+    );
+  } catch (error) {
+    if (!isPersistenceStreamCapacityError(error)) throw error;
+    return createErrorResult(
+      HTTP_STATUS.SERVICE_UNAVAILABLE,
+      "Gateway attempt capacity is unavailable. Please retry later.",
+      null,
+      PERSISTENCE_STREAM_CAPACITY_CODE,
+      "local_queue_capacity"
+    );
+  }
 }
 
 async function handleChatCoreInner({

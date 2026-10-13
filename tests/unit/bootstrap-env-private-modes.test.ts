@@ -20,6 +20,7 @@ const SECRET_KEYS = ["JWT_SECRET", "STORAGE_ENCRYPTION_KEY", "API_KEY_SECRET"];
 function withIsolatedEnv(fn: (dataDir: string) => void) {
   const originalCwd = process.cwd();
   const originalEnv = { ...process.env };
+  process.env.OMNIROUTE_DATABASE_BACKEND = "sqlite";
   const previousUmask = process.umask(0o022);
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "omniroute-envmode-"));
   const home = path.join(root, "home");

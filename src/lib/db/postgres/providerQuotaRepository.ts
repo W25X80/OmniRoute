@@ -1,4 +1,5 @@
 import type { PostgresDatabase } from "./database";
+import { acquirePostgresEntityLock } from "./locks";
 
 export interface NativeProviderQuotaRow {
   connection_id: string;
@@ -55,9 +56,7 @@ export async function writeProviderQuotaUsage(
     // after the lock acknowledgement, so a queued write cannot publish an older clock.
     // The namespace is distinct from quota-consumption locks; hash collisions can only
     // reduce parallelism, while the JSON tuple keeps entity keys unambiguous.
-    await tx.query("SELECT pg_advisory_xact_lock(18767,hashtext($1))", [
-      JSON.stringify([id, model]),
-    ]);
+    await acquirePostgresEntityLock(tx, "providerQuota", [id, model]);
     const now = Date.now(),
       start = Math.floor(now / window) * window;
     await tx.query(

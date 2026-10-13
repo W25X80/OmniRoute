@@ -1,6 +1,7 @@
 import "../_setup/isolateDataDir.ts";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
+import { AsyncResource } from "node:async_hooks";
 import test from "node:test";
 import type { BatchRecord } from "../../src/lib/db/batches.ts";
 import type { PostgresControlPlaneBinding } from "../../src/lib/db/controlPlaneContext.ts";
@@ -137,6 +138,8 @@ test(
           assert.equal((await run(() => files.getFileAsync(f.input.id)))?.apiKeyId, owner);
           let sibling: BatchRecord | undefined;
           let scheduled = false;
+          // The injected writer models a separate HTTP request, not a nested SQL callback.
+          const siblingRequest = new AsyncResource("batch-expiry-sibling-request");
           const observed = observeQueries(database, async (text, values) => {
             if (
               !scheduled &&
@@ -144,7 +147,7 @@ test(
               values?.[0] === "omniroute.services:files-batches"
             ) {
               scheduled = true;
-              sibling = await f.sibling();
+              sibling = await siblingRequest.runInAsyncScope(() => f.sibling());
             }
           });
           const { processPendingBatches, stopBatchProcessor, waitForAllBatches } =
@@ -159,6 +162,7 @@ test(
             );
             assert.deepEqual(await run(() => files.getFileContentAsync(f.input.id)), payload);
           } finally {
+            siblingRequest.emitDestroy();
             stopBatchProcessor();
             await waitForAllBatches();
           }

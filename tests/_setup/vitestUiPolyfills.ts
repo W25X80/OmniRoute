@@ -1,3 +1,6 @@
+// Explicit legacy persistence profile for the UI/unit suite only.
+process.env.OMNIROUTE_DATABASE_BACKEND ??= "sqlite";
+
 // jsdom (unlike real browsers) does not implement `window.matchMedia`. Several
 // dashboard components read the OS color-scheme preference via
 // `window.matchMedia("(prefers-color-scheme: dark)")` (see

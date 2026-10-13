@@ -1,4 +1,5 @@
 import { getSelectedPersistenceIdentity, getSelectedPostgresDatabase } from "./controlPlaneContext";
+import { acquirePostgresLock } from "./postgres/locks";
 
 export function isPostgresSessionModelHistorySelected(): boolean {
   return getSelectedPostgresDatabase() !== undefined;
@@ -21,7 +22,7 @@ export async function observeSessionModelHistoryFence(
   const authority = getSelectedPersistenceIdentity();
   if (!authority) throw new Error("Session history authority is unavailable");
   return database.transaction(async (transaction) => {
-    await transaction.query("SELECT pg_advisory_xact_lock(18765,13)");
+    await acquirePostgresLock(transaction, "sessions");
     const { rows } = await transaction.query<{ high_water: string | null }>(
       `SELECT max(id)::text AS high_water FROM omniroute.session_model_history
        WHERE session_id=$1 AND combo_name=$2`,
@@ -42,7 +43,7 @@ export async function deleteSessionModelHistoryWithFence(
   const database = getSelectedPostgresDatabase();
   if (!database || fence.authority !== getSelectedPersistenceIdentity()) return false;
   return database.transaction(async (transaction) => {
-    await transaction.query("SELECT pg_advisory_xact_lock(18765,13)");
+    await acquirePostgresLock(transaction, "sessions");
     if (!stillCurrent()) return false;
     const { rows } = await transaction.query<{ high_water: string | null }>(
       `SELECT max(id)::text AS high_water FROM omniroute.session_model_history

@@ -322,22 +322,24 @@ export function getSyncedPricing(): PricingByProvider {
  */
 export async function saveSyncedPricingAsync(data: PricingByProvider): Promise<void> {
   const catalogDatabase = getSelectedPostgresDatabase();
-  if (catalogDatabase)
+  if (catalogDatabase) {
+    const rows = Object.entries(data).map(([key, models]) => ({
+      key,
+      value: JSON.stringify(models),
+    }));
+    const payload = JSON.stringify(rows);
     return mutatePostgresCatalog(catalogDatabase, async () => {
       await writePostgresCatalog("DELETE FROM omniroute.key_value WHERE namespace=$1", [
         "pricing_synced",
       ]);
-      const rows = Object.entries(data).map(([key, models]) => ({
-        key,
-        value: JSON.stringify(models),
-      }));
       if (rows.length)
         await writePostgresCatalog(
           "INSERT INTO omniroute.key_value(namespace,key,value) SELECT $1, key,value FROM json_to_recordset($2::json) AS data(key text,value text)",
-          ["pricing_synced", JSON.stringify(rows)]
+          ["pricing_synced", payload]
         );
       afterPostgresCatalogCommit(() => invalidateDbCache("pricing"));
     });
+  }
 
   const db = getDbInstance();
   const del = db.prepare("DELETE FROM key_value WHERE namespace = 'pricing_synced'");

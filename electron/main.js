@@ -758,9 +758,9 @@ function startNextServer() {
     return;
   }
 
-  // ── Zero-config bootstrap: auto-generate required secrets ─────────────────
-  // Electron uses CJS — cannot dynamically import ESM bootstrap-env.mjs.
-  // This mirrors bootstrap-env.mjs logic synchronously:
+  // ── Selected-backend bootstrap ────────────────────────────────────────────
+  // The self-contained CJS carrier mirrors bootstrap-env.mjs selection.
+  // Only explicit SQLite uses local secret provisioning:
   //   1. Read persisted secrets from the resolved DATA_DIR/server.env
   //   2. Generate missing secrets with crypto.randomBytes()
   //   3. Persist back to DATA_DIR/server.env for future restarts
@@ -782,63 +782,81 @@ function startNextServer() {
 
   const preferredEnvPath = getPreferredEnvFilePath(process.env);
   const preferredEnv = preferredEnvPath ? parseEnvFile(preferredEnvPath) : {};
-  const dataDir = resolveDataDir(null, { ...preferredEnv, ...process.env });
-  const serverEnvPath = path.join(dataDir, "server.env");
-  // GHSA-mh4f-3xj9-4gc4: server.env holds JWT_SECRET / STORAGE_ENCRYPTION_KEY /
-  // API_KEY_SECRET. Repair a file an earlier version wrote world-readable (and the
-  // data dir's "other" bits) on every start — the write below only runs when a secret
-  // is missing. Best-effort: never block the app on a chmod failure.
-  tightenServerEnv(dataDir, serverEnvPath);
-  const persisted = parseEnvFile(serverEnvPath);
-  const serverEnv = { ...persisted, ...preferredEnv, ...process.env };
-  let changed = false;
+  const configuredEnv = { ...preferredEnv, ...process.env };
+  const databaseBackend = configuredEnv.OMNIROUTE_DATABASE_BACKEND ?? "postgres";
+  if (databaseBackend !== "sqlite" && databaseBackend !== "postgres") {
+    console.error("[Electron] OMNIROUTE_DATABASE_BACKEND must be sqlite or postgres");
+    sendToRenderer("server-status", { status: "error", port: serverPort });
+    return;
+  }
+  if (
+    databaseBackend === "postgres" &&
+    (!configuredEnv.DATA_DIR?.trim() || !configuredEnv.STORAGE_ENCRYPTION_KEY?.trim())
+  ) {
+    console.error("[Electron] PostgreSQL requires explicit DATA_DIR and STORAGE_ENCRYPTION_KEY");
+    sendToRenderer("server-status", { status: "error", port: serverPort });
+    return;
+  }
+  const dataDir = resolveDataDir(null, configuredEnv);
+  const serverEnv = { ...configuredEnv, OMNIROUTE_DATABASE_BACKEND: databaseBackend };
+  if (databaseBackend === "sqlite") {
+    const serverEnvPath = path.join(dataDir, "server.env");
+    // GHSA-mh4f-3xj9-4gc4: server.env holds JWT_SECRET / STORAGE_ENCRYPTION_KEY /
+    // API_KEY_SECRET. Repair a file an earlier version wrote world-readable (and the
+    // data dir's "other" bits) on every start — the write below only runs when a secret
+    // is missing. Best-effort: never block the app on a chmod failure.
+    tightenServerEnv(dataDir, serverEnvPath);
+    const persisted = parseEnvFile(serverEnvPath);
+    Object.assign(serverEnv, persisted, preferredEnv, process.env);
+    let changed = false;
 
-  if (!serverEnv.JWT_SECRET) {
-    serverEnv.JWT_SECRET = persisted.JWT_SECRET = crypto.randomBytes(64).toString("hex");
-    changed = true;
-    console.log("[Electron] ✨ JWT_SECRET auto-generated");
-  }
-  if (!serverEnv.STORAGE_ENCRYPTION_KEY) {
-    if (hasEncryptedCredentials(path.join(dataDir, "storage.sqlite"))) {
-      console.error(
-        `[Electron] Refusing to auto-generate STORAGE_ENCRYPTION_KEY: encrypted credentials already exist in ${path.join(
-          dataDir,
-          "storage.sqlite"
-        )}. Restore the key via ${preferredEnvPath || "an appropriate .env file"}, ${serverEnvPath}, or process.env.`
-      );
-      sendToRenderer("server-status", { status: "error", port: serverPort });
-      return;
+    if (!serverEnv.JWT_SECRET) {
+      serverEnv.JWT_SECRET = persisted.JWT_SECRET = crypto.randomBytes(64).toString("hex");
+      changed = true;
+      console.log("[Electron] ✨ JWT_SECRET auto-generated");
     }
-    serverEnv.STORAGE_ENCRYPTION_KEY = persisted.STORAGE_ENCRYPTION_KEY = crypto
-      .randomBytes(32)
-      .toString("hex");
-    serverEnv.STORAGE_ENCRYPTION_KEY_VERSION = persisted.STORAGE_ENCRYPTION_KEY_VERSION = "v1";
-    changed = true;
-    console.log("[Electron] ✨ STORAGE_ENCRYPTION_KEY auto-generated");
-  }
-  if (!serverEnv.API_KEY_SECRET) {
-    serverEnv.API_KEY_SECRET = persisted.API_KEY_SECRET = crypto.randomBytes(32).toString("hex");
-    changed = true;
-    console.log("[Electron] ✨ API_KEY_SECRET auto-generated");
-  }
-  if (changed) {
-    serverEnv.OMNIROUTE_BOOTSTRAPPED = "true";
-    try {
-      if (!fs.existsSync(dataDir)) {
-        fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
-        chmodQuietly(dataDir, 0o700);
+    if (!serverEnv.STORAGE_ENCRYPTION_KEY) {
+      if (hasEncryptedCredentials(path.join(dataDir, "storage.sqlite"))) {
+        console.error(
+          `[Electron] Refusing to auto-generate STORAGE_ENCRYPTION_KEY: encrypted credentials already exist in ${path.join(
+            dataDir,
+            "storage.sqlite"
+          )}. Restore the key via ${preferredEnvPath || "an appropriate .env file"}, ${serverEnvPath}, or process.env.`
+        );
+        sendToRenderer("server-status", { status: "error", port: serverPort });
+        return;
       }
-      const lines = [
-        "# Auto-generated by OmniRoute bootstrap",
-        "",
-        ...Object.entries(persisted).map(([k, v]) => `${k}=${v}`),
-        "",
-      ];
-      fs.writeFileSync(serverEnvPath, lines.join("\n"), { encoding: "utf8", mode: 0o600 });
-      chmodQuietly(serverEnvPath, 0o600);
-      console.log("[Electron] 📁 Secrets persisted to:", serverEnvPath);
-    } catch (e) {
-      console.warn("[Electron] Could not persist secrets:", e.message);
+      serverEnv.STORAGE_ENCRYPTION_KEY = persisted.STORAGE_ENCRYPTION_KEY = crypto
+        .randomBytes(32)
+        .toString("hex");
+      serverEnv.STORAGE_ENCRYPTION_KEY_VERSION = persisted.STORAGE_ENCRYPTION_KEY_VERSION = "v1";
+      changed = true;
+      console.log("[Electron] ✨ STORAGE_ENCRYPTION_KEY auto-generated");
+    }
+    if (!serverEnv.API_KEY_SECRET) {
+      serverEnv.API_KEY_SECRET = persisted.API_KEY_SECRET = crypto.randomBytes(32).toString("hex");
+      changed = true;
+      console.log("[Electron] ✨ API_KEY_SECRET auto-generated");
+    }
+    if (changed) {
+      serverEnv.OMNIROUTE_BOOTSTRAPPED = "true";
+      try {
+        if (!fs.existsSync(dataDir)) {
+          fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+          chmodQuietly(dataDir, 0o700);
+        }
+        const lines = [
+          "# Auto-generated by OmniRoute bootstrap",
+          "",
+          ...Object.entries(persisted).map(([k, v]) => `${k}=${v}`),
+          "",
+        ];
+        fs.writeFileSync(serverEnvPath, lines.join("\n"), { encoding: "utf8", mode: 0o600 });
+        chmodQuietly(serverEnvPath, 0o600);
+        console.log("[Electron] 📁 Secrets persisted to:", serverEnvPath);
+      } catch (e) {
+        console.warn("[Electron] Could not persist secrets:", e.message);
+      }
     }
   }
 

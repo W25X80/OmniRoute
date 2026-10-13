@@ -8,6 +8,7 @@ export const shutdownFixture = {
   logRows: [] as string[],
   logClosing: false,
   stopFailure: false,
+  costFailure: undefined as Error | undefined,
   onPhase: undefined as ((phase: string) => void) | undefined,
   reset() {
     writer.resetForTests();
@@ -16,6 +17,7 @@ export const shutdownFixture = {
     shutdownFixture.logRows = [];
     shutdownFixture.logClosing = false;
     shutdownFixture.stopFailure = false;
+    shutdownFixture.costFailure = undefined;
     shutdownFixture.onPhase = undefined;
   },
 };
@@ -25,6 +27,7 @@ const writer = new SpendBatchWriter({
   persistEntries: (entries) =>
     runPersistenceBackgroundWork(async () => {
       if (!getSelectedPersistenceIdentity()) throw new Error("Native shutdown authority absent");
+      if (shutdownFixture.costFailure) throw shutdownFixture.costFailure;
       shutdownFixture.persistedCost += entries.reduce((sum, entry) => sum + entry.cost, 0);
       shutdownFixture.events.push("cost:persisted");
     }),
@@ -41,6 +44,17 @@ export async function saveTailLog(id: string): Promise<void> {
 export async function flushSpendBatchWriter(): Promise<void> {
   shutdownFixture.events.push("cost:flush");
   await writer.flush();
+}
+export function beginNativeSpendBatchWriterClose(): void {
+  recordShutdownPhase("cost:admission-close");
+  writer.beginNativeClose();
+}
+export async function closeNativeSpendBatchWriter(): Promise<void> {
+  shutdownFixture.events.push("cost:flush");
+  await writer.closeNative();
+}
+export function getPendingTailCost(): number {
+  return writer.getPendingCostTotal("shutdown-tail");
 }
 export async function closeCallLogSaves(): Promise<void> {
   shutdownFixture.logClosing = true;
@@ -101,6 +115,8 @@ export const closeCloudSyncScheduler = stop;
 export const stopProviderLimitsSyncScheduler = stop;
 export const stopConnectionRecoveryScheduler = stop;
 export const stopBackgroundRefresh = stop;
+export const stopAntigravityCreditSweep = stop;
+export const stopNativeArtifactRecovery = stop;
 export const stopSessionAccountAffinityCleanup = stop;
 export const stopCleanupSchedulerAsync = stop;
 export const stopCredentialHealthCheckAsync = stop;

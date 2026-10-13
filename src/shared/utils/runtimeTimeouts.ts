@@ -1,3 +1,5 @@
+import { parseDatabaseBackend } from "../../lib/db/backendSelection";
+
 type EnvSource = Record<string, string | undefined>;
 type TimeoutLogger = (message: string) => void;
 
@@ -38,6 +40,21 @@ export const DEFAULT_API_BRIDGE_SERVER_SOCKET_TIMEOUT_MS = 0;
 // idle-pool window, mirroring the API bridge server's pattern.
 export const DEFAULT_MAIN_SERVER_KEEPALIVE_TIMEOUT_MS = 65_000;
 export const DEFAULT_MAIN_SERVER_HEADERS_TIMEOUT_MS = 66_000;
+
+/** Native drain and cleanup retain a margin below the 120-second task stop deadline. */
+export function getShutdownBudgetConfig(env: EnvSource = process.env) {
+  const native = parseDatabaseBackend(env) === "postgres";
+  const parsed = Number(env.SHUTDOWN_TIMEOUT_MS);
+  const requested =
+    env.SHUTDOWN_TIMEOUT_MS?.trim() && Number.isFinite(parsed) && parsed >= 0
+      ? Math.floor(parsed)
+      : native
+        ? 90_000
+        : 30_000;
+  const drainMs = native ? Math.min(requested, 90_000) : requested;
+  const cleanupMs = native ? 20_000 : 5_000;
+  return { drainMs, cleanupMs, forceExitMs: drainMs + cleanupMs };
+}
 // A client that closes its connection right after reading a fully-completed
 // SSE stream can race OmniRoute's own completion bookkeeping (#9653): the
 // bytes already reached the client, but the disconnect handler can fire

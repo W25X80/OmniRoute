@@ -1,5 +1,8 @@
+import { AsyncLocalStorage } from "node:async_hooks";
+import { performance } from "node:perf_hooks";
 import type { Logger } from "pino";
 import type { PostgresConfiguration } from "./config";
+import { TransactionDiagnostics } from "./transactionDiagnostics";
 
 export interface PostgresResult<Row = Record<string, unknown>> {
   rows: Row[];
@@ -31,6 +34,7 @@ type FailureKind =
   | "query_failed"
   | "transaction_failed"
   | "commit_unknown"
+  | "nested_transaction"
   | "invalid_scope"
   | "transaction_timeout";
 
@@ -41,6 +45,7 @@ const messages: Record<FailureKind, string> = {
   query_failed: "PostgreSQL query failed",
   transaction_failed: "PostgreSQL transaction did not commit",
   commit_unknown: "PostgreSQL commit outcome is unknown",
+  nested_transaction: "Independent nested PostgreSQL transactions are not supported",
   invalid_scope: "PostgreSQL queries must be awaited inside their transaction",
   transaction_timeout: "PostgreSQL transaction deadline exceeded",
 };
@@ -106,10 +111,17 @@ const rejectedCommitStates = new Set([
 
 /** Internal repository primitive. Never expose SQL or a driver handle to route callers. */
 export interface PostgresTransaction {
+  /** Registry-supplied static identity only; never bind row identities or SQL values. */
+  noteAdvisoryLock?(owner: string, mode: "shared" | "exclusive"): void;
   query<Row = Record<string, unknown>>(
     text: string,
     values?: unknown[]
   ): Promise<PostgresResult<Row>>;
+}
+
+export interface PostgresTransactionOptions {
+  /** A static repository operation name, never an ID or user-provided value. */
+  operation?: string;
 }
 
 class TransactionScope implements PostgresTransaction {
@@ -118,7 +130,15 @@ class TransactionScope implements PostgresTransaction {
   disconnect = false;
   failure: PostgresError | undefined;
 
-  constructor(private readonly client: PostgresClient) {}
+  constructor(
+    private readonly client: PostgresClient,
+    private readonly diagnostics: TransactionDiagnostics
+  ) {}
+
+  noteAdvisoryLock(owner: string, mode: "shared" | "exclusive"): void {
+    this.diagnostics.lockOwner = owner;
+    this.diagnostics.lockMode = mode;
+  }
 
   query<Row = Record<string, unknown>>(
     text: string,
@@ -137,14 +157,17 @@ class TransactionScope implements PostgresTransaction {
     }
     if (this.failure) throw this.failure;
     this.pending = true;
+    const started = this.diagnostics.startQuery(text);
     try {
       return await query<Row>(this.client, text, values);
     } catch (error) {
+      this.diagnostics.failed();
       this.disconnect = !statementRejected(error);
       this.failure ??= new PostgresError("query_failed", sqlState(error));
       throw this.failure;
     } finally {
       this.pending = false;
+      this.diagnostics.finishQuery(started);
     }
   }
 }
@@ -172,6 +195,7 @@ type AdmissionConfiguration = Pick<
  * and external side effects are outside this internal contract.
  */
 export class PostgresDatabase {
+  private readonly transactions = new AsyncLocalStorage<TransactionScope>();
   private admitted = 0;
   private readonly waiting: AdmissionWaiter[] = [];
   private closing = false;
@@ -181,29 +205,67 @@ export class PostgresDatabase {
   constructor(
     private readonly pool: PostgresPool,
     private readonly config: AdmissionConfiguration,
-    logger: Pick<Logger, "warn">
+    private readonly logger: Pick<Logger, "warn">
   ) {
     pool.on("error", (error) => {
-      logger.warn(
+      this.warn(
         { module: "postgres", sqlState: sqlState(error) },
         "Idle PostgreSQL connection failed"
       );
     });
   }
 
-  async transaction<T>(body: (transaction: PostgresTransaction) => Promise<T>): Promise<T> {
-    const admission = this.admit();
-    if (admission) await admission;
+  private warn(fields: Record<string, unknown>, message: string): void {
     try {
+      this.logger.warn(fields, message);
+    } catch {
+      // A diagnostic sink cannot change an acknowledged transaction outcome.
+    }
+  }
+
+  async transaction<T>(
+    body: (transaction: PostgresTransaction) => Promise<T>,
+    options: PostgresTransactionOptions = {}
+  ): Promise<T> {
+    const parent = this.transactions.getStore();
+    if (parent) {
+      if (!parent.active) throw new PostgresError("invalid_scope");
+      parent.failure ??= new PostgresError("nested_transaction");
+      throw parent.failure;
+    }
+    const diagnostics = new TransactionDiagnostics(options.operation);
+    let admitted = false;
+    try {
+      const admission = this.admit();
+      if (admission) await admission;
+      admitted = true;
+      diagnostics.queueMs = performance.now() - diagnostics.started;
+      diagnostics.phase = "connect";
+      const connectingAt = performance.now();
       let client: PostgresClient;
       try {
         client = await this.pool.connect();
       } catch (error) {
         throw new PostgresError("unavailable", sqlState(error));
+      } finally {
+        diagnostics.connectionMs = performance.now() - connectingAt;
       }
-      return await this.runTransaction(client, body);
+      const value = await this.runTransaction(client, body, diagnostics);
+      if (diagnostics.callbackGapMs >= 1000)
+        this.warn(diagnostics.snapshot("committed"), "PostgreSQL transaction callback stalled");
+      return value;
+    } catch (error) {
+      diagnostics.failed();
+      this.warn(
+        diagnostics.snapshot(
+          error instanceof PostgresError ? error.kind : "domain_error",
+          error instanceof PostgresError ? error.sqlState : undefined
+        ),
+        "PostgreSQL operation failed"
+      );
+      throw error;
     } finally {
-      this.releaseAdmission();
+      if (admitted) this.releaseAdmission();
     }
   }
 
@@ -261,34 +323,42 @@ export class PostgresDatabase {
 
   private async runTransaction<T>(
     client: PostgresClient,
-    body: (transaction: PostgresTransaction) => Promise<T>
+    body: (transaction: PostgresTransaction) => Promise<T>,
+    diagnostics: TransactionDiagnostics
   ): Promise<T> {
-    const scope = new TransactionScope(client);
+    const scope = new TransactionScope(client, diagnostics);
     let destroy = false;
     let connectionFailure: PostgresError | undefined;
     let begun = false;
     let committing = false;
     const onError = (error: Error) => {
+      diagnostics.failed();
       destroy = true;
       connectionFailure ??= new PostgresError("query_failed", sqlState(error));
+      scope.failure ??= connectionFailure;
     };
     client.on("error", onError);
     try {
+      diagnostics.phase = "begin";
       if ((await query(client, "BEGIN")).command !== "BEGIN") {
         throw new PostgresError("query_failed");
       }
       begun = true;
-      const value = await this.runBody(scope, body);
+      diagnostics.beginBody();
+      const value = await this.transactions.run(scope, () => this.runBody(scope, body));
+      diagnostics.noteGap();
       if (scope.pending || scope.failure) {
         throw scope.failure ?? new PostgresError("invalid_scope");
       }
       if (destroy) throw connectionFailure ?? new PostgresError("query_failed");
       committing = true;
+      diagnostics.phase = "commit";
       const result = await query(client, "COMMIT");
       if (result.command === "ROLLBACK") throw new PostgresError("transaction_failed");
       if (result.command !== "COMMIT") throw new PostgresError("commit_unknown");
       return value;
     } catch (error) {
+      diagnostics.failed();
       if (committing) {
         destroy = true;
         if (error instanceof PostgresError) throw error;
@@ -312,6 +382,7 @@ export class PostgresDatabase {
         destroy = true;
       } else {
         try {
+          diagnostics.phase = "rollback";
           destroy = (await query(client, "ROLLBACK")).command !== "ROLLBACK";
         } catch {
           destroy = true;

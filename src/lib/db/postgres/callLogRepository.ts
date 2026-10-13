@@ -1,3 +1,5 @@
+import { stageArtifactRecovery, type ArtifactRecoveryIntent } from "./artifactRecoveryRepository";
+import { acquirePostgresLock } from "./locks";
 import { queuePostgresArtifactDeletions } from "./cleanupRepository";
 import {
   requireArtifactPublication,
@@ -64,6 +66,7 @@ const INSERT_COLUMNS = {
   comboExecutionKey: "combo_execution_key",
   errorSummary: "error_summary",
   detailState: "detail_state",
+  detailReason: "detail_reason",
   artifactRelPath: "artifact_relpath",
   artifactSizeBytes: "artifact_size_bytes",
   artifactSha256: "artifact_sha256",
@@ -93,63 +96,83 @@ export class PostgresCallLogRepository {
   constructor(private readonly database: PostgresDatabase) {}
 
   async insert(
-    parameters: Record<string, unknown>
-  ): Promise<{ payloadAccepted: boolean; inserted: boolean }> {
-    return this.database.transaction(async (transaction) => {
-      await transaction.query("SELECT pg_advisory_xact_lock_shared(18765,5)");
-      // Serialized allocation keeps the export cursor in commit order, including concurrent writes.
-      await transaction.query("SELECT pg_advisory_xact_lock(18765,8)");
-      const stored = { ...parameters };
-      const artifactReference =
-        typeof stored.artifactRelPath === "string" ? stored.artifactRelPath : null;
-      if (artifactReference) {
-        await requireArtifactPublication(
-          transaction,
-          artifactReference,
-          stored.artifactPublicationOwner,
-          stored.artifactSizeBytes,
-          stored.artifactSha256
-        );
-      }
-      let payloadAccepted = true;
-      if (typeof stored.apiKeyId === "string" && stored.apiKeyId) {
-        const row = (
-          await transaction.query<{ no_log: number }>(
-            "SELECT no_log FROM omniroute.api_keys WHERE id=$1",
-            [stored.apiKeyId]
-          )
-        ).rows[0];
-        payloadAccepted = Boolean(row && row.no_log !== 1);
-        if (!payloadAccepted) {
-          Object.assign(stored, {
-            detailState: "none",
-            artifactRelPath: null,
-            artifactSizeBytes: null,
-            artifactSha256: null,
-            hasRequestBody: 0,
-            hasResponseBody: 0,
-            hasPipelineDetails: 0,
-            requestSummary: null,
-            hasContent: null,
-          });
+    parameters: Record<string, unknown>,
+    intent?: ArtifactRecoveryIntent
+  ): Promise<{ payloadAccepted: boolean; inserted: boolean; intentAccepted: boolean }> {
+    return this.database.transaction(
+      async (transaction) => {
+        await acquirePostgresLock(transaction, "keyPolicy", "shared");
+        // Serialized allocation keeps the export cursor in commit order, including concurrent writes.
+        await acquirePostgresLock(transaction, "accounting");
+        const stored = { ...parameters };
+        const artifactReference =
+          typeof stored.artifactRelPath === "string" ? stored.artifactRelPath : null;
+        if (artifactReference) {
+          await requireArtifactPublication(
+            transaction,
+            artifactReference,
+            stored.artifactPublicationOwner,
+            stored.artifactSizeBytes,
+            stored.artifactSha256
+          );
         }
-      }
-      const keys = Object.keys(INSERT_COLUMNS) as Array<keyof typeof INSERT_COLUMNS>;
-      const inserted = await transaction.query(
-        `INSERT INTO omniroute.call_logs(${keys.map((key) => INSERT_COLUMNS[key]).join(",")})
-        VALUES(${keys.map((_, index) => `$${index + 1}`).join(",")}) ON CONFLICT(id) DO NOTHING RETURNING id`,
-        keys.map((key) => stored[key] ?? null)
-      );
-      if (inserted.rowCount === 1 && artifactReference) {
-        await finishArtifactPublication(
-          transaction,
-          artifactReference,
-          stored.artifactPublicationOwner as string,
-          payloadAccepted
+        let payloadAccepted = true;
+        if (typeof stored.apiKeyId === "string" && stored.apiKeyId) {
+          const row = (
+            await transaction.query<{ no_log: number }>(
+              "SELECT no_log FROM omniroute.api_keys WHERE id=$1",
+              [stored.apiKeyId]
+            )
+          ).rows[0];
+          payloadAccepted = Boolean(row && row.no_log !== 1);
+          if (!payloadAccepted) {
+            Object.assign(stored, {
+              detailState: "none",
+              artifactRelPath: null,
+              artifactSizeBytes: null,
+              artifactSha256: null,
+              hasRequestBody: 0,
+              hasResponseBody: 0,
+              hasPipelineDetails: 0,
+              requestSummary: null,
+              errorSummary: null,
+              detailReason: "privacy",
+              hasContent: null,
+            });
+          }
+        }
+        const keys = Object.keys(INSERT_COLUMNS) as Array<keyof typeof INSERT_COLUMNS>;
+        const inserted = await transaction.query(
+          `INSERT INTO omniroute.call_logs(${keys.map((key) => INSERT_COLUMNS[key]).join(",")})
+        VALUES(${keys.map((_, index) => `$${index + 1}`).join(",")}) ON CONFLICT(id) DO NOTHING RETURNING id,insertion_order`,
+          keys.map((key) => stored[key] ?? null)
         );
-      }
-      return { payloadAccepted, inserted: inserted.rowCount === 1 };
-    });
+        if (inserted.rowCount === 1 && artifactReference) {
+          await finishArtifactPublication(
+            transaction,
+            artifactReference,
+            stored.artifactPublicationOwner as string,
+            payloadAccepted
+          );
+        }
+        let intentAccepted = false;
+        if (inserted.rowCount === 1 && intent && payloadAccepted) {
+          intentAccepted = await stageArtifactRecovery(
+            transaction,
+            intent,
+            String(stored.id),
+            String(inserted.rows[0].insertion_order)
+          );
+          if (!intentAccepted)
+            await transaction.query(
+              "UPDATE omniroute.call_logs SET detail_state='missing',detail_reason='staging_capacity' WHERE id=$1",
+              [stored.id]
+            );
+        }
+        return { payloadAccepted, inserted: inserted.rowCount === 1, intentAccepted };
+      },
+      { operation: "callLog.admit" }
+    );
   }
 
   async list(filter: Record<string, unknown> = {}): Promise<Record<string, unknown>[]> {
@@ -260,7 +283,7 @@ export class PostgresCallLogRepository {
   }
   async setDetailState(id: string, state: string): Promise<void> {
     await this.database.transaction(async (transaction) => {
-      await transaction.query("SELECT pg_advisory_xact_lock(18765,8)");
+      await acquirePostgresLock(transaction, "accounting");
       await transaction.query("UPDATE omniroute.call_logs SET detail_state=$2 WHERE id=$1", [
         id,
         state,
@@ -269,7 +292,7 @@ export class PostgresCallLogRepository {
   }
   async clearReference(relativePath: string, nextState: string): Promise<void> {
     await this.database.transaction(async (transaction) => {
-      await transaction.query("SELECT pg_advisory_xact_lock(18765,8)");
+      await acquirePostgresLock(transaction, "accounting");
       await transaction.query(
         `UPDATE omniroute.call_logs SET detail_state=$2,
         artifact_relpath=NULL,artifact_size_bytes=NULL,artifact_sha256=NULL WHERE artifact_relpath=$1`,
@@ -360,7 +383,7 @@ export class PostgresCallLogRepository {
     limit: number
   ): Promise<{ deletedRows: number; paths: string[] }> {
     return this.database.transaction(async (transaction) => {
-      await transaction.query("SELECT pg_advisory_xact_lock(18765,8)");
+      await acquirePostgresLock(transaction, "accounting");
       const rows = (
         await transaction.query<{ artifact_relpath: string | null }>(
           `DELETE FROM omniroute.call_logs WHERE id IN
@@ -386,7 +409,7 @@ export class PostgresCallLogRepository {
   }
   async trim(maxRows: number, limit: number): Promise<{ deletedRows: number; paths: string[] }> {
     return this.database.transaction(async (transaction) => {
-      await transaction.query("SELECT pg_advisory_xact_lock(18765,8)");
+      await acquirePostgresLock(transaction, "accounting");
       const excess = safeUsageNumber(
         (
           await transaction.query<{ count: string }>(

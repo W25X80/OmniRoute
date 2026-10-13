@@ -13,11 +13,16 @@
  */
 
 import { parseDatabaseBackend } from "@/lib/db/backendSelection";
-import { beginPersistenceAdmissionClose } from "@/lib/db/persistenceRuntime";
+import {
+  beginPersistenceAdmissionClose,
+  cancelPersistenceAttempts,
+  getPersistenceRuntimeStatus,
+} from "@/lib/db/persistenceRuntime";
+import { getShutdownBudgetConfig } from "@/shared/utils/runtimeTimeouts";
 import { markServerStopping } from "@/lib/serverLifecycle";
 
 /** Grace period before forced exit (default 30s, configurable) */
-const SHUTDOWN_TIMEOUT_MS = parseInt(process.env.SHUTDOWN_TIMEOUT_MS || "30000", 10);
+const SHUTDOWN_TIMEOUT_MS = getShutdownBudgetConfig().drainMs;
 
 declare global {
   var __omnirouteShutdown:
@@ -77,7 +82,7 @@ export function getActiveRequestCount(): number {
 /**
  * Wait for all in-flight requests to complete, with timeout.
  */
-async function waitForDrain(): Promise<void> {
+async function waitForDrain(): Promise<boolean> {
   const state = getShutdownState();
   const start = Date.now();
   const CHECK_INTERVAL_MS = 250;
@@ -86,7 +91,7 @@ async function waitForDrain(): Promise<void> {
     const check = () => {
       if (state.activeRequests <= 0) {
         console.log("[Shutdown] All in-flight requests drained.");
-        resolve();
+        resolve(true);
         return;
       }
 
@@ -94,7 +99,7 @@ async function waitForDrain(): Promise<void> {
         console.warn(
           `[Shutdown] Timeout after ${SHUTDOWN_TIMEOUT_MS}ms with ${state.activeRequests} active requests. Forcing exit.`
         );
-        resolve();
+        resolve(false);
         return;
       }
 
@@ -220,8 +225,26 @@ export function requestGracefulShutdown(signal: string): Promise<void> {
   state.shutdownPromise = (async () => {
     console.log(`\n[Shutdown] Received ${signal}. Draining ${state.activeRequests} request(s)...`);
 
-    await waitForDrain();
-    await cleanup();
+    if (parseDatabaseBackend() === "postgres") {
+      let deadlineExceeded = false;
+      const cancellationTimer = setTimeout(() => {
+        deadlineExceeded = true;
+        console.error("[Shutdown] Native drain deadline exceeded", getPersistenceRuntimeStatus());
+        cancelPersistenceAttempts();
+      }, SHUTDOWN_TIMEOUT_MS);
+      try {
+        // Stop producers now; their accepted work and request/stream tails join in
+        // the coordinator while the HTTP drain proceeds concurrently.
+        const [drained] = await Promise.all([waitForDrain(), cleanup()]);
+        if (!drained || deadlineExceeded)
+          throw new Error("PostgreSQL shutdown drain exceeded its deadline");
+      } finally {
+        clearTimeout(cancellationTimer);
+      }
+    } else {
+      await waitForDrain();
+      await cleanup();
+    }
 
     console.log("[Shutdown] Bye.");
   })();
@@ -246,9 +269,19 @@ export function initGracefulShutdown(): void {
 
   const shutdown = (signal: string) => {
     if (parseDatabaseBackend() === "postgres") {
+      const forcedExit = setTimeout(() => {
+        console.error(
+          "[Shutdown] Native cleanup exceeded the process budget; exiting unsuccessfully"
+        );
+        process.exit(1);
+      }, getShutdownBudgetConfig().forceExitMs);
       void globalThis.__omnirouteRequestShutdown?.(signal).then(
-        () => setTimeout(() => process.exit(0), 0),
         () => {
+          clearTimeout(forcedExit);
+          setTimeout(() => process.exit(0), 0);
+        },
+        () => {
+          clearTimeout(forcedExit);
           console.error("[Shutdown] PostgreSQL cleanup failed; exiting with an error.");
           setTimeout(() => process.exit(1), 0);
         }

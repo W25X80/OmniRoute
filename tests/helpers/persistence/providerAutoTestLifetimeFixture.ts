@@ -92,6 +92,13 @@ export async function createPostgresDatabase(): Promise<
           } else if (text.startsWith("SELECT pg_advisory_xact_lock(")) {
             found = [];
           } else if (
+            text ===
+            "SELECT name,description,pipeline FROM omniroute.compression_combos WHERE id=$1 FOR UPDATE"
+          ) {
+            // This transport fixture has no seeded compression combo; boot's
+            // explicit upgrade owner consequently has no row to transform.
+            found = [];
+          } else if (
             text === "SELECT key, value FROM omniroute.key_value WHERE namespace = 'settings'"
           ) {
             found = Object.entries(settings).map(([key, value]) => ({

@@ -10,6 +10,7 @@ import type {
 import { normalizeScope, type AccessScope } from "../../accessTokens/scopes";
 import type { PostgresDatabase, PostgresTransaction } from "./database";
 import { databaseTimestamp } from "./leaseRepository";
+import { acquirePostgresLock } from "./locks";
 
 type Row = Record<string, unknown>;
 export interface SessionAffinityRecord {
@@ -102,7 +103,7 @@ export function createPostgresSessionRepository(database: PostgresDatabase) {
   // Fences absent KV rows and compare/delete with concurrent replacement of the same pin.
   function affinityTransaction<T>(body: (transaction: PostgresTransaction) => Promise<T>) {
     return database.transaction(async (transaction) => {
-      await transaction.query("SELECT pg_advisory_xact_lock(18765,13)");
+      await acquirePostgresLock(transaction, "sessions");
       return body(transaction);
     });
   }
@@ -298,7 +299,7 @@ export function createPostgresSessionRepository(database: PostgresDatabase) {
       connection?: string
     ) {
       return database.transaction(async (transaction) => {
-        await transaction.query("SELECT pg_advisory_xact_lock(18765,13)");
+        await acquirePostgresLock(transaction, "sessions");
         await transaction.query(
           `INSERT INTO omniroute.session_model_history(session_id,combo_name,model_str,provider,connection_id,used_at) VALUES($1,$2,$3,$4,$5,$6)`,
           [
@@ -520,7 +521,7 @@ export function createPostgresSessionRepository(database: PostgresDatabase) {
       if (!name) return Promise.reject(new Error("Access token name is required"));
       const secret = `oma_live_${randomBytes(32).toString("base64url")}`;
       return database.transaction(async (transaction) => {
-        await transaction.query("SELECT pg_advisory_xact_lock(18765,14)");
+        await acquirePostgresLock(transaction, "accessTokens");
         const record: AccessTokenRecord = {
           id: `tok_${randomUUID()}`,
           name,
@@ -608,7 +609,7 @@ export function createPostgresSessionRepository(database: PostgresDatabase) {
       const none = { revoked: false, alreadyRevoked: false, ambiguous: false };
       if (!idOrPrefix) return Promise.resolve(none);
       return database.transaction(async (transaction) => {
-        await transaction.query("SELECT pg_advisory_xact_lock(18765,14)");
+        await acquirePostgresLock(transaction, "accessTokens");
         const matches = (
           await transaction.query<{ id: string; revoked_at: string | null }>(
             `SELECT id,revoked_at FROM omniroute.cli_access_tokens WHERE id=$1 OR token_prefix=$1 FOR UPDATE`,

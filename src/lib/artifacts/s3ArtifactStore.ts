@@ -13,6 +13,7 @@ import {
   type NativeArtifactStore,
   type StoredArtifact,
   type ArtifactPutOptions,
+  type PreparedArtifact,
 } from "@/domain/persistence/artifactStore";
 import {
   parseS3ArtifactConfiguration,
@@ -81,6 +82,26 @@ async function loadDefaultClient(
       agent.destroy();
     },
   };
+}
+
+export function artifactStorageDiagnostic(error: unknown) {
+  const candidate = error as {
+    name?: unknown;
+    $metadata?: { httpStatusCode?: unknown; requestId?: unknown };
+  } | null;
+  const safe = (value: unknown, maximum: number) =>
+    typeof value === "string" && value.length <= maximum && /^[A-Za-z0-9_+\/=.-]+$/.test(value)
+      ? value
+      : undefined;
+  const status = candidate?.$metadata?.httpStatusCode;
+  return Object.freeze({
+    name: safe(candidate?.name, 80),
+    status:
+      Number.isInteger(status) && Number(status) >= 100 && Number(status) <= 599
+        ? Number(status)
+        : undefined,
+    requestId: safe(candidate?.$metadata?.requestId, 200),
+  });
 }
 
 function isMissingObject(error: unknown): boolean {
@@ -214,8 +235,29 @@ export function createS3ArtifactStore(
   let closing = false;
   let closePromise: Promise<void> | undefined;
 
-  const client = () =>
-    (clientPromise ??= (dependencies.loadClient ?? loadDefaultClient)(configuration));
+  const client = () => {
+    if (!clientPromise) {
+      const preparation = (dependencies.loadClient ?? loadDefaultClient)(configuration);
+      clientPromise = preparation;
+      void preparation.catch(() => {
+        if (clientPromise === preparation) clientPromise = undefined;
+      });
+    }
+    return clientPromise;
+  };
+
+  function prepare(bytes: Uint8Array): PreparedArtifact {
+    if (!(bytes instanceof Uint8Array)) throw new ArtifactStorageError("integrity");
+    if (bytes.byteLength > MAX_ARTIFACT_BYTES) throw new ArtifactStorageError("too_large");
+    const checksum = digest(bytes);
+    return Object.freeze({
+      reference: `s3/${randomUUID()}_${checksum}.json`,
+      sizeBytes: bytes.byteLength,
+      checksum,
+      storageScope,
+      singleAttempt: true as const,
+    });
+  }
 
   function operation<T>(
     body: (signal: AbortSignal) => Promise<T>,
@@ -246,6 +288,22 @@ export function createS3ArtifactStore(
 
   return {
     storageScope,
+    prepare,
+    warmup: () =>
+      operation(async (signal) => {
+        try {
+          await client();
+          assertActive(signal);
+        } catch (error) {
+          if (error instanceof ArtifactStorageError) throw error;
+          throw new ArtifactStorageError(
+            "unavailable",
+            undefined,
+            false,
+            artifactStorageDiagnostic(error)
+          );
+        }
+      }),
     isPutActive(reference: string): boolean {
       return (pendingPuts.get(reference) ?? 0) > 0;
     },
@@ -254,14 +312,24 @@ export function createS3ArtifactStore(
         return Promise.reject(new ArtifactStorageError("integrity"));
       if (bytes.byteLength > MAX_ARTIFACT_BYTES)
         return Promise.reject(new ArtifactStorageError("too_large"));
-      const referenceId = randomUUID();
+      const allocated = options.prepared ?? prepare(bytes);
+      if (options.prepared && !options.onPrepared)
+        return Promise.reject(new ArtifactStorageError("configuration"));
       let reference: string | undefined;
       let putStarted = false;
       const deadlineError = new ArtifactStorageError("deadline");
       return operation(async (signal) => {
         const immutableBytes = Buffer.from(bytes);
         const checksum = digest(immutableBytes);
-        reference = `s3/${referenceId}_${checksum}.json`;
+        reference = allocated.reference;
+        if (
+          parseReference(reference) !== checksum ||
+          allocated.checksum !== checksum ||
+          allocated.sizeBytes !== immutableBytes.byteLength ||
+          allocated.storageScope !== storageScope ||
+          allocated.singleAttempt !== true
+        )
+          throw new ArtifactStorageError("integrity");
         pendingPuts.set(reference, (pendingPuts.get(reference) ?? 0) + 1);
         try {
           // Caller SQL/checkpoint errors remain authoritative, not PUT errors.
@@ -300,8 +368,13 @@ export function createS3ArtifactStore(
             assertActive(signal);
             assertAcknowledged(result);
             return { reference, sizeBytes: immutableBytes.byteLength, checksum };
-          } catch {
-            throw new ArtifactStorageError("put_unknown", reference, putStarted);
+          } catch (error) {
+            throw new ArtifactStorageError(
+              putStarted ? "put_unknown" : "unavailable",
+              reference,
+              putStarted,
+              artifactStorageDiagnostic(error)
+            );
           }
         } finally {
           // A public deadline must not pretend the opaque transport has settled.
@@ -366,7 +439,12 @@ export function createS3ArtifactStore(
           if (error instanceof ArtifactStorageError) throw error;
           if (signal.aborted) throw new ArtifactStorageError("deadline");
           if (isMissingObject(error)) return null;
-          throw new ArtifactStorageError("unavailable");
+          throw new ArtifactStorageError(
+            "unavailable",
+            undefined,
+            undefined,
+            artifactStorageDiagnostic(error)
+          );
         } finally {
           if (!complete && body) {
             try {
@@ -404,7 +482,12 @@ export function createS3ArtifactStore(
           if (error instanceof ArtifactStorageError) throw error;
           if (signal.aborted) throw new ArtifactStorageError("deadline");
           if (isMissingObject(error)) return false;
-          throw new ArtifactStorageError("unavailable");
+          throw new ArtifactStorageError(
+            "unavailable",
+            undefined,
+            undefined,
+            artifactStorageDiagnostic(error)
+          );
         }
       });
     },

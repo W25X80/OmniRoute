@@ -51,7 +51,7 @@ lastUpdated: 2026-10-12
 
 ## 1. Required Secrets
 
-For the default SQLite startup, unset secrets marked **Yes** are auto-generated on the first run (`JWT_SECRET`, `API_KEY_SECRET`) and persisted to `server.env` in the data directory — set them explicitly when that directory is ephemeral. The PostgreSQL runtime uses encrypted durable secrets when explicit nonempty values are absent; preserve the original values during migration. The exception is `OMNIROUTE_WS_BRIDGE_SECRET`: it is not persisted to `server.env` — the server entrypoints mint an ephemeral per-boot value only the in-process bridge can use, so external bridge clients need it set explicitly.
+For explicitly selected SQLite startup, unset secrets marked **Yes** are auto-generated on the first run (`JWT_SECRET`, `API_KEY_SECRET`) and persisted to `server.env` in the data directory — set them explicitly when that directory is ephemeral. The PostgreSQL runtime uses encrypted durable secrets when explicit nonempty values are absent; preserve the original values during migration. The exception is `OMNIROUTE_WS_BRIDGE_SECRET`: it is not persisted to `server.env` — the server entrypoints mint an ephemeral per-boot value only the in-process bridge can use, so external bridge clients need it set explicitly.
 
 | Variable                     | Required             | Default           | Source File                                        | Description                                                                                                                                                                                                                                                                                                                                                        |
 | ---------------------------- | -------------------- | ----------------- | -------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
@@ -82,8 +82,8 @@ echo "OMNIROUTE_WS_BRIDGE_SECRET=$(openssl rand -base64 32)"
 
 ## 2. Storage & Database
 
-SQLite remains the default embedded backend. The optional PostgreSQL server is selected at startup
-through `OMNIROUTE_DATABASE_BACKEND`; see [its configuration](#optional-postgresql-server-and-offline-tools).
+This fork defaults to native PostgreSQL when `OMNIROUTE_DATABASE_BACKEND` is absent.
+Only explicit `sqlite` selects the embedded legacy backend; see [PostgreSQL configuration](#postgresql-server-and-offline-tools).
 These variables control data location, credential/secret encryption and lifecycle. PostgreSQL still
 requires writable local scratch; its durable authority is not the local SQLite file.
 
@@ -1851,11 +1851,12 @@ Used by `open-sse/services/combo.ts` and `src/lib/quota/quotaScheduler.ts` for p
 | `OMNIROUTE_ESTIMATOR_CALIBRATION` | _(on)_ | `open-sse/services/estimatorCalibration.ts` | Feedback calibration of the context-guard token estimator (#14931): per (provider, model, tools present) EMA of `usage.prompt_tokens` / estimate, clamped to 0.15–2.0, in memory only. `off`, `0` or `false` disables recording and application. |
 | `GROK_SUBSCRIPTION_IMAGES_ENABLED` | `false` | `open-sse/config/imageRegistry.ts` | Registers the `xai-oauth` (`xao`) and `grok-cli` image routes. Dashboard feature flag of the same name; a DB override wins over this value. |
 
-### Optional PostgreSQL server and offline tools
+### PostgreSQL server and offline tools
 
 `OMNIROUTE_DATABASE_BACKEND` selects the durable authority once at process startup. Unset means
-SQLite; `postgres` requires native initialization. Change the backend only through offline migration
-and restart. PostgreSQL configuration/startup failures do not select SQLite. See the
+`postgres`; only explicit `sqlite` selects SQLite. Empty or invalid values are rejected.
+Change the backend only through offline migration and restart. PostgreSQL configuration/startup
+failures do not select SQLite or provision replacement local secrets. See the
 [PostgreSQL runbook](../ops/POSTGRESQL.md) for source-checkout maintenance commands, stable
 secrets, private S3 configuration and pending exact-artifact qualification.
 
@@ -1867,7 +1868,7 @@ lower-level explicit factory's 4-connection/no-queue defaults.
 
 | Variable                                         | Default                                        | Description                                                                                                                                           |
 | ------------------------------------------------ | ---------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `OMNIROUTE_DATABASE_BACKEND`                     | `sqlite` when unset                            | Accepted values: `sqlite`, `postgres`. Startup selection; a restart is required to change authority.                                                  |
+| `OMNIROUTE_DATABASE_BACKEND`                     | `postgres` when unset                            | Accepted values: `sqlite`, `postgres`. Startup selection; a restart is required to change authority.                                                  |
 | `OMNIROUTE_POSTGRES_HOST`                        | _(empty; required for PostgreSQL)_             | Target hostname. Use the certificate's hostname for verify-full TLS.                                                                                  |
 | `OMNIROUTE_POSTGRES_PORT`                        | `5432`                                         | Target TCP port.                                                                                                                                      |
 | `OMNIROUTE_POSTGRES_DATABASE`                    | _(empty; required for PostgreSQL)_             | Dedicated target database.                                                                                                                            |

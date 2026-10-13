@@ -6,7 +6,7 @@ const dns = require("dns");
 const { promisify } = require("util");
 const os = require("os");
 
-const databaseBackend = process.env.OMNIROUTE_DATABASE_BACKEND ?? "sqlite";
+const databaseBackend = process.env.OMNIROUTE_DATABASE_BACKEND ?? "postgres";
 if (databaseBackend !== "sqlite" && databaseBackend !== "postgres") {
   throw new Error("OMNIROUTE_DATABASE_BACKEND must be sqlite or postgres");
 }

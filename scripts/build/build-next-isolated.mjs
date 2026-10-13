@@ -101,6 +101,9 @@ function runNextBuild() {
   return new Promise((resolve) => {
     const nextBin = path.join(projectRoot, "node_modules", "next", "dist", "bin", "next");
     const buildEnv = resolveNextBuildEnv(process.env);
+    if (process.env.DATA_DIR === undefined) {
+      mkdirSync(buildEnv.DATA_DIR, { recursive: true, mode: 0o700 });
+    }
     ensureWindowsBuildProfileDirs(buildEnv);
     const nextArgs = process.versions.bun
       ? [
@@ -169,6 +172,9 @@ export function resolveNextBuildEnv(baseEnv = process.env, platform = process.pl
     // better-sqlite3 addon (its Statement destructor SIGABRTs at worker
     // teardown: node::RemoveEnvironmentCleanupHook). (#10060)
     OMNIROUTE_BUILDING: "1",
+    // The native build imports path declarations but must not initialize a database.
+    // This owned scratch directory is removed with backupRoot in main's finally.
+    DATA_DIR: baseEnv.DATA_DIR === undefined ? path.join(backupRoot, "scratch") : baseEnv.DATA_DIR,
     // No telemetry, anywhere: disable Next.js's anonymous build-time telemetry
     // on every build path (local, CI, Docker), not just the image build.
     NEXT_TELEMETRY_DISABLED: baseEnv.NEXT_TELEMETRY_DISABLED || "1",

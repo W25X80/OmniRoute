@@ -1,11 +1,12 @@
 import { getSelectedPostgresDatabase } from "../controlPlaneContext";
 import type { PostgresDatabase } from "./database";
 import { queryUsageRows, safeUsageNumber, bindSelectedUsageRepository } from "./usageQueries";
+import { acquirePostgresLock } from "./locks";
 export class PostgresDetailedLogRepository {
   constructor(private readonly database: PostgresDatabase) {}
   async save(parameters: unknown[], apiKeyId?: string | null): Promise<void> {
     await this.database.transaction(async (transaction) => {
-      await transaction.query("SELECT pg_advisory_xact_lock_shared(18765,5)");
+      await acquirePostgresLock(transaction, "keyPolicy", "shared");
       if (apiKeyId) {
         const row = (
           await transaction.query<{ no_log: number }>(
@@ -15,7 +16,7 @@ export class PostgresDetailedLogRepository {
         ).rows[0];
         if (!row || row.no_log === 1) return;
       }
-      await transaction.query("SELECT pg_advisory_xact_lock(18765,8)");
+      await acquirePostgresLock(transaction, "accounting");
       await transaction.query(
         `INSERT INTO omniroute.request_detail_logs
     (id,call_log_id,timestamp,client_request,translated_request,provider_response,client_response,provider,model,source_format,target_format,duration_ms)

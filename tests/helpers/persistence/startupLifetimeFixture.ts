@@ -119,6 +119,12 @@ export async function stopConnectionRecoveryScheduler(): Promise<void> {
 export async function stopBackgroundRefresh(): Promise<void> {
   await stop("quota");
 }
+export async function stopNativeArtifactRecovery(): Promise<void> {
+  await stop("artifactRecovery");
+}
+export async function stopAntigravityCreditSweep(): Promise<void> {
+  await stop("antigravityCreditSweep");
+}
 export async function stopSessionAccountAffinityCleanup(): Promise<void> {
   await stop("affinity");
 }
@@ -178,6 +184,12 @@ async function flush(name: string): Promise<void> {
   if (name === "spend" && startupFixture.flushFailure) throw new Error("Flush failed");
 }
 export async function flushSpendBatchWriter(): Promise<void> {
+  await flush("spend");
+}
+export async function beginNativeSpendBatchWriterClose(): Promise<void> {
+  await stop("spend");
+}
+export async function closeNativeSpendBatchWriter(): Promise<void> {
   await flush("spend");
 }
 export async function closeCallLogSaves(): Promise<void> {

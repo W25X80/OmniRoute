@@ -13,6 +13,7 @@ import {
   type SettingsEnvironment,
 } from "../settings/persistenceSemantics";
 import type { PostgresDatabase, PostgresTransaction } from "./database";
+import { acquirePostgresLock } from "./locks";
 
 /** Required composition callbacks. Tests must supply explicit inert callbacks. */
 export interface PostgresSettingsEffects {
@@ -44,7 +45,7 @@ export class PostgresSettingsEffectsError extends Error {
 
 async function lockSettings(transaction: PostgresTransaction): Promise<void> {
   // This lock also covers the absent revision row and headless-onboarding writes.
-  await transaction.query("SELECT pg_advisory_xact_lock(18765, 3)");
+  await acquirePostgresLock(transaction, "settings");
 }
 
 async function readSettingsRows(transaction: PostgresTransaction) {

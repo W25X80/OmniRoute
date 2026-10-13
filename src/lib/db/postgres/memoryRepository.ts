@@ -3,6 +3,7 @@ import type { Memory, MemoryType } from "@/lib/memory/types";
 import { rowToMemory } from "@/lib/memory/retrieval/scoring";
 import type { MemoryRow } from "@/lib/memory/retrieval/scoring";
 import type { PostgresDatabase, PostgresTransaction } from "./database";
+import { acquirePostgresLock } from "./locks";
 
 export const POSTGRES_MEMORY_SCHEMA_STATEMENTS = [
   `CREATE TABLE omniroute.memories (
@@ -57,7 +58,7 @@ function parseMetadata(value: string | null): Record<string, unknown> {
 }
 
 async function lockMemories(transaction: PostgresTransaction, shared = false): Promise<void> {
-  await transaction.query(`SELECT pg_advisory_xact_lock${shared ? "_shared" : ""}(18765, 9)`);
+  await acquirePostgresLock(transaction, "memory", shared ? "shared" : "exclusive");
 }
 
 function dateText(value: Date | null | undefined): string | null {

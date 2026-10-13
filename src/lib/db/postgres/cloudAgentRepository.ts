@@ -1,5 +1,6 @@
 import type { CloudAgentTaskRow } from "../cloudAgentTasks";
 import type { PostgresDatabase, PostgresTransaction } from "./database";
+import { acquirePostgresLock } from "./locks";
 const COLUMNS =
   "id,provider_id,external_id,status,prompt,source,options,result,activities,error,created_at,updated_at,completed_at";
 const UPDATABLE = new Set([
@@ -15,7 +16,7 @@ const UPDATABLE = new Set([
 export function createPostgresCloudAgentRepository(database: PostgresDatabase) {
   function operation<T>(write: boolean, body: (tx: PostgresTransaction) => Promise<T>) {
     return database.transaction(async (tx) => {
-      await tx.query(`SELECT pg_advisory_xact_lock${write ? "" : "_shared"}(18765,12)`);
+      await acquirePostgresLock(tx, "cloudAgents", write ? "exclusive" : "shared");
       return body(tx);
     });
   }

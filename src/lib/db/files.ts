@@ -1,6 +1,6 @@
 import type { NativeFileWork } from "./nativeFileWork";
 import { getSelectedPostgresDatabase } from "./controlPlaneContext";
-import { getDbInstance, rowToCamel, objToSnake } from "./core";
+import { getDbInstance, rowToCamel } from "./core";
 import { v4 as uuidv4 } from "uuid";
 import { DEFAULT_BATCH_EXPIRATION_SECONDS } from "@/shared/constants/batch";
 
@@ -223,7 +223,7 @@ export async function createFileAsync(
   const postgres = getSelectedPostgresDatabase();
   if (postgres) {
     const native = await import("./postgres/serviceFiles");
-    return postgres.transaction((transaction) => native.createFile(transaction, ...args));
+    return native.createFile(postgres, ...args);
   }
   return createFile(...args);
 }
@@ -245,7 +245,7 @@ export async function getFileContentAsync(
   const postgres = getSelectedPostgresDatabase();
   if (postgres) {
     const native = await import("./postgres/serviceFiles");
-    return postgres.transaction((transaction) => native.getFileContent(transaction, ...args));
+    return native.getFileContent(postgres, ...args);
   }
   return getFileContent(...args);
 }
@@ -314,7 +314,5 @@ export async function getFileContentForConsumerAsync(
   if (!postgres) return getFileContent(id);
   consumer.assertActive();
   const native = await import("./postgres/serviceFiles");
-  return postgres.transaction((transaction) =>
-    native.getFileContent(transaction, id, (size) => consumer.reserveDownload(size))
-  );
+  return native.getFileContent(postgres, id, (size) => consumer.reserveDownload(size));
 }

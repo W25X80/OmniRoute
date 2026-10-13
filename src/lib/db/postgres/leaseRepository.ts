@@ -1,6 +1,7 @@
 import type * as Leases from "../exclusiveConnectionLeases";
 import { hashLeaseOwnerId } from "../exclusiveConnectionLeases";
 import type { PostgresDatabase, PostgresTransaction } from "./database";
+import { acquirePostgresLock } from "./locks";
 
 type Lease = Leases.ExclusiveConnectionLease;
 type Input<Name extends keyof typeof Leases> = Parameters<
@@ -105,8 +106,8 @@ export function createPostgresLeaseRepository(database: PostgresDatabase) {
     body: (transaction: PostgresTransaction, now: string) => Promise<T>
   ) {
     return database.transaction(async (transaction) => {
-      await transaction.query("SELECT pg_advisory_xact_lock(18765,4)");
-      await transaction.query("SELECT pg_advisory_xact_lock(18765,7)");
+      await acquirePostgresLock(transaction, "providers");
+      await acquirePostgresLock(transaction, "validation");
       const timestamp = await databaseTimestamp(transaction, now);
       await expire(transaction, timestamp);
       return body(transaction, timestamp);
@@ -149,8 +150,8 @@ export function createPostgresLeaseRepository(database: PostgresDatabase) {
   return {
     reconcileExpiredExclusiveConnectionLeases: (now?: string) =>
       database.transaction(async (transaction) => {
-        await transaction.query("SELECT pg_advisory_xact_lock(18765,4)");
-        await transaction.query("SELECT pg_advisory_xact_lock(18765,7)");
+        await acquirePostgresLock(transaction, "providers");
+        await acquirePostgresLock(transaction, "validation");
         return expire(transaction, await databaseTimestamp(transaction, now));
       }),
     acquireExclusiveConnectionLease(

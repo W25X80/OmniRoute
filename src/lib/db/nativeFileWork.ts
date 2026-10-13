@@ -72,7 +72,8 @@ function fileContext(): FileContext {
 export function nativeFileDownloadReservation(size: number): number {
   checkedBytes(size);
   const chunk = Math.min(size, NATIVE_BLOB_LIMITS.chunkBytes);
-  return checkedBytes(Math.max(3 * size, size + 16 * chunk + 64 * 1024));
+  // Retained base64 text (even UTF-16), the owned result and bounded decode/hash scratch.
+  return checkedBytes(Math.max(4 * size, size + 16 * chunk + 64 * 1024));
 }
 
 /** Private app-consumer capacity; the low-level Buffer APIs remain caller-owned. */
@@ -161,7 +162,8 @@ export class NativeFileWork {
     if (this.kind !== "internal") throw new Error("Invalid native file consumer");
     checkedBytes(size);
     const chunk = Math.min(size, NATIVE_BLOB_LIMITS.chunkBytes);
-    this.reserve(checkedBytes(size + 16 * chunk + 64 * 1024));
+    // Original output buffers plus immutable prepared chunk copies and bounded transport scratch.
+    this.reserve(checkedBytes(2 * size + 16 * chunk + 64 * 1024));
   }
   release(): void {
     if (!this.active) return;

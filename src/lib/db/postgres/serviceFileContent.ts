@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { setImmediate as yieldChunk } from "node:timers/promises";
 import type { PostgresTransaction } from "./database";
 import {
   checkedNativeBlobReference,
@@ -57,11 +58,11 @@ function decodeChunk(value: unknown, length: number): Buffer {
 }
 
 /** Bound to the supplied client/transaction. Maintenance includes deleted rows. */
-export async function openStoredFileContent(
+async function openStoredFileContentReader(
   transaction: PostgresTransaction,
   id: string,
   options: { includeDeleted?: boolean } = {}
-): Promise<StoredFileContent | null> {
+): Promise<EncodedFileReader | null> {
   const result = await transaction.query<Header>(
     `SELECT octet_length(f.content) AS inline_length, s.file_id AS stored_file_id,
       s.size_bytes, s.chunk_count, s.checksum
@@ -108,11 +109,10 @@ export async function openStoredFileContent(
     if (orphans.rows.length !== 1 || orphans.rows[0].present !== false) throw invalid();
   }
   let next = 0;
-  const whole = mapped ? createHash("sha256") : null;
   return {
     sizeBytes,
     checksum,
-    async readChunk(index) {
+    async readEncodedChunk(index) {
       if (!Number.isSafeInteger(index) || index < 0 || index !== next || index > count)
         throw invalid();
       if (index === count) return null;
@@ -139,24 +139,176 @@ export async function openStoredFileContent(
         chunk.chunk_index !== index
       )
         throw invalid();
-      const bytes = decodeChunk(chunk.content, length);
-      if (mapped) {
-        if (
-          typeof chunk.checksum !== "string" ||
-          !CHECKSUM.test(chunk.checksum) ||
-          hash(bytes) !== chunk.checksum
-        )
-          throw invalid();
-        whole!.update(bytes);
-        if (index === count - 1 && whole!.digest("hex") !== checksum) throw invalid();
-      }
       next++;
+      return { content: chunk.content, checksum: chunk.checksum, length };
+    },
+  };
+}
+
+interface EncodedChunk {
+  content: unknown;
+  checksum: unknown;
+  length: number;
+}
+interface EncodedFileReader {
+  sizeBytes: number | null;
+  checksum: string | null;
+  readEncodedChunk(index: number): Promise<EncodedChunk | null>;
+}
+export interface StoredFileSnapshot {
+  readonly sizeBytes: number;
+  readonly checksum: string | null;
+  readonly chunks: readonly EncodedChunk[];
+}
+
+function checkedChunk(chunk: EncodedChunk, mapped: boolean): Buffer {
+  const bytes = decodeChunk(chunk.content, chunk.length);
+  if (
+    mapped &&
+    (typeof chunk.checksum !== "string" ||
+      !CHECKSUM.test(chunk.checksum) ||
+      hash(bytes) !== chunk.checksum)
+  )
+    throw invalid();
+  return bytes;
+}
+
+/** Explicit offline streaming contract: the supplied transaction remains owned by the caller. */
+export async function openStoredFileContent(
+  transaction: PostgresTransaction,
+  id: string,
+  options: { includeDeleted?: boolean } = {}
+): Promise<StoredFileContent | null> {
+  const reader = await openStoredFileContentReader(transaction, id, options);
+  if (!reader) return null;
+  const whole = reader.checksum !== null ? createHash("sha256") : null;
+  let count = 0;
+  return {
+    sizeBytes: reader.sizeBytes,
+    checksum: reader.checksum,
+    async readChunk(index) {
+      const chunk = await reader.readEncodedChunk(index);
+      if (!chunk) return null;
+      const bytes = checkedChunk(chunk, whole !== null);
+      whole?.update(bytes);
+      count += bytes.length;
+      if (whole && count === reader.sizeBytes && whole.digest("hex") !== reader.checksum)
+        throw invalid();
       return bytes;
     },
   };
 }
 
-/** Atomic with parent metadata in the caller's one-client transaction; no advisory lock. */
+/** Capture one complete version under the parent lock; no payload decode/hash/copy here. */
+export async function captureStoredFileContent(
+  transaction: PostgresTransaction,
+  id: string,
+  reserve?: (sizeBytes: number) => void
+): Promise<StoredFileSnapshot | null> {
+  const reader = await openStoredFileContentReader(transaction, id, { includeDeleted: false });
+  if (!reader || reader.sizeBytes === null) return null;
+  reserve?.(reader.sizeBytes);
+  const chunks: EncodedChunk[] = [];
+  const count = Math.ceil(reader.sizeBytes / NATIVE_BLOB_LIMITS.chunkBytes);
+  for (let index = 0; index < count; index++) {
+    const chunk = await reader.readEncodedChunk(index);
+    if (!chunk) throw invalid();
+    chunks.push(chunk);
+  }
+  return { sizeBytes: reader.sizeBytes, checksum: reader.checksum, chunks };
+}
+
+/** Runs after SQL settlement. Never expose a partially verified result. */
+export async function materializeStoredFileContent(
+  snapshot: StoredFileSnapshot | null
+): Promise<Buffer | null> {
+  if (!snapshot) return null;
+  const output = Buffer.allocUnsafe(snapshot.sizeBytes);
+  const whole = snapshot.checksum !== null ? createHash("sha256") : null;
+  let offset = 0;
+  for (const chunk of snapshot.chunks) {
+    const bytes = checkedChunk(chunk, whole !== null);
+    if (offset + bytes.length > output.length) throw invalid();
+    whole?.update(bytes);
+    bytes.copy(output, offset);
+    offset += bytes.length;
+    await yieldChunk();
+  }
+  if (offset !== output.length || (whole && whole.digest("hex") !== snapshot.checksum))
+    throw invalid();
+  return output;
+}
+
+interface PreparedChunk {
+  readonly bytes: Buffer;
+  readonly checksum: string;
+}
+export interface PreparedFileContent {
+  readonly sizeBytes: number | null;
+  readonly checksum: string | null;
+}
+const preparedChunks = new WeakMap<PreparedFileContent, readonly PreparedChunk[]>();
+
+/** Capture caller bytes before SQL admission; bounded macrotasks let other SQL owners progress. */
+export async function prepareFileContent(content: Buffer | null): Promise<PreparedFileContent> {
+  const sizeBytes = content === null ? null : content.byteLength;
+  if (sizeBytes !== null && sizeBytes > NATIVE_BLOB_LIMITS.fileBytes)
+    throw new Error("File content exceeds the supported size limit");
+  const chunks: PreparedChunk[] = [],
+    whole = createHash("sha256");
+  for (
+    let offset = 0;
+    content && offset < content.length;
+    offset += NATIVE_BLOB_LIMITS.chunkBytes
+  ) {
+    const bytes = Buffer.from(content.subarray(offset, offset + NATIVE_BLOB_LIMITS.chunkBytes));
+    chunks.push({ bytes, checksum: hash(bytes) });
+    whole.update(bytes);
+    await yieldChunk();
+  }
+  const prepared = Object.freeze({
+    sizeBytes,
+    checksum: sizeBytes === null ? null : whole.digest("hex"),
+  });
+  preparedChunks.set(prepared, chunks);
+  return prepared;
+}
+
+/** Only pre-captured content is accepted; this serving primitive performs database work only. */
+export async function replacePreparedFileContent(
+  transaction: PostgresTransaction,
+  id: string,
+  prepared: PreparedFileContent
+): Promise<void> {
+  const chunks = preparedChunks.get(prepared);
+  if (!chunks) throw new Error("File content was not prepared before SQL admission");
+  const parent = await transaction.query("SELECT id FROM omniroute.files WHERE id=$1 FOR UPDATE", [
+    id,
+  ]);
+  if (parent.rows.length !== 1) throw invalid();
+  await transaction.query("DELETE FROM omniroute.files_content_state WHERE file_id=$1", [id]);
+  if (prepared.sizeBytes !== null) {
+    for (let index = 0; index < chunks.length; index++) {
+      const chunk = chunks[index];
+      const inserted = await transaction.query(
+        "INSERT INTO omniroute.files_content_chunks(file_id,chunk_index,content,checksum) VALUES($1,$2,$3,$4)",
+        [id, index, chunk.bytes, chunk.checksum]
+      );
+      if (inserted.rowCount !== 1) throw invalid();
+    }
+    const marker = await transaction.query(
+      "INSERT INTO omniroute.files_content_state(file_id,size_bytes,chunk_count,checksum) VALUES($1,$2,$3,$4)",
+      [id, prepared.sizeBytes, chunks.length, prepared.checksum]
+    );
+    if (marker.rowCount !== 1) throw invalid();
+  }
+  const updated = await transaction.query("UPDATE omniroute.files SET content=NULL WHERE id=$1", [
+    id,
+  ]);
+  if (updated.rowCount !== 1) throw invalid();
+}
+
+/** Offline import/restore streaming; serving callers must use prepared content instead. */
 export async function replaceStoredFileContent(
   transaction: PostgresTransaction,
   id: string,

@@ -5,6 +5,7 @@ import test from "node:test";
 import { fixture, barrier } from "../../helpers/persistence/runtimeOwnedWorkFixture.ts";
 import { shutdownFixture } from "../../helpers/persistence/shutdownOrderingFixture.ts";
 import type { PersistenceTailPermit } from "../../../src/lib/db/persistenceRuntime.ts";
+import { PostgresError } from "../../../src/lib/db/postgres/database.ts";
 
 const runtimeUrl = new URL("../../../src/lib/db/persistenceRuntime.ts", import.meta.url).href;
 const shutdownUrl = new URL("../../../src/lib/startup/postgresShutdown.ts", import.meta.url).href;
@@ -85,6 +86,32 @@ test.after(() => {
     else process.env[name] = value;
   }
 });
+
+for (const kind of ["transaction_failed", "commit_unknown"] as const) {
+  test(
+    `native shutdown rejects ${kind} cost residue while closing independent resources`,
+    { timeout: 10000 },
+    () =>
+      scenario(async () => {
+        await runtime.ensurePersistenceReady();
+        sinks.recordTailCost(4);
+        shutdownFixture.costFailure = new PostgresError(kind);
+        await assert.rejects(shutdown.shutdownPostgresApplication(), (error: unknown) => {
+          assert.ok(error instanceof AggregateError);
+          assert.ok(
+            error.errors.some(
+              (entry) => entry instanceof Error && entry.message.includes("unsettled cost")
+            )
+          );
+          return true;
+        });
+        assert.equal(sinks.getPendingTailCost(), 4);
+        assert.equal(shutdownFixture.persistedCost, 0);
+        assert.equal(fixture.poolCloses, 1);
+        assert.equal(shutdownFixture.logClosing, true);
+      })
+  );
+}
 
 // Runtime and coordinator are real; SQL/producer transports and log admission are controlled.
 test(

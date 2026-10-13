@@ -63,7 +63,7 @@ async function fixture(body: (binding: PostgresControlPlaneBinding) => Promise<v
 /** Timing/error injection only: every admitted SQL statement uses the real PostgreSQL client. */
 function interceptTransactions(
   database: PostgresDatabase,
-  before: (sql: string) => Promise<void>
+  before: (sql: string, values?: unknown[]) => Promise<void>
 ): PostgresDatabase {
   return new Proxy(database, {
     get(target, property, receiver) {
@@ -72,7 +72,7 @@ function interceptTransactions(
         target.transaction(async (transaction) =>
           body({
             query: async <Row = Record<string, unknown>>(sql: string, values?: unknown[]) => {
-              await before(sql);
+              await before(sql, values);
               return transaction.query<Row>(sql, values);
             },
           })
@@ -97,8 +97,8 @@ test(
         const entered = deferred(),
           release = deferred();
         let once = true;
-        const intercepted = interceptTransactions(binding.database!, async (sql) => {
-          if (once && sql === "SELECT pg_advisory_xact_lock(18765,13)") {
+        const intercepted = interceptTransactions(binding.database!, async (sql, values) => {
+          if (once && sql === "SELECT pg_advisory_xact_lock(18765,$1)" && values?.[0] === 13) {
             once = false;
             entered.resolve();
             await release.promise;
@@ -179,8 +179,8 @@ test(
         const entered = deferred(),
           release = deferred();
         let once = true;
-        const intercepted = interceptTransactions(binding.database!, async (sql) => {
-          if (once && sql === "SELECT pg_advisory_xact_lock(18765,13)") {
+        const intercepted = interceptTransactions(binding.database!, async (sql, values) => {
+          if (once && sql === "SELECT pg_advisory_xact_lock(18765,$1)" && values?.[0] === 13) {
             once = false;
             entered.resolve();
             await release.promise;

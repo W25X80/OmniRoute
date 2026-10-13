@@ -17,7 +17,7 @@ import { pipeline } from "node:stream/promises";
 import { resolveDataDir } from "../data-dir.mjs";
 import { getBaseUrl, isServerUp } from "../api.mjs";
 import { t } from "../i18n.mjs";
-import { backupSqliteFile } from "../sqlite.mjs";
+import { assertSqliteCliBackend, backupSqliteFile } from "../sqlite.mjs";
 import { CLI_TOKEN_HEADER, getCliToken } from "../utils/cliToken.mjs";
 
 function getBackupDir() {
@@ -179,6 +179,7 @@ async function pruneBackups(backupDir, retention) {
 }
 
 export async function runBackupCommand(opts = {}) {
+  assertSqliteCliBackend();
   const dataDir = resolveDataDir();
   const backupDir = getBackupDir();
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
@@ -335,6 +336,7 @@ function getSchedulePath() {
 }
 
 export async function runBackupAutoEnableCommand(opts = {}) {
+  assertSqliteCliBackend();
   const schedulePath = getSchedulePath();
   const schedule = {
     enabled: true,
@@ -352,6 +354,7 @@ export async function runBackupAutoEnableCommand(opts = {}) {
 }
 
 export async function runBackupAutoDisableCommand() {
+  assertSqliteCliBackend();
   const schedulePath = getSchedulePath();
   if (existsSync(schedulePath)) {
     const schedule = JSON.parse(readFileSync(schedulePath, "utf8"));
@@ -364,6 +367,7 @@ export async function runBackupAutoDisableCommand() {
 }
 
 export async function runBackupAutoStatusCommand() {
+  assertSqliteCliBackend();
   const schedulePath = getSchedulePath();
   if (!existsSync(schedulePath)) {
     console.log(t("backup.auto.notConfigured"));
@@ -380,6 +384,7 @@ export async function runBackupAutoStatusCommand() {
 }
 
 export async function runRestoreCommand(backupId, opts = {}) {
+  assertSqliteCliBackend();
   const backupDir = getBackupDir();
 
   if (opts.list || !backupId) {

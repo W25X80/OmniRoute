@@ -24,6 +24,7 @@ import {
 } from "../quotaSemantics";
 import { advanceApiKeyPolicyEpoch, lockApiKeyPolicy } from "./apiKeyPolicyState";
 import type { PostgresDatabase, PostgresTransaction } from "./database";
+import { acquirePostgresEntityLock, acquirePostgresLock } from "./locks";
 
 interface PoolRow {
   id: string;
@@ -60,9 +61,7 @@ async function lockCounter(
   apiKeyId: string,
   dimensionKey: string
 ) {
-  await transaction.query("SELECT pg_advisory_xact_lock(18766,hashtext($1))", [
-    JSON.stringify([apiKeyId, dimensionKey]),
-  ]);
+  await acquirePostgresEntityLock(transaction, "quotaCounter", [apiKeyId, dimensionKey]);
 }
 
 async function pair(
@@ -105,7 +104,7 @@ export class PostgresQuotaRepository {
     return this.database.transaction(async (transaction) => {
       // Permission-affecting quota metadata shares the durable key-policy fence.
       await lockApiKeyPolicy(transaction);
-      await transaction.query("SELECT pg_advisory_xact_lock(18765,11)");
+      await acquirePostgresLock(transaction, "quotaGroups");
       const result = await operation(transaction);
       await advanceApiKeyPolicyEpoch(transaction);
       return result;

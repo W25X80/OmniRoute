@@ -38,6 +38,7 @@ import {
 import { PROXY_ALIVE_PREDICATE } from "../proxies/guards";
 import { bumpProxyRegistryGeneration } from "../proxies/registryGeneration";
 import { readPostgresEgressAddressSet } from "./proxyOperatorEgressRepository";
+import { acquirePostgresLock } from "./locks";
 const PROXY_UPDATE_ORDER = `CASE WHEN pg_input_is_valid(updated_at, 'timestamptz') THEN date_trunc('second', updated_at::timestamptz) END DESC NULLS LAST,name COLLATE "C",insertion_order`;
 const PROXY_COLUMNS =
   "id,name,type,host,port,username,password,region,notes,status,source,family,subscription_id,created_at,updated_at";
@@ -48,11 +49,7 @@ interface PreferredMember {
 }
 
 export async function lockProxyState(tx: PostgresTransaction, shared = false): Promise<void> {
-  await tx.query(
-    shared
-      ? "SELECT pg_advisory_xact_lock_shared(18765,10)"
-      : "SELECT pg_advisory_xact_lock(18765,10)"
-  );
+  await acquirePostgresLock(tx, "proxies", shared ? "shared" : "exclusive");
 }
 
 function scopeIdentity(scope: string, scopeId?: string | null): [ProxyScope, string | null] {

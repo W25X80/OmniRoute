@@ -1,11 +1,13 @@
 # Native PostgreSQL persistence
 
-The server can select `OMNIROUTE_DATABASE_BACKEND=postgres`; an unset value or `sqlite`
-keeps SQLite as the default. Selection happens at process startup. Changing authority requires
+This fork selects native PostgreSQL when `OMNIROUTE_DATABASE_BACKEND` is unset or `postgres`.
+SQLite requires explicit `OMNIROUTE_DATABASE_BACKEND=sqlite`; empty and invalid values are
+rejected. Selection happens at process startup. Changing authority requires
 an offline data migration and restart; a PostgreSQL error never selects SQLite as a fallback.
 This is implemented server behavior, not a deployment-readiness or multi-writer certificate.
-See the [operations runbook](../../../../docs/ops/POSTGRESQL.md) and the upstream
-[persistence proposal](../../../../docs/architecture/persistence-backend-boundary.md).
+See the [operations runbook](../../../../docs/ops/POSTGRESQL.md). The upstream
+[persistence proposal](../../../../docs/architecture/persistence-backend-boundary.md) records
+the earlier SQLite-default design; the fork's current selection contract is stated above.
 
 ## Architecture and lifecycle
 
@@ -37,6 +39,11 @@ cleanup is not guaranteed after a forced kill or expired stop grace period. Post
 polls fresh native settings (5 seconds by default) without watching `storage.sqlite`.
 Process-local caches, runtime settings and producer ownership still require the single-writer
 operational profile; durable SQL locks do not establish active-active readiness.
+
+Native shutdown stops the spend timer while accepted request/stream owners finish accounting,
+then joins and flushes the final batch. Requeued or uncertain costs make shutdown fail rather
+than report a clean exit; unknown financial COMMITs are not replayed. The existing spend buffer
+is in memory, so this lifecycle contract does not promise crash durability before SQL admission.
 
 ## Configuration and admission
 
@@ -78,6 +85,24 @@ and must await each query. Normal repository callbacks contain database work onl
 transactions, transaction-control SQL or external effects. Failure taints the transaction even
 if a callback catches the query error; expired scopes cannot issue later SQL.
 
+Independent nested transactions on the same database are rejected before leasing another
+client and taint their parent. Explicit helpers composing queries on the supplied transaction
+remain supported. Diagnostics record static operation names, SQLSTATE, a statement SHA-256,
+admission/connect/query durations and the longest callback gap; they omit SQL text, parameters
+and driver error messages. A successful transaction with a callback gap of at least one second
+is also reported. These measurements distinguish waiting for SQL from work between queries;
+they do not identify the cause of a historical unlabelled incident.
+
+[`locks.ts`](locks.ts) owns advisory identities and documents compound acquisition order.
+Compression, conversations, Skills, A2A, cloud agents, agent metadata, memory and quota have
+separate domains. Metadata operations that write Skills share its owner. Privacy and accounting
+fences remain shared by their compound operations. Compression config/default reads use one
+SQL snapshot; the legacy default upgrade runs once per startup before admission. Conversation
+node inserts use bounded statements inside one atomic append, preserving input order and exact
+retry behavior. The lock protocol change requires a drained single-writer replacement: old and
+new binaries must not overlap. `npm run check:postgres-lock-owners` rejects literal advisory SQL
+outside the registry; it is a source guard, not a proof of arbitrary dynamic SQL or deadlock freedom.
+
 Only a `COMMIT` command tag acknowledges success. Ambiguous/lost acknowledgement yields
 `PostgresError.kind = "commit_unknown"` and destroys the uncertain client. The callback is never
 automatically replayed. A timeout or closed socket does not prove that a sent COMMIT failed;
@@ -107,6 +132,18 @@ GET validates length and digest. It admits at most 8 operations with a 5-second 
 are not evidence that no object exists. Log cleanup queues deletion in SQL when the last reference
 is removed; acknowledged object deletion is followed by queue acknowledgement. SQL and S3 are
 separate commit domains. The store does not expose a production endpoint override or filesystem fallback.
+
+Call-log metadata and an encrypted detail publication intent commit together before uploading.
+Staging is capped at 128 MiB in aggregate and the existing 8 MiB per object. Capacity rejection
+preserves metadata with an explicit missing-detail reason. A recovery pass claims unsent intent
+before PUT and verifies uncertain attempts through matching GET results, without replaying a PUT
+on an ambiguous acknowledgement or interpreting 404 as proof of failure. Successful attachment
+clears staged bytes. Deleting the call log, deleting its key or enabling no-log revokes pending
+publication; re-enabling logging cannot resurrect the revoked intent. Recovery preserves staging
+until attachment, explicit revocation or ordinary call-log retention, rather than expiring it on
+an arbitrary short timer. SDK warmup initializes the client within its deadline; it does not
+certify IAM, credential resolution or S3 reachability. Previously missing payloads cannot be
+reconstructed by this protocol.
 
 Application files retain their existing logical `files.content` contract and 512 MiB content
 boundary. Migration 4 adds private `files_content_state` and `files_content_chunks` tables.

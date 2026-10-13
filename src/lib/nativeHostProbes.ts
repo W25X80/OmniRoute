@@ -1,6 +1,7 @@
 import { createRequire } from "node:module";
 import type { ChildProcess } from "node:child_process";
 import { getSelectedPostgresDatabase } from "./db/controlPlaneContext";
+import { parseDatabaseBackend } from "./db/backendSelection";
 
 const require = createRequire(import.meta.url);
 const childProcess = require("node:child_process") as typeof import("node:child_process");
@@ -19,7 +20,7 @@ const state = (globalThis.__omnirouteNativeHostProbes ??= {
 
 /** Capture before deferred host work; probes do not hold a database lease. */
 export function usesNativeHostProfile(): boolean {
-  return process.env.OMNIROUTE_DATABASE_BACKEND === "postgres" || !!getSelectedPostgresDatabase();
+  return parseDatabaseBackend() === "postgres" || !!getSelectedPostgresDatabase();
 }
 
 export interface NativeHostProbeResult {
