@@ -202,10 +202,12 @@ function asynchronousAdapter<T>(module: Record<string, unknown>): T {
 test.describe("SQLite API-key repository conformance", () => {
   const directory = mkdtempSync(join(tmpdir(), "omniroute-key-conformance-"));
   const original = process.env.DATA_DIR;
+  const originalBackend = process.env.OMNIROUTE_DATABASE_BACKEND;
   let core: typeof import("../../src/lib/db/core.ts");
   let apiKeys: typeof import("../../src/lib/db/apiKeys.ts");
   let groups: typeof import("../../src/lib/db/apiKeyGroups.ts");
   test.before(async () => {
+    process.env.OMNIROUTE_DATABASE_BACKEND = "sqlite";
     process.env.DATA_DIR = directory;
     core = await import("../../src/lib/db/core.ts");
     apiKeys = await import("../../src/lib/db/apiKeys.ts");
@@ -213,6 +215,8 @@ test.describe("SQLite API-key repository conformance", () => {
   });
   test.after(() => {
     core?.resetDbInstance();
+    if (originalBackend === undefined) delete process.env.OMNIROUTE_DATABASE_BACKEND;
+    else process.env.OMNIROUTE_DATABASE_BACKEND = originalBackend;
     if (original === undefined) delete process.env.DATA_DIR;
     else process.env.DATA_DIR = original;
     rmSync(directory, { recursive: true, force: true });

@@ -25,6 +25,11 @@ test(
   { skip: !postgresTestsEnabled, timeout: 30_000 },
   async () => {
     const directory = mkdtempSync(join(tmpdir(), "omniroute-routing-import-"));
+    const previousBackend = process.env.OMNIROUTE_DATABASE_BACKEND;
+    const restoreBackend = () => {
+      if (previousBackend === undefined) delete process.env.OMNIROUTE_DATABASE_BACKEND;
+      else process.env.OMNIROUTE_DATABASE_BACKEND = previousBackend;
+    };
     // Only the disposable test fixture invokes SQLite startup migrations.
     process.env.DATA_DIR = directory;
     process.env.APP_LOG_TO_FILE = "false";
@@ -43,6 +48,7 @@ test(
     try {
       await db.transaction((tx) => tx.query("DROP SCHEMA IF EXISTS omniroute CASCADE"));
       await migratePostgresSchema(db);
+      process.env.OMNIROUTE_DATABASE_BACKEND = "sqlite";
       const sqlite = core.getDbInstance();
       sqlite
         .prepare(
@@ -82,6 +88,7 @@ test(
         .prepare("INSERT INTO proxy_scope_rotation(scope,scope_id) VALUES (?,?)")
         .run("combo", "combo");
       core.resetDbInstance();
+      restoreBackend();
       const source = tryOpenSync(join(directory, "storage.sqlite"), {
         readonly: true,
         fileMustExist: true,
@@ -257,6 +264,7 @@ test(
       }
     } finally {
       core.resetDbInstance();
+      restoreBackend();
       await db.close();
       rmSync(directory, { recursive: true, force: true });
     }

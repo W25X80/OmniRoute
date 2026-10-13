@@ -29,8 +29,10 @@ test(
       jwt: process.env.JWT_SECRET,
       api: process.env.API_KEY_SECRET,
       password: process.env.INITIAL_PASSWORD,
+      backend: process.env.OMNIROUTE_DATABASE_BACKEND,
     };
     process.env.DATA_DIR = directory;
+    process.env.OMNIROUTE_DATABASE_BACKEND = "postgres";
     process.env.STORAGE_ENCRYPTION_KEY = "isolated-pg-control-plane-encryption-key";
     delete process.env.JWT_SECRET;
     delete process.env.API_KEY_SECRET;
@@ -183,7 +185,7 @@ test(
             assert.equal(typeof (await caches.getCachedPricing()), "object");
           });
           assert.equal(reloads, 1);
-          assert.equal(getSelectedControlPlane(), undefined);
+          assert.throws(getSelectedControlPlane, /PostgreSQL application persistence is not ready/);
           assert.equal(existsSync(join(directory, "storage.sqlite")), false);
         }
       );
@@ -203,21 +205,30 @@ test(
         "unported synchronous access rejects even with an existing SQLite singleton",
         async () => {
           mkdirSync(directory, { recursive: true });
-          const legacy = sqlite.getDbInstance();
-          assert.ok(legacy);
-          await settings.updateSettings({ cloudEnabled: false });
-          assert.equal((await caches.getCachedSettings()).cloudEnabled, false);
-          await first.run(async () => {
-            assert.throws(() => sqlite.getDbInstance(), UnsupportedPersistenceDomainError);
-            assert.equal((await caches.getCachedSettings()).cloudEnabled, true);
-            assert.equal(
-              (await caches.getCachedRawProviderConnections())[0] &&
-                (await providers.getProviderConnectionById(providerId))?.id,
-              providerId
-            );
-          });
-          assert.equal((await caches.getCachedSettings()).cloudEnabled, false);
-          sqlite.closeDbInstance({ checkpointMode: null });
+          const previousBackend = process.env.OMNIROUTE_DATABASE_BACKEND;
+          process.env.OMNIROUTE_DATABASE_BACKEND = "sqlite";
+          try {
+            const legacy = sqlite.getDbInstance();
+            assert.ok(legacy);
+            await settings.updateSettings({ cloudEnabled: false });
+            assert.equal((await caches.getCachedSettings()).cloudEnabled, false);
+            process.env.OMNIROUTE_DATABASE_BACKEND = "postgres";
+            await first.run(async () => {
+              assert.throws(() => sqlite.getDbInstance(), UnsupportedPersistenceDomainError);
+              assert.equal((await caches.getCachedSettings()).cloudEnabled, true);
+              assert.equal(
+                (await caches.getCachedRawProviderConnections())[0] &&
+                  (await providers.getProviderConnectionById(providerId))?.id,
+                providerId
+              );
+            });
+            process.env.OMNIROUTE_DATABASE_BACKEND = "sqlite";
+            assert.equal((await caches.getCachedSettings()).cloudEnabled, false);
+          } finally {
+            sqlite.closeDbInstance({ checkpointMode: null });
+            if (previousBackend === undefined) delete process.env.OMNIROUTE_DATABASE_BACKEND;
+            else process.env.OMNIROUTE_DATABASE_BACKEND = previousBackend;
+          }
         }
       );
 
@@ -378,6 +389,7 @@ test(
       restore("JWT_SECRET", saved.jwt);
       restore("API_KEY_SECRET", saved.api);
       restore("INITIAL_PASSWORD", saved.password);
+      restore("OMNIROUTE_DATABASE_BACKEND", saved.backend);
       rmSync(directory, { recursive: true, force: true });
     }
   }

@@ -190,11 +190,13 @@ test(
           );
           assert.equal(await proxies.blockingProvider("anthropic"), false);
           assert.deepEqual(
-            await resolvePostgresProxyForConnection(
-              database,
-              "missing-connection",
-              undefined,
-              "anthropic"
+            await plane!.run(() =>
+              resolvePostgresProxyForConnection(
+                database,
+                "missing-connection",
+                undefined,
+                "anthropic"
+              )
             ),
             { proxy: null, level: "direct", levelId: null }
           );
