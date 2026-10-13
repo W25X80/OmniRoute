@@ -95,6 +95,7 @@ const IGNORE_FROM_CODE = new Set([
   "VITEST",
   // Disposable PostgreSQL benchmark storage; never read by the application.
   "RUN_PG_RETENTION_SCALE",
+  "RUN_PG_RUNTIME_SOAK",
   // Instruction snippet shown to users (Traffic Inspector HttpProxySnippetCard) — not OmniRoute config.
   "NODE_TLS_REJECT_UNAUTHORIZED",
   // Claude Code's own auth env var — read from the CLI environment to detect
