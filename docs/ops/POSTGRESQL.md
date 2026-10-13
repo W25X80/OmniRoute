@@ -128,6 +128,14 @@ accepted explicit transaction configuration; its 15,000-millisecond default and 
 bounds and ordering requirements remain unchanged. Live gateway deadlines remain unchanged. These bounds are
 not an RSS ceiling or a guarantee of completion within any deadline.
 
+When referenced call-log files exceed the ordinary 512 MiB aggregate carrier budget, add
+`--large-artifacts` to capture/export and import/restore/verify. This opt-in permits up to
+10 GiB of referenced artifact bytes stored outside the JSON bundle. Each object remains limited
+to 8 MiB and is read, hashed and verified individually; the JSON snapshot limit is unchanged.
+Without the flag, both capture and bundle loading reject larger aggregate declarations.
+Retain the entire private `objects/` directory with the bundle. Large aggregate capacity does
+not change serving object limits, bypass checksums or guarantee completion before a deadline.
+
 The maximum-file maintenance witness uses explicit PostgreSQL statement/query/idle/transaction
 budgets of 60000/90000/90000/300000 milliseconds through
 `OMNIROUTE_POSTGRES_STATEMENT_TIMEOUT_MS`, `OMNIROUTE_POSTGRES_QUERY_TIMEOUT_MS`,

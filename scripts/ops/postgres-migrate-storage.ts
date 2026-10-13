@@ -134,7 +134,8 @@ function references(snapshot: ReturnType<typeof checkedApplicationSnapshot>): st
 async function saveBundle(
   filename: string,
   snapshot: ReturnType<typeof checkedApplicationSnapshot>,
-  read: (reference: string) => Promise<Uint8Array>
+  read: (reference: string) => Promise<Uint8Array>,
+  largeArtifacts = false
 ): Promise<Bundle> {
   const directory = path.dirname(path.resolve(filename));
   await mkdir(path.join(directory, "objects"), { recursive: true, mode: 0o700 });
@@ -145,7 +146,11 @@ async function saveBundle(
     if (bytes.byteLength > APPLICATION_SNAPSHOT_LIMITS.blobBytes)
       throw new ApplicationImportError("limits");
     bytesTotal += bytes.byteLength;
-    if (bytesTotal > APPLICATION_SNAPSHOT_LIMITS.bytes) throw new ApplicationImportError("limits");
+    if (
+      bytesTotal >
+      (largeArtifacts ? NATIVE_BLOB_LIMITS.carrierBytes : APPLICATION_SNAPSHOT_LIMITS.bytes)
+    )
+      throw new ApplicationImportError("limits");
     const checksum = digest(bytes),
       file = `objects/${checksum}.bin`,
       target = path.join(directory, file);
@@ -169,13 +174,18 @@ async function saveBundle(
   await atomicJson(filename, bundle);
   return bundle;
 }
-async function loadBundle(filename: string): Promise<Bundle> {
+async function loadBundle(filename: string, largeArtifacts = false): Promise<Bundle> {
   if ((await stat(filename)).size > APPLICATION_SNAPSHOT_LIMITS.bytes)
     throw new ApplicationImportError("limits");
   const result = bundleSchema.safeParse(JSON.parse(await readFile(filename, "utf8")));
   if (!result.success) throw new ApplicationImportError("schema");
   const bundle = result.data,
     snapshot = checkedApplicationSnapshot(bundle.snapshot);
+  if (
+    bundle.objects.reduce((sum, object) => sum + object.sizeBytes, 0) >
+    (largeArtifacts ? NATIVE_BLOB_LIMITS.carrierBytes : APPLICATION_SNAPSHOT_LIMITS.bytes)
+  )
+    throw new ApplicationImportError("limits");
   if (
     applicationSnapshotDigest(snapshot) !== bundle.snapshotDigest ||
     new Set(bundle.objects.map((object) => object.reference)).size !== bundle.objects.length
@@ -282,6 +292,7 @@ async function main(): Promise<void> {
       offline: { type: "boolean", default: false },
       "large-files": { type: "boolean", default: false },
       "large-rows": { type: "boolean", default: false },
+      "large-artifacts": { type: "boolean", default: false },
       "memory-budget-mib": { type: "string" },
     },
   });
@@ -306,10 +317,15 @@ async function main(): Promise<void> {
     } finally {
       source.close();
     }
-    const bundle = await saveBundle(values.bundle, snapshot, async (reference) => {
-      if (!values["artifact-dir"]) throw new ApplicationImportError("artifact");
-      return localArtifact(values["artifact-dir"], reference);
-    });
+    const bundle = await saveBundle(
+      values.bundle,
+      snapshot,
+      async (reference) => {
+        if (!values["artifact-dir"]) throw new ApplicationImportError("artifact");
+        return localArtifact(values["artifact-dir"], reference);
+      },
+      values["large-artifacts"]
+    );
     process.stdout.write(
       JSON.stringify({
         format: bundle.format,
@@ -339,11 +355,16 @@ async function main(): Promise<void> {
     if (action === "import" || action === "restore") await migratePostgresSchema(database);
     if (action === "export") {
       const snapshot = await capturePostgresApplicationSnapshot(database, { blobSink: sink() }),
-        bundle = await saveBundle(values.bundle, snapshot, async (reference) => {
-          const bytes = await artifacts().get(reference);
-          if (!bytes) throw new ApplicationImportError("artifact");
-          return bytes;
-        });
+        bundle = await saveBundle(
+          values.bundle,
+          snapshot,
+          async (reference) => {
+            const bytes = await artifacts().get(reference);
+            if (!bytes) throw new ApplicationImportError("artifact");
+            return bytes;
+          },
+          values["large-artifacts"]
+        );
       process.stdout.write(
         JSON.stringify({
           format: bundle.format,
@@ -353,7 +374,7 @@ async function main(): Promise<void> {
       );
       return;
     }
-    const bundle = await loadBundle(values.bundle),
+    const bundle = await loadBundle(values.bundle, values["large-artifacts"]),
       snapshot = checkedApplicationSnapshot(bundle.snapshot);
     if (
       (action === "import" && snapshot.source !== "sqlite") ||
