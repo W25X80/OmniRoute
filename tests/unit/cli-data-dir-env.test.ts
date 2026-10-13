@@ -55,8 +55,9 @@ test("CLI data dir preserves existing legacy ~/.omniroute before XDG", async () 
 
 test("CLI env loader scans all env paths while preserving first value wins", () => {
   const source = fs.readFileSync(BIN, "utf8");
-  const loaderStart = source.indexOf("function loadEnvFile()");
+  const loaderStart = source.indexOf("function loadEnvFile(");
   const loaderEnd = source.indexOf("loadEnvFile();", loaderStart);
+  assert.ok(loaderStart >= 0 && loaderEnd > loaderStart, "CLI env loader is present");
   const loaderSource = source.slice(loaderStart, loaderEnd);
 
   assert.match(loaderSource, /for \(const envPath of envPaths\)/);
