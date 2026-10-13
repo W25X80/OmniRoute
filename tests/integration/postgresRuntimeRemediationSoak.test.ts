@@ -591,24 +591,41 @@ test(
       let preparing = true,
         preparationQueries = 0,
         preparationTicks = 0;
-      const sqlProgress = (async () => {
-        while (preparing) {
-          await observer!.transaction((tx) => tx.query("SELECT 1"));
-          if (preparing) preparationQueries++;
-        }
-      })();
+      const queryDispatched = barrier();
+      let queryCompletedAt = 0;
+      const sqlProgress = observer!.transaction(async (tx) => {
+        const query = tx.query("SELECT 1");
+        queryDispatched.release();
+        await query;
+        queryCompletedAt = performance.now();
+        if (preparing) preparationQueries++;
+      });
+      // Acquisition and BEGIN must finish before the preparation observation window.
+      await Promise.race([queryDispatched.promise, sqlProgress]);
+      const preparationStarted = performance.now();
       const preparationHeartbeat = (async () => {
         while (preparing) {
           await turn();
-          preparationTicks++;
+          if (preparing) preparationTicks++;
         }
       })();
+      let preparationFinished = 0;
       try {
         await prepareFileContent(payload);
       } finally {
+        preparationFinished = performance.now();
         preparing = false;
         await Promise.all([sqlProgress, preparationHeartbeat]);
       }
+      t.diagnostic(
+        JSON.stringify({
+          event: "file-preparation-sql-overlap",
+          preparationMs: preparationFinished - preparationStarted,
+          queryCompletionMs: queryCompletedAt - preparationStarted,
+          preparationQueries,
+          preparationTicks,
+        })
+      );
       assert.ok(preparationQueries > 0, "independent SQL completes while file preparation yields");
       assert.ok(
         preparationTicks >= FILE_BYTES / (8 * 1024 * 1024),
