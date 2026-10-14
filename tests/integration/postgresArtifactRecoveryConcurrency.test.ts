@@ -67,6 +67,7 @@ test(
             timestamp: new Date().toISOString(),
             detailState: "missing",
             detailReason: "publication_pending",
+            videoContentRemoved: 0,
           },
           intent
         );
