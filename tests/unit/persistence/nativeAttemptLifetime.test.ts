@@ -540,3 +540,74 @@ for (const compressed of [false, true]) {
       }
     }));
 }
+
+test("A2A memory recall retains its actual search after the optional deadline", () =>
+  scenario(async () => {
+    const entered = barrier(),
+      finish = barrier();
+    let identity: object | undefined;
+    const searches: Promise<unknown>[] = [];
+    type Execution = typeof import("../../../src/lib/a2a/taskExecution.ts");
+    const module = await controlledOwnerModule<Pick<Execution, "collectMemoryHits">>(
+      new URL("../../../src/lib/a2a/taskExecution.ts", import.meta.url),
+      {},
+      {
+        getSelectedPersistenceIdentity,
+        isApplicationPersistenceIdentity: runtime.isApplicationPersistenceIdentity,
+        runPersistenceAttempt: runtime.runPersistenceAttempt,
+        setTimeout,
+        clearTimeout,
+        log,
+      },
+      (source) =>
+        source.slice(
+          source.indexOf("export const MEMORY_RECALL_TIMEOUT_MS"),
+          source.indexOf("export type A2ASkillHandler")
+        )
+    );
+    try {
+      const result = runtime.runPersistenceRequest(() =>
+        runtime.runPersistenceAttempt(() =>
+          module.collectMemoryHits(
+            {
+              id: "recall-owner",
+              input: { messages: [{ role: "user", content: "query" }] },
+            } as Parameters<Execution["collectMemoryHits"]>[0],
+            {
+              timeoutMs: 5,
+              search: () => {
+                const work = (async () => {
+                  entered.resolve();
+                  await finish.promise;
+                  identity = getSelectedPersistenceIdentity();
+                  return [];
+                })();
+                void work.catch(() => {});
+                searches.push(work);
+                return work;
+              },
+            }
+          )
+        )
+      );
+      await entered.promise;
+      assert.deepEqual(Array.from(await result), [], "optional recall keeps its bounded response");
+      assert.equal(
+        runtime.getPersistenceRuntimeStatus().activeAttempts,
+        1,
+        "the deadline must not retire the unfinished search owner"
+      );
+      let drained = false;
+      const closing = runtime.closePersistenceRuntime().then(() => {
+        drained = true;
+      });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(drained, false, "shutdown must retain the actual search until settlement");
+      finish.resolve();
+      await closing;
+      assert.equal(identity, fixture.authority);
+    } finally {
+      finish.resolve();
+      await Promise.allSettled(searches);
+    }
+  }));

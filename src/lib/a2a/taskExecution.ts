@@ -1,4 +1,6 @@
 import { isNativeAgentPersistenceError } from "../db/agentRuntimeState";
+import { getSelectedPersistenceIdentity } from "../db/controlPlaneContext";
+import { isApplicationPersistenceIdentity, runPersistenceAttempt } from "../db/persistenceRuntime";
 import type { A2ATask, TaskArtifact } from "./taskManager";
 import { appendA2ATaskEventAsync } from "@/lib/db/a2aTasks";
 import { memoryManager } from "@/lib/memory/manager";
@@ -115,7 +117,12 @@ export async function collectMemoryHits(
         timeoutMs
       );
     });
-    const results = await Promise.race([search({ query, apiKeyId, limit: 5 }), deadline]);
+    const recall = () => search({ query, apiKeyId, limit: 5 });
+    // The deadline bounds observability latency; the underlying search can still write access data.
+    const work = isApplicationPersistenceIdentity(getSelectedPersistenceIdentity())
+      ? runPersistenceAttempt(recall, { independent: true })
+      : recall();
+    const results = await Promise.race([work, deadline]);
     return results.map((m) => ({
       id: m.id,
       key: m.key,
