@@ -1,15 +1,13 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { registerHooks } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import test from "node:test";
-import {
-  postgresTestsEnabled,
-  testPostgresOptions,
-} from "../helpers/persistence/postgresTestDatabase.ts";
-import type { PostgresControlPlane } from "../../src/lib/db/postgres/controlPlane.ts";
+import { getSelectedControlPlane } from "../../src/lib/db/controlPlaneContext.ts";
+import { postgresTestsEnabled } from "../helpers/persistence/postgresTestDatabase.ts";
 
 test(
   "native public chat rejects exhausted metered budget before selecting credentials or cooling a connection",
@@ -32,12 +30,29 @@ test(
     delete process.env.API_KEY_SECRET;
     delete process.env.INITIAL_PASSWORD;
     const chatUrl = new URL("../../src/sse/handlers/chat.ts", import.meta.url).href;
+    const runtimeUrl = pathToFileURL(
+      realpathSync(new URL("../../src/lib/db/persistenceRuntime.ts", import.meta.url))
+    ).href;
+    const nativeFixtureUrl = new URL(
+      "../helpers/persistence/runtimeNativeIntegrationFixture.ts",
+      import.meta.url
+    ).href;
     const fixtureUrl = new URL(
       "../helpers/persistence/nativeMeteredBudgetGateFixture.ts",
       import.meta.url
     ).href;
     const hooks = registerHooks({
       resolve(specifier, context, nextResolve) {
+        if (
+          context.parentURL === runtimeUrl &&
+          [
+            "./postgres/environment",
+            "./postgres/controlPlane",
+            "../artifacts/s3ArtifactConfiguration",
+            "../artifacts/s3ArtifactStore",
+          ].includes(specifier)
+        )
+          return { url: nativeFixtureUrl, shortCircuit: true };
         if (
           context.parentURL === chatUrl &&
           ["../services/auth", "../services/auth.ts"].includes(specifier)
@@ -52,23 +67,20 @@ test(
       fetches++;
       throw new Error("Unexpected outbound fetch in denied budget scenario");
     };
-    let plane: PostgresControlPlane | undefined;
+    let runtime: typeof import("../../src/lib/db/persistenceRuntime.ts") | undefined;
     let keyId: string | undefined;
     const connectionIds: string[] = [];
     let meteredGateFixture:
       | typeof import("../helpers/persistence/nativeMeteredBudgetGateFixture.ts").meteredGateFixture
       | undefined;
     try {
-      const { initializePostgresControlPlane } =
-        await import("../../src/lib/db/postgres/controlPlane.ts");
-      plane = await initializePostgresControlPlane({
-        connection: await testPostgresOptions(),
-        logger: { warn() {} },
-        runtime: { applyRuntimeSettings() {}, scheduleCatalogRevalidationAfterInit() {} },
-      });
+      assert.equal(globalThis.__omniroutePersistenceRuntime, undefined);
+      runtime = await import(runtimeUrl);
+      await runtime!.ensurePersistenceReady();
       const { withPostgresCatalogSnapshot } =
         await import("../../src/lib/db/postgres/catalogSnapshot.ts");
-      await plane.run(async (binding) => {
+      await runtime!.runPersistenceRequest(async () => {
+        const binding = getSelectedControlPlane()!;
         const { initializeCircuitBreakerPersistence } =
           await import("../../src/shared/utils/circuitBreaker.ts");
         await initializeCircuitBreakerPersistence(binding.database!);
@@ -140,9 +152,10 @@ test(
       });
     } finally {
       globalThis.fetch = originalFetch;
-      if (plane && keyId)
-        await plane
-          .run(async (binding) => {
+      if (runtime && keyId)
+        await runtime
+          .runPersistenceRequest(async () => {
+            const binding = getSelectedControlPlane()!;
             await binding.database!.transaction(async (tx) => {
               await tx.query("DELETE FROM omniroute.domain_cost_history WHERE api_key_id=$1", [
                 keyId,
@@ -158,8 +171,9 @@ test(
           })
           .catch(() => {});
       try {
-        await plane?.close();
+        await runtime?.closePersistenceRuntime();
       } finally {
+        delete globalThis.__omniroutePersistenceRuntime;
         hooks.deregister();
         meteredGateFixture?.reset();
         rmSync(directory, { recursive: true, force: true });
