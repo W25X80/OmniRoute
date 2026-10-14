@@ -311,6 +311,7 @@ test(
     const publicationRefs = new Map<string, string>();
     const deferredCleanupRefs = new Set<string>();
     let controlledCleanupDeferrals = 0,
+      controlledHoldWarnings = 0,
       measuredCleanupDeferrals = 0,
       cleanupLockTimeouts = 0,
       drainedCleanupDeferrals = 0;
@@ -366,6 +367,7 @@ test(
       peakPublications,
       artifactCleanup: {
         controlledDeferrals: controlledCleanupDeferrals,
+        controlledHoldWarnings,
         measuredDeferrals: measuredCleanupDeferrals,
         lockTimeouts: cleanupLockTimeouts,
         pending: deferredCleanupRefs.size,
@@ -895,15 +897,21 @@ test(
           });
           const held = barrier(),
             release = barrier();
+          const heldDiagnostics: Record<string, unknown>[] = [];
           let holder: Promise<unknown> | undefined;
           try {
             if (holdCleanup) {
               // The metadata deletion commits before this controlled optional-cleanup conflict.
-              holder = observer!.transaction(async (tx) => {
-                await acquirePostgresLock(tx, "accounting");
-                held.release();
-                await release.promise;
-              });
+              holder = cleanupDiagnostics.run(heldDiagnostics, () =>
+                observer!.transaction(
+                  async (tx) => {
+                    await acquirePostgresLock(tx, "accounting");
+                    held.release();
+                    await release.promise;
+                  },
+                  { operation: "soak.controlled_cleanup_hold" }
+                )
+              );
               void holder.catch(() => {});
               await Promise.race([held.promise, holder]);
             }
@@ -950,6 +958,20 @@ test(
           } finally {
             release.release();
             await holder;
+            if (holdCleanup) {
+              assert.equal(heldDiagnostics.length, 1);
+              const event = heldDiagnostics[0];
+              assert.equal(event.operation, "soak.controlled_cleanup_hold");
+              assert.equal(event.outcome, "committed");
+              assert.equal(event.phase, "commit");
+              assert.equal(event.sqlState, undefined);
+              assert.equal(event.queryCount, 1);
+              assert.equal(event.lockOwner, "accounting");
+              assert.equal(event.lockMode, "exclusive");
+              assert.equal(event.statementId, accountingLockStatement);
+              assert.ok(Number(event.callbackGapMs) >= 1000);
+              controlledHoldWarnings++;
+            }
           }
         }
       }
@@ -1280,7 +1302,7 @@ test(
           })
         )
       );
-      assert.equal(diagnostics.length, 0);
+      assert.equal(diagnostics.length, 0, JSON.stringify(diagnostics));
       assert.equal(seenStorageWarnings, expectedStorageWarnings);
       for (const lane of lanes)
         assert.ok(
@@ -1485,6 +1507,7 @@ test(
             artifactCleanup: {
               version: 1,
               controlledDeferrals: controlledCleanupDeferrals,
+              controlledHoldWarnings,
               measuredDeferrals: measuredCleanupDeferrals,
               lockTimeouts: cleanupLockTimeouts,
               pending: deferredCleanupRefs.size,
