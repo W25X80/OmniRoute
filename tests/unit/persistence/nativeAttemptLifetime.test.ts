@@ -5,7 +5,10 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
-import { getSelectedPersistenceIdentity } from "../../../src/lib/db/controlPlaneContext.ts";
+import {
+  getSelectedPersistenceIdentity,
+  getSelectedPostgresDatabase,
+} from "../../../src/lib/db/controlPlaneContext.ts";
 import { barrier, fixture } from "../../helpers/persistence/runtimeOwnedWorkFixture.ts";
 import { controlledOwnerModule } from "../../helpers/persistence/controlledOwnerModule.ts";
 
@@ -28,13 +31,6 @@ const hooks = registerHooks({
     return nextResolve(specifier, context);
   },
 });
-const runtime: typeof import("../../../src/lib/db/persistenceRuntime.ts") = await import(
-  runtimeUrl
-);
-const { buildTargetTimeoutRunner } =
-  await import("../../../open-sse/services/combo/targetTimeoutRunner.ts");
-const { executeWithUpstreamStartTimeout } =
-  await import("../../../open-sse/handlers/chatCore/upstreamTimeouts.ts");
 const previous = new Map(
   ["OMNIROUTE_DATABASE_BACKEND", "JWT_SECRET", "API_KEY_SECRET", "DATA_DIR"].map((key) => [
     key,
@@ -43,7 +39,121 @@ const previous = new Map(
 );
 const directory = mkdtempSync(join(tmpdir(), "omni-native-attempt-"));
 process.env.DATA_DIR = directory;
+const runtime: typeof import("../../../src/lib/db/persistenceRuntime.ts") = await import(
+  runtimeUrl
+);
+const { buildTargetTimeoutRunner } =
+  await import("../../../open-sse/services/combo/targetTimeoutRunner.ts");
+const { executeWithUpstreamStartTimeout } =
+  await import("../../../open-sse/handlers/chatCore/upstreamTimeouts.ts");
 const log = { warn() {}, info() {}, error() {}, debug() {} };
+
+test("a failed streaming dispatch joins native log and usage work before retiring its attempt", () =>
+  scenario(async () => {
+    const logEntered = barrier(),
+      finishLog = barrier(),
+      usageEntered = barrier(),
+      finishUsage = barrier();
+    const identities: Array<object | undefined> = [];
+    const errors = await import("../../../open-sse/utils/error.ts");
+    const streamErrors = await import("../../../open-sse/handlers/chatCore/streamErrorResult.ts");
+    const { HTTP_STATUS, ANTIGRAVITY_PRE_RESPONSE_TIMEOUT_CODE } =
+      await import("../../../open-sse/config/constants.ts");
+    const { projectFailureUsageErrorCode } =
+      await import("../../../open-sse/handlers/chatCore/failureUsage.ts");
+    type Leg = typeof import("../../../open-sse/handlers/chatCore/streamingResponse.ts");
+    const noop = () => {};
+    let dispatched = false;
+    const leg = await controlledOwnerModule<Leg>(
+      new URL("../../../open-sse/handlers/chatCore/streamingResponse.ts", import.meta.url),
+      {},
+      {
+        ...errors,
+        ...streamErrors,
+        HTTP_STATUS,
+        ANTIGRAVITY_PRE_RESPONSE_TIMEOUT_CODE,
+        projectFailureUsageErrorCode,
+        getSelectedPostgresDatabase,
+        runProviderExecutionPipeline: async () => {
+          dispatched = true;
+          throw new Error("Upstream unavailable");
+        },
+        trackPendingRequest: noop,
+        appendRequestLog: async () => {},
+        getProviderCredentials: noop,
+        updateFromHeaders: noop,
+        updateFromResponseBody: noop,
+        writeTerminalStatus: noop,
+        updateProviderConnection: noop,
+        lockModel: noop,
+        recordCoreOwnedAntigravityQuotaState: noop,
+        shouldIsolateProbeFailures: noop,
+        isLocalStreamLifecycleError: () => false,
+        localLimiterErrors: {
+          getClientSafeLocalRateLimitError: () => undefined,
+          markTrustedLocalRateLimitResponse: noop,
+        },
+        COLORS: { red: "", reset: "" },
+      },
+      (source) => source.slice(source.indexOf("export async function runStreamingResponse("))
+    );
+    const pending: Promise<void>[] = [];
+    const persist =
+      (entered: ReturnType<typeof barrier>, finish: ReturnType<typeof barrier>) => () => {
+        const work = (async () => {
+          entered.resolve();
+          await finish.promise;
+          identities.push(getSelectedPersistenceIdentity());
+        })();
+        void work.catch(() => {});
+        pending.push(work);
+        return work;
+      };
+    let settled = false;
+    const response = runtime.runPersistenceRequest(() =>
+      runtime.runPersistenceAttempt(() =>
+        leg.runStreamingResponse({
+          provider: "test",
+          model: "test",
+          stream: true,
+          getCurrentConnectionId: () => "connection",
+          getManagedLeaseFenceErrorCode: () => null,
+          persistAttemptLogs: persist(logEntered, finishLog),
+          persistFailureUsage: persist(usageEntered, finishUsage),
+          translatedBody: {},
+          triedModels: new Set(),
+          streamController: { handleError: noop },
+        })
+      )
+    );
+    void response.then(
+      () => {
+        settled = true;
+      },
+      () => {
+        settled = true;
+      }
+    );
+    try {
+      await logEntered.promise;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(dispatched, true);
+      assert.equal(settled, false, "the failed response must not orphan its call log");
+      finishLog.resolve();
+      await usageEntered.promise;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(settled, false, "the failed response must not orphan its usage");
+      finishUsage.resolve();
+      const result = await response;
+      assert.equal(result.response.status, 502);
+      assert.deepEqual(identities, [fixture.authority, fixture.authority]);
+    } finally {
+      finishLog.resolve();
+      finishUsage.resolve();
+      await response.catch(() => {});
+      await Promise.allSettled(pending);
+    }
+  }));
 
 test("a shutdown cancellation tick after pool teardown is harmless", () =>
   scenario(async () => {

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { AsyncResource } from "node:async_hooks";
 import { registerHooks } from "node:module";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -182,7 +183,72 @@ test("abort before reservation binding enters releases its late-acquired permit"
     });
   }));
 
-test("pre-handoff observation remains synchronous and background-owned despite reservation", () =>
+test("a reserved callback keeps its authority when cancellation ends the request before handoff", () =>
+  scenario(async () => {
+    await runtime.ensurePersistenceReady();
+    const entered = barrier(),
+      finish = barrier();
+    let capability: NonNullable<ReturnType<typeof createNativeStreamingPersistence>>;
+    let work: Promise<object | undefined> | undefined;
+    try {
+      await runtime.runPersistenceRequest(async () => {
+        capability = createNativeStreamingPersistence()!;
+        await capability.reserve();
+        work = capability.run(async () => {
+          entered.resolve();
+          await finish.promise;
+          return context.getSelectedPersistenceIdentity();
+        });
+        // Observe immediately even when an assertion fails; never leave a test rejection detached.
+        void work.catch(() => {});
+        await entered.promise;
+      });
+      let released = false;
+      const release = capability!.release().then(() => {
+        released = true;
+      });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(released, false, "release must join accepted pre-handoff callbacks");
+      finish.resolve();
+      assert.equal(await work, owner.authority);
+      await release;
+      assert.equal(runtime.getPersistenceRuntimeStatus().streamTails, 0);
+      await assert.rejects(
+        capability!.run(async () => 1),
+        /authority has ended/
+      );
+    } finally {
+      finish.resolve();
+      await work?.catch(() => {});
+      await capability!?.release();
+    }
+  }));
+
+test("a reserved callback re-enters its held authority from an ended request context", () =>
+  scenario(async () => {
+    await runtime.ensurePersistenceReady();
+    let capability: NonNullable<ReturnType<typeof createNativeStreamingPersistence>>;
+    let stale: AsyncResource;
+    try {
+      await runtime.runPersistenceRequest(async () => {
+        capability = createNativeStreamingPersistence()!;
+        await capability.reserve();
+        stale = new AsyncResource("cancelled-request-callback");
+      });
+      assert.throws(() => stale!.runInAsyncScope(context.getSelectedPersistenceIdentity), /ended/);
+      assert.equal(
+        await stale!.runInAsyncScope(() =>
+          capability!.run(async () => context.getSelectedPersistenceIdentity())
+        ),
+        owner.authority
+      );
+    } finally {
+      stale!?.emitDestroy();
+      await capability!?.release();
+    }
+  }));
+
+test("pre-handoff observation remains synchronous and its reserved tail joins accepted work", () =>
   scenario(async () => {
     await runtime.ensurePersistenceReady();
     const entered = barrier(),
@@ -208,16 +274,10 @@ test("pre-handoff observation remains synchronous and background-owned despite r
         );
         assert.equal(observed, 1, "the accepted scalar hint does not await catalog/SQL");
         await entered.promise;
-        assert.equal(runtime.getPersistenceRuntimeStatus().backgroundOperations, 1);
+        assert.equal(runtime.getPersistenceRuntimeStatus().backgroundOperations, 0);
         assert.equal(runtime.getPersistenceRuntimeStatus().streamTails, 1);
       });
-      await capability!.release();
-      assert.equal(runtime.getPersistenceRuntimeStatus().streamTails, 0);
-      assert.equal(
-        runtime.getPersistenceRuntimeStatus().backgroundOperations,
-        1,
-        "existing accepted BG work keeps its own authority"
-      );
+      const release = capability!.release();
       const closing = runtime.closePersistenceRuntime();
       let closed = false;
       void closing.then(() => {
@@ -225,8 +285,10 @@ test("pre-handoff observation remains synchronous and background-owned despite r
       });
       await Promise.resolve();
       assert.equal(closed, false);
+      assert.equal(runtime.getPersistenceRuntimeStatus().streamTails, 1);
       finish.resolve();
       await work!;
+      await release;
       await closing;
       assert.equal(runtime.getPersistenceRuntimeStatus().phase, "closed");
     } finally {

@@ -635,6 +635,8 @@ async function handleChatCoreInner({
     aggregate?: FailureUsageAggregate | null,
     completionClock?: import("./chatCore/streamingCompletion.ts").StreamCompletionClock
   ) => {
+    // Select before creating the promise: a rejected selection must not orphan a write.
+    const nativePersistence = Boolean(getSelectedPostgresDatabase());
     const persisted = saveRequestUsage(
       buildFailureUsageRecord({
         provider,
@@ -653,7 +655,7 @@ async function handleChatCoreInner({
         aggregate: aggregate ?? undefined,
       })
     );
-    if (getSelectedPostgresDatabase()) return observeFailureUsagePersistence(persisted);
+    if (nativePersistence) return observeFailureUsagePersistence(persisted);
     void persisted.catch(() => {});
   };
   // Key-health updater extracted to chatCore/keyHealth.ts (#3501); bind the per-request log once

@@ -161,9 +161,12 @@ export function createNativeStreamingPersistence():
       };
       let work: Promise<T>;
       try {
-        if (permit) {
+        const activePermit = permit ?? reserved;
+        if (activePermit) {
+          // Reservation already owns dispatch callbacks. HTTP cancellation can end the
+          // request before adoption, so these must not inherit its shorter lifetime.
           // run registers the accepted callback synchronously, before its scalar cache hint.
-          work = permit.run(owned);
+          work = activePermit.run(owned);
         } else if (observation) {
           assertIdentity();
           // Before handoff, retain the existing hint even if best-effort BG admission refuses.
