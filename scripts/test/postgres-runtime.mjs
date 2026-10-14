@@ -231,6 +231,7 @@ try {
             ...process.env,
             DATA_DIR: dataDir,
             OMNIROUTE_TEST_POSTGRES_PORT: port,
+            OMNIROUTE_TEST_POSTGRES_CONTAINER: name,
             OMNIROUTE_TEST_POSTGRES_CA: join(directory, "server.crt"),
             OMNIROUTE_TEST_POSTGRES_KEY: join(directory, "server.key"),
           },

@@ -23,6 +23,11 @@ import {
   postgresTestsEnabled,
   testPostgresOptions,
 } from "../helpers/persistence/postgresTestDatabase.ts";
+import {
+  assertDisposableDiskBudget,
+  createDisposableDiskBudget,
+  readDisposablePostgresDisk,
+} from "../helpers/persistence/disposablePostgresStorage.ts";
 
 function bounded(name: string, fallback: number, minimum: number, maximum: number) {
   const value = Number(process.env[name] ?? fallback);
@@ -34,6 +39,13 @@ const enabled = process.env.RUN_PG_RUNTIME_SOAK === "1";
 const durationMs = enabled ? bounded("PG_RUNTIME_SOAK_SECONDS", 60, 60, 3600) * 1000 : 60000;
 const historyRows = enabled ? bounded("PG_RUNTIME_SOAK_HISTORY_ROWS", 50000, 1000, 4800000) : 1000;
 const FILE_BYTES = 64 * 1024 * 1024;
+// Ten initial file offers, then one file lane in every six timed offers. The
+// fastest scheduled interval is 500ms; the assertion below also bounds runaway timers.
+const maximumFileOffers = 10 + Math.ceil((Math.ceil(durationMs / 500) + 1) / 6);
+const maximumLogicalFileBytes =
+  maximumFileOffers * FILE_BYTES +
+  (process.env.RUN_PG_IMPORT_MAX_BLOB === "1" ? 512 * 1024 * 1024 : 0) +
+  FILE_BYTES; // Conservative preparation margin; preparation itself persists no file.
 const lanes = ["history", "reads", "files", "receipt", "publication", "cancelled"] as const;
 type Lane = (typeof lanes)[number];
 function barrier() {
@@ -347,6 +359,94 @@ test(
       eventLoopP99Ms: loop.percentile(99) / 1e6,
       eventLoopMaxMs: loop.max / 1e6,
     });
+    let diskBudget: ReturnType<typeof createDisposableDiskBudget> | undefined;
+    let diskSamples = 0,
+      minimumFreeBytes = Number.MAX_SAFE_INTEGER,
+      peakChunkBytes = 0,
+      baselineChunkBytes = 0,
+      provedFileDeletions = 0;
+    let latestStorage: Record<string, unknown> | undefined;
+    let storageIdentity: string | undefined;
+    async function sampleStorage(label: string, measureDisk = false, remainingLogicalBytes = 0) {
+      assert.ok(observer);
+      const row = (
+        await observer.transaction((tx) =>
+          tx.query<Record<string, string>>(
+            `SELECT c.oid::text AS relation_id, pg_relation_filenode(c.oid)::text AS filenode,
+              c.reltoastrelid::text AS toast_id, pg_relation_filenode(c.reltoastrelid)::text AS toast_filenode,
+              pg_total_relation_size(c.oid)::text AS chunk_bytes,
+              pg_relation_size(c.oid)::text AS heap_bytes, pg_indexes_size(c.oid)::text AS index_bytes,
+              pg_total_relation_size(c.reltoastrelid)::text AS toast_bytes,
+              pg_relation_size(c.reltoastrelid)::text AS toast_heap_bytes,
+              pg_indexes_size(c.reltoastrelid)::text AS toast_index_bytes,
+              s.n_dead_tup::text AS dead_estimate, s.autovacuum_count::text AS autovacuum_count,
+              ts.n_dead_tup::text AS toast_dead_estimate, ts.autovacuum_count::text AS toast_autovacuum_count,
+              (SELECT COUNT(*) FROM omniroute.files)::text AS live_files,
+              (SELECT COUNT(*) FROM omniroute.files_content_state)::text AS live_states,
+              (SELECT COUNT(*) FROM omniroute.files_content_chunks)::text AS live_chunks,
+              (SELECT COALESCE(SUM(size_bytes),0) FROM omniroute.files_content_state)::text AS logical_bytes,
+              (SELECT COUNT(*) FROM pg_stat_activity WHERE datname=current_database()
+                AND state='idle in transaction' AND clock_timestamp()-state_change>interval '1 second')::text AS stale_idle
+            FROM pg_class c JOIN pg_stat_all_tables s ON s.relid=c.oid
+            JOIN pg_stat_all_tables ts ON ts.relid=c.reltoastrelid
+            WHERE c.oid='omniroute.files_content_chunks'::regclass`
+          )
+        )
+      ).rows[0];
+      assert.ok(row);
+      const bytes = Number(row.chunk_bytes);
+      assert.ok(Number.isSafeInteger(bytes) && bytes >= 0);
+      peakChunkBytes = Math.max(peakChunkBytes, bytes);
+      const disk = measureDisk ? await readDisposablePostgresDisk() : undefined;
+      if (disk) {
+        diskSamples++;
+        minimumFreeBytes = Math.min(minimumFreeBytes, disk.freeBytes);
+      }
+      latestStorage = {
+        event: "runtime-soak-storage",
+        label,
+        ...row,
+        disk,
+        completedFiles: counters.files.completed,
+        completedFileBytes: counters.files.completed * FILE_BYTES,
+        activeFiles: fileActive,
+        orphanFiles: orphanFiles.size,
+      };
+      // Keep the actual operands before any assertion can abort or cleanup can mask them.
+      if (measureDisk) t.diagnostic(JSON.stringify(latestStorage));
+      try {
+        const identity = JSON.stringify([
+          row.relation_id,
+          row.filenode,
+          row.toast_id,
+          row.toast_filenode,
+        ]);
+        storageIdentity ??= identity;
+        assert.equal(identity, storageIdentity);
+        assert.equal(row.stale_idle, "0", "no unexplained prolonged idle transaction");
+        assert.ok(
+          Number(row.logical_bytes) <= 6 * FILE_BYTES,
+          "bounded in-flight and orphan file content"
+        );
+        if (diskBudget) {
+          assert.ok(
+            bytes - baselineChunkBytes <= diskBudget.growthBudgetBytes,
+            "finite fixture chunk growth"
+          );
+          if (disk)
+            assertDisposableDiskBudget(
+              diskBudget,
+              disk,
+              Math.max(0, bytes - baselineChunkBytes),
+              remainingLogicalBytes
+            );
+        }
+      } catch (error) {
+        if (!measureDisk) t.diagnostic(JSON.stringify(latestStorage));
+        throw error;
+      }
+      return row;
+    }
     let payload: Buffer | undefined;
     const keys = Array.from({ length: 10 }, (_, i) => `${prefix}-key-${i}`);
     const privateKeys = keys.map((key) => key + "-private");
@@ -377,6 +477,10 @@ test(
         idle: "5s",
         tls: true,
       });
+      diskBudget = createDisposableDiskBudget(await readDisposablePostgresDisk());
+      assertDisposableDiskBudget(diskBudget, diskBudget, 0, maximumLogicalFileBytes);
+      const initialStorage = await sampleStorage("before-seed", true, maximumLogicalFileBytes);
+      baselineChunkBytes = Number(initialStorage.chunk_bytes);
       await runtime.runPersistenceRequest(async () => {
         nativeIdentity = getSelectedPersistenceIdentity();
         storageScope = runtime.getPersistenceArtifactStore().storageScope!;
@@ -825,6 +929,21 @@ test(
             assert.equal(content.byteLength, FILE_BYTES);
             assert.equal(createHash("sha256").update(content).digest("hex"), expectedFileHash);
             await files.deleteFileAsync(file.id);
+            const deleted = await database.transaction((tx) =>
+              tx.query(
+                `SELECT f.deleted_at IS NOT NULL AS deleted, f.content IS NULL AS cleared,
+                  NOT EXISTS (SELECT 1 FROM omniroute.files_content_state WHERE file_id=$1) AS state_absent,
+                  NOT EXISTS (SELECT 1 FROM omniroute.files_content_chunks WHERE file_id=$1) AS chunks_absent
+                FROM omniroute.files f WHERE f.id=$1`,
+                [file.id]
+              )
+            );
+            assert.deepEqual(
+              deleted.rows,
+              [{ deleted: true, cleared: true, state_absent: true, chunks_absent: true }],
+              "product deletion must clear content before fixture hard cleanup"
+            );
+            provedFileDeletions++;
             await database.transaction((tx) =>
               tx.query("DELETE FROM omniroute.files WHERE id=$1", [file.id])
             );
@@ -889,6 +1008,10 @@ test(
           client = Math.floor(slot / 6),
           row = counters[lane];
         row.offered++;
+        assert.ok(
+          counters.files.offered <= maximumFileOffers,
+          "finite scheduled file-offer envelope"
+        );
         if (active.has(slot)) {
           row.plannedThrottled++;
           return;
@@ -940,6 +1063,8 @@ test(
           fail(new Error("Unexpected internal warning during mixed soak"));
         }
       };
+      // Seed/index/WAL usage is included in this fresh remaining-headroom check.
+      await sampleStorage("before-measured-load", true, maximumLogicalFileBytes);
       running = true;
       loop.enable();
       const began = performance.now();
@@ -972,22 +1097,11 @@ test(
           );
           assert.ok(status.attemptOperations <= 60 && status.activeAttempts <= 60);
           assert.ok(objects.size <= 20 && effects.size <= 20);
-          const sample = (
-            await observer!.transaction((tx) =>
-              tx.query<{ stale_idle: string; bytes: string }>(
-                `SELECT (SELECT COUNT(*) FROM pg_stat_activity WHERE datname=current_database() AND state='idle in transaction' AND clock_timestamp()-state_change>interval '1 second') AS stale_idle,
-           pg_total_relation_size('omniroute.files_content_chunks') AS bytes`
-              )
-            )
-          ).rows[0];
-          assert.equal(sample.stale_idle, "0", "no unexplained prolonged idle transaction");
-          assert.ok(
-            Number(sample.bytes) < 4 * 1024 ** 3,
-            "file dead/live tuples exceed the bounded fixture storage budget"
-          );
+          const reportDue = performance.now() >= nextReport;
+          await sampleStorage("measured-load", reportDue);
           sqlHeartbeats++;
           if (fileActive) fileSqlOverlap++;
-          if (performance.now() >= nextReport) {
+          if (reportDue) {
             t.diagnostic(JSON.stringify({ ...snapshot(), elapsedMs: performance.now() - began }));
             nextReport += 60000;
           }
@@ -1040,6 +1154,17 @@ test(
       await Promise.all(active.values());
       loop.disable();
       if (fatal.length) {
+        try {
+          await sampleStorage("failure-before-cleanup", true);
+        } catch (error) {
+          t.diagnostic(
+            JSON.stringify({
+              event: "runtime-soak-storage-failure-sample",
+              name: (error as Error).name,
+              latestStorage,
+            })
+          );
+        }
         t.diagnostic(
           JSON.stringify({
             ...snapshot(),
@@ -1130,6 +1255,11 @@ test(
       });
       assert.equal(orphanFiles.size, 0);
       assert.equal(appendIds.size, 0);
+      const drainedStorage = await sampleStorage("after-drain", true);
+      for (const field of ["live_files", "live_states", "live_chunks", "logical_bytes"])
+        assert.equal(drainedStorage[field], "0", "exact drained file absence");
+      assert.ok(provedFileDeletions >= counters.files.completed);
+      assert.ok(diskSamples >= 3);
       const durable = await observer.transaction(async (tx) => ({
         spend: (
           await tx.query<{ receipt_id: string; cost: number; history_cost: number }>(
@@ -1267,6 +1397,18 @@ test(
             eventLoopP99Ms: loop.percentile(99) / 1e6,
             eventLoopMaxMs: loop.max / 1e6,
             scope: "native-domain-component",
+            fixtureStorage: {
+              version: 2,
+              diskBudget,
+              diskSamples,
+              minimumFreeBytes,
+              peakChunkBytes,
+              maximumFileOffers,
+              maximumLogicalFileBytes,
+              provedFileDeletions,
+              finalLogicalRows: 0,
+              capacityClaim: "sampled disposable-volume containment; not RDS steady-state capacity",
+            },
             externalCgroupRequired: { cpus: 2, memoryBytes: 4 * 1024 ** 3 },
           })
       );
