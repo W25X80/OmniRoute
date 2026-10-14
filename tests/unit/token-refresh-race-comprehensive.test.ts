@@ -2,6 +2,10 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "fs/promises";
 import path from "path";
+import {
+  controlledBarrier,
+  controlledOwnerModule,
+} from "../helpers/persistence/controlledOwnerModule.ts";
 
 const root = path.resolve(import.meta.dirname, "../..");
 
@@ -19,27 +23,76 @@ test("Fix A: getAccessToken accepts an onPersist parameter", async () => {
   );
 });
 
-test("Fix A: getAccessToken invokes onPersist INSIDE the per-connection mutex closure", async () => {
-  const src = await read("open-sse/services/tokenRefresh.ts");
-  // #15002 (#14970) moved the closure into `const work = (async () => {...})()` and made the
-  // shared `entry.promise` a bounded race over it; the closure is still the mutex body.
-  const closureMatch = src.match(
-    /(?:entry\.promise|const work)\s*=\s*\(async\s*\(\)\s*=>\s*\{([\s\S]+?)\}\)\(\)/
+test("getAccessToken shares the mutex until its persistence callback settles", async () => {
+  const entered = controlledBarrier(),
+    finish = controlledBarrier();
+  const mutex = new Map<string, { waiters: number }>();
+  let refreshes = 0,
+    persists = 0,
+    casChecks = 0;
+  type Service = typeof import("../../open-sse/services/tokenRefresh.ts");
+  const service = await controlledOwnerModule<Pick<Service, "getAccessToken">>(
+    new URL("../../open-sse/services/tokenRefresh.ts", import.meta.url),
+    {},
+    {
+      connectionRefreshMutex: mutex,
+      refreshMutexMaxMs: 5000,
+      getActiveOnPersist: () => undefined,
+      // This oracle owns mutex ordering; native lifetime has a separate real-runtime oracle.
+      runNativeRefreshWork: (body: () => Promise<unknown>) => body(),
+      _getAccessTokenWithStalenessCheck: async () => {
+        refreshes++;
+        return { accessToken: "new-access", refreshToken: "new-refresh" };
+      },
+      casGuardShouldSkipPersist: async () => {
+        casChecks++;
+        return false;
+      },
+      setTimeout,
+      clearTimeout,
+    },
+    (source) =>
+      source.slice(
+        source.indexOf("export async function getAccessToken("),
+        source.indexOf("async function _getAccessTokenWithStalenessCheck")
+      )
   );
-  assert.ok(closureMatch, "Per-connection mutex closure must use the (async () => {...})() form");
-  if (/const work\s*=/.test(closureMatch![0])) {
-    assert.match(
-      src,
-      /entry\.promise\s*=\s*Promise\.race\(\[\s*work,/,
-      "the shared mutex promise must be the raced `work` closure"
+  const pending: Promise<unknown>[] = [];
+  try {
+    const credentials = { connectionId: "mutex-persist", refreshToken: "old-refresh" };
+    const first = service.getAccessToken("codex", credentials, undefined, null, async () => {
+      persists++;
+      entered.release();
+      await finish.promise;
+    });
+    pending.push(first);
+    await entered.promise;
+    assert.ok(mutex.has(credentials.connectionId), "persistence must remain inside the mutex");
+    const second = service.getAccessToken("codex", credentials, undefined, null, async () => {
+      assert.fail("a waiter must share the leader's callback");
+    });
+    pending.push(second);
+    let settled = false;
+    const result = Promise.all([first, second]).then((values) => {
+      settled = true;
+      return values;
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(settled, false, "neither caller may observe success before persistence");
+    assert.equal(refreshes, 1);
+    assert.equal(persists, 1);
+    assert.equal(casChecks, 1);
+    assert.equal(mutex.get(credentials.connectionId)?.waiters, 1);
+    finish.release();
+    assert.deepEqual(
+      (await result).map((value) => value?.accessToken),
+      ["new-access", "new-access"]
     );
+    assert.equal(mutex.size, 0, "the shared mutex releases after persistence");
+  } finally {
+    finish.release();
+    await Promise.allSettled(pending);
   }
-  const closureBody = closureMatch![1];
-  assert.match(
-    closureBody,
-    /effectiveOnPersist/,
-    "The mutex closure body must reference effectiveOnPersist so the persist runs before the mutex releases"
-  );
 });
 
 test("Fix A: runWithOnPersist + getActiveOnPersist are exported for executor plumbing", async () => {
