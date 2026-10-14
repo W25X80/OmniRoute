@@ -7,6 +7,7 @@ const mount = "/var/lib/postgresql";
 
 export interface DisposablePostgresDisk {
   filesystem: string;
+  reportedMount: string;
   totalBytes: number;
   freeBytes: number;
 }
@@ -17,7 +18,9 @@ export function parseDisposablePostgresDisk(output: string): DisposablePostgresD
   assert.equal(lines.length, 2, "one disposable volume must be measured");
   const fields = lines[1].trim().split(/\s+/);
   assert.equal(fields.length, 6);
-  assert.equal(fields[5], mount);
+  // df measures the fixed FILE operand, but may display another mount alias on
+  // the same filesystem (for example Docker's /etc/resolv.conf bind mount).
+  assert.ok(fields[5].startsWith("/"), "absolute filesystem display label");
   const bytes = (value: string) => {
     assert.match(value, /^\d+$/);
     const result = Number(value) * 1024;
@@ -27,7 +30,7 @@ export function parseDisposablePostgresDisk(output: string): DisposablePostgresD
   const totalBytes = bytes(fields[1]);
   const freeBytes = bytes(fields[3]);
   assert.ok(totalBytes > 0 && freeBytes <= totalBytes);
-  return { filesystem: fields[0], totalBytes, freeBytes };
+  return { filesystem: fields[0], reportedMount: fields[5], totalBytes, freeBytes };
 }
 
 export async function readDisposablePostgresDisk(): Promise<DisposablePostgresDisk> {

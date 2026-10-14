@@ -26,9 +26,17 @@ test("disposable storage preserves a fixed initial reserve across later samples"
   assert.throws(() => assertDisposableDiskBudget(budget, initial, 0, -1));
 });
 
-test("disposable storage rejects the wrong mount, malformed output and unsafe byte arithmetic", () => {
+test("disposable storage accepts a display alias without changing the measured filesystem", () => {
+  const alias = parseDisposablePostgresDisk(
+    header + "/dev/fixture 1000000 200000 800000 20% /etc/resolv.conf\n"
+  );
+  assert.deepEqual(alias, { ...initial, reportedMount: "/etc/resolv.conf" });
+  assertDisposableDiskBudget(createDisposableDiskBudget(initial), alias, 0);
+});
+
+test("disposable storage rejects malformed output, display labels and unsafe byte arithmetic", () => {
   for (const body of [
-    "/dev/fixture 100 20 80 20% /",
+    "/dev/fixture 100 20 80 20% relative",
     "/dev/fixture 100 20 101 20% /var/lib/postgresql",
     "/dev/fixture 100 20 -1 20% /var/lib/postgresql",
     "/dev/fixture 100 20 1.2 20% /var/lib/postgresql",
