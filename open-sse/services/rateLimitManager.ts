@@ -1055,8 +1055,13 @@ export function getLearnedLimits() {
 
 async function persistLearnedLimitsNow() {
   try {
-    const { updateSettings } = await import("@/lib/db/settings");
-    await updateSettings({ learnedRateLimits: JSON.stringify(Object.fromEntries(learnedLimits)) });
+    const { runPersistenceBackgroundWork } = await import("@/lib/db/persistenceRuntime");
+    await runPersistenceBackgroundWork(async () => {
+      const { updateSettings } = await import("@/lib/db/settings");
+      await updateSettings({
+        learnedRateLimits: JSON.stringify(Object.fromEntries(learnedLimits)),
+      });
+    });
     logRateLimit(`💾 [RATE-LIMIT] Persisted learned limits for ${learnedLimits.size} provider(s)`);
   } catch (err) {
     errorRateLimit("[RATE-LIMIT] Failed to persist learned limits:", err.message);

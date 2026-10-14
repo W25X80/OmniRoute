@@ -48,6 +48,59 @@ const { executeWithUpstreamStartTimeout } =
   await import("../../../open-sse/handlers/chatCore/upstreamTimeouts.ts");
 const log = { warn() {}, info() {}, error() {}, debug() {} };
 
+test("debounced learned limits persist after their scheduling request ends", () =>
+  scenario(async () => {
+    let timer: (() => Promise<void>) | undefined;
+    let resource: AsyncResource | undefined;
+    const writes: string[] = [];
+    const failures: unknown[] = [];
+    const limits = new Map([["claude:account", { remaining: 17 }]]);
+    const owner = await controlledOwnerModule<{ schedulePersist(): void }>(
+      new URL("../../../open-sse/services/rateLimitManager.ts", import.meta.url),
+      {
+        "@/lib/db/persistenceRuntime": runtime,
+        "@/lib/db/settings": {
+          async updateSettings(value: unknown) {
+            assert.equal(getSelectedPersistenceIdentity(), fixture.authority);
+            await new Promise<void>((resolve) => setImmediate(resolve));
+            assert.equal(getSelectedPersistenceIdentity(), fixture.authority);
+            writes.push((value as { learnedRateLimits: string }).learnedRateLimits);
+          },
+        },
+      },
+      {
+        learnedLimits: limits,
+        persistTimer: null,
+        PERSIST_DEBOUNCE_MS: 60_000,
+        trackAsyncOperation: (work: Promise<void>) => work,
+        logRateLimit() {},
+        errorRateLimit: (...args: unknown[]) => failures.push(args),
+        setTimeout(callback: () => Promise<void>, delay: number) {
+          assert.equal(delay, 60_000);
+          timer = callback;
+          resource = new AsyncResource("learned-limit-timer");
+          return {};
+        },
+      },
+      (source) => {
+        const start = source.indexOf("async function persistLearnedLimitsNow()");
+        const end = source.indexOf("export async function __flushLearnedLimitsForTests", start);
+        assert.ok(start >= 0 && end > start);
+        return source.slice(start, end) + "\nexport { schedulePersist };";
+      }
+    );
+    await runtime.runPersistenceRequest(() => owner.schedulePersist());
+    assert.ok(resource && timer);
+    try {
+      resource.runInAsyncScope(() => assert.throws(() => getSelectedPersistenceIdentity()));
+      await resource.runInAsyncScope(timer);
+      assert.deepEqual(failures, []);
+      assert.deepEqual(writes, [JSON.stringify(Object.fromEntries(limits))]);
+    } finally {
+      resource.emitDestroy();
+    }
+  }));
+
 test("a failed streaming dispatch joins direct usage while call logging keeps its background owner", () =>
   scenario(async () => {
     const logEntered = barrier(),
