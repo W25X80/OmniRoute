@@ -48,7 +48,7 @@ const { executeWithUpstreamStartTimeout } =
   await import("../../../open-sse/handlers/chatCore/upstreamTimeouts.ts");
 const log = { warn() {}, info() {}, error() {}, debug() {} };
 
-test("a failed streaming dispatch joins native log and usage work before retiring its attempt", () =>
+test("a failed streaming dispatch joins direct usage while call logging keeps its background owner", () =>
   scenario(async () => {
     const logEntered = barrier(),
       finishLog = barrier(),
@@ -118,7 +118,8 @@ test("a failed streaming dispatch joins native log and usage work before retirin
           stream: true,
           getCurrentConnectionId: () => "connection",
           getManagedLeaseFenceErrorCode: () => null,
-          persistAttemptLogs: persist(logEntered, finishLog),
+          persistAttemptLogs: () =>
+            runtime.runPersistenceBackgroundWork(persist(logEntered, finishLog)),
           persistFailureUsage: persist(usageEntered, finishUsage),
           translatedBody: {},
           triedModels: new Set(),
@@ -138,14 +139,17 @@ test("a failed streaming dispatch joins native log and usage work before retirin
       await logEntered.promise;
       await new Promise<void>((resolve) => setImmediate(resolve));
       assert.equal(dispatched, true);
-      assert.equal(settled, false, "the failed response must not orphan its call log");
-      finishLog.resolve();
+      assert.equal(settled, false, "the failed response must not orphan its direct usage");
       await usageEntered.promise;
       await new Promise<void>((resolve) => setImmediate(resolve));
       assert.equal(settled, false, "the failed response must not orphan its usage");
       finishUsage.resolve();
       const result = await response;
       assert.equal(result.response.status, 502);
+      assert.deepEqual(identities, [fixture.authority]);
+      assert.equal(runtime.getPersistenceRuntimeStatus().backgroundOperations, 1);
+      finishLog.resolve();
+      await runtime.drainPersistenceAcceptedWork();
       assert.deepEqual(identities, [fixture.authority, fixture.authority]);
     } finally {
       finishLog.resolve();
@@ -383,3 +387,156 @@ test(
       assert.equal(runtime.getPersistenceRuntimeStatus().activeAttempts, 0);
     })
 );
+
+test(
+  "a late rotating-token refresh retains CAS and persistence after its shared timeout",
+  { timeout: 5000 },
+  () =>
+    scenario(async () => {
+      const entered = barrier(),
+        finish = barrier(),
+        casDone = barrier();
+      const identities: Array<object | undefined> = [];
+      type Refresh = typeof import("../../../open-sse/services/tokenRefresh.ts");
+      const module = await controlledOwnerModule<Pick<Refresh, "getAccessToken">>(
+        new URL("../../../open-sse/services/tokenRefresh.ts", import.meta.url),
+        {},
+        {
+          runPersistenceAttempt: runtime.runPersistenceAttempt,
+          isApplicationPersistenceIdentity: runtime.isApplicationPersistenceIdentity,
+          getSelectedPersistenceIdentity,
+          connectionRefreshMutex: new Map(),
+          refreshMutexMaxMs: 5,
+          getActiveOnPersist: () => undefined,
+          setTimeout,
+          clearTimeout,
+          _getAccessTokenWithStalenessCheck: async () => {
+            entered.resolve();
+            await finish.promise;
+            return { accessToken: "rotated-access", refreshToken: "rotated-refresh" };
+          },
+          casGuardShouldSkipPersist: async () => {
+            try {
+              identities.push(getSelectedPersistenceIdentity());
+              return false;
+            } finally {
+              casDone.resolve();
+            }
+          },
+        },
+        (source) => {
+          const helper = source.indexOf("function runNativeRefreshWork");
+          const start = source.indexOf("export async function getAccessToken(");
+          const end = source.indexOf("async function _getAccessTokenWithStalenessCheck", start);
+          assert.ok(start >= 0 && end > start);
+          return (
+            (helper >= 0 ? source.slice(helper, source.indexOf("/**", helper)) : "") +
+            source.slice(start, end)
+          );
+        }
+      );
+      const keepAlive = setTimeout(() => {}, 1000);
+      try {
+        const response = runtime.runPersistenceRequest(() =>
+          runtime.runPersistenceAttempt(() =>
+            module.getAccessToken(
+              "codex",
+              { connectionId: "late-refresh", refreshToken: "original" },
+              log,
+              null,
+              async () => {
+                identities.push(getSelectedPersistenceIdentity());
+              }
+            )
+          )
+        );
+        await entered.promise;
+        assert.equal(await response, null, "the existing shared timeout remains bounded");
+        let drained = false;
+        const closing = runtime.closePersistenceRuntime().then(() => {
+          drained = true;
+        });
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        assert.equal(drained, false, "timeout must not hide the underlying refresh from drain");
+        finish.resolve();
+        await closing;
+        assert.deepEqual(identities, [fixture.authority, fixture.authority]);
+      } finally {
+        clearTimeout(keepAlive);
+        finish.resolve();
+        await casDone.promise;
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
+    })
+);
+
+for (const compressed of [false, true]) {
+  test(`Responses WS preparation joins ${compressed ? "compressed" : "skipped"} analytics`, () =>
+    scenario(async () => {
+      const entered = barrier(),
+        finish = barrier();
+      let identity: object | undefined;
+      const work: Promise<unknown>[] = [];
+      const write = () => {
+        const pending = (async () => {
+          entered.resolve();
+          await finish.promise;
+          identity = getSelectedPersistenceIdentity();
+        })();
+        void pending.catch(() => {});
+        work.push(pending);
+        return pending;
+      };
+      const module = await controlledOwnerModule<{
+        persistAndRestore(...args: unknown[]): Promise<object>;
+      }>(
+        new URL("../../../src/app/api/internal/codex-responses-ws/compression.ts", import.meta.url),
+        {},
+        {
+          writeCompressionSkip: write,
+          writeCompressionAnalytics: write,
+          log,
+        },
+        (source) =>
+          source
+            .slice(source.indexOf("async function persistAndRestore("))
+            .replace(
+              "async function persistAndRestore(",
+              "export async function persistAndRestore("
+            )
+      );
+      const original = { input: "original" },
+        restored = { input: "compressed" };
+      let settled = false;
+      const response = runtime.runPersistenceRequest(() =>
+        module.persistAndRestore(
+          { stats: {}, compressed, body: restored },
+          { restore: (body: object) => body },
+          original,
+          "lite",
+          {},
+          { provider: "test", model: "test", requestId: "compression-lifetime" }
+        )
+      );
+      void response.then(
+        () => {
+          settled = true;
+        },
+        () => {
+          settled = true;
+        }
+      );
+      try {
+        await entered.promise;
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        assert.equal(settled, false, "preparation must not abandon the writer's returned promise");
+        finish.resolve();
+        assert.deepEqual(await response, compressed ? restored : original);
+        assert.equal(identity, fixture.authority);
+      } finally {
+        finish.resolve();
+        await response.catch(() => {});
+        await Promise.allSettled(work);
+      }
+    }));
+}

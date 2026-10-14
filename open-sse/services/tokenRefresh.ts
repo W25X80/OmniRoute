@@ -11,6 +11,11 @@
 // importers (open-sse/index.ts, executors, src/sse/services/tokenRefresh.ts,
 // tests) keep a stable surface.
 import { AsyncLocalStorage } from "node:async_hooks";
+import { getSelectedPersistenceIdentity } from "@/lib/db/controlPlaneContext";
+import {
+  isApplicationPersistenceIdentity,
+  runPersistenceAttempt,
+} from "@/lib/db/persistenceRuntime";
 import { PROVIDERS } from "../config/constants.ts";
 import { getCodexAuthIdentityHeaders } from "../config/codexClient.ts";
 import { runWithProxyContext } from "../utils/proxyFetch.ts";
@@ -523,6 +528,13 @@ export function supportsTokenRefresh(provider) {
 // and re-exported) — used by refreshWithRetry (./tokenRefresh/circuitBreaker.ts)
 // and by callers that need to classify a refresh result.
 
+function runNativeRefreshWork<T>(body: () => Promise<T>): Promise<T> {
+  // Retain application work before the shared timeout can return. Explicit standalone
+  // planes and SQLite keep their caller-owned execution contract.
+  if (!isApplicationPersistenceIdentity(getSelectedPersistenceIdentity())) return body();
+  return runPersistenceAttempt(body, { independent: true });
+}
+
 /**
  * Get access token for a specific provider (with deduplication).
  *
@@ -582,7 +594,7 @@ export async function getAccessToken(
     // promise is what gets bounded: if it never settles, the race resolves
     // null (refresh failure), the entry is evicted, and the next caller starts
     // a fresh refresh instead of rejoining the wedge.
-    const work = (async () => {
+    const work = runNativeRefreshWork(async () => {
       const result = await _getAccessTokenWithStalenessCheck(
         provider,
         credentials,
@@ -609,7 +621,7 @@ export async function getAccessToken(
         }
       }
       return result;
-    })();
+    });
     let mutexTimer: ReturnType<typeof setTimeout> | null = null;
     entry.promise = Promise.race([
       work,

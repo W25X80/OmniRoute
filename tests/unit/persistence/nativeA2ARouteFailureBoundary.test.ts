@@ -22,6 +22,7 @@ const dependencies = new Set([
   "@/lib/a2a/streaming",
   "@/lib/a2a/taskExecution",
   "@/lib/db/settings",
+  "@/lib/db/persistenceRuntime",
 ]);
 const hooks = registerHooks({
   resolve(specifier, context, nextResolve) {

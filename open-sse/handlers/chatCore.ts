@@ -1401,7 +1401,7 @@ async function handleChatCoreInner({
       log?.debug?.("COMPRESSION", "Prompt compression disabled for this API key");
     }
     if (compressionExcluded) {
-      void writeCompressionSkip(
+      await writeCompressionSkip(
         {
           stats: {
             originalTokens: estimatedTokens,

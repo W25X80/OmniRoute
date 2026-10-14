@@ -1,4 +1,5 @@
 import { isNativeAgentPersistenceError } from "@/lib/db/agentRuntimeState";
+import { runPersistenceAttempt } from "@/lib/db/persistenceRuntime";
 /**
  * A2A JSON-RPC 2.0 Router — `/a2a` endpoint
  *
@@ -290,22 +291,27 @@ export async function POST(req: NextRequest) {
           return jsonRpcError(id, -32601, `Unknown skill: ${skill}`);
         }
 
-        const task = tm.createTask({ skill, messages, metadata: params?.metadata }, callerOwner);
-        await tm.flushPersistence(task.id);
-        tm.updateTask(task.id, "working");
-        await tm.flushPersistence(task.id);
+        return await runPersistenceAttempt(async () => {
+          const task = tm.createTask({ skill, messages, metadata: params?.metadata }, callerOwner);
+          await tm.flushPersistence(task.id);
+          tm.updateTask(task.id, "working");
+          await tm.flushPersistence(task.id);
 
-        const stream = createA2AStream(
-          task,
-          async (t) => executeA2ATaskWithState(tm, t, handler),
-          req.signal,
-          {
-            onStart: () => tm.beginStream(),
-            onEnd: () => tm.endStream(),
-          }
-        );
+          const stream = createA2AStream(
+            task,
+            async (t) =>
+              runPersistenceAttempt(() => executeA2ATaskWithState(tm, t, handler), {
+                independent: true,
+              }),
+            req.signal,
+            {
+              onStart: () => tm.beginStream(),
+              onEnd: () => tm.endStream(),
+            }
+          );
 
-        return new Response(stream, { headers: SSE_HEADERS });
+          return new Response(stream, { headers: SSE_HEADERS });
+        });
       }
 
       // ── tasks/get ─────────────────────────────────────────

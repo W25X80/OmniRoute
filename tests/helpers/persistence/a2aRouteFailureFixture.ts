@@ -4,6 +4,12 @@ import { createA2AStream as stream } from "../../../src/lib/a2a/streaming.ts";
 export { SSE_HEADERS } from "../../../src/lib/a2a/streaming.ts";
 export { executeA2ATaskWithState } from "../../../src/lib/a2a/taskExecution.ts";
 
+// This fixture isolates task-write outcomes under an explicit test plane. Real admission,
+// HTTP cancellation and drain are exercised by nativeHttpHandlerLifetime.test.ts.
+export async function runPersistenceAttempt<T>(body: () => T | Promise<T>): Promise<T> {
+  return body();
+}
+
 export const a2aRouteFixture = {
   manager: undefined as A2ATaskManager | undefined,
   writes: [] as string[],

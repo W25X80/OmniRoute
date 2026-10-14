@@ -127,10 +127,10 @@ async function persistAndRestore(
   };
 
   if (!result.compressed) {
-    void writeCompressionSkip(writeOpts, "no_savings");
+    await writeCompressionSkip(writeOpts, "no_savings");
     return responseBody;
   }
 
-  void writeCompressionAnalytics(writeOpts);
+  await writeCompressionAnalytics(writeOpts);
   return adapter.restore(result.body) as JsonRecord;
 }

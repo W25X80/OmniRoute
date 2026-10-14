@@ -400,7 +400,7 @@ export async function runStreamingResponse(deps: StreamingDeps) {
         status: `FAILED ${semaphoreCode}`,
       }).catch(() => {});
       const failureMessage = sanitizeErrorMessage(errorMetadata.message) || "Semaphore timeout";
-      const attemptLogPersistence = persistAttemptLogs({
+      persistAttemptLogs({
         status: HTTP_STATUS.RATE_LIMITED,
         error: failureMessage,
         providerRequest: finalBody || translatedBody,
@@ -408,7 +408,6 @@ export async function runStreamingResponse(deps: StreamingDeps) {
         claudeCacheMeta: claudePromptCacheLogMeta,
         cacheSource: "upstream",
       });
-      if (nativePersistence) await attemptLogPersistence;
       const failureUsagePersistence = persistFailureUsage(HTTP_STATUS.RATE_LIMITED, semaphoreCode);
       if (nativePersistence) await failureUsagePersistence;
       const result = stream
@@ -497,7 +496,7 @@ export async function runStreamingResponse(deps: StreamingDeps) {
       connectionId,
       status: `FAILED ${failureStatus}`,
     }).catch(() => {});
-    const attemptLogPersistence = persistAttemptLogs({
+    persistAttemptLogs({
       status: failureStatus,
       error: safeFailureMessage,
       providerRequest: finalBody || translatedBody,
@@ -513,7 +512,6 @@ export async function runStreamingResponse(deps: StreamingDeps) {
       claudeCacheMeta: claudePromptCacheLogMeta,
       cacheSource: "upstream",
     });
-    if (nativePersistence) await attemptLogPersistence;
     if (isRequestAborted) {
       streamController.handleError(createSafeAbortError());
       return {
@@ -1036,7 +1034,7 @@ export async function runStreamingResponse(deps: StreamingDeps) {
             // We fall through by NOT returning here
           } else {
             // Fallback also failed — return original error
-            const attemptLogPersistence = persistAttemptLogs({
+            persistAttemptLogs({
               status: statusCode,
               error: safeErrMsg,
               providerRequest: finalBody || translatedBody,
@@ -1044,7 +1042,6 @@ export async function runStreamingResponse(deps: StreamingDeps) {
               clientResponse: buildErrorBody(statusCode, errMsg),
               cacheSource: "upstream",
             });
-            if (nativePersistence) await attemptLogPersistence;
             const failureUsagePersistence = persistFailureUsage(statusCode, "model_unavailable");
             if (nativePersistence) await failureUsagePersistence;
             return {
@@ -1070,7 +1067,7 @@ export async function runStreamingResponse(deps: StreamingDeps) {
             };
           }
         } catch {
-          const attemptLogPersistence = persistAttemptLogs({
+          persistAttemptLogs({
             status: statusCode,
             error: safeErrMsg,
             providerRequest: finalBody || translatedBody,
@@ -1078,7 +1075,6 @@ export async function runStreamingResponse(deps: StreamingDeps) {
             clientResponse: buildErrorBody(statusCode, errMsg),
             cacheSource: "upstream",
           });
-          if (nativePersistence) await attemptLogPersistence;
           const failureUsagePersistence = persistFailureUsage(statusCode, "model_unavailable");
           if (nativePersistence) await failureUsagePersistence;
           return {
@@ -1104,7 +1100,7 @@ export async function runStreamingResponse(deps: StreamingDeps) {
           };
         }
       } else {
-        const attemptLogPersistence = persistAttemptLogs({
+        persistAttemptLogs({
           status: statusCode,
           error: safeErrMsg,
           providerRequest: finalBody || translatedBody,
@@ -1112,7 +1108,6 @@ export async function runStreamingResponse(deps: StreamingDeps) {
           clientResponse: buildErrorBody(statusCode, errMsg),
           cacheSource: "upstream",
         });
-        if (nativePersistence) await attemptLogPersistence;
         const failureUsagePersistence = persistFailureUsage(statusCode, "model_unavailable");
         if (nativePersistence) await failureUsagePersistence;
         return {
@@ -1168,7 +1163,7 @@ export async function runStreamingResponse(deps: StreamingDeps) {
               `Serving ${nextModel} as fallback for ${model}`
             );
           } else {
-            const attemptLogPersistence = persistAttemptLogs({
+            persistAttemptLogs({
               status: statusCode,
               error: safeErrMsg,
               providerRequest: finalBody || translatedBody,
@@ -1176,7 +1171,6 @@ export async function runStreamingResponse(deps: StreamingDeps) {
               clientResponse: buildErrorBody(statusCode, errMsg),
               cacheSource: "upstream",
             });
-            if (nativePersistence) await attemptLogPersistence;
             const failureUsagePersistence = persistFailureUsage(statusCode, "context_overflow");
             if (nativePersistence) await failureUsagePersistence;
             return {
@@ -1202,7 +1196,7 @@ export async function runStreamingResponse(deps: StreamingDeps) {
             };
           }
         } catch {
-          const attemptLogPersistence = persistAttemptLogs({
+          persistAttemptLogs({
             status: statusCode,
             error: safeErrMsg,
             providerRequest: finalBody || translatedBody,
@@ -1210,7 +1204,6 @@ export async function runStreamingResponse(deps: StreamingDeps) {
             clientResponse: buildErrorBody(statusCode, errMsg),
             cacheSource: "upstream",
           });
-          if (nativePersistence) await attemptLogPersistence;
           const failureUsagePersistence = persistFailureUsage(statusCode, "context_overflow");
           if (nativePersistence) await failureUsagePersistence;
           return {
@@ -1236,7 +1229,7 @@ export async function runStreamingResponse(deps: StreamingDeps) {
           };
         }
       } else {
-        const attemptLogPersistence = persistAttemptLogs({
+        persistAttemptLogs({
           status: statusCode,
           error: safeErrMsg,
           providerRequest: finalBody || translatedBody,
@@ -1244,7 +1237,6 @@ export async function runStreamingResponse(deps: StreamingDeps) {
           clientResponse: buildErrorBody(statusCode, errMsg),
           cacheSource: "upstream",
         });
-        if (nativePersistence) await attemptLogPersistence;
         const failureUsagePersistence = persistFailureUsage(statusCode, "context_overflow");
         if (nativePersistence) await failureUsagePersistence;
         return {
@@ -1270,7 +1262,7 @@ export async function runStreamingResponse(deps: StreamingDeps) {
         };
       }
     } else {
-      const attemptLogPersistence = persistAttemptLogs({
+      persistAttemptLogs({
         status: statusCode,
         error: safeErrMsg,
         providerRequest: finalBody || translatedBody,
@@ -1278,7 +1270,6 @@ export async function runStreamingResponse(deps: StreamingDeps) {
         clientResponse: buildErrorBody(statusCode, errMsg),
         cacheSource: "upstream",
       });
-      if (nativePersistence) await attemptLogPersistence;
       const failureUsagePersistence = persistFailureUsage(statusCode, `upstream_${statusCode}`);
       if (nativePersistence) await failureUsagePersistence;
 

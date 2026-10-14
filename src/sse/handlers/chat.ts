@@ -8,7 +8,11 @@ import { buildClientRawRequest, resolveDispatchClientRawRequest } from "./chat/c
 export { buildClientRawRequest, resolveDispatchClientRawRequest };
 import { normalizeReasoningRequest } from "@/shared/reasoning/effortStandardization";
 import { isDetailedLoggingEnabled } from "@/lib/db/detailedLogs";
-import { PERSISTENCE_STREAM_CAPACITY_CODE } from "@/lib/db/persistenceRuntime";
+import {
+  PERSISTENCE_STREAM_CAPACITY_CODE,
+  isPersistenceStreamCapacityError,
+  runPersistenceAttempt,
+} from "@/lib/db/persistenceRuntime";
 import { resolvePreviousResponseStateAsync } from "@/lib/db/responsesContinuationStore";
 import { normalizeResponsesPreviousResponseIdMode } from "@omniroute/open-sse/utils/responsesStatePolicy.ts";
 import { FORMATS } from "@omniroute/open-sse/translator/formats.ts";
@@ -1485,7 +1489,26 @@ async function handleChatImplementation(
   );
 }
 
-export const handleChat = chatAdmission.withChatAdmission(handleChatImplementation);
+const handleChatWithAdmission = chatAdmission.withChatAdmission(handleChatImplementation);
+
+export async function handleChat(
+  ...args: Parameters<typeof handleChatWithAdmission>
+): Promise<Response> {
+  try {
+    // Early keepalive can close HTTP before preparation or result accounting finishes.
+    return await runPersistenceAttempt(() => handleChatWithAdmission(...args));
+  } catch (error) {
+    if (!isPersistenceStreamCapacityError(error)) throw error;
+    return errorResponse(
+      HTTP_STATUS.SERVICE_UNAVAILABLE,
+      "Gateway attempt capacity is unavailable. Please retry later.",
+      {
+        code: PERSISTENCE_STREAM_CAPACITY_CODE,
+        type: "local_queue_capacity",
+      }
+    );
+  }
+}
 
 /** Handle one resolved model through gates, credentials, and retry/fallback. */
 async function handleSingleModelChat(
