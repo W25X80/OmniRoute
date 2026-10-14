@@ -526,7 +526,22 @@ describe(
           await tx.query("DELETE FROM omniroute.conversation_turn_nodes WHERE id='relative'");
         });
       }
+      const beforeRewrite = await database.transaction((tx) =>
+        tx.query<{ node: number }>(
+          "SELECT pg_relation_filenode('omniroute.conversation_turn_nodes') AS node"
+        )
+      );
       await migrate();
+      const afterRewrite = await database.transaction((tx) =>
+        tx.query<{ node: number }>(
+          "SELECT pg_relation_filenode('omniroute.conversation_turn_nodes') AS node"
+        )
+      );
+      assert.notEqual(
+        afterRewrite.rows[0].node,
+        beforeRewrite.rows[0].node,
+        "legacy backfill rewrites the heap instead of maintaining indexes per updated row"
+      );
       const rows = await database.transaction((tx) =>
         tx.query<{ id: string; last_seen_at: string; agrees: boolean }>(
           "SELECT id,last_seen_at,last_seen_at_retention=last_seen_at::timestamptz AS agrees FROM omniroute.conversation_turn_nodes ORDER BY id"

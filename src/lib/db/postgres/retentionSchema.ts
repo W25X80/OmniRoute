@@ -15,8 +15,9 @@ export const POSTGRES_RETENTION_SCHEMA_STATEMENTS = [
    END $$`,
   `ALTER TABLE omniroute.conversation_turn_nodes
    ADD COLUMN last_seen_at_retention timestamptz`,
-  `UPDATE omniroute.conversation_turn_nodes
-   SET last_seen_at_retention=last_seen_at::timestamptz`,
+  // Rewrite once instead of maintaining every existing index for millions of UPDATEs.
+  `ALTER TABLE omniroute.conversation_turn_nodes
+   ALTER COLUMN last_seen_at_retention TYPE timestamptz USING last_seen_at::timestamptz`,
   // The default admits existing import column lists. The trigger always replaces it.
   `ALTER TABLE omniroute.conversation_turn_nodes
    ALTER COLUMN last_seen_at_retention SET NOT NULL,
