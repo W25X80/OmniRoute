@@ -73,6 +73,13 @@ const logger = {
         phase: fields.phase,
         outcome: fields.outcome,
         sqlState: fields.sqlState,
+        statementId: fields.statementId,
+        lockOwner: fields.lockOwner,
+        lockMode: fields.lockMode,
+        queryCount: fields.queryCount,
+        queryMs: fields.queryMs,
+        callbackGapMs: fields.callbackGapMs,
+        durationMs: fields.durationMs,
       });
   },
 };

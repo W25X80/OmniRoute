@@ -19,7 +19,14 @@ import {
   publishApiKeyNoLog,
   readApiKeyPolicyVersion,
 } from "../../src/lib/db/postgres/apiKeyPolicyState.ts";
-import { PostgresError, type PostgresDatabase } from "../../src/lib/db/postgres/database.ts";
+import {
+  PostgresError,
+  type PostgresDatabase,
+  type PostgresTransaction,
+  type PostgresTransactionOptions,
+} from "../../src/lib/db/postgres/database.ts";
+import { deleteApiKeyDependents } from "../../src/lib/db/postgres/controlPlaneEffects.ts";
+import { deferArtifactRecovery } from "../../src/lib/db/postgres/artifactRecoveryRepository.ts";
 import { migratePostgresSchema } from "../../src/lib/db/postgres/migrations.ts";
 import { API_KEY_COLUMN_FALLBACKS } from "../../src/lib/db/apiKeyColumnFallbacks.ts";
 import { resolveProviderId } from "../../src/shared/constants/providers.ts";
@@ -809,6 +816,124 @@ if (!postgresTestsEnabled) {
       const metadata = await keys.getApiKeyMetadata(created.key);
       assert.equal(metadata?.noLog, true);
       assert.deepEqual(metadata?.scopes, ["manage"]);
+    });
+
+    test("key deletion acquires accounting before artifact revocation triggers", async (t) => {
+      await reset();
+      const created = await keys.createApiKey("delete-fence", "machine");
+      const reference = "delete-fence-" + randomUUID();
+      const id = "delete-fence-" + randomUUID();
+      await database.transaction(async (tx) => {
+        await tx.query(
+          "INSERT INTO omniroute.call_logs(id,timestamp,api_key_id,detail_state,detail_reason) VALUES($1,$2,$3,'missing','publication_pending')",
+          [id, new Date().toISOString(), created.id]
+        );
+        await tx.query(
+          "INSERT INTO omniroute.artifact_deletion_queue(relpath,publication_state,call_log_id,call_log_order) SELECT $1,'publishing',id,insertion_order FROM omniroute.call_logs WHERE id=$2",
+          [reference, id]
+        );
+        await tx.query(
+          "INSERT INTO omniroute.domain_budgets(api_key_id,daily_limit_usd) VALUES($1,1)",
+          [created.id]
+        );
+        await tx.query(
+          "INSERT INTO omniroute.domain_cost_history(api_key_id,cost,timestamp) VALUES($1,0.125,$2)",
+          [created.id, Date.now()]
+        );
+      });
+      const other = await createTestPostgresDatabase();
+      const deleting = createPostgresApiKeyRepository(other, {
+        ...dependencies,
+        deleteDependents: deleteApiKeyDependents,
+      });
+      let held!: () => void, release!: () => void;
+      const entered = new Promise<void>((resolve) => {
+        held = resolve;
+      });
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      let holderPid = 0;
+      const original = database.transaction;
+      t.mock.method(database, "transaction", function <
+        T,
+      >(this: PostgresDatabase, body: (tx: PostgresTransaction) => Promise<T>, options?: PostgresTransactionOptions): Promise<T> {
+        return original.call(
+          this,
+          async (tx: PostgresTransaction) =>
+            body({
+              noteAdvisoryLock: (owner, mode) => tx.noteAdvisoryLock?.(owner, mode),
+              async query<Row>(text: string, values?: unknown[]) {
+                if (
+                  options?.operation === "artifact.defer" &&
+                  text.startsWith("UPDATE omniroute.artifact_deletion_queue")
+                ) {
+                  holderPid = (await tx.query<{ pid: number }>("SELECT pg_backend_pid() AS pid"))
+                    .rows[0].pid;
+                  held();
+                  await gate;
+                }
+                return tx.query<Row>(text, values);
+              },
+            }),
+          options
+        ) as Promise<T>;
+      });
+      const deferred = deferArtifactRecovery(database, reference);
+      void deferred.catch(() => {});
+      let deletion: Promise<boolean> | undefined;
+      try {
+        await Promise.race([entered, deferred]);
+        deletion = deleting.deleteApiKey(created.id);
+        void deletion.catch(() => {});
+        let waiting = false;
+        const deadline = performance.now() + 700;
+        while (!waiting && performance.now() < deadline) {
+          waiting = (
+            await database.transaction((tx) =>
+              tx.query<{ present: boolean }>(
+                "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE wait_event_type='Lock' AND wait_event='advisory' AND $1=ANY(pg_blocking_pids(pid))) AS present",
+                [holderPid]
+              )
+            )
+          ).rows[0].present;
+          if (!waiting) await delay(10);
+        }
+        assert.equal(waiting, true, "key deletion must actually wait on the accounting owner");
+        release();
+        await deferred;
+        assert.equal(await deletion, true);
+        const state = await database.transaction((tx) =>
+          tx.query(
+            `SELECT c.detail_state,q.publication_state,
+            (SELECT count(*) FROM omniroute.api_keys WHERE id=$2)::text AS keys,
+            (SELECT count(*) FROM omniroute.domain_budgets WHERE api_key_id=$2)::text AS budgets,
+            (SELECT count(*) FROM omniroute.domain_cost_history WHERE api_key_id=$2)::text AS costs
+           FROM omniroute.call_logs c JOIN omniroute.artifact_deletion_queue q ON q.call_log_id=c.id
+           WHERE c.id=$1`,
+            [id, created.id]
+          )
+        );
+        assert.deepEqual(state.rows, [
+          {
+            detail_state: "none",
+            publication_state: "delete_pending",
+            keys: "0",
+            budgets: "0",
+            costs: "0",
+          },
+        ]);
+      } finally {
+        release();
+        await Promise.allSettled([deferred, ...(deletion ? [deletion] : [])]);
+        await other.close();
+        await database.transaction(async (tx) => {
+          await tx.query("DELETE FROM omniroute.call_logs WHERE id=$1", [id]);
+          await tx.query("DELETE FROM omniroute.artifact_deletion_queue WHERE relpath=$1", [
+            reference,
+          ]);
+        });
+      }
     });
 
     test("native groups preserve malformed wildcard literals, cascading deletion and missing membership", async () => {

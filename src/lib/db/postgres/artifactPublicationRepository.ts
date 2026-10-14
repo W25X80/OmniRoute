@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { acquirePostgresLock } from "./locks";
+import { acquirePostgresLock, type PostgresLockMode } from "./locks";
 import type { PreparedArtifact } from "@/domain/persistence/artifactStore";
 import type { PostgresDatabase, PostgresTransaction } from "./database";
 
@@ -42,8 +42,11 @@ export function isArtifactPublicationConflict(error: unknown): boolean {
     error && typeof error === "object" && (error as Record<symbol, unknown>)[CONFLICT] === true
   );
 }
-export function lockArtifactPublication(transaction: PostgresTransaction) {
-  return acquirePostgresLock(transaction, "accounting");
+export function lockArtifactPublication(
+  transaction: PostgresTransaction,
+  mode: PostgresLockMode = "exclusive"
+) {
+  return acquirePostgresLock(transaction, "accounting", mode);
 }
 export async function artifactHasSqlOwner(
   transaction: PostgresTransaction,

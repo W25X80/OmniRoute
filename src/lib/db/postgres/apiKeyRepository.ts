@@ -35,6 +35,7 @@ import {
   stripExtendedContextSuffix,
 } from "../apiKeys/modelPermissions";
 import type { PostgresDatabase, PostgresTransaction } from "./database";
+import { acquirePostgresLock } from "./locks";
 import { loadKeyGroupPolicy, type KeyGroupPolicy } from "./apiKeyGroupsRepository";
 import {
   advanceApiKeyPolicyVersion,
@@ -512,6 +513,7 @@ export function createPostgresApiKeyRepository(
       mutation(async (tx) => {
         const row = await keyById(tx, id);
         if (!row) return { value: false, effects: null };
+        await acquirePostgresLock(tx, "accounting");
         await tx.query("DELETE FROM omniroute.api_keys WHERE id=$1", [id]);
         await dependencies.deleteDependents(tx, id);
         return {

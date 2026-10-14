@@ -114,7 +114,7 @@ export async function claimArtifactRecoveryDispatch(
   return database.transaction(
     async (tx) => {
       await acquirePostgresLock(tx, "keyPolicy", "shared");
-      await lockArtifactPublication(tx);
+      await lockArtifactPublication(tx, "shared");
       const row = (await readArtifactPublication(tx, reference)) as ArtifactRecoveryRow | undefined;
       if (
         !row ||
@@ -145,7 +145,7 @@ export async function deferArtifactRecovery(
 ): Promise<void> {
   await database.transaction(
     async (tx) => {
-      await lockArtifactPublication(tx);
+      await lockArtifactPublication(tx, "shared");
       await tx.query(
         `UPDATE omniroute.artifact_deletion_queue SET next_attempt_at=statement_timestamp()+interval '30 seconds',
        upload_state=CASE WHEN $3 AND dispatch_owner=$2::uuid THEN 'not_sent' ELSE upload_state END,
@@ -172,7 +172,7 @@ export async function attachArtifactRecovery(
   return database.transaction(
     async (tx) => {
       await acquirePostgresLock(tx, "keyPolicy", "shared");
-      await lockArtifactPublication(tx);
+      await lockArtifactPublication(tx, "shared");
       const row = (await readArtifactPublication(tx, reference)) as ArtifactRecoveryRow | undefined;
       if (!row || row.publication_owner !== owner) return false;
       if (row.publication_state === "attached") return true;
