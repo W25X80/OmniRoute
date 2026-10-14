@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { AsyncResource } from "node:async_hooks";
+import { AsyncLocalStorage, AsyncResource } from "node:async_hooks";
 import { createHash, randomUUID, randomFillSync } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { registerHooks } from "node:module";
@@ -19,6 +19,7 @@ import {
 } from "../../src/domain/persistence/artifactStore.ts";
 import type { PostgresControlPlaneOptions } from "../../src/lib/db/postgres/controlPlane.ts";
 import type { PostgresDatabase } from "../../src/lib/db/postgres/database.ts";
+import { acquirePostgresLock } from "../../src/lib/db/postgres/locks.ts";
 import {
   postgresTestsEnabled,
   testPostgresOptions,
@@ -73,14 +74,22 @@ const effects = new Map<
   }
 >();
 const diagnostics: unknown[] = [];
+const cleanupDiagnostics = new AsyncLocalStorage<Record<string, unknown>[]>();
+const accountingLockStatement = createHash("sha256")
+  .update("SELECT pg_advisory_xact_lock(18765,$1)")
+  .digest("hex");
 const artifactErrors: { operation: string; name?: string; kind?: string; sqlState?: string }[] = [];
 let capacityDiagnostics = 0;
 let expectedStorageWarnings = 0;
 const logger = {
   warn(fields: Record<string, unknown>) {
-    if (fields.outcome === "overloaded" && !fields.sqlState) capacityDiagnostics++;
-    else if (diagnostics.length < 64)
-      diagnostics.push({
+    const cleanup = cleanupDiagnostics.getStore();
+    if (!cleanup && fields.outcome === "overloaded" && !fields.sqlState) {
+      capacityDiagnostics++;
+      return;
+    }
+    if (cleanup || diagnostics.length < 64) {
+      const record = {
         operation: fields.operation,
         phase: fields.phase,
         outcome: fields.outcome,
@@ -92,7 +101,11 @@ const logger = {
         queryMs: fields.queryMs,
         callbackGapMs: fields.callbackGapMs,
         durationMs: fields.durationMs,
-      });
+      };
+      if (cleanup) {
+        if (cleanup.length < 64) cleanup.push(record);
+      } else diagnostics.push(record);
+    }
   },
 };
 export async function readPostgresEnvironment() {
@@ -296,6 +309,11 @@ test(
     const publicationModes = { ack: 0, lost: 0, late: 0, private: 0 };
     const orphanFiles = new Set<string>();
     const publicationRefs = new Map<string, string>();
+    const deferredCleanupRefs = new Set<string>();
+    let controlledCleanupDeferrals = 0,
+      measuredCleanupDeferrals = 0,
+      cleanupLockTimeouts = 0,
+      drainedCleanupDeferrals = 0;
     const appendIds = new Set<string>();
     const active = new Map<number, Promise<void>>();
     const parents: Promise<void>[] = [];
@@ -346,6 +364,13 @@ test(
       fileActive,
       publicationActive,
       peakPublications,
+      artifactCleanup: {
+        controlledDeferrals: controlledCleanupDeferrals,
+        measuredDeferrals: measuredCleanupDeferrals,
+        lockTimeouts: cleanupLockTimeouts,
+        pending: deferredCleanupRefs.size,
+        drained: drainedCleanupDeferrals,
+      },
       active: active.size,
       sqlHeartbeats,
       fileSqlOverlap,
@@ -796,7 +821,8 @@ test(
         database: PostgresDatabase,
         id: string,
         client: number,
-        sequence: number
+        sequence: number,
+        holdCleanup = false
       ) {
         const mode = (["ack", "lost", "late", "private"] as const)[Math.floor(sequence / 6) % 4];
         const key = mode === "private" ? privateKeys[client] : keys[client];
@@ -862,14 +888,69 @@ test(
           effect.gate?.release();
           await effect.pending;
           await database.transaction(async (tx) => {
+            await acquirePostgresLock(tx, "accounting");
             await tx.query("DELETE FROM omniroute.call_logs WHERE id=$1", [id]);
             if (mode === "private")
               await tx.query("UPDATE omniroute.api_keys SET no_log=0 WHERE id=$1", [key]);
           });
-          const deleted = await deleteNativeCallArtifacts([intent.artifact.reference]);
-          assert.equal(deleted.pendingArtifactDeletions, 0);
-          effects.delete(intent.artifact.reference);
-          publicationRefs.delete(id);
+          const held = barrier(),
+            release = barrier();
+          let holder: Promise<unknown> | undefined;
+          try {
+            if (holdCleanup) {
+              // The metadata deletion commits before this controlled optional-cleanup conflict.
+              holder = observer!.transaction(async (tx) => {
+                await acquirePostgresLock(tx, "accounting");
+                held.release();
+                await release.promise;
+              });
+              void holder.catch(() => {});
+              await Promise.race([held.promise, holder]);
+            }
+            const observed: Record<string, unknown>[] = [];
+            const deleted = await cleanupDiagnostics.run(observed, () =>
+              deleteNativeCallArtifacts([intent.artifact.reference])
+            );
+            if (deleted.pendingArtifactDeletions === 0) {
+              assert.equal(holdCleanup, false, "the controlled owner must exclude cleanup");
+              assert.equal(deleted.errors, 0);
+              assert.equal(observed.length, 0);
+              effects.delete(intent.artifact.reference);
+              publicationRefs.delete(id);
+            } else {
+              assert.equal(deleted.pendingArtifactDeletions, 1);
+              assert.equal(deleted.errors, 1);
+              assert.ok(observed.length >= 1 && observed.length <= 2);
+              for (const event of observed) {
+                assert.equal(event.outcome, "query_failed");
+                assert.equal(event.sqlState, "55P03");
+                assert.equal(event.phase, "query");
+                assert.equal(event.queryCount, 1);
+                assert.equal(event.lockOwner, "accounting");
+                assert.equal(event.lockMode, "exclusive");
+                assert.equal(event.statementId, accountingLockStatement);
+              }
+              const proof = await database.transaction((tx) =>
+                tx.query(
+                  `SELECT publication_state,staged_payload IS NULL AND staged_bytes=0 AS unstaged,
+                    NOT EXISTS(SELECT 1 FROM omniroute.call_logs WHERE artifact_relpath=$1
+                      UNION ALL SELECT 1 FROM omniroute.call_logs_v1_legacy WHERE artifact_relpath=$1) AS unowned
+                   FROM omniroute.artifact_deletion_queue WHERE relpath=$1 AND store_scope=$2`,
+                  [intent.artifact.reference, storageScope]
+                )
+              );
+              assert.deepEqual(proof.rows, [
+                { publication_state: "delete_pending", unstaged: true, unowned: true },
+              ]);
+              deferredCleanupRefs.add(intent.artifact.reference);
+              cleanupLockTimeouts += observed.length;
+              if (holdCleanup) controlledCleanupDeferrals++;
+              else measuredCleanupDeferrals++;
+            }
+          } finally {
+            release.release();
+            await holder;
+          }
         }
       }
       async function perform(lane: Lane, client: number, sequence: number) {
@@ -963,7 +1044,7 @@ test(
             [...spend.values()].filter((row) => row.apiKeyId === keys[client]).length * 0.125
           );
         } else if (lane === "publication") {
-          if (publicationActive >= ARTIFACT_OPERATION_LIMIT) {
+          if (publicationActive + deferredCleanupRefs.size >= ARTIFACT_OPERATION_LIMIT) {
             counters.publication.plannedThrottled++;
             return false;
           }
@@ -991,6 +1072,12 @@ test(
         await receipt(database, id, lane);
         return true;
       }
+      await runtime.runPersistenceRequest(async () => {
+        await publication(getSelectedPostgresDatabase()!, prefix + "-cleanup-proof", 0, 0, true);
+      });
+      assert.equal(controlledCleanupDeferrals, 1);
+      assert.equal(deferredCleanupRefs.size, 1);
+      publicationModes.ack--;
       for (let client = 0; client < 10; client++) {
         const ready = barrier();
         const parent = runtime.runPersistenceRequest(async () => {
@@ -1245,16 +1332,20 @@ test(
           const effect = effects.get(reference);
           effect?.gate?.release();
           await effect?.pending;
-          await database.transaction((tx) =>
-            tx.query("DELETE FROM omniroute.call_logs WHERE id=$1", [id])
-          );
+          await database.transaction(async (tx) => {
+            await acquirePostgresLock(tx, "accounting");
+            await tx.query("DELETE FROM omniroute.call_logs WHERE id=$1", [id]);
+          });
           assert.equal((await deleteNativeCallArtifacts([reference])).pendingArtifactDeletions, 0);
+          if (deferredCleanupRefs.delete(reference)) drainedCleanupDeferrals++;
           effects.delete(reference);
         }
         publicationRefs.clear();
       });
       assert.equal(orphanFiles.size, 0);
       assert.equal(appendIds.size, 0);
+      assert.equal(deferredCleanupRefs.size, 0);
+      assert.equal(drainedCleanupDeferrals, controlledCleanupDeferrals + measuredCleanupDeferrals);
       const drainedStorage = await sampleStorage("after-drain", true);
       for (const field of ["live_files", "live_states", "live_chunks", "logical_bytes"])
         assert.equal(drainedStorage[field], "0", "exact drained file absence");
@@ -1391,6 +1482,14 @@ test(
             retentionDeleted,
             spendReceipts: spend.size,
             publicationModes,
+            artifactCleanup: {
+              version: 1,
+              controlledDeferrals: controlledCleanupDeferrals,
+              measuredDeferrals: measuredCleanupDeferrals,
+              lockTimeouts: cleanupLockTimeouts,
+              pending: deferredCleanupRefs.size,
+              drained: drainedCleanupDeferrals,
+            },
             diagnostics: diagnostics.length,
             fatal: fatal.length,
             peakRss: maxRss,
