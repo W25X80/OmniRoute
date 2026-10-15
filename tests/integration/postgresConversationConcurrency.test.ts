@@ -121,6 +121,16 @@ describe("native implicit conversation concurrency", { skip: !postgresTestsEnabl
     await assertTranscript(seed.conversationId!, ["a", "b", "c", "d"], 3);
   });
 
+  it("prefers the longest verified run when repeated content ends later", async () => {
+    const original = ["start", "a1", "ok", "poll", "ok", "poll"];
+    const continued = [...original, "ok", "brand new"];
+    const seed = await resolve("repeated-content", original);
+    const result = await resolve("repeated-content", continued);
+    assert.equal(result.conversationId, seed.conversationId);
+    assert.equal(result.isNewConversation, false);
+    await assertTranscript(seed.conversationId!, continued, 2);
+  });
+
   it("keeps explicit headers authoritative over divergent histories", async () => {
     const header = randomUUID();
     const results = await Promise.all([
