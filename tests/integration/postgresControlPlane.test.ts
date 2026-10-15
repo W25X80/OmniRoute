@@ -207,6 +207,7 @@ test(
           const tokenRoute = await import("../../src/app/api/cli/tokens/route.ts");
           const keyRoute = await import("../../src/app/api/cli-tools/keys/route.ts");
           const accessTokens = await import("../../src/lib/db/accessTokens.ts");
+          const { isAuthRequired } = await import("../../src/shared/utils/apiAuth.ts");
           const { SignJWT } = await import("jose");
           const jwtEnvironment = process.env.JWT_SECRET;
           const session = await new SignJWT({ authenticated: true })
@@ -218,7 +219,9 @@ test(
           try {
             await first.run(async () => {
               const previous = await settings.getSettings();
-              await settings.updateSettings({ requireLogin: true });
+              // The parent intentionally has no password override. Close its
+              // loopback onboarding exemption before exercising delegated auth.
+              await settings.updateSettings({ requireLogin: true, setupComplete: true });
               try {
                 const machine = await keys.createApiKey("native-cli-machine", "native-cli", [
                   "manage",
@@ -227,16 +230,19 @@ test(
                   "admin",
                 ]);
                 const before = await accessTokens.listAccessTokensAsync();
-                const denied = await tokenRoute.POST(
-                  new Request("http://localhost/api/cli/tokens", {
-                    method: "POST",
-                    headers: {
-                      authorization: `Bearer ${machine.key}`,
-                      "content-type": "application/json",
-                    },
-                    body: JSON.stringify({ name: "native-denied-admin", scope: "admin" }),
-                  })
+                const deniedRequest = new Request("http://localhost/api/cli/tokens", {
+                  method: "POST",
+                  headers: {
+                    authorization: `Bearer ${machine.key}`,
+                    "content-type": "application/json",
+                  },
+                  body: JSON.stringify({ name: "native-denied-admin", scope: "admin" }),
+                });
+                assert.equal(
+                  await isAuthRequired(deniedRequest, { ignorePublicRoute: true }),
+                  true
                 );
+                const denied = await tokenRoute.POST(deniedRequest);
                 assert.equal(denied.status, 403);
                 assert.deepEqual(await accessTokens.listAccessTokensAsync(), before);
                 const masked = await keyRoute.GET(
@@ -273,7 +279,10 @@ test(
                 assert.throws(() => sqlite.getDbInstance(), UnsupportedPersistenceDomainError);
                 assert.equal(process.env.JWT_SECRET, first.bootstrapSecrets.jwtSecret);
               } finally {
-                await settings.updateSettings({ requireLogin: previous.requireLogin });
+                await settings.updateSettings({
+                  requireLogin: previous.requireLogin,
+                  setupComplete: previous.setupComplete === true,
+                });
               }
             });
           } finally {
