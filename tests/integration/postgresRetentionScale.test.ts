@@ -164,7 +164,9 @@ describe(
           return database.transaction((tx) =>
             body({
               async query<Row>(sql: string, values?: unknown[]) {
-                if (sql.includes("WITH expired")) {
+                // An empty candidate set now ends after the parent/orphan lookups,
+                // before DELETE. Observe their real plans as well as any deletion.
+                if (sql.includes("omniroute.conversation_turn_nodes")) {
                   const explain = await tx.query<{
                     "QUERY PLAN": Array<{ Plan: Plan; "Execution Time": number }>;
                   }>(`EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) ${sql}`, values);
