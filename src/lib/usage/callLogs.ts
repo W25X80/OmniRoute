@@ -936,7 +936,7 @@ async function saveCallLogOperation(entry: any, captured?: NativeCallLogContext)
   }
 }
 
-export function saveCallLog(entry: any): Promise<void> {
+function updateCallLogTokens(entry: any): void {
   // Usage is also needed by the live dashboard when disk history is disabled.
   // Retain only counters, never the request/response bodies from this entry.
   if (entry?.tokens && typeof entry.tokens === "object") {
@@ -949,6 +949,20 @@ export function saveCallLog(entry: any): Promise<void> {
       compressed: typeof entry.tokensCompressed === "number" ? entry.tokensCompressed : null,
     });
   }
+}
+
+type CallLogSaveInput =
+  { entry: Record<string, unknown> } | { prepare: () => Promise<Record<string, unknown>> };
+
+function captureCallLogEntry(entry: Record<string, unknown>): Record<string, unknown> {
+  return {
+    ...entry,
+    id: typeof entry.id === "string" && entry.id.length > 0 ? entry.id : generateLogId(),
+    timestamp: typeof entry.timestamp === "string" ? entry.timestamp : new Date().toISOString(),
+  };
+}
+
+function startCallLogSave(input: CallLogSaveInput): Promise<void> {
   if (!shouldPersistToDisk || callLogSavesClosing) return Promise.resolve();
 
   let operation: Promise<void>;
@@ -960,23 +974,38 @@ export function saveCallLog(entry: any): Promise<void> {
         apiKeyContext: apiKeyContext ? { ...apiKeyContext } : null,
         resilience: captureResilienceActions(),
       };
-      const capturedEntry = {
-        ...entry,
-        id: typeof entry.id === "string" && entry.id.length > 0 ? entry.id : generateLogId(),
-        timestamp: typeof entry.timestamp === "string" ? entry.timestamp : new Date().toISOString(),
-      };
-      operation = runPersistenceBackgroundWork(() => {
+      const capturedEntry = "entry" in input ? captureCallLogEntry(input.entry) : undefined;
+      operation = runPersistenceBackgroundWork(async () => {
         if (
           !isApplicationPersistenceIdentity(identity) ||
           getSelectedPersistenceIdentity() !== identity
         ) {
           throw new Error("Call log persistence authority changed before admission");
         }
-        return saveCallLogOperation(capturedEntry, captured);
+        if ("entry" in input) return saveCallLogOperation(capturedEntry, captured);
+        const prepared = await input.prepare();
+        if (
+          !isApplicationPersistenceIdentity(identity) ||
+          getSelectedPersistenceIdentity() !== identity
+        ) {
+          throw new Error("Call log persistence authority changed during preparation");
+        }
+        const entry = captureCallLogEntry(prepared);
+        updateCallLogTokens(entry);
+        return saveCallLogOperation(entry, captured);
       }).catch(reportCallLogSaveFailure);
     } else {
       // Standalone native planes retain their explicit-await contract; SQLite starts immediately.
-      operation = saveCallLogOperation(entry);
+      operation =
+        "entry" in input
+          ? saveCallLogOperation(input.entry)
+          : input
+              .prepare()
+              .then((entry) => {
+                updateCallLogTokens(entry);
+                return saveCallLogOperation(entry);
+              })
+              .catch(reportCallLogSaveFailure);
     }
   } catch (error) {
     reportCallLogSaveFailure(error);
@@ -988,6 +1017,16 @@ export function saveCallLog(entry: any): Promise<void> {
     () => pendingCallLogSaves.delete(operation)
   );
   return operation;
+}
+
+export function saveCallLog(entry: any): Promise<void> {
+  updateCallLogTokens(entry);
+  return startCallLogSave({ entry });
+}
+
+/** Admission and shutdown draining include preparation, without a second background slot. */
+export function saveCallLogFrom(prepare: () => Promise<Record<string, unknown>>): Promise<void> {
+  return startCallLogSave({ prepare });
 }
 
 export async function waitForCallLogSaves(timeoutMs: number): Promise<boolean> {

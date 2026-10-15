@@ -8,7 +8,7 @@
  * turn a rejection into a second failure. Fire-and-forget on purpose:
  * awaiting disk I/O here would hold the rejection path.
  */
-import { saveCallLog } from "@/lib/usageDb";
+import { saveCallLogFrom } from "@/lib/usage/callLogs";
 import { cloneLogPayload } from "@/lib/logPayloads";
 import { redactVideoTranscriptFieldsForLog } from "@/lib/guardrails/videoBridgeSnapshotRedaction";
 
@@ -38,8 +38,7 @@ export async function logAdmissionRejection(
   entry: AdmissionRejectionLogEntry
 ): Promise<void> {
   try {
-    const admissionError = await extractAdmissionRejectionReason(rejection);
-    await saveCallLog({
+    await saveCallLogFrom(async () => ({
       method: "POST",
       path: entry.path,
       status: rejection.status,
@@ -47,13 +46,13 @@ export async function logAdmissionRejection(
       requestedModel: entry.model,
       provider: "-",
       duration: 0,
-      error: admissionError,
+      error: await extractAdmissionRejectionReason(rejection),
       requestBody: cloneLogPayload(redactVideoTranscriptFieldsForLog(entry.requestBody)) ?? null,
       apiKeyId: entry.apiKeyId,
       apiKeyName: entry.apiKeyName,
       correlationId: entry.correlationId,
       sessionTag: null,
-    });
+    }));
   } catch {}
 }
 
