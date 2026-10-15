@@ -13,11 +13,19 @@ export class TransactionDiagnostics {
   connectionMs = 0;
   queryCount = 0;
   queryMs = 0;
+  lockMs = 0;
+  commitMs = 0;
   callbackGapMs = 0;
   statementId: string | undefined;
   lockOwner: string | undefined;
   lockMode: "shared" | "exclusive" | undefined;
   private settledAt: number | undefined;
+  private nextQueryIsLock = false;
+  private queryingLock = false;
+
+  noteLock(): void {
+    this.nextQueryIsLock = true;
+  }
 
   constructor(operation?: string) {
     this.operation =
@@ -38,12 +46,17 @@ export class TransactionDiagnostics {
     this.noteGap();
     this.phase = "query";
     this.queryCount++;
+    this.queryingLock = this.nextQueryIsLock;
+    this.nextQueryIsLock = false;
     this.statementId = createHash("sha256").update(text).digest("hex");
     return performance.now();
   }
 
   finishQuery(started: number): void {
-    this.queryMs += performance.now() - started;
+    const elapsed = performance.now() - started;
+    this.queryMs += elapsed;
+    if (this.queryingLock) this.lockMs += elapsed;
+    this.queryingLock = false;
     this.beginBody();
   }
 
@@ -66,6 +79,8 @@ export class TransactionDiagnostics {
       queueMs: Math.round(this.queueMs),
       connectionMs: Math.round(this.connectionMs),
       queryMs: Math.round(this.queryMs),
+      lockMs: Math.round(this.lockMs),
+      commitMs: Math.round(this.commitMs),
       callbackGapMs: Math.round(this.callbackGapMs),
       durationMs: Math.round(performance.now() - this.started),
     };

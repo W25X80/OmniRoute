@@ -3,13 +3,16 @@
  * cooldown or unavailability (#11911 #919), scoped to the pin that names the
  * failed target when the caller knows it (#12235).
  *
- * Non-blocking by design: the fallback loop never waits on these SQLite writes. A
+ * Non-blocking by design: the fallback loop never waits on these owned writes. A
  * failed clear is not silent — it logs a warning carrying the combo and the
  * execution key. The returned promise never rejects: routing callers ignore it,
  * tests await it.
  *
  * @internal — re-exported by combo.ts as `clearStaleLKGP`.
  */
+
+import { runPersistenceBackgroundWork } from "../../../src/lib/db/persistenceRuntime.ts";
+import type { LKGPObservation } from "../../../src/lib/db/settings/lkgp.ts";
 
 type WarnLogger = { warn?: (tag: string, msg: string, data?: unknown) => void } | null;
 type ClearLkgp = (comboName: string, modelKey: string) => Promise<void>;
@@ -28,11 +31,11 @@ async function clearPins(
   const comboKey = comboId || comboName;
 
   // The target-scoped pin is unambiguously about the target that just failed.
-  const pending: Promise<void>[] = executionKey ? [clear(comboName, executionKey)] : [];
+  const keys = new Set<string>(executionKey ? [executionKey] : []);
 
   if (!failed?.provider) {
     // No target in scope: previous unconditional behaviour.
-    pending.push(clear(comboName, comboKey));
+    keys.add(comboKey);
   } else {
     const { getLKGP } = await import("@/lib/db/settings");
     const pin = await getLKGP(comboName, comboKey);
@@ -41,10 +44,30 @@ async function clearPins(
     const namesFailedTarget =
       pin?.provider === failed.provider &&
       (!pin?.connectionId || !failed.connectionId || pin.connectionId === failed.connectionId);
-    if (namesFailedTarget) pending.push(clear(comboName, comboKey));
+    if (namesFailedTarget) keys.add(comboKey);
   }
 
-  await Promise.all(pending);
+  for (const key of keys) await clear(comboName, key);
+}
+
+/** Prepare once in the parent scope; every routing clear compares this immutable observation. */
+export async function prepareLkgpClear(comboName: string, log?: WarnLogger) {
+  let observed: LKGPObservation;
+  try {
+    observed = await (
+      await import("../../../src/lib/db/settings/lkgp.ts")
+    ).observeLKGPPins(comboName);
+  } catch (err: unknown) {
+    log?.warn?.("COMBO", "Failed to observe Last Known Good Provider pins.", {
+      combo: comboName,
+      err,
+    });
+    observed = new Map();
+  }
+  return (...args: Parameters<typeof clearStaleLKGP>) => {
+    const [name, key, id, logger, tag, writer, failed] = args;
+    return clearStaleLKGP(name, key, id, logger, tag, writer, failed, observed);
+  };
 }
 
 export function clearStaleLKGP(
@@ -65,16 +88,25 @@ export function clearStaleLKGP(
    * discarded a preference for a healthy provider every time an unrelated target
    * was skipped. Omitted keeps the previous unconditional behaviour (#12235).
    */
-  failed?: FailedTarget
+  failed?: FailedTarget,
+  observed?: LKGPObservation
 ): Promise<void> {
-  return clearPins(comboName, executionKey, comboId, clearLKGP, failed ?? null).catch(
-    (err: unknown) => {
-      log?.warn?.(tag, "Failed to clear Last Known Good Provider. This is non-fatal.", {
-        combo: comboName,
-        comboId: comboId ?? null,
-        executionKey: executionKey ?? null,
-        err,
-      });
-    }
-  );
+  return runPersistenceBackgroundWork(
+    async () => {
+      if (observed && !clearLKGP) {
+        const { clearObservedLKGPPins } = await import("../../../src/lib/db/settings/lkgp.ts");
+        await clearObservedLKGPPins(comboName, executionKey, comboId, observed, failed);
+      } else {
+        await clearPins(comboName, executionKey, comboId, clearLKGP, failed ?? null);
+      }
+    },
+    { owner: "lkgp.clear" }
+  ).catch((err: unknown) => {
+    log?.warn?.(tag, "Failed to clear Last Known Good Provider. This is non-fatal.", {
+      combo: comboName,
+      comboId: comboId ?? null,
+      executionKey: executionKey ?? null,
+      err,
+    });
+  });
 }

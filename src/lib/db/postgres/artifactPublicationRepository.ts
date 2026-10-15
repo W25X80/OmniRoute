@@ -174,12 +174,15 @@ export async function abandonArtifactPublication(
 export async function claimArtifactDeletion(
   database: PostgresDatabase,
   reference: string,
-  isLive: () => boolean
+  isLive: () => boolean,
+  expectedScope?: string
 ): Promise<ArtifactPublicationRow | null | undefined> {
   return database.transaction(async (transaction) => {
     await lockArtifactPublication(transaction);
     const row = await readArtifactPublication(transaction, reference);
     if (!row) return null;
+    // Scope admission precedes every journal transition, not just external DELETE.
+    if (expectedScope !== undefined && row.store_scope !== expectedScope) return undefined;
     // Durable recovery owns this un-attached logical call until publication or
     // revocation. Cleanup cannot turn a pending metadata row into an orphan.
     if (row.publication_state === "publishing" && row.call_log_id) {

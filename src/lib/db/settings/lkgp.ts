@@ -2,6 +2,7 @@
  * db/settings/lkgp.ts — Last Known Good Provider (LKGP) persistence.
  */
 
+import { randomUUID } from "node:crypto";
 import { getDbInstance } from "../core";
 import { getSelectedPostgresDatabase } from "../controlPlaneContext";
 import {
@@ -46,6 +47,21 @@ export interface LKGPRecord {
   connectionId?: string;
 }
 
+export type LKGPObservation = ReadonlyMap<string, string>;
+
+function decodePin(value: string): LKGPRecord {
+  try {
+    const parsed = JSON.parse(value);
+    if (typeof parsed === "object" && parsed !== null && "provider" in parsed) {
+      const { revision: _revision, ...record } = parsed;
+      return record as LKGPRecord;
+    }
+    return { provider: String(parsed) };
+  } catch {
+    return { provider: value };
+  }
+}
+
 export async function getLKGP(comboName: string, modelId: string): Promise<LKGPRecord | null> {
   const postgres = getSelectedPostgresDatabase();
   const key = `${comboName}:${modelId}`;
@@ -55,15 +71,7 @@ export async function getLKGP(comboName: string, modelId: string): Promise<LKGPR
         .prepare("SELECT value FROM key_value WHERE namespace = 'lkgp' AND key = ?")
         .get(key) as { value?: string } | undefined);
   if (!row?.value) return null;
-  try {
-    const parsed = JSON.parse(row.value);
-    if (typeof parsed === "object" && parsed !== null && "provider" in parsed) {
-      return parsed as LKGPRecord;
-    }
-    return { provider: String(parsed) };
-  } catch {
-    return { provider: row.value };
-  }
+  return decodePin(row.value);
 }
 
 export async function setLKGP(
@@ -72,19 +80,118 @@ export async function setLKGP(
   providerId: string,
   connectionId?: string
 ) {
-  const key = `${comboName}:${modelId}`;
-  const value: LKGPRecord = { provider: providerId };
-  if (connectionId) value.connectionId = connectionId;
+  await setLKGPPins(comboName, [modelId], providerId, connectionId);
+}
+
+/** Related routing hints commit together; each success has a distinct ABA token. */
+export async function setLKGPPins(
+  comboName: string,
+  modelIds: readonly string[],
+  providerId: string,
+  connectionId?: string
+): Promise<void> {
+  const keys = [...new Set(modelIds.map((modelId) => `${comboName}:${modelId}`))];
+  const value = JSON.stringify({
+    provider: providerId,
+    ...(connectionId ? { connectionId } : {}),
+    revision: randomUUID(),
+  });
   const postgres = getSelectedPostgresDatabase();
-  if (postgres) {
-    await withPostgresKeyValueMutation(postgres, (transaction) =>
-      writePostgresKeyValue(transaction, "lkgp", key, JSON.stringify(value))
-    );
-    return;
+  try {
+    if (postgres) {
+      await withPostgresKeyValueMutation(postgres, async (transaction) => {
+        for (const key of keys) await writePostgresKeyValue(transaction, "lkgp", key, value);
+      });
+    } else {
+      const db = getDbInstance();
+      const insert = db.prepare(
+        "INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES ('lkgp', ?, ?)"
+      );
+      db.transaction(() => {
+        for (const key of keys) insert.run(key, value);
+      })();
+    }
+  } finally {
+    // An unknown COMMIT also invalidates the cache; it never authorizes a write replay.
+    await invalidatePostgresPins(keys);
   }
-  getDbInstance()
-    .prepare("INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES ('lkgp', ?, ?)")
-    .run(key, JSON.stringify(value));
+}
+
+/** Capture before target dispatch; background effects retain data, never a scoped DB handle. */
+export async function observeLKGPPins(comboName: string): Promise<LKGPObservation> {
+  const prefix = `${comboName}:`;
+  const postgres = getSelectedPostgresDatabase();
+  const rows = postgres
+    ? await postgres.transaction(
+        async (tx) =>
+          (
+            await tx.query<{ key: string; value: string }>(
+              "SELECT key,value FROM omniroute.key_value WHERE namespace='lkgp' AND starts_with(key,$1)",
+              [prefix]
+            )
+          ).rows
+      )
+    : (getDbInstance()
+        .prepare(
+          "SELECT key,value FROM key_value WHERE namespace='lkgp' AND key LIKE ? ESCAPE '\\'"
+        )
+        .all(`${escapeLikePattern(prefix)}%`) as Array<{ key: string; value: string }>);
+  return new Map(rows.map((row) => [row.key, row.value]));
+}
+
+/** A delayed failure can invalidate only the exact hint observed before that attempt. */
+export async function clearObservedLKGPPins(
+  comboName: string,
+  executionKey: string | null | undefined,
+  comboId: string | null | undefined,
+  observed: LKGPObservation,
+  failed?: { provider?: string | null; connectionId?: string | null } | null
+): Promise<void> {
+  const comboKey = `${comboName}:${comboId || comboName}`;
+  const keys = new Set(executionKey ? [`${comboName}:${executionKey}`] : []);
+  const comboValue = observed.get(comboKey);
+  if (comboValue !== undefined) {
+    const pin = decodePin(comboValue);
+    if (
+      !failed?.provider ||
+      (pin.provider === failed.provider &&
+        (!pin.connectionId || !failed.connectionId || pin.connectionId === failed.connectionId))
+    )
+      keys.add(comboKey);
+  }
+  const expected = [...keys].flatMap((key) => {
+    const value = observed.get(key);
+    return value === undefined ? [] : [{ key, value }];
+  });
+  if (!expected.length) return;
+  const postgres = getSelectedPostgresDatabase();
+  const removed: string[] = [];
+  try {
+    if (postgres) {
+      await withPostgresKeyValueMutation(postgres, async (tx) => {
+        for (const { key, value } of expected) {
+          const result = await tx.query(
+            "DELETE FROM omniroute.key_value WHERE namespace='lkgp' AND key=$1 AND value=$2",
+            [key, value]
+          );
+          if (result.rowCount) removed.push(key);
+        }
+      });
+    } else {
+      const db = getDbInstance();
+      const erase = db.prepare(
+        "DELETE FROM key_value WHERE namespace='lkgp' AND key=? AND value=?"
+      );
+      db.transaction(() => {
+        for (const { key, value } of expected) if (erase.run(key, value).changes) removed.push(key);
+      })();
+    }
+  } catch (error) {
+    // An unknown COMMIT must not leave a known-stale local hint or replay the mutation.
+    await invalidatePostgresPins(expected.map(({ key }) => key));
+    throw error;
+  }
+  await invalidatePostgresPins(removed);
 }
 
 export function clearAllLKGP(): void {

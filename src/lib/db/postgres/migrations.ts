@@ -27,6 +27,7 @@ import { POSTGRES_IMPORT_COMPAT_SCHEMA_STATEMENTS } from "./applicationImportSch
 import { POSTGRES_CONFIG_AUDIT_INDEX_STATEMENTS } from "./configAuditSchema";
 import { POSTGRES_RETENTION_SCHEMA_STATEMENTS } from "./retentionSchema";
 import { POSTGRES_ARTIFACT_RECOVERY_SCHEMA_STATEMENTS } from "./artifactRecoverySchema";
+import { POSTGRES_CONVERSATION_CONCURRENCY_STATEMENTS } from "./conversationConcurrencySchema";
 import { acquirePostgresLock } from "./locks";
 
 interface Migration {
@@ -151,6 +152,11 @@ const migrations: readonly Migration[] = [
     version: 8,
     name: "durable_artifact_recovery",
     statements: POSTGRES_ARTIFACT_RECOVERY_SCHEMA_STATEMENTS,
+  },
+  {
+    version: 9,
+    name: "conversation_concurrency",
+    statements: POSTGRES_CONVERSATION_CONCURRENCY_STATEMENTS,
   },
 ];
 

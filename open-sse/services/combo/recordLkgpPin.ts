@@ -1,11 +1,13 @@
 /**
  * Record persisted LKGP pins after a combo target succeeds.
  *
- * Non-blocking by design: the fallback loop never waits on these SQLite
+ * Non-blocking by design: the fallback loop never waits on these owned
  * writes. A failed write is not silent — it logs a warning carrying the
  * combo, the execution key and the provider. The returned promise never
  * rejects: routing callers ignore it, tests await it.
  */
+
+import { runPersistenceBackgroundWork } from "../../../src/lib/db/persistenceRuntime.ts";
 
 type WarnLogger = { warn?: (tag: string, msg: string, data?: unknown) => void } | null;
 type SetLkgp = (
@@ -23,16 +25,14 @@ async function writePins(
   connectionId: string | undefined,
   setLKGPFn: SetLkgp | undefined
 ): Promise<void> {
-  const set = setLKGPFn ?? (await import("@/lib/db/settings")).setLKGP;
   const comboKey = comboId || comboName;
-  if (comboKey === comboName) {
-    await set(comboName, comboKey, provider, connectionId);
-    return;
+  const keys = comboKey === comboName ? [comboKey] : [...new Set([executionKey, comboKey])];
+  if (setLKGPFn) {
+    for (const key of keys) await setLKGPFn(comboName, key, provider, connectionId);
+  } else {
+    const { setLKGPPins } = await import("../../../src/lib/db/settings/lkgp.ts");
+    await setLKGPPins(comboName, keys, provider, connectionId);
   }
-  await Promise.all([
-    set(comboName, executionKey, provider, connectionId),
-    set(comboName, comboKey, provider, connectionId),
-  ]);
 }
 
 export function recordLkgpPin(opts: {
@@ -50,16 +50,17 @@ export function recordLkgpPin(opts: {
   const log = opts.log;
   const tag = opts.tag ?? "COMBO";
   const setLKGP = opts.setLKGP;
-  return writePins(comboName, executionKey, comboId, provider, connectionId, setLKGP).catch(
-    (err: unknown) => {
-      log?.warn?.(tag, "Failed to record Last Known Good Provider. This is non-fatal.", {
-        combo: comboName,
-        comboId: comboId ?? null,
-        executionKey,
-        provider,
-        connectionId: connectionId ?? null,
-        err,
-      });
-    }
-  );
+  return runPersistenceBackgroundWork(
+    () => writePins(comboName, executionKey, comboId, provider, connectionId, setLKGP),
+    { owner: "lkgp.record" }
+  ).catch((err: unknown) => {
+    log?.warn?.(tag, "Failed to record Last Known Good Provider. This is non-fatal.", {
+      combo: comboName,
+      comboId: comboId ?? null,
+      executionKey,
+      provider,
+      connectionId: connectionId ?? null,
+      err,
+    });
+  });
 }

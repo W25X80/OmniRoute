@@ -12,6 +12,7 @@ export const artifactAuthorityFixture = {
   creates: 0,
   closes: 0,
   objects: new Map<string, { bytes: Buffer; checksum: string }>(),
+  getFailure: undefined as unknown,
   reset() {
     this.puts = 0;
     this.gets = 0;
@@ -19,6 +20,7 @@ export const artifactAuthorityFixture = {
     this.creates = 0;
     this.closes = 0;
     this.objects.clear();
+    this.getFailure = undefined;
   },
   effects() {
     return { puts: this.puts, gets: this.gets, deletes: this.deletes };
@@ -44,6 +46,7 @@ export function createS3ArtifactStore() {
       }
       if (command instanceof GetObjectCommand) {
         artifactAuthorityFixture.gets++;
+        if (artifactAuthorityFixture.getFailure) throw artifactAuthorityFixture.getFailure;
         const stored = artifactAuthorityFixture.objects.get(command.input.Key!);
         if (!stored)
           throw Object.assign(new Error("missing test object"), {

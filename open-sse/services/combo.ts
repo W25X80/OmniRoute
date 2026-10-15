@@ -140,7 +140,7 @@ import { dispatchWithCooldownRetry } from "./combo/comboAttemptLoop.ts";
 import { evaluateExecuteTargetGates } from "./combo/executeTargetGates.ts";
 import { executeTargetAttempt } from "./combo/executeTargetAttempt.ts";
 import type { AttemptLoopDeps, AttemptLoopState } from "./combo/attemptLoopTypes.ts";
-import { clearStaleLKGP } from "./combo/staleLkgpClear.ts";
+import { clearStaleLKGP, prepareLkgpClear } from "./combo/staleLkgpClear.ts";
 import { getStrategyTraits } from "./combo/strategyRegistry.ts";
 
 // Native Codex auto-resume (#13180) rejection reasons that mean the turn either carries
@@ -1155,7 +1155,7 @@ async function handleComboChatInner({
     body: body as Record<string, unknown>,
     startTime: comboStartTime,
     releaseStickyPinOnFailure,
-    clearStaleLKGP,
+    clearStaleLKGP: await prepareLkgpClear(combo.name, log),
     clientManagedResponsesContext,
     nativeCodexAutoResume: isAutoResuming,
     reasoningTokenBufferEnabled,

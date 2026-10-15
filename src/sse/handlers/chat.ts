@@ -955,6 +955,7 @@ async function handleChatImplementation(
       apiKeyId: apiKeyInfo?.id ?? null,
       clientSessionIdHeader: clientConversationHeader,
       correlationId: reqId,
+      signal: request.signal,
     }));
   } catch (error) {
     // Best-effort tracking: a DB hiccup here must not turn an otherwise-working

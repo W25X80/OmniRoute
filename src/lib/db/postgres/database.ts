@@ -122,6 +122,8 @@ export interface PostgresTransaction {
 export interface PostgresTransactionOptions {
   /** A static repository operation name, never an ID or user-provided value. */
   operation?: string;
+  /** One consistent MVCC state for a bounded compound read, without blocking ordinary writers. */
+  readOnlySnapshot?: boolean;
 }
 
 class TransactionScope implements PostgresTransaction {
@@ -138,6 +140,7 @@ class TransactionScope implements PostgresTransaction {
   noteAdvisoryLock(owner: string, mode: "shared" | "exclusive"): void {
     this.diagnostics.lockOwner = owner;
     this.diagnostics.lockMode = mode;
+    this.diagnostics.noteLock();
   }
 
   query<Row = Record<string, unknown>>(
@@ -201,6 +204,7 @@ export class PostgresDatabase {
   private closing = false;
   private closed: Promise<void> | undefined;
   private drained: (() => void) | undefined;
+  private readonly slowOperations = new Map<string, number>();
 
   constructor(
     private readonly pool: PostgresPool,
@@ -250,9 +254,17 @@ export class PostgresDatabase {
       } finally {
         diagnostics.connectionMs = performance.now() - connectingAt;
       }
-      const value = await this.runTransaction(client, body, diagnostics);
+      const value = await this.runTransaction(client, body, diagnostics, options);
       if (diagnostics.callbackGapMs >= 1000)
         this.warn(diagnostics.snapshot("committed"), "PostgreSQL transaction callback stalled");
+      else if (performance.now() - diagnostics.started >= 1000) {
+        const last = this.slowOperations.get(diagnostics.operation) ?? -Infinity;
+        if (performance.now() - last >= 30000) {
+          if (this.slowOperations.size >= 128) this.slowOperations.clear();
+          this.slowOperations.set(diagnostics.operation, performance.now());
+          this.warn(diagnostics.snapshot("committed"), "Slow PostgreSQL operation committed");
+        }
+      }
       return value;
     } catch (error) {
       diagnostics.failed();
@@ -324,7 +336,8 @@ export class PostgresDatabase {
   private async runTransaction<T>(
     client: PostgresClient,
     body: (transaction: PostgresTransaction) => Promise<T>,
-    diagnostics: TransactionDiagnostics
+    diagnostics: TransactionDiagnostics,
+    options: PostgresTransactionOptions
   ): Promise<T> {
     const scope = new TransactionScope(client, diagnostics);
     let destroy = false;
@@ -340,7 +353,10 @@ export class PostgresDatabase {
     client.on("error", onError);
     try {
       diagnostics.phase = "begin";
-      if ((await query(client, "BEGIN")).command !== "BEGIN") {
+      const begin = options.readOnlySnapshot
+        ? "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY"
+        : "BEGIN";
+      if ((await query(client, begin)).command !== "BEGIN") {
         throw new PostgresError("query_failed");
       }
       begun = true;
@@ -353,7 +369,13 @@ export class PostgresDatabase {
       if (destroy) throw connectionFailure ?? new PostgresError("query_failed");
       committing = true;
       diagnostics.phase = "commit";
-      const result = await query(client, "COMMIT");
+      const commitStarted = performance.now();
+      let result: PostgresResult;
+      try {
+        result = await query(client, "COMMIT");
+      } finally {
+        diagnostics.commitMs = performance.now() - commitStarted;
+      }
       if (result.command === "ROLLBACK") throw new PostgresError("transaction_failed");
       if (result.command !== "COMMIT") throw new PostgresError("commit_unknown");
       return value;

@@ -123,7 +123,8 @@ import {
   filterTargetsByRequestCompatibility,
   resolveComboTargets,
 } from "./comboStructure.ts";
-import { releaseStickyPinOnFailure, clearStaleLKGP } from "../combo.ts";
+import { releaseStickyPinOnFailure } from "../combo.ts";
+import { prepareLkgpClear } from "./staleLkgpClear.ts";
 import { resolveComboDailyReset } from "./comboDailyResetClock.ts";
 import { resolveTargetTokenLimit } from "./targetTokenLimit.ts";
 import { isProviderProbeResponse } from "../../../src/shared/utils/providerProbeResult.ts";
@@ -206,6 +207,7 @@ export async function handleRoundRobinCombo({
         }
     : allCombos;
 
+  const clearStaleLKGP = await prepareLkgpClear(combo.name, log);
   let orderedTargets = resolveComboTargets(
     rrExpandedCombo,
     rrExpandedAllCombos,

@@ -1,11 +1,19 @@
 import { randomUUID } from "node:crypto";
-import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
 import type {
   PreparedArtifact,
   StoredArtifact,
   ArtifactPutOptions,
 } from "@/domain/persistence/artifactStore";
-import { isArtifactStorageErrorKind } from "@/domain/persistence/artifactStore";
+import {
+  ArtifactStorageError,
+  isArtifactStorageErrorKind,
+} from "@/domain/persistence/artifactStore";
+import {
+  artifactFailureDiagnostic,
+  isSharedArtifactFailure,
+  type ArtifactReconciliationOptions,
+  type ArtifactStorageOperation,
+} from "./artifactReconciliationStatus";
 import {
   getSelectedPostgresDatabase,
   getSelectedPersistenceIdentity,
@@ -100,7 +108,10 @@ export function createNativeArtifactPublication() {
   };
 }
 /** Rotation and scheduled cleanup share the same claimed native deletion contract. */
-export async function deleteNativeCallArtifacts(paths: readonly string[]): Promise<{
+export async function deleteNativeCallArtifacts(
+  paths: readonly string[],
+  options: ArtifactReconciliationOptions = {}
+): Promise<{
   deletedArtifacts: number;
   pendingArtifactDeletions: number;
   errors: number;
@@ -116,24 +127,36 @@ export async function deleteNativeCallArtifacts(paths: readonly string[]): Promi
   const isLive = (reference: string) =>
     (root[PUBLICATIONS]?.get(identity)?.get(reference)?.size ?? 0) > 0 ||
     store.isPutActive!(reference);
-  const started = Date.now();
+  const deadline = options.deadline ?? Date.now() + 30000;
   for (const reference of unique) {
-    if (Date.now() - started >= 30000) break;
+    if (Date.now() >= deadline) break;
+    let operation: ArtifactStorageOperation | undefined;
     try {
-      const row = await claimArtifactDeletion(database, reference, () => isLive(reference));
+      const row = await claimArtifactDeletion(
+        database,
+        reference,
+        () => isLive(reference),
+        store.storageScope
+      );
       if (row === null || row?.publication_state === "attached") {
         result.pendingArtifactDeletions--;
         continue;
       }
       if (!row) continue;
-      if (row.store_scope !== null && row.store_scope !== store.storageScope)
-        throw new Error("Artifact deletion storage scope does not match");
+      if (row.store_scope !== store.storageScope) {
+        // NULL is legacy authority, not evidence that this bucket owns the object.
+        await postponeArtifactReconciliation(database, reference);
+        continue;
+      }
       if (row.upload_state === "legacy_unknown") {
         await postponeArtifactReconciliation(database, reference);
         continue;
       }
       if (row.upload_state === "uncertain") {
+        operation = "get";
         const bytes = await store.get(reference);
+        options.onStorageSuccess?.(operation);
+        operation = undefined;
         if (bytes === null) {
           await postponeArtifactReconciliation(database, reference);
           continue;
@@ -144,7 +167,7 @@ export async function deleteNativeCallArtifacts(paths: readonly string[]): Promi
           row.expected_sha256 === null ||
           !reference.endsWith(`_${row.expected_sha256}.json`)
         )
-          throw new Error("Artifact reconciliation integrity check failed");
+          throw new ArtifactStorageError("integrity");
         if (isLive(reference)) {
           await postponeArtifactReconciliation(database, reference);
           continue;
@@ -157,15 +180,20 @@ export async function deleteNativeCallArtifacts(paths: readonly string[]): Promi
       }
       // False is confirmed already-absent, not an availability failure. The upload
       // is completed (or never dispatched) before either result can retire identity.
-      if (row.upload_state !== "not_sent" && (await store.delete(reference)))
-        result.deletedArtifacts++;
+      if (row.upload_state !== "not_sent") {
+        operation = "delete";
+        if (await store.delete(reference)) result.deletedArtifacts++;
+        options.onStorageSuccess?.(operation);
+        operation = undefined;
+      }
       if (await createPostgresCleanupRepository(database).acknowledgeArtifactDeletion(reference))
         result.pendingArtifactDeletions--;
     } catch (error) {
       result.errors++;
-      console.error("[Cleanup] Artifact reconciliation failed:", sanitizeErrorMessage(error));
+      options.onFailure?.(error, operation);
+      console.error("[Cleanup] Artifact reconciliation failed", artifactFailureDiagnostic(error));
       await postponeArtifactReconciliation(database, reference).catch(() => {});
-      break;
+      if (isSharedArtifactFailure(error)) break;
     }
   }
   return result;

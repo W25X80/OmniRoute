@@ -94,3 +94,22 @@ export async function acquirePostgresServiceLock(
     `omniroute.services:${owner}`,
   ]);
 }
+
+/** Absent conversation roots coordinate with orphan cleanup in the separate bigint key space. */
+export async function acquireConversationCreationLock(
+  transaction: PostgresTransaction,
+  id: string,
+  skip = false
+): Promise<boolean> {
+  transaction.noteAdvisoryLock?.("conversation-root", "exclusive");
+  const identity = `omniroute.conversation.root:${id}`;
+  if (skip)
+    return (
+      await transaction.query<{ locked: boolean }>(
+        "SELECT pg_try_advisory_xact_lock(hashtextextended($1,0)) AS locked",
+        [identity]
+      )
+    ).rows[0].locked;
+  await transaction.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [identity]);
+  return true;
+}

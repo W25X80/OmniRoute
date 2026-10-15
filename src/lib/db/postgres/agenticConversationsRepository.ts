@@ -8,7 +8,20 @@ import type {
   MultiTurnConversationRow,
 } from "../agenticConversations";
 import type { PostgresDatabase, PostgresTransaction } from "./database";
-import { acquirePostgresLock } from "./locks";
+import {
+  advanceConversationHistory,
+  buildConversationIndex,
+  insertConversationChunks,
+  lockConversationRoots,
+  lockConversationCreation,
+  lockConversationWrite,
+  prepareConversationChunks,
+  readConversationIndex,
+} from "./conversationHistory";
+export {
+  CONVERSATION_INSERT_CHUNK_ROWS,
+  CONVERSATION_INSERT_CHUNK_BYTES,
+} from "./conversationHistory";
 type JsonRecord = Record<string, unknown>;
 
 function asRecord(value: unknown): JsonRecord {
@@ -60,51 +73,20 @@ function toMultiTurnConversationRow(value: unknown): MultiTurnConversationRow {
   };
 }
 
-// Bound each SQL payload without splitting the logical append's transaction.
-export const CONVERSATION_INSERT_CHUNK_ROWS = 256;
-export const CONVERSATION_INSERT_CHUNK_BYTES = 256 * 1024;
-
-function prepareNodeChunks(
-  nodes: Array<{ id: string; parentId: string | null; role: string; contentHash: string }>
-): string[] {
-  const chunks: string[] = [];
-  let rows: string[] = [],
-    bytes = 2;
-  for (const node of nodes) {
-    const row = JSON.stringify([node.id, node.parentId, node.role, node.contentHash]);
-    const size = Buffer.byteLength(row, "utf8");
-    if (size + 2 > CONVERSATION_INSERT_CHUNK_BYTES)
-      throw new RangeError("Conversation turn node exceeds the insert payload limit");
-    if (
-      rows.length &&
-      (rows.length === CONVERSATION_INSERT_CHUNK_ROWS ||
-        bytes + size + 1 > CONVERSATION_INSERT_CHUNK_BYTES)
-    ) {
-      chunks.push(`[${rows.join(",")}]`);
-      rows = [];
-      bytes = 2;
-    }
-    rows.push(row);
-    bytes += size + 1;
-  }
-  if (rows.length) chunks.push(`[${rows.join(",")}]`);
-  return chunks;
-}
-
 const MULTI_TURN_CONVERSATION_SELECT = `
   SELECT ac.*, latest.id as last_call_log_id, latest.model as last_model,
          latest.provider as last_provider, latest.status as last_status,
          latest.artifact_relpath as last_artifact_relpath,
          latest.api_key_id as last_api_key_id
   FROM omniroute.agentic_conversations ac
-  LEFT JOIN (
+  LEFT JOIN LATERAL (
     SELECT cl1.id, cl1.session_tag, cl1.model, cl1.provider, cl1.status,
            cl1.artifact_relpath, cl1.api_key_id
     FROM omniroute.call_logs cl1
-    WHERE cl1.timestamp = (
-      SELECT MAX(cl2.timestamp) FROM omniroute.call_logs cl2 WHERE cl2.session_tag = cl1.session_tag
+    WHERE cl1.session_tag=ac.id AND cl1.timestamp = (
+      SELECT MAX(cl2.timestamp) FROM omniroute.call_logs cl2 WHERE cl2.session_tag = ac.id
     )
-  ) latest ON latest.session_tag = ac.id
+  ) latest ON true
 `;
 
 export function createPostgresAgenticConversationsRepository(database: PostgresDatabase) {
@@ -115,10 +97,10 @@ export function createPostgresAgenticConversationsRepository(database: PostgresD
   ) {
     return database.transaction(
       async (tx) => {
-        await acquirePostgresLock(tx, "conversations", write ? "exclusive" : "shared");
+        if (write) await lockConversationWrite(tx);
         return body(tx);
       },
-      { operation: name }
+      { operation: name, readOnlySnapshot: !write }
     );
   }
   return {
@@ -132,6 +114,7 @@ export function createPostgresAgenticConversationsRepository(database: PostgresD
         async (tx) => {
           const now = new Date().toISOString(),
             id = input.id || `conv_${uuidv4()}`;
+          await lockConversationCreation(tx, id);
           await tx.query(
             "INSERT INTO omniroute.agentic_conversations(id,api_key_id,fingerprint_hash,last_message_count,last_messages_hash,turn_count,first_seen_at,last_seen_at) VALUES($1,$2,$3,0,'',1,$4,$4)",
             [id, input.apiKeyId, input.fingerprintHash, now]
@@ -175,52 +158,25 @@ export function createPostgresAgenticConversationsRepository(database: PostgresD
     getConversationTurnIndex: async (id: string): Promise<ConversationTurnIndex> => {
       const rows = await operation(
         false,
-        async (tx) =>
-          (
-            await tx.query<{ id: string; parent_id: string | null; content_hash: string }>(
-              "SELECT id,parent_id,content_hash FROM omniroute.conversation_turn_nodes WHERE conversation_id=$1 ORDER BY insertion_order",
-              [id]
-            )
-          ).rows,
+        (tx) => readConversationIndex(tx, id),
         "conversations.getConversationTurnIndex"
       );
-      const nodeIds = new Set<string>(),
-        byContentHash = new Map<string, string[]>(),
-        parentsWithChildren = new Set<string>();
-      for (const row of rows) {
-        nodeIds.add(row.id);
-        if (row.parent_id) parentsWithChildren.add(row.parent_id);
-        if (row.content_hash) {
-          const bucket = byContentHash.get(row.content_hash) || [];
-          bucket.push(row.id);
-          byContentHash.set(row.content_hash, bucket);
-        }
-      }
-      return { nodeIds, byContentHash, parentsWithChildren };
+      return buildConversationIndex(rows);
     },
     insertConversationTurnNodes: (
       id: string,
       correlationId: string | null,
       nodes: Array<{ id: string; parentId: string | null; role: string; contentHash: string }>
     ) => {
-      const chunks = prepareNodeChunks(nodes);
+      const chunks = prepareConversationChunks(nodes);
       if (!chunks.length) return Promise.resolve();
       return operation(
         true,
         async (tx) => {
-          const now = new Date().toISOString();
-          for (const payload of chunks) {
-            // ORDER BY feeds identity allocation in caller order, including conflict gaps.
-            // Chunks share this transaction: a later failure rolls back the whole append.
-            await tx.query(
-              `INSERT INTO omniroute.conversation_turn_nodes
-            (id,conversation_id,parent_id,role,content_hash,last_correlation_id,first_seen_at,last_seen_at)
-            SELECT node->>0,$1,node->>1,node->>2,node->>3,$2,$3,$3
-            FROM jsonb_array_elements($4::jsonb) WITH ORDINALITY AS input(node,ordinal)
-            ORDER BY ordinal ON CONFLICT(id) DO NOTHING`,
-              [id, correlationId, now, payload]
-            );
-          }
+          const [root] = await lockConversationRoots(tx, [id]);
+          if (!root) throw new Error("Conversation root is unavailable");
+          if (await insertConversationChunks(tx, id, correlationId, chunks))
+            await advanceConversationHistory(tx, [id]);
         },
         "conversations.insertConversationTurnNodes"
       );
@@ -281,6 +237,7 @@ export function createPostgresAgenticConversationsRepository(database: PostgresD
         true,
         async (tx) => {
           const now = new Date().toISOString();
+          await lockConversationCreation(tx, id);
           await tx.query(
             `INSERT INTO omniroute.agentic_conversations(id,api_key_id,fingerprint_hash,last_message_count,last_messages_hash,turn_count,first_seen_at,last_seen_at)
         VALUES($1,$2,'',0,'',1,$3,$3) ON CONFLICT(id) DO UPDATE SET turn_count=agentic_conversations.turn_count+1,last_seen_at=excluded.last_seen_at`,
@@ -294,7 +251,7 @@ export function createPostgresAgenticConversationsRepository(database: PostgresD
         false,
         async (tx) => {
           const floor =
-            "WHERE (SELECT count(*) FROM omniroute.conversation_turn_nodes n WHERE n.conversation_id=ac.id)>=2";
+            "WHERE EXISTS(SELECT 1 FROM omniroute.conversation_turn_nodes n WHERE n.conversation_id=ac.id OFFSET 1 LIMIT 1)";
           const total = Number(
             (
               await tx.query<{ c: string }>(

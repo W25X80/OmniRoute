@@ -76,6 +76,19 @@ const BACKGROUND_LIMIT = 64;
 const TAIL_LIMIT = 64;
 const ATTEMPT_LIMIT = 64;
 
+export type PersistenceBackgroundOwner = "lkgp.clear" | "lkgp.record" | "artifact.reconcile";
+type BackgroundCounters = { admitted: number; completed: number; refused: number; failed: number };
+const metricsKey = Symbol.for("omniroute.persistence.background.metrics.v1");
+const metricsRoot = globalThis as typeof globalThis & {
+  [metricsKey]?: Partial<Record<PersistenceBackgroundOwner, BackgroundCounters>>;
+};
+const backgroundMetrics = (metricsRoot[metricsKey] ??= {});
+export function getPersistenceBackgroundMetrics() {
+  return Object.fromEntries(
+    Object.entries(backgroundMetrics).map(([owner, value]) => [owner, { ...value }])
+  );
+}
+
 function runtime(): Runtime {
   const backend = parseDatabaseBackend();
   const existing = globalThis.__omniroutePersistenceRuntime;
@@ -293,17 +306,32 @@ export function cancelPersistenceAttempts(): void {
 }
 
 /** Admit at enqueue time. During drain, only live admitted work can create descendants. */
-export async function runPersistenceBackgroundWork<T>(body: () => Promise<T>): Promise<T> {
+export async function runPersistenceBackgroundWork<T>(
+  body: () => Promise<T>,
+  options: { owner?: PersistenceBackgroundOwner } = {}
+): Promise<T> {
   if (parseDatabaseBackend() === "sqlite") return body();
   const state = runtime();
+  const counters = options.owner
+    ? (backgroundMetrics[options.owner] ??= { admitted: 0, completed: 0, refused: 0, failed: 0 })
+    : undefined;
   const descendant = state.owners.getStore()?.active === true;
   if (
     (state.phase !== "ready" && !(state.phase === "closing" && descendant)) ||
     state.background.size >= BACKGROUND_LIMIT
   ) {
+    if (counters) counters.refused++;
     throw new Error("Persistence background admission is unavailable");
   }
-  return tracked(state.background, freshScope(state, body));
+  if (counters) counters.admitted++;
+  try {
+    const value = await tracked(state.background, freshScope(state, body));
+    if (counters) counters.completed++;
+    return value;
+  } catch (error) {
+    if (counters) counters.failed++;
+    throw error;
+  }
 }
 
 /** Internal shutdown owners can flush after request admission closes. */

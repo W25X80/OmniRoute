@@ -63,6 +63,55 @@ have a separate 512 MiB logical content boundary. New files use transactional 8 
 chunks with a final size/SHA marker; callers retain the logical file API. This size limit does not
 guarantee completion within the configured SQL deadlines.
 
+### History concurrency and artifact recovery
+
+Native migration 9 adds a root `history_revision` and indexes for session-specific latest-log
+lookups and fingerprint candidates. History reads use MVCC without the global history advisory
+lock; compound reads request a read-only repeatable-read transaction from the database owner.
+Ordinary writers take a shared reset gate and lock their affected parent rows before node rows.
+Only an explicit whole-history reset takes the gate exclusively. Classification runs outside SQL,
+then append/count changes commit atomically if both the parent incarnation and revision match.
+An acknowledged pre-write conflict can be reclassified twice; an unknown COMMIT is never replayed.
+The process-local fingerprint fence has bounded waiting and cancellation. This remains a
+single-writer deployment profile, not multi-replica qualification.
+
+LKGP record and clear operations acquire background ownership before suspension, retain the
+existing 64-operation limit, and drain during shutdown. Related hints commit together. Delayed
+clears compare the observed persisted value, including its private revision token, so a newer
+success on the same provider/account survives an older failure. The public pin shape is unchanged.
+
+The existing 30-second artifact recovery producer serves publication and deletion queues in
+alternating order, within one 10-second admission budget. An admitted storage operation retains
+its actual I/O lifetime; the pass does not abandon raw work at its admission deadline. Shared
+transport/authentication failures stop the pass with bounded backoff (30 seconds to 5 minutes).
+Object-specific integrity/reference failures defer that item and allow neighbours to proceed.
+The six-hour retention schedule is unchanged. Only matching, non-NULL storage scopes are eligible
+for automated object deletion; legacy and foreign-scope entries need explicit operator review.
+
+S3 requires bucket-level `s3:ListBucket` to distinguish a missing object from forbidden access
+using GET. Provision this separately for the dedicated artifact bucket and the actual task role,
+with an explicit decision about exposing object names outside the call-log prefix. Validate an
+existing object and a random missing key under that role with ExpectedBucketOwner. A 403 is an
+availability/access failure, never evidence of absence. A negative GET after an uncertain PUT
+does not prove that the PUT cannot complete later; its journal identity remains pending.
+
+The authenticated management health payload includes `artifactReconciliation` (pending/uncertain/
+legacy/foreign-scope counts, staged bytes, oldest pending timestamp and safe failure diagnostics)
+and `persistenceBackground` counters for the declared LKGP/reconciliation owners. Anonymous
+liveness responses do not expose these details. PostgreSQL diagnostics separate advisory lock,
+query and COMMIT timing; slow successful operations are rate-limited by static operation name.
+`npm run check:persistence-background-owners` is an AST admission ratchet with a frozen legacy
+inventory. It does not prove transitive callback safety or the absence of all blocking code;
+scenario tests and native runtime qualification remain required.
+
+Before upgrading, drain the sole writer and capture a verified recoverable database backup plus
+the unchanged encryption/authentication secrets. Apply migration 9 offline and verify its history
+and indexes before opening traffic. An older image does not recognize the new migration history:
+image-only rollback is unsupported. Rehearse a database-aware restore on an isolated target.
+Restoring the pre-upgrade backup after traffic resumes loses later database writes; obtain an
+explicit recovery-point decision before doing so. Prefer a compatible corrective image when
+retaining those writes is required. Do not delete or edit migration-history rows to bypass checks.
+
 ## Offline SQLite cutover
 
 The following commands run from a source checkout with its project dependencies installed.

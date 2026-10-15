@@ -8,6 +8,8 @@ import { APP_CONFIG } from "@/shared/constants/config";
 import { AI_PROVIDERS } from "@/shared/constants/providers";
 import { isAuthenticated } from "@/shared/utils/apiAuth";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
+import { getArtifactReconciliationStatus } from "@/lib/usage/artifactReconciliationStatus";
+import { getPersistenceBackgroundMetrics } from "@/lib/db/persistenceRuntime";
 
 /**
  * GET /api/monitoring/health — System health overview
@@ -304,32 +306,40 @@ async function rebuildHealthPayload(): Promise<unknown> {
   // the DB — a monitoring read stays cheap. Additive key, nothing moves.
   const walMaintenance = readHealthValue("wal maintenance", () => getWalMaintenanceState(), null);
 
-  const payload = buildHealthPayload({
-    appVersion: APP_CONFIG.version,
-    // #10427: surface the artifact's git SHA so a deployment can be audited over HTTP
-    // instead of SSH + grepping compiled chunks (the 2026-08-14 gateway outage).
-    buildSha: await readRunningBuildShaAsync(),
-    catalogCount: Object.keys(AI_PROVIDERS).length,
-    settings,
-    connections,
-    circuitBreakers,
-    rateLimitStatus,
-    learnedLimits,
-    lockouts,
-    localProviders,
-    inflightRequests:
-      requestDedupModule.status === "fulfilled"
-        ? readHealthValue("inflight requests", () => requestDedupModule.value.getInflightCount(), 0)
-        : 0,
-    quotaMonitorSummary,
-    quotaMonitorMonitors,
-    activeSessions,
-    activeSessionsByKey,
-    credentialHealth,
-    adaptiveAdmission,
-    chatAdmission,
-    walMaintenance,
-  });
+  const payload = {
+    ...buildHealthPayload({
+      appVersion: APP_CONFIG.version,
+      // #10427: surface the artifact's git SHA so a deployment can be audited over HTTP
+      // instead of SSH + grepping compiled chunks (the 2026-08-14 gateway outage).
+      buildSha: await readRunningBuildShaAsync(),
+      catalogCount: Object.keys(AI_PROVIDERS).length,
+      settings,
+      connections,
+      circuitBreakers,
+      rateLimitStatus,
+      learnedLimits,
+      lockouts,
+      localProviders,
+      inflightRequests:
+        requestDedupModule.status === "fulfilled"
+          ? readHealthValue(
+              "inflight requests",
+              () => requestDedupModule.value.getInflightCount(),
+              0
+            )
+          : 0,
+      quotaMonitorSummary,
+      quotaMonitorMonitors,
+      activeSessions,
+      activeSessionsByKey,
+      credentialHealth,
+      adaptiveAdmission,
+      chatAdmission,
+      walMaintenance,
+    }),
+    artifactReconciliation: getArtifactReconciliationStatus(),
+    persistenceBackground: getPersistenceBackgroundMetrics(),
+  };
 
   if (generation === healthPayloadCacheGeneration) {
     healthPayloadCache = { payload, expiresAt: Date.now() + HEALTH_PAYLOAD_TTL_MS };

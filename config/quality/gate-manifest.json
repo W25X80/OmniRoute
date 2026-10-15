@@ -240,7 +240,7 @@
     },
     {
       "name": "check:postgres-lock-owners",
-      "command": "node scripts/check/check-postgres-lock-owners.mjs",
+      "command": "node scripts/check/check-postgres-lock-owners.mjs && npm run check:persistence-background-owners",
       "disposition": "separately-invoked"
     },
     {
@@ -696,6 +696,11 @@
     {
       "name": "typecheck:noimplicit:core",
       "command": "tsc --pretty false -p tsconfig.typecheck-noimplicit-core.json",
+      "disposition": "separately-invoked"
+    },
+    {
+      "name": "check:persistence-background-owners",
+      "command": "node scripts/check/check-persistence-background-owners.mjs",
       "disposition": "separately-invoked"
     }
   ],

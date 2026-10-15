@@ -1,5 +1,10 @@
 import { artifactHasSqlOwner, lockArtifactPublication } from "./artifactPublicationRepository";
 import { acquirePostgresLock } from "./locks";
+import {
+  deleteExpiredConversationNodes,
+  deleteExpiredConversationRoots,
+  invalidatePurgedConversationHistory,
+} from "./conversationRetention";
 import type { DeleteByPeriodTarget } from "../cleanup/usagePurge";
 import type { PostgresDatabase, PostgresTransaction } from "./database";
 
@@ -106,6 +111,49 @@ export function createPostgresCleanupRepository(database: PostgresDatabase) {
         return result.rows.map((row) => row.relpath);
       });
     },
+    async dueArtifactDeletions(scope: string, limit = 8): Promise<string[]> {
+      return database.transaction(async (tx) =>
+        (
+          await tx.query<{ relpath: string }>(
+            `SELECT relpath FROM omniroute.artifact_deletion_queue
+           WHERE publication_state='delete_pending' AND store_scope=$1
+           AND upload_state<>'legacy_unknown' AND next_attempt_at<=statement_timestamp()
+           ORDER BY next_attempt_at,created_at,relpath LIMIT $2`,
+            [scope, Math.max(1, Math.min(8, limit))]
+          )
+        ).rows.map((row) => row.relpath)
+      );
+    },
+    async artifactReconciliationCounts(scope: string) {
+      return database.transaction(async (tx) => {
+        const row = (
+          await tx.query<{
+            pending: string;
+            uncertain: string;
+            legacy: string;
+            foreign_scope: string;
+            staged_bytes: string;
+            oldest_pending_at: string | null;
+          }>(
+            `SELECT count(*) AS pending,
+          count(*) FILTER(WHERE upload_state='uncertain') AS uncertain,
+          count(*) FILTER(WHERE upload_state='legacy_unknown' OR store_scope IS NULL) AS legacy,
+          count(*) FILTER(WHERE store_scope IS NOT NULL AND store_scope<>$1) AS foreign_scope,
+          COALESCE(sum(staged_bytes),0) AS staged_bytes,min(created_at)::text AS oldest_pending_at
+          FROM omniroute.artifact_deletion_queue WHERE publication_state<>'attached'`,
+            [scope]
+          )
+        ).rows[0];
+        return {
+          pending: Number(row.pending),
+          uncertain: Number(row.uncertain),
+          legacy: Number(row.legacy),
+          foreignScope: Number(row.foreign_scope),
+          stagedBytes: Number(row.staged_bytes),
+          oldestPendingAt: row.oldest_pending_at,
+        };
+      });
+    },
     async acknowledgeArtifactDeletion(path: string): Promise<boolean> {
       return database.transaction(async (transaction) => {
         await lockArtifactPublication(transaction);
@@ -137,23 +185,10 @@ export function createPostgresCleanupRepository(database: PostgresDatabase) {
             await acquirePostgresLock(transaction, "accounting");
           }
           if (!(await exists(transaction, target.table))) return 0;
-          if (target.table === "conversation_turn_nodes") {
-            // Deleting the ordered prefix makes the remaining index a durable
-            // resume position. Always restart there: skipped locks and backdated
-            // arrivals are revisited on later passes rather than lost behind a cursor.
-            // Consume physical tuple addresses only inside this statement while
-            // their row locks are held. A TID-array lookup avoids an id join whose
-            // cost-based plan can scan the whole history for each bounded batch.
-            const result = await transaction.query(
-              `WITH expired AS MATERIALIZED (
-                 SELECT ctid FROM ${table}
-                 WHERE last_seen_at_retention < $1::timestamptz
-                 ORDER BY last_seen_at_retention,id LIMIT 1000 FOR UPDATE SKIP LOCKED)
-               DELETE FROM ${table} WHERE ctid=ANY(ARRAY(SELECT ctid FROM expired))`,
-              [value]
-            );
-            return result.rowCount ?? 0;
-          }
+          if (target.table === "conversation_turn_nodes")
+            return deleteExpiredConversationNodes(transaction, String(value));
+          if (target.table === "agentic_conversations")
+            return deleteExpiredConversationRoots(transaction, String(value), false);
           const result = await transaction.query(
             `WITH expired AS (SELECT ctid FROM ${table} WHERE ${target.cutoff === "iso" ? `"${target.column}"::timestamptz < $1::timestamptz` : `"${target.column}" < $1`} LIMIT 1000)
              DELETE FROM ${table} WHERE ctid IN (SELECT ctid FROM expired)`,
@@ -162,7 +197,7 @@ export function createPostgresCleanupRepository(database: PostgresDatabase) {
           return result.rowCount ?? 0;
         });
         deleted += count;
-        if (count < 1000) break;
+        if (count === 0 || (target.table !== "conversation_turn_nodes" && count < 1000)) break;
       }
       return deleted;
     },
@@ -175,16 +210,7 @@ export function createPostgresCleanupRepository(database: PostgresDatabase) {
             !(await exists(transaction, "conversation_turn_nodes"))
           )
             return 0;
-          const result = await transaction.query(
-            `WITH expired AS (
-               SELECT ctid FROM omniroute.agentic_conversations a
-               WHERE last_seen_at::timestamptz < $1::timestamptz AND NOT EXISTS
-                 (SELECT 1 FROM omniroute.conversation_turn_nodes n WHERE n.conversation_id = a.id)
-               LIMIT 1000)
-             DELETE FROM omniroute.agentic_conversations WHERE ctid IN (SELECT ctid FROM expired)`,
-            [cutoff]
-          );
-          return result.rowCount ?? 0;
+          return deleteExpiredConversationRoots(transaction, cutoff, true);
         });
         deleted += count;
         if (count < 1000) break;
@@ -220,6 +246,11 @@ export function createPostgresCleanupRepository(database: PostgresDatabase) {
     async deleteAll(table: string): Promise<number> {
       const qualified = qualify(table);
       return database.transaction(async (transaction) => {
+        if (table === "conversation_turn_nodes" || table === "agentic_conversations") {
+          await acquirePostgresLock(transaction, "conversations");
+          if (table === "conversation_turn_nodes")
+            await invalidatePurgedConversationHistory(transaction);
+        }
         if (!(await exists(transaction, table))) return 0;
         const result = await transaction.query(`DELETE FROM ${qualified}`);
         return result.rowCount ?? 0;
@@ -235,6 +266,16 @@ export function createPostgresCleanupRepository(database: PostgresDatabase) {
           targets.some((target) => target.table === "call_logs" && (!cutoff || !target.allOnly))
         ) {
           await acquirePostgresLock(transaction, "accounting");
+        }
+        const historyTargets = targets.filter(
+          (target) =>
+            (!cutoff || !target.allOnly) &&
+            (target.table === "conversation_turn_nodes" || target.table === "agentic_conversations")
+        );
+        if (historyTargets.length) {
+          await acquirePostgresLock(transaction, "conversations");
+          if (historyTargets.some((target) => target.table === "conversation_turn_nodes"))
+            await invalidatePurgedConversationHistory(transaction);
         }
         const counts: Record<string, number> = {};
         const artifacts: string[] = [];
