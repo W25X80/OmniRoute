@@ -38,13 +38,13 @@ export async function deleteExpiredConversationNodes(tx: PostgresTransaction, cu
   // before checking absence, so their deletion cannot silently change a new incarnation.
   const orphans = (
     await tx.query<{ conversation_id: string }>(
-      `SELECT DISTINCT conversation_id FROM (
+      `SELECT DISTINCT conversation_id COLLATE "C" AS conversation_id FROM (
        SELECT n.conversation_id FROM omniroute.conversation_turn_nodes n
        WHERE n.last_seen_at_retention<$1::timestamptz
        ORDER BY n.last_seen_at_retention,n.id LIMIT 1000) candidates
      WHERE NOT EXISTS(SELECT 1 FROM omniroute.agentic_conversations a
        WHERE a.id=candidates.conversation_id)
-     ORDER BY conversation_id COLLATE "C" LIMIT 16`,
+     ORDER BY conversation_id LIMIT 16`,
       [cutoff]
     )
   ).rows;
