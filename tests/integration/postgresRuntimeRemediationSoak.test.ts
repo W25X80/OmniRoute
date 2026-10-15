@@ -74,6 +74,7 @@ const effects = new Map<
   }
 >();
 const diagnostics: unknown[] = [];
+const slowCommits: Record<string, unknown>[] = [];
 const cleanupDiagnostics = new AsyncLocalStorage<Record<string, unknown>[]>();
 const accountingLockStatement = createHash("sha256")
   .update("SELECT pg_advisory_xact_lock(18765,$1)")
@@ -82,8 +83,25 @@ const artifactErrors: { operation: string; name?: string; kind?: string; sqlStat
 let capacityDiagnostics = 0;
 let expectedStorageWarnings = 0;
 const logger = {
-  warn(fields: Record<string, unknown>) {
+  warn(fields: Record<string, unknown>, message?: string) {
     const cleanup = cleanupDiagnostics.getStore();
+    // Successful SQL I/O can exceed one second for the 512 MiB fixture. Keep
+    // its new latency telemetry separate from failures and callback stalls;
+    // the durability, overlap, admission, RSS and event-loop gates still apply.
+    if (
+      message === "Slow PostgreSQL operation committed" &&
+      fields.outcome === "committed" &&
+      fields.phase === "commit" &&
+      fields.sqlState === undefined &&
+      typeof fields.callbackGapMs === "number" &&
+      fields.callbackGapMs < 1000 &&
+      typeof fields.durationMs === "number" &&
+      Number.isFinite(fields.durationMs) &&
+      fields.durationMs >= 1000
+    ) {
+      if (slowCommits.length < 64) slowCommits.push(fields);
+      return;
+    }
     if (!cleanup && fields.outcome === "overloaded" && !fields.sqlState) {
       capacityDiagnostics++;
       return;
@@ -382,6 +400,7 @@ test(
       retentionDeleted,
       capacityDiagnostics,
       diagnostics: diagnostics.length,
+      slowCommits,
       fatal: fatal.length,
       eventLoopP99Ms: loop.percentile(99) / 1e6,
       eventLoopMaxMs: loop.max / 1e6,
@@ -1514,6 +1533,7 @@ test(
               drained: drainedCleanupDeferrals,
             },
             diagnostics: diagnostics.length,
+            slowCommits,
             fatal: fatal.length,
             peakRss: maxRss,
             eventLoopP99Ms: loop.percentile(99) / 1e6,
