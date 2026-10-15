@@ -202,6 +202,89 @@ test(
       });
 
       await t.test(
+        "operator-only CLI actions preserve native asynchronous persistence",
+        async () => {
+          const tokenRoute = await import("../../src/app/api/cli/tokens/route.ts");
+          const keyRoute = await import("../../src/app/api/cli-tools/keys/route.ts");
+          const accessTokens = await import("../../src/lib/db/accessTokens.ts");
+          const { SignJWT } = await import("jose");
+          const jwtEnvironment = process.env.JWT_SECRET;
+          const session = await new SignJWT({ authenticated: true })
+            .setProtectedHeader({ alg: "HS256" })
+            .setIssuedAt()
+            .setExpirationTime("1h")
+            .sign(new TextEncoder().encode(first.bootstrapSecrets.jwtSecret));
+          process.env.JWT_SECRET = first.bootstrapSecrets.jwtSecret;
+          try {
+            await first.run(async () => {
+              const previous = await settings.getSettings();
+              await settings.updateSettings({ requireLogin: true });
+              try {
+                const machine = await keys.createApiKey("native-cli-machine", "native-cli", [
+                  "manage",
+                ]);
+                const victim = await keys.createApiKey("native-cli-operator", "native-cli", [
+                  "admin",
+                ]);
+                const before = await accessTokens.listAccessTokensAsync();
+                const denied = await tokenRoute.POST(
+                  new Request("http://localhost/api/cli/tokens", {
+                    method: "POST",
+                    headers: {
+                      authorization: `Bearer ${machine.key}`,
+                      "content-type": "application/json",
+                    },
+                    body: JSON.stringify({ name: "native-denied-admin", scope: "admin" }),
+                  })
+                );
+                assert.equal(denied.status, 403);
+                assert.deepEqual(await accessTokens.listAccessTokensAsync(), before);
+                const masked = await keyRoute.GET(
+                  new Request("http://localhost/api/cli-tools/keys", {
+                    headers: { authorization: `Bearer ${machine.key}` },
+                  })
+                );
+                assert.equal(masked.status, 200);
+                const text = await masked.text();
+                assert.ok(!text.includes(machine.key) && !text.includes(victim.key));
+                assert.ok(!text.includes('"rawKey"'));
+                const granted = await tokenRoute.POST(
+                  new Request("http://localhost/api/cli/tokens", {
+                    method: "POST",
+                    headers: {
+                      cookie: `auth_token=${session}`,
+                      "content-type": "application/json",
+                    },
+                    body: JSON.stringify({ name: "native-operator-admin", scope: "admin" }),
+                  })
+                );
+                assert.equal(granted.status, 200);
+                assert.equal((await granted.json()).scope, "admin");
+                const plaintext = await keyRoute.GET(
+                  new Request("http://localhost/api/cli-tools/keys", {
+                    headers: { cookie: `auth_token=${session}` },
+                  })
+                );
+                assert.equal(plaintext.status, 200);
+                assert.equal(
+                  (await plaintext.json()).keys.find((entry) => entry.id === victim.id).rawKey,
+                  victim.key
+                );
+                assert.throws(() => sqlite.getDbInstance(), UnsupportedPersistenceDomainError);
+                assert.equal(process.env.JWT_SECRET, first.bootstrapSecrets.jwtSecret);
+              } finally {
+                await settings.updateSettings({ requireLogin: previous.requireLogin });
+              }
+            });
+          } finally {
+            if (jwtEnvironment === undefined) delete process.env.JWT_SECRET;
+            else process.env.JWT_SECRET = jwtEnvironment;
+          }
+          assert.equal(process.env.JWT_SECRET, jwtEnvironment);
+        }
+      );
+
+      await t.test(
         "unported synchronous access rejects even with an existing SQLite singleton",
         async () => {
           mkdirSync(directory, { recursive: true });
