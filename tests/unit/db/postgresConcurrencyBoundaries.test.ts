@@ -68,8 +68,12 @@ describe("PostgreSQL concurrency boundaries", () => {
       contentHash: `hash-${i}`,
     }));
     input[1] = { ...input[0], contentHash: "conflicting-retry" };
-    const f = fixture((sql) =>
-      sql.includes("SELECT id,parent_id")
+    const f = fixture((sql) => {
+      if (sql.includes("AS incarnation,history_revision::text AS revision")) {
+        assert.match(sql, /FOR UPDATE/);
+        return [{ id: "conversation", incarnation: "1", revision: "0" }];
+      }
+      return sql.includes("SELECT id,parent_id")
         ? [
             {
               get id() {
@@ -80,8 +84,8 @@ describe("PostgreSQL concurrency boundaries", () => {
               content_hash: "hash-0",
             },
           ]
-        : []
-    );
+        : [];
+    });
     const repo = createPostgresAgenticConversationsRepository(f.database);
     await repo.insertConversationTurnNodes("conversation", "correlation", input);
     const inserts = f.calls.filter(({ sql }) => sql.includes("INSERT INTO"));
