@@ -15,13 +15,21 @@ test(
     timeout: 1200000,
   },
   async () => {
-    const database = await createTestPostgresDatabase({ maxConnections: 4 });
+    const roots = 55000,
+      nodes = 12500000,
+      logs = 90000;
+    // Bulk preparation and ANALYZE use an offline budget, including waits for maintenance.
+    // The measured application below gets a separate client with the original defaults.
+    const setup = await createTestPostgresDatabase({
+      maxConnections: 1,
+      lockTimeoutMs: 30_000,
+      statementTimeoutMs: 240_000,
+      queryTimeoutMs: 250_000,
+      transactionTimeoutMs: 600_000,
+    });
     try {
-      await migratePostgresSchema(database);
-      const roots = 55000,
-        nodes = 12500000,
-        logs = 90000;
-      await database.transaction((tx) =>
+      await migratePostgresSchema(setup);
+      await setup.transaction((tx) =>
         tx.query(
           `INSERT INTO omniroute.agentic_conversations(id,api_key_id,fingerprint_hash,last_message_count,last_messages_hash,first_seen_at,last_seen_at)
        SELECT 'scale-root-'||n,NULL,'scale',0,'','2026-10-15T00:00:00Z','2026-10-15T00:00:00Z' FROM generate_series(1,$1) n`,
@@ -29,7 +37,7 @@ test(
         )
       );
       for (let start = 1; start <= nodes; start += 10000) {
-        await database.transaction((tx) =>
+        await setup.transaction((tx) =>
           tx.query(
             `INSERT INTO omniroute.conversation_turn_nodes(id,conversation_id,parent_id,role,content_hash,first_seen_at,last_seen_at)
          SELECT 'scale-node-'||n,'scale-root-'||(n%$3+1),NULL,'user',repeat('a',64),'2026-10-15T00:00:00Z','2026-10-15T00:00:00Z'
@@ -39,7 +47,7 @@ test(
         );
       }
       for (let start = 1; start <= logs; start += 10000)
-        await database.transaction((tx) =>
+        await setup.transaction((tx) =>
           tx.query(
             `INSERT INTO omniroute.call_logs(id,timestamp,session_tag)
        SELECT 'scale-log-'||n,'2026-10-15T00:00:00Z','scale-root-'||(n%$3+1) FROM generate_series($1::int,$2::int) n`,
@@ -47,7 +55,19 @@ test(
           )
         );
       for (const table of ["agentic_conversations", "conversation_turn_nodes", "call_logs"])
-        await database.transaction((tx) => tx.query(`ANALYZE omniroute.${table}`));
+        await setup.transaction((tx) => tx.query(`ANALYZE omniroute.${table}`));
+    } finally {
+      await setup.close();
+    }
+    const database = await createTestPostgresDatabase({ maxConnections: 4 });
+    try {
+      const timeouts = await database.transaction((tx) =>
+        tx.query(
+          "SELECT current_setting('lock_timeout') AS lock_timeout,current_setting('statement_timeout') AS statement_timeout"
+        )
+      );
+      assert.deepEqual(timeouts.rows, [{ lock_timeout: "1s", statement_timeout: "5s" }]);
+      console.info("OMNIROUTE_HISTORY_SCALE_FIXTURE_READY");
       const repository = createPostgresAgenticConversationsRepository(database);
       const readMs: number[] = [],
         writeMs: number[] = [];
