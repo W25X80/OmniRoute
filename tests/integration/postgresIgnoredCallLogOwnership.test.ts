@@ -252,7 +252,7 @@ test(
             assert.equal(result.rows[0].detail_state, "none");
             assert.equal(result.rows[0].has_request_body, 0);
             assert.equal(result.rows[0].has_response_body, 0);
-            assert.match(result.rows[0].error_summary, /model_not_allowed/);
+            assert.equal(result.rows[0].error_summary, null, "privacy also removes error details");
             assert.equal(
               callLogNativeFixture.puts,
               puts,
@@ -271,22 +271,33 @@ test(
       await t.test(
         "accepted call-log producers use one slot through preparation and persistence",
         async () => {
-          const prepared = barrier(),
+          const prepared = Array.from({ length: 64 }, () => barrier()),
+            entered = Array.from({ length: 64 }, () => barrier()),
             jobs: Promise<void>[] = [];
           try {
             await runtime!.runPersistenceRequest(async () => {
-              for (let index = 0; index < 64; index++)
+              for (let index = 0; index < 64; index++) {
                 jobs.push(
                   callLogs.saveCallLogFrom(async () => {
-                    await prepared.promise;
+                    entered[index].resolve();
+                    await prepared[index].promise;
                     return { id: `${prefix}-prepared-${index}`, status: 403 };
                   })
                 );
+                // Hold every producer without saturating the independent SQL admission budget.
+                await Promise.race([
+                  entered[index].promise,
+                  jobs[index].then(() => assert.fail("producer ended before preparation")),
+                ]);
+              }
               assert.equal(state.background.size, 64);
             });
             assert.equal(await callLogs.waitForCallLogSaves(1), false);
-            prepared.resolve();
-            await Promise.all(jobs);
+            // The first save starts with all 64 background slots occupied and must reuse its slot.
+            for (let index = 0; index < jobs.length; index++) {
+              prepared[index].resolve();
+              await jobs[index];
+            }
             const result = await database.transaction((tx) =>
               tx.query<{ count: number }>(
                 "SELECT COUNT(*)::int AS count FROM omniroute.call_logs WHERE id LIKE $1",
@@ -295,7 +306,7 @@ test(
             );
             assert.equal(result.rows[0].count, 64, "preparation cannot consume a second admission");
           } finally {
-            prepared.resolve();
+            for (const gate of prepared) gate.resolve();
             await Promise.allSettled(jobs);
           }
         }
