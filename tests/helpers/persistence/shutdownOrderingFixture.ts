@@ -120,6 +120,7 @@ export const stopNativeArtifactRecovery = stop;
 export const stopSessionAccountAffinityCleanup = stop;
 export const stopCleanupSchedulerAsync = stop;
 export const stopCredentialHealthCheckAsync = stop;
+export const stopLocalHealthCheck = stop;
 export const stopQuotaAutoPingAsync = stop;
 export const stopReasoningCacheCleanupJob = stop;
 export const stopContextWindowReconcileAsync = stop;

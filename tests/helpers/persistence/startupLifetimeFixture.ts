@@ -134,6 +134,9 @@ export async function stopCleanupSchedulerAsync(): Promise<void> {
 export async function stopCredentialHealthCheckAsync(): Promise<void> {
   await stop("credential");
 }
+export function stopLocalHealthCheck(): void {
+  record("stop:localHealth");
+}
 export async function stopQuotaAutoPingAsync(): Promise<void> {
   await stop("quotaPing");
 }
