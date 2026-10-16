@@ -172,6 +172,12 @@ async function stopPostgresApplication(): Promise<void> {
                   return module.stopQuotaAutoPingAsync();
                 }
             ),
+            import("@/lib/localHealthCheck").then(
+              (module) =>
+                function stopLocalHealthCheck() {
+                  module.stopLocalHealthCheck();
+                }
+            ),
             import("@/lib/jobs/reasoningCacheCleanupJob").then(
               (module) =>
                 function stopReasoningCacheCleanupJob() {

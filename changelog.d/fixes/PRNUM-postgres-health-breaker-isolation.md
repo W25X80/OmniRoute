@@ -1,0 +1,2 @@
+- **fix(postgres):** Run local provider health sweeps in fresh background scopes, stop their scheduler before shutdown drain, and isolate circuit-breaker persistence from accounting maintenance.
+- **fix(sse):** Share resource-pressure state across server bundles (backported from upstream #16144).

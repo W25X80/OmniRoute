@@ -76,7 +76,7 @@ export async function appendResetLog(tx: PostgresTransaction, entry: ResetLog) {
   );
 }
 
-/** Domain operations serialize on lock 8; callbacks contain database work only. */
+/** Accounting and breaker snapshots have independent fences; callbacks contain SQL only. */
 export class PostgresDomainStateRepository {
   constructor(readonly database: PostgresDatabase) {}
 
@@ -281,7 +281,8 @@ export class PostgresDomainStateRepository {
     );
   }
   async saveCircuitBreakerState(name: string, state: Breaker) {
-    await this.withDomainLock(async (tx) => {
+    await this.database.transaction(async (tx) => {
+      await acquirePostgresLock(tx, "circuitBreakers");
       await tx.query(
         `INSERT INTO omniroute.domain_circuit_breakers(name,state,failure_count,last_failure_time,options)
        VALUES($1,$2,$3,$4,$5) ON CONFLICT(name) DO UPDATE SET state=excluded.state,
@@ -338,12 +339,14 @@ export class PostgresDomainStateRepository {
   }
 
   async deleteCircuitBreakerState(name: string) {
-    await this.withDomainLock(async (tx) => {
+    await this.database.transaction(async (tx) => {
+      await acquirePostgresLock(tx, "circuitBreakers");
       await tx.query("DELETE FROM omniroute.domain_circuit_breakers WHERE name=$1", [name]);
     });
   }
   async deleteAllCircuitBreakerStates() {
-    await this.withDomainLock(async (tx) => {
+    await this.database.transaction(async (tx) => {
+      await acquirePostgresLock(tx, "circuitBreakers");
       await tx.query("DELETE FROM omniroute.domain_circuit_breakers");
     });
   }

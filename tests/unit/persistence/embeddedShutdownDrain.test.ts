@@ -290,6 +290,8 @@ server.listen(Number(process.argv[2]), "127.0.0.1", () => console.log("child-rea
       assert.ok(fixture.events.indexOf("child:exit") < fixture.events.indexOf("buffers:closing"));
       assert.ok(fixture.events.indexOf("buffers:closed") < fixture.events.indexOf("pool-close"));
       assert.equal(fixture.poolCloses, 1);
+      assert.equal(fixture.events.filter((event) => event === "local-health:stop").length, 1);
+      assert.ok(fixture.events.indexOf("local-health:stop") < fixture.events.indexOf("pool-close"));
       assert.equal(fixture.events.filter((event) => event === "subscription:stop").length, 1);
       assert.ok(
         fixture.events.indexOf("subscription:stopped") < fixture.events.indexOf("cost:flush")

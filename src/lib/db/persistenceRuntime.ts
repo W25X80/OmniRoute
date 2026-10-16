@@ -76,7 +76,8 @@ const BACKGROUND_LIMIT = 64;
 const TAIL_LIMIT = 64;
 const ATTEMPT_LIMIT = 64;
 
-export type PersistenceBackgroundOwner = "lkgp.clear" | "lkgp.record" | "artifact.reconcile";
+export type PersistenceBackgroundOwner =
+  "lkgp.clear" | "lkgp.record" | "artifact.reconcile" | "local-health.sweep";
 type BackgroundCounters = { admitted: number; completed: number; refused: number; failed: number };
 const metricsKey = Symbol.for("omniroute.persistence.background.metrics.v1");
 const metricsRoot = globalThis as typeof globalThis & {

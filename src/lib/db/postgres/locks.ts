@@ -3,6 +3,7 @@ import type { PostgresTransaction } from "./database";
 /**
  * Transaction-scoped semantic fences. IDs are a persisted coordination protocol.
  * Existing owners retain their IDs; 21-26 partition legacy agent/memory contention.
+ * Breaker snapshots use 27 independently of accounting; reset shares that fence.
  * Deploy this protocol only after draining the sole old writer (no rolling overlap).
  *
  * Compound acquisition order (before row locks):
@@ -11,7 +12,7 @@ import type { PostgresTransaction } from "./database";
  * settings/providers -> keyPolicy -> accounting/usage; providers -> validation;
  * keyPolicy -> quotaGroups; validation -> accounting.
  * These are dependency edges, not numeric ordering. Do not reverse an edge.
- * Accounting intentionally still covers receipts, artifacts, budgets, breakers and
+ * Accounting intentionally still covers receipts, artifacts, budgets and
  * quota-reset history until their cross-table invariants admit a narrower fence.
  */
 export const POSTGRES_LOCK_OWNERS = {
@@ -41,6 +42,7 @@ export const POSTGRES_LOCK_OWNERS = {
   cloudAgents: 24,
   agentMetadata: 25,
   memory: 26,
+  circuitBreakers: 27,
   applicationImport: 31,
 } as const;
 

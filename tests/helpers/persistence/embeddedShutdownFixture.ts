@@ -95,3 +95,8 @@ export async function closeProxyLogSavesAsync(): Promise<void> {
   assertShutdownScope();
   fixture.events.push("proxy:close");
 }
+
+export function stopLocalHealthCheck(): void {
+  assertShutdownScope();
+  fixture.events.push("local-health:stop");
+}

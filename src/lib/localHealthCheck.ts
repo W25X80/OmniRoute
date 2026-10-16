@@ -12,6 +12,7 @@
  */
 
 import { getCachedProviderNodes } from "@/lib/db/readCache";
+import { runPersistenceBackgroundWork } from "@/lib/db/persistenceRuntime";
 import { isLocalProviderNodeHost } from "@/shared/network/localNodeHosts";
 import { isAutomatedTestProcess } from "@/shared/utils/testProcess";
 
@@ -138,48 +139,55 @@ export async function sweep(): Promise<void> {
   state.sweepInProgress = true;
 
   try {
-    let nodes: Array<{ id: string; prefix: string; baseUrl: string }>;
-    try {
-      const raw = await getCachedProviderNodes();
-      nodes = (Array.isArray(raw) ? raw : []).filter(
-        (n: Record<string, unknown>) =>
-          typeof n.baseUrl === "string" && isLocalhostUrl(n.baseUrl as string)
-      ) as Array<{ id: string; prefix: string; baseUrl: string }>;
-    } catch (err) {
-      console.error(LOG_PREFIX, "Failed to load provider_nodes:", err);
-      return;
-    }
-
-    // Prune stale entries for deleted nodes
-    const currentNodeIds = new Set(nodes.map((n) => n.id));
-    for (const key of healthCache.keys()) {
-      if (!currentNodeIds.has(key)) healthCache.delete(key);
-    }
-
-    if (nodes.length === 0) return;
-
-    const results = await Promise.allSettled(nodes.map((node) => checkNode(node)));
-
-    for (const result of results) {
-      if (result.status === "fulfilled") {
-        const status = result.value;
-        const prev = healthCache.get(status.nodeId);
-
-        // Log state transitions
-        if (prev && prev.isHealthy !== status.isHealthy) {
-          const emoji = status.isHealthy ? "✅" : "❌";
-          console.log(
-            LOG_PREFIX,
-            `${emoji} ${status.prefix} is now ${status.isHealthy ? "healthy" : "unhealthy"}${status.lastError ? ` (${status.lastError})` : ""} [${status.responseTimeMs}ms]`
-          );
-        }
-
-        healthCache.set(status.nodeId, status);
-      }
-    }
+    await runPersistenceBackgroundWork(sweepSelectedProviders, { owner: "local-health.sweep" });
+  } catch (err) {
+    console.error(LOG_PREFIX, "Sweep failed:", err);
   } finally {
     state.sweepInProgress = false;
     scheduleSweep();
+  }
+}
+
+/** Timers can outlive their creator request; repository reads need fresh authority. */
+async function sweepSelectedProviders(): Promise<void> {
+  let nodes: Array<{ id: string; prefix: string; baseUrl: string }>;
+  try {
+    const raw = await getCachedProviderNodes();
+    nodes = (Array.isArray(raw) ? raw : []).filter(
+      (n: Record<string, unknown>) =>
+        typeof n.baseUrl === "string" && isLocalhostUrl(n.baseUrl as string)
+    ) as Array<{ id: string; prefix: string; baseUrl: string }>;
+  } catch (err) {
+    console.error(LOG_PREFIX, "Failed to load provider_nodes:", err);
+    return;
+  }
+
+  // Prune stale entries for deleted nodes
+  const currentNodeIds = new Set(nodes.map((n) => n.id));
+  for (const key of healthCache.keys()) {
+    if (!currentNodeIds.has(key)) healthCache.delete(key);
+  }
+
+  if (nodes.length === 0) return;
+
+  const results = await Promise.allSettled(nodes.map((node) => checkNode(node)));
+
+  for (const result of results) {
+    if (result.status === "fulfilled") {
+      const status = result.value;
+      const prev = healthCache.get(status.nodeId);
+
+      // Log state transitions
+      if (prev && prev.isHealthy !== status.isHealthy) {
+        const emoji = status.isHealthy ? "✅" : "❌";
+        console.log(
+          LOG_PREFIX,
+          `${emoji} ${status.prefix} is now ${status.isHealthy ? "healthy" : "unhealthy"}${status.lastError ? ` (${status.lastError})` : ""} [${status.responseTimeMs}ms]`
+        );
+      }
+
+      healthCache.set(status.nodeId, status);
+    }
   }
 }
 

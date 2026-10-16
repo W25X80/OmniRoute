@@ -38,7 +38,9 @@ export function inspectBackgroundOwners(text, file = "source.ts") {
       if (!owner) unnamed++;
       else if (
         !ts.isStringLiteral(owner.initializer) ||
-        !["lkgp.clear", "lkgp.record", "artifact.reconcile"].includes(owner.initializer.text)
+        !["lkgp.clear", "lkgp.record", "artifact.reconcile", "local-health.sweep"].includes(
+          owner.initializer.text
+        )
       )
         invalid.push(source.getLineAndCharacterOfPosition(node.getStart()).line + 1);
     }
