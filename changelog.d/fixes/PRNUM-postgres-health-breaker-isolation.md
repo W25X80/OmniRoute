@@ -1,2 +1,4 @@
 - **fix(postgres):** Run local provider health sweeps in fresh background scopes, stop their scheduler before shutdown drain, and isolate circuit-breaker persistence from accounting maintenance.
 - **fix(sse):** Share resource-pressure state across server bundles (backported from upstream #16144).
+- **fix(postgres):** Index artifact retirement across all publication states and ID collations, avoiding repeated queue scans during call-log rotation.
+- **fix(chat):** Ignore null tool and input entries in session fingerprints and Claude translation (backported from upstream #17023 — thanks @pacocartones).
