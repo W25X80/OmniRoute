@@ -164,7 +164,9 @@ const migrations: readonly Migration[] = [
     statements: [
       // The retirement trigger searches every state. The active-owner unique index
       // cannot serve that lookup: its publication_state predicate is not implied.
-      "CREATE INDEX artifact_recovery_retirement_owner_idx ON omniroute.artifact_deletion_queue(call_log_id,call_log_order) WHERE call_log_id IS NOT NULL",
+      // Lead with the numeric identity so both database-default and C-collated
+      // log IDs have a selective prefix, including parameters from OLD.id.
+      'CREATE INDEX artifact_recovery_retirement_owner_idx ON omniroute.artifact_deletion_queue(call_log_order,call_log_id COLLATE "C") WHERE call_log_id IS NOT NULL',
     ],
   },
 ];

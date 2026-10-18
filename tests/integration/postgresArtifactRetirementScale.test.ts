@@ -135,6 +135,34 @@ test(
             (n) => n["Node Type"] === "Seq Scan" && n["Relation Name"] === "artifact_deletion_queue"
           )
         );
+        // OLD.id comes from a C-collated column; an untyped client parameter may
+        // use the database default instead. Both must avoid a queue-sized scan.
+        for (const collation of ["", ' COLLATE "C"']) {
+          const report = await fixture.transaction(
+            async (tx) =>
+              (
+                await tx.query<{
+                  "QUERY PLAN": Array<{
+                    Plan: Plan & { "Shared Hit Blocks": number; "Shared Read Blocks": number };
+                  }>;
+                }>(
+                  `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) SELECT 1
+                FROM omniroute.artifact_deletion_queue
+                WHERE call_log_id=$1${collation} AND call_log_order=$2`,
+                  [owner, owner === "absent-owner" ? "1" : owner.slice(7)]
+                )
+              ).rows[0]["QUERY PLAN"][0].Plan
+          );
+          assert.ok(
+            nodes(report).some(
+              (node) => node["Index Name"] === "artifact_recovery_retirement_owner_idx"
+            )
+          );
+          assert.ok(
+            report["Shared Hit Blocks"] + report["Shared Read Blocks"] < 32,
+            "owner lookup must touch a bounded index path, not scan its retained entries"
+          );
+        }
       }
 
       const repository = new PostgresCallLogRepository(database);
