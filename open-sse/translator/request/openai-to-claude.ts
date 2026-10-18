@@ -414,6 +414,7 @@ export function openaiToClaudeRequest(model, body, stream, credentials = null) {
   if (body.tools && Array.isArray(body.tools)) {
     result.tools = body.tools
       .map((tool) => {
+        if (!tool || typeof tool !== "object") return null;
         // Function-shaped tools arrive in two flavors from real clients:
         //   (a) openai-spec: { type: "function", function: { name, ... } }
         //   (b) bare/loose:  { function: { name, ... } }   (no parent `type`)
