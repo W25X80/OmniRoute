@@ -151,7 +151,7 @@ test(
       assert.deepEqual(upgradedHistory.slice(0, 4), version4History);
       assert.deepEqual(
         upgradedHistory.map((row) => row.version),
-        [1, 2, 3, 4, 5, 6, 7, 8, 9]
+        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
       );
       assert.equal(upgradedHistory[4].name, "artifact_publication_ownership");
       assert.deepEqual(await oldQueue(), version4Queue);
