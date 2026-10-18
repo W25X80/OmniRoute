@@ -158,6 +158,15 @@ const migrations: readonly Migration[] = [
     name: "conversation_concurrency",
     statements: POSTGRES_CONVERSATION_CONCURRENCY_STATEMENTS,
   },
+  {
+    version: 10,
+    name: "indexed_artifact_recovery_retirement",
+    statements: [
+      // The retirement trigger searches every state. The active-owner unique index
+      // cannot serve that lookup: its publication_state predicate is not implied.
+      "CREATE INDEX artifact_recovery_retirement_owner_idx ON omniroute.artifact_deletion_queue(call_log_id,call_log_order) WHERE call_log_id IS NOT NULL",
+    ],
+  },
 ];
 
 function checksum(migration: Migration): string {
