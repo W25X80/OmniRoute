@@ -13,13 +13,4 @@
  * sentinel exactly like `null` instead of duplicating (and potentially
  * missing a field of) the truthiness test.
  */
-export function isCredentialDiagnosticSentinel(value: unknown): boolean {
-  if (!value || typeof value !== "object") return false;
-  const record = value as Record<string, unknown>;
-  return Boolean(
-    record.allRateLimited ||
-    record.allExpired ||
-    record.blockedByKeyPolicy ||
-    record.leaseConnectionMismatch
-  );
-}
+export { isCredentialDiagnosticSentinel } from "@omniroute/open-sse/services/credentialSentinel.ts";

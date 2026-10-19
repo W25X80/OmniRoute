@@ -1,3 +1,6 @@
+import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
+import { requireOperatorCredential } from "@/lib/api/operatorCredential";
+import { createErrorResponseFromUnknown } from "@/lib/api/errorResponse";
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import { getRelayTokensAsync, createRelayTokenAsync } from "@/lib/db/relayProxies";
@@ -15,7 +18,9 @@ const relayTokenInputSchema = z.object({
   metadata: z.record(z.string(), z.unknown()).optional(),
 });
 
-export async function GET() {
+export async function GET(request: Request) {
+  const denied = await requireManagementAuth(request, { alwaysRequireAuth: true });
+  if (denied) return denied;
   const tokens = await getRelayTokensAsync();
   // Strip hash from response
   const safe = tokens.map((t) => ({
@@ -39,6 +44,11 @@ export async function GET() {
 }
 
 export async function POST(request: Request) {
+  const verdict = await requireOperatorCredential(request, {
+    alwaysRequireAuth: true,
+    forbiddenMessage: "Minting relay tokens requires an operator credential.",
+  });
+  if (verdict.ok === false) return verdict.response;
   try {
     const rawBody = await request.json();
     const validation = validateBody(relayTokenInputSchema, rawBody);
@@ -54,7 +64,8 @@ export async function POST(request: Request) {
       tokenPrefix: token.tokenPrefix,
     });
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Unknown error";
-    return NextResponse.json({ error: message }, { status: 400 });
+    if (error instanceof SyntaxError)
+      return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
+    return createErrorResponseFromUnknown(error, "Failed to create relay token");
   }
 }

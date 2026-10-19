@@ -167,6 +167,8 @@ export { SPAWN_CAPABLE_PREFIXES, SPAWN_CAPABLE_PATTERNS };
 export const LOCAL_ONLY_MANAGE_SCOPE_BYPASS_PREFIXES: ReadonlyArray<string> = ["/api/mcp/"];
 
 export const ALWAYS_PROTECTED_API_PATHS: ReadonlyArray<string> = [
+  "/api/relay/tokens",
+  "/api/sync/tokens",
   "/api/shutdown",
   "/api/providers/health-autopilot/actions",
   "/api/settings/database",

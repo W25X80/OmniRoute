@@ -1,4 +1,8 @@
 import {
+  requireOperatorCredential,
+  CREDENTIAL_EXPORT_FORBIDDEN_MESSAGE,
+} from "@/lib/api/operatorCredential";
+import {
   requireSqliteMaintenance,
   persistenceCapabilityResponse,
 } from "@/lib/db/persistenceCapabilities";
@@ -92,9 +96,11 @@ export async function GET(request: NextRequest) {
  * Security: Requires admin authentication.
  */
 export async function POST(request: NextRequest) {
-  if (!(await isAuthenticated(request))) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
+  const verdict = await requireOperatorCredential(request, {
+    alwaysRequireAuth: true,
+    forbiddenMessage: CREDENTIAL_EXPORT_FORBIDDEN_MESSAGE,
+  });
+  if (verdict.ok === false) return verdict.response;
 
   let rawBody;
   try {

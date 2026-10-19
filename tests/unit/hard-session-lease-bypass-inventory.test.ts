@@ -33,7 +33,7 @@ const EXPECTED: Record<InventoryKind, Record<string, number>> = {
     "open-sse/handlers/chatCore/emptyTurnRetryLoop.ts": 1,
     "open-sse/handlers/chatCore/providerExecutionPipeline.ts": 2,
     "open-sse/services/imageCombo.ts": 1,
-    "open-sse/services/speechCombo.ts": 1,
+    "open-sse/services/speechCombo.ts": 2,
     "open-sse/services/videoCombo.ts": 2,
     "src/app/api/compression/compare/verify/route.ts": 1,
     "src/app/api/internal/codex-responses-ws/route.ts": 1,
@@ -43,10 +43,10 @@ const EXPECTED: Record<InventoryKind, Record<string, number>> = {
     "src/app/api/search/providers/route.ts": 3,
     "src/app/api/v1/_shared/elevenLabsProxy.ts": 1,
     "src/app/api/v1/_shared/fishAudioProxy.ts": 1,
-    "src/app/api/v1/audio/speech/route.ts": 1,
+    "src/app/api/v1/audio/speech/route.ts": 2,
     "src/app/api/v1/_shared/videoModelResolution.ts": 1,
-    "src/app/api/v1/audio/transcriptions/route.ts": 2,
-    "src/app/api/v1/audio/translations/route.ts": 1,
+    "src/app/api/v1/audio/transcriptions/route.ts": 3,
+    "src/app/api/v1/audio/translations/route.ts": 2,
     "src/app/api/v1/classify/route.ts": 1,
     // v3.8.51 #11754: the second resolveImageRouteModel() call (a duplicate
     // of the retirement-check one hoisted before enforceApiKeyPolicy) was
@@ -60,7 +60,7 @@ const EXPECTED: Record<InventoryKind, Record<string, number>> = {
     "src/app/api/v1/images/upscale/route.ts": 1,
     "src/app/api/v1/messages/count_tokens/route.ts": 1,
     "src/app/api/v1/moderations/route.ts": 1,
-    "src/app/api/v1/music/generations/route.ts": 2,
+    "src/app/api/v1/music/generations/route.ts": 1,
     "src/app/api/v1/ocr/route.ts": 1,
     "src/app/api/v1/providers/[provider]/embeddings/route.ts": 1,
     "src/app/api/v1/providers/[provider]/images/generations/route.ts": 1,
@@ -81,7 +81,7 @@ const EXPECTED: Record<InventoryKind, Record<string, number>> = {
     // fenced the same way as the two pre-existing sites.
     // #15761: local embeddings resolve credentials through the serving-connection allowlist
     // (getProviderCredentials(provider, null, servingIds)) — one more site (3 -> 4).
-    "src/lib/embeddings/service.ts": 4,
+    "src/lib/embeddings/service.ts": 5,
     // PR #11390: second site is the generic derived-provider listing fallback —
     // read-only key presence probe used to decide whether a configured chat
     // provider may appear in the memory embedding-source dropdown.
@@ -492,16 +492,16 @@ test("managed request surfaces are fenced centrally or rejected before independe
   );
   const rotationPolicySites = [
     ...nonStreamingLeg.matchAll(
-      /allowAccountRotation: !managedLease && comboStrategy !== "context-relay"/g
+      /allowAccountRotation:\s*!managedLease && !forcedConnectionId && comboStrategy !== "context-relay"/g
     ),
     ...streamingLeg.matchAll(
-      /allowAccountRotation: !managedLease && comboStrategy !== "context-relay"/g
+      /allowAccountRotation:\s*!managedLease && !forcedConnectionId && comboStrategy !== "context-relay"/g
     ),
   ];
   assert.equal(
     rotationPolicySites?.length,
     2,
-    "both the streaming and the non-streaming leg must derive account rotation from !managedLease"
+    "both provider legs disable rotation for managed leases and forced targets"
   );
   assert.match(pipeline, /const canRotateAccount = policy\.allowAccountRotation && !isolateProbe;/);
   assert.match(pipeline, /canRotateAccount &&\s*target\.provider === "codex"/);

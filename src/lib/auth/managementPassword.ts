@@ -1,5 +1,7 @@
+import { getAuthSettingsSnapshot } from "@/lib/db/authSettings";
+import { withPasswordGeneration } from "@/lib/db/authSettingsSemantics";
 import bcrypt from "bcryptjs";
-import { getSettings, updateSettings } from "@/lib/db/settings";
+import { updateSettings } from "@/lib/db/settings";
 
 const BCRYPT_HASH_PATTERN = /^\$2[aby]\$\d{2}\$[./A-Za-z0-9]{53}$/;
 const MANAGEMENT_PASSWORD_SALT_ROUNDS = 12;
@@ -17,6 +19,7 @@ interface EnsureManagementPasswordOptions {
   logger?: Pick<Console, "log"> & Partial<Pick<Console, "warn">>;
   settings?: JsonRecord;
   source?: string;
+  revision?: number;
 }
 
 export interface EnsuredManagementPassword {
@@ -24,6 +27,7 @@ export interface EnsuredManagementPassword {
   migrated: boolean;
   settings: JsonRecord;
   source: MigrationSource;
+  revision: number;
 }
 
 function getInitialPasswordValue(value: string | null | undefined) {
@@ -65,7 +69,11 @@ export async function verifyManagementPassword(password: string, hash: string) {
 export async function ensurePersistentManagementPasswordHash(
   options: EnsureManagementPasswordOptions = {}
 ): Promise<EnsuredManagementPassword> {
-  const settings = options.settings ?? ((await getSettings()) as JsonRecord);
+  const snapshot =
+    options.settings && options.revision !== undefined
+      ? { settings: options.settings, revision: options.revision }
+      : await getAuthSettingsSnapshot();
+  const settings = snapshot.settings;
   const storedPassword = getStoredManagementPassword(settings);
 
   if (isBcryptHash(storedPassword)) {
@@ -74,6 +82,7 @@ export async function ensurePersistentManagementPasswordHash(
       migrated: false,
       settings,
       source: "stored_hash",
+      revision: snapshot.revision,
     };
   }
 
@@ -96,6 +105,7 @@ export async function ensurePersistentManagementPasswordHash(
       migrated: false,
       settings,
       source: "missing",
+      revision: snapshot.revision,
     };
   }
 
@@ -109,7 +119,9 @@ export async function ensurePersistentManagementPasswordHash(
     updates.requireLogin = true;
   }
 
-  const nextSettings = (await updateSettings(updates)) as JsonRecord;
+  const guardedUpdates = withPasswordGeneration(updates);
+  await updateSettings(guardedUpdates, { expectedRevision: snapshot.revision });
+  const nextSettings = { ...settings, ...guardedUpdates };
   if (options.logger) {
     const context = options.source ? ` during ${options.source}` : "";
     const migrationSource = storedPassword ? "stored plaintext password" : "INITIAL_PASSWORD";
@@ -121,5 +133,6 @@ export async function ensurePersistentManagementPasswordHash(
     migrated: true,
     settings: nextSettings,
     source: storedPassword ? "stored_plaintext" : "env",
+    revision: snapshot.revision + 1,
   };
 }

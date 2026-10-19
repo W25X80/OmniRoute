@@ -1,13 +1,13 @@
+import { isSyntheticApiKeyId } from "@/shared/constants/apiKeyIdentities";
 import { createHash, randomBytes } from "crypto";
 import {
   createSyncTokenRecord,
-  getSyncTokenByHash,
+  validateSyncTokenRecord,
   listSyncTokens,
   revokeSyncToken,
-  touchSyncTokenLastUsed,
   type SyncTokenRecord,
 } from "@/lib/db/syncTokens";
-import { getApiKeyMetadata } from "@/lib/db/apiKeys";
+import { getApiKeyMetadata, getApiKeyById } from "@/lib/db/apiKeys";
 
 function normalizeToken(rawToken: string | null | undefined) {
   if (typeof rawToken !== "string") return null;
@@ -26,12 +26,21 @@ export function generatePlaintextSyncToken() {
   return `osync_${randomBytes(32).toString("base64url")}`;
 }
 
-export async function issueSyncToken(params: { name: string; syncApiKeyId?: string | null }) {
+export async function issueSyncToken(params: {
+  name: string;
+  syncApiKeyId?: string | null;
+  issuedBy: string;
+  authGeneration: string;
+  expiresAt?: string;
+}) {
   const plaintextToken = generatePlaintextSyncToken();
   const record = await createSyncTokenRecord({
     name: params.name,
     tokenHash: hashSyncToken(plaintextToken),
     syncApiKeyId: params.syncApiKeyId || null,
+    issuedBy: params.issuedBy,
+    authGeneration: params.authGeneration,
+    expiresAt: params.expiresAt ?? new Date(Date.now() + 30 * 86400000).toISOString(),
   });
 
   return {
@@ -44,13 +53,11 @@ export async function validateSyncToken(rawToken: string | null | undefined) {
   const token = normalizeToken(rawToken);
   if (!token) return null;
 
-  const record = await getSyncTokenByHash(hashSyncToken(token));
-  if (!record || record.revokedAt) return null;
-  return record;
+  return validateSyncTokenRecord(hashSyncToken(token));
 }
 
 export async function markSyncTokenUsed(record: SyncTokenRecord) {
-  await touchSyncTokenLastUsed(record.id);
+  return (await validateSyncTokenRecord(record.tokenHash, new Date().toISOString())) !== null;
 }
 
 export async function listSyncTokenSummaries() {
@@ -59,6 +66,8 @@ export async function listSyncTokenSummaries() {
     id: record.id,
     name: record.name,
     syncApiKeyId: record.syncApiKeyId,
+    issuedBy: record.issuedBy,
+    expiresAt: record.expiresAt,
     revokedAt: record.revokedAt,
     lastUsedAt: record.lastUsedAt,
     createdAt: record.createdAt,
@@ -73,6 +82,8 @@ export async function revokeSyncTokenById(id: string) {
     id: revoked.id,
     name: revoked.name,
     syncApiKeyId: revoked.syncApiKeyId,
+    issuedBy: revoked.issuedBy,
+    expiresAt: revoked.expiresAt,
     revokedAt: revoked.revokedAt,
     lastUsedAt: revoked.lastUsedAt,
     createdAt: revoked.createdAt,
@@ -90,7 +101,8 @@ export async function resolveSyncApiKeyIdFromManagementRequest(request: Request)
   if (!apiKey) return null;
 
   const metadata = await getApiKeyMetadata(apiKey);
-  return metadata?.id || null;
+  if (!metadata?.id || isSyntheticApiKeyId(metadata.id)) return null;
+  return (await getApiKeyById(metadata.id)) ? metadata.id : null;
 }
 
 export function getSyncTokenFromRequest(request: Request) {

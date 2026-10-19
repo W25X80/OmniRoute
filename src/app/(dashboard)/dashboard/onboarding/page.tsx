@@ -227,7 +227,7 @@ export default function OnboardingWizard() {
       const settings = await fetch("/api/settings/require-login")
         .then((r) => r.json())
         .catch(() => ({}));
-      if (!settings.hasPassword) {
+      if (!settings.hasPassword && settings.requireLogin !== false) {
         const requireLoginRes = await fetch("/api/settings/require-login", {
           method: "POST",
           headers: bootstrapHeaders({ "Content-Type": "application/json" }),

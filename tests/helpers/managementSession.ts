@@ -12,7 +12,10 @@ export async function createManagementSessionToken(
 ): Promise<string> {
   process.env.JWT_SECRET = secret;
 
-  return new SignJWT({ authenticated: true })
+  const { getAuthSettingsSnapshot } = await import("../../src/lib/db/authSettings.ts");
+  const { generation } = await getAuthSettingsSnapshot();
+  if (!generation) throw new Error("Test authentication generation unavailable");
+  return new SignJWT({ authenticated: true, managementAuthGeneration: generation })
     .setProtectedHeader({ alg: "HS256" })
     .setIssuedAt()
     .setExpirationTime("1h")

@@ -1,3 +1,8 @@
+import { randomUUID } from "node:crypto";
+import { getAuthSettingsSnapshot } from "@/lib/db/authSettings";
+import { AUTH_GENERATION_SETTING } from "@/lib/db/authSettingsSemantics";
+import { SECURITY_IMPACTING_SETTINGS_KEYS } from "@/shared/constants/securityImpactingSettings";
+import { requireOperatorCredential } from "@/lib/api/operatorCredential";
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import {
@@ -36,7 +41,6 @@ import {
   SESSIONS_VALID_AFTER_SETTING,
   getDashboardJwtSecret,
   mintDashboardSessionToken,
-  verifyDashboardSessionToken,
 } from "@/shared/utils/dashboardSessionToken";
 import { isCliTokenAuthValid } from "@/lib/middleware/cliTokenAuth";
 import { extractApiKey } from "@/sse/services/auth";
@@ -124,15 +128,7 @@ function parseExpectedRevision(
  * prompt. The Authz section can still prompt client-side for consistency,
  * but the server accepts the change without re-auth.
  */
-const SECURITY_IMPACTING_KEYS = [
-  "localOnlyManageScopeBypassEnabled",
-  "localOnlyManageScopeBypassPrefixes",
-  "requireLogin",
-  "newPassword",
-  "oidcEnabled",
-  "oidcDisablePasswordLogin",
-  "oidcClientSecret",
-] as const;
+const SECURITY_IMPACTING_KEYS = SECURITY_IMPACTING_SETTINGS_KEYS;
 
 /**
  * Derive an audit actor string from the inbound request. Falls back to
@@ -236,6 +232,7 @@ export async function GET(request: Request) {
     const settingsRevision = await getSettingsRevision();
     const {
       password,
+      [AUTH_GENERATION_SETTING]: _authGeneration,
       [SESSIONS_VALID_AFTER_SETTING]: _sessionsValidAfter,
       [REVOKED_SESSIONS_SETTING]: _revokedSessions,
       ...safeSettings
@@ -289,16 +286,6 @@ export async function GET(request: Request) {
   }
 }
 
-function readCookie(request: Request, name: string): string | null {
-  for (const part of (request.headers.get("cookie") || "").split(";")) {
-    const separator = part.indexOf("=");
-    if (separator > 0 && part.slice(0, separator).trim() === name) {
-      return part.slice(separator + 1).trim() || null;
-    }
-  }
-  return null;
-}
-
 export async function PATCH(request: Request) {
   const authError = await requireManagementAuth(request);
   if (authError) return authError;
@@ -318,7 +305,7 @@ export async function PATCH(request: Request) {
     );
   }
   const attemptedKeys = attemptedKeysOf(rawBody);
-  const expectedRevision = parseExpectedRevision(request, rawBody);
+  let expectedRevision = parseExpectedRevision(request, rawBody);
 
   try {
     // Zod validation
@@ -339,6 +326,35 @@ export async function PATCH(request: Request) {
       return NextResponse.json({ error: validation.error }, { status: 400 });
     }
     const body: typeof validation.data & { password?: string } = { ...validation.data };
+    const touchesSecurity =
+      SECURITY_IMPACTING_KEYS.some((key) => key in validation.data) ||
+      Object.keys(validation.data).some((key) => key.startsWith("oidc"));
+    const operator = touchesSecurity
+      ? await requireOperatorCredential(request, {
+          alwaysRequireAuth: true,
+          forbiddenMessage: "Changing security policy requires an operator credential.",
+        })
+      : null;
+    if (operator?.ok === false) return operator.response;
+    const securitySnapshot = touchesSecurity ? await getAuthSettingsSnapshot() : null;
+    if (
+      securitySnapshot &&
+      operator?.ok === true &&
+      operator.operator === "dashboard_session" &&
+      operator.generation !== securitySnapshot.generation
+    ) {
+      return NextResponse.json({ error: "Authentication changed; sign in again" }, { status: 409 });
+    }
+    if (
+      securitySnapshot &&
+      expectedRevision !== undefined &&
+      expectedRevision !== securitySnapshot.revision
+    ) {
+      return NextResponse.json(
+        { error: "Settings changed; refresh before retrying" },
+        { status: 409 }
+      );
+    }
 
     // Sanitize model lockout settings: clamp values to valid bounds.
     if (body.modelLockout) {
@@ -375,14 +391,27 @@ export async function PATCH(request: Request) {
     // password is verified at most once per PATCH.
     const touchedSecurityKeys = SECURITY_IMPACTING_KEYS.filter((k) => k in validation.data);
     if (touchedSecurityKeys.length > 0) {
-      const settings = await getSettings();
+      const settings = securitySnapshot!.settings;
       // Lazy-hash any plaintext INITIAL_PASSWORD migration BEFORE we read the
       // stored hash, so the gate works on fresh deploys too.
       const passwordState = await ensurePersistentManagementPasswordHash({
         settings,
         source: "settings.security_impacting_update",
+        revision: securitySnapshot!.revision,
       });
       const storedPasswordHash = getStoredManagementPassword(passwordState.settings);
+      expectedRevision = passwordState.revision;
+      if (
+        body.newPassword &&
+        !storedPasswordHash &&
+        operator?.ok === true &&
+        operator.operator !== "local_cli"
+      ) {
+        return NextResponse.json(
+          { error: "Password recovery requires the local CLI" },
+          { status: 403 }
+        );
+      }
       // Cold-boot exception: same condition the existing newPassword path
       // honoured before T-011 — when no password is configured yet AND login
       // is currently disabled, allow the first write to set policy (incl.
@@ -456,12 +485,13 @@ export async function PATCH(request: Request) {
     const passwordChanged = Boolean(body.newPassword);
     if (body.newPassword) {
       body.password = await hashManagementPassword(body.newPassword);
+      Object.assign(body, { [AUTH_GENERATION_SETTING]: randomUUID() });
       body[SESSIONS_VALID_AFTER_SETTING] = Math.floor(Date.now() / 1000);
       delete body.newPassword;
     }
-    const callerSession = passwordChanged
-      ? await verifyDashboardSessionToken(readCookie(request, DASHBOARD_SESSION_COOKIE))
-      : null;
+    // Preserve the principal verified before any acknowledged lazy password migration.
+    const callerSession =
+      passwordChanged && operator?.ok === true && operator.operator === "dashboard_session";
     delete body.currentPassword;
     delete body.expectedRevision;
 
@@ -570,6 +600,7 @@ export async function PATCH(request: Request) {
 
     const {
       password,
+      [AUTH_GENERATION_SETTING]: _authGeneration,
       [SESSIONS_VALID_AFTER_SETTING]: _sessionsValidAfter,
       [REVOKED_SESSIONS_SETTING]: _revokedSessions,
       ...safeSettings
@@ -587,19 +618,32 @@ export async function PATCH(request: Request) {
         .split(",")[0]
         .trim()
         .toLowerCase();
-      response.cookies.set(DASHBOARD_SESSION_COOKIE, await mintDashboardSessionToken(secret), {
-        httpOnly: true,
-        secure:
-          process.env.AUTH_COOKIE_SECURE === "true" ||
-          forwardedProto === "https" ||
-          new URL(request.url).protocol === "https:",
-        sameSite: "lax",
-        path: "/",
-        maxAge: 60 * 60 * 24 * 30,
-      });
+      response.cookies.set(
+        DASHBOARD_SESSION_COOKIE,
+        await mintDashboardSessionToken(
+          secret,
+          (body as Record<string, unknown>)[AUTH_GENERATION_SETTING] as string
+        ),
+        {
+          httpOnly: true,
+          secure:
+            process.env.AUTH_COOKIE_SECURE === "true" ||
+            forwardedProto === "https" ||
+            new URL(request.url).protocol === "https:",
+          sameSite: "lax",
+          path: "/",
+          maxAge: 60 * 60 * 24 * 30,
+        }
+      );
     }
     return response;
   } catch (error) {
+    if (error instanceof SettingsRevisionConflictError) {
+      return NextResponse.json(
+        { error: "Settings changed; refresh before retrying" },
+        { status: 409 }
+      );
+    }
     console.log("Error updating settings:", error);
     return NextResponse.json({ error: "Failed to update settings" }, { status: 500 });
   }

@@ -62,7 +62,11 @@ function splitFlattenedNamespaceWireName(toolName: string): RequestToolIdentity 
  * splitting an otherwise unknown tool name outside the narrow `mcp__`
  * fallback below.
  */
-export function resolveRequestToolIdentity(identityMap: unknown, toolName: string) {
+export function resolveRequestToolIdentity(
+  identityMap: unknown,
+  toolName: string,
+  options: { explicitNames?: Iterable<string> | null } = {}
+) {
   if (!toolName) return null;
 
   const direct =
@@ -77,15 +81,32 @@ export function resolveRequestToolIdentity(identityMap: unknown, toolName: strin
   const directIdentity = asRequestToolIdentity(direct);
   if (directIdentity) return directIdentity;
 
-  const candidates =
+  // The ledger is consulted for both dotted and bare aliases. Materialize its
+  // values once because a Map iterator is single-use.
+  const candidates = Array.from(
     identityMap instanceof Map
       ? identityMap.values()
       : identityMap && typeof identityMap === "object" && !Array.isArray(identityMap)
         ? Object.values(identityMap as Record<string, unknown>)
-        : [];
+        : []
+  );
   for (const candidate of candidates) {
     const identity = asRequestToolIdentity(candidate);
     if (identity && `${identity.namespace}.${identity.name}` === toolName) return identity;
+  }
+
+  // A provider may omit the namespace prefix. Restore only a unique ledger
+  // leaf, and preserve an explicitly declared flat tool with the same name.
+  if (toolName && !toolName.includes("__")) {
+    const explicit = options.explicitNames == null ? null : new Set(options.explicitNames);
+    if (!explicit || !explicit.has(toolName)) {
+      const leafMatches: RequestToolIdentity[] = [];
+      for (const candidate of candidates) {
+        const identity = asRequestToolIdentity(candidate);
+        if (identity && identity.name === toolName) leafMatches.push(identity);
+      }
+      if (leafMatches.length === 1) return leafMatches[0];
+    }
   }
 
   // The wire-name split only stands in for a request that declared no

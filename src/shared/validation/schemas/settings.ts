@@ -259,6 +259,7 @@ export const updateRequireLoginSchema = z
   .object({
     requireLogin: z.boolean().optional(),
     password: z.string().min(4, "Password must be at least 4 characters").optional(),
+    currentPassword: z.string().max(200).optional(),
   })
   .superRefine((value, ctx) => {
     if (value.requireLogin === undefined && !value.password) {

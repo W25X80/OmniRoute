@@ -32,7 +32,8 @@ export async function GET(request: Request) {
     }
 
     const { version, bundle } = await buildConfigSyncEnvelope();
-    await markSyncTokenUsed(syncToken);
+    if (!(await markSyncTokenUsed(syncToken)))
+      return createErrorResponse({ status: 401, message: "Invalid sync token" });
 
     if (matchesEtag(request, version)) {
       return new Response(null, {

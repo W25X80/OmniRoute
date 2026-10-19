@@ -1,10 +1,13 @@
+import {
+  requireOperatorCredential,
+  CREDENTIAL_EXPORT_FORBIDDEN_MESSAGE,
+} from "@/lib/api/operatorCredential";
 import { NextResponse } from "next/server";
 import { getSettings } from "@/lib/db/settings";
 import { getProviderConnections } from "@/lib/db/providers";
 import { getCachedProviderNodes } from "@/lib/db/readCache";
 import { getCombos } from "@/lib/db/combos";
 import { getApiKeys } from "@/lib/db/apiKeys";
-import { isAuthRequired, isAuthenticated } from "@/shared/utils/apiAuth";
 import {
   getAllUsageHistoryAsync as getAllUsageHistory,
   getAllDomainCostHistoryAsync as getAllDomainCostHistory,
@@ -47,11 +50,11 @@ export function filterPaidComboSteps<T extends { models?: unknown }>(combos: T[]
  * Exports a legacy OmniRoute-compatible JSON backup.
  */
 export async function GET(request: Request) {
-  if (await isAuthRequired(request)) {
-    if (!(await isAuthenticated(request))) {
-      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-    }
-  }
+  const verdict = await requireOperatorCredential(request, {
+    alwaysRequireAuth: true,
+    forbiddenMessage: CREDENTIAL_EXPORT_FORBIDDEN_MESSAGE,
+  });
+  if (verdict.ok === false) return verdict.response;
 
   try {
     const url = new URL(request.url);

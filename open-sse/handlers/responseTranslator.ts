@@ -836,7 +836,8 @@ function convertOpenAINonStreamingToClaude(
     for (const tool of messageObj.tool_calls) {
       const toolObj = toRecord(tool);
       const fn = toRecord(toolObj.function);
-      const rawId = toString(toolObj.id, `call_${Date.now()}`);
+      // An id-less call gets a random id; a timestamp collides across calls.
+      const rawId = toString(toolObj.id) || undefined;
       content.push({
         type: "tool_use",
         id: sanitizeToolId(rawId),

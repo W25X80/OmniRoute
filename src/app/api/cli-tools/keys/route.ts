@@ -6,7 +6,7 @@ import { getApiKeys } from "@/lib/db/apiKeys";
 import { maskStoredApiKey } from "@/lib/apiKeyExposure";
 
 // GET /api/cli-tools/keys - List API keys; plaintext `rawKey` only for the instance operator
-// (dashboard session / local CLI / login disabled). Machine credentials (API keys, `oma_`
+// (dashboard session / authenticated local CLI). Open mode and machine credentials (API keys, `oma_`
 // access tokens of any scope) get the masked listing so a delegated token cannot recover
 // higher-privilege keys.
 export async function GET(request: Request) {
@@ -15,7 +15,7 @@ export async function GET(request: Request) {
 
   let operator: Awaited<ReturnType<typeof resolveOperatorCredential>>;
   try {
-    operator = await resolveOperatorCredential(request);
+    operator = await resolveOperatorCredential(request, { alwaysRequireAuth: true });
   } catch {
     return createErrorResponse({
       status: 503,

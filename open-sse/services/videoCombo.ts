@@ -1,3 +1,10 @@
+import {
+  targetConnectionScope,
+  scopeComboTargetsForKey,
+  isCredentialDiagnosticSentinel,
+  type ComboKeyScope,
+} from "./comboKeyScope.ts";
+import { scopedCredentialSelector } from "./scopedCredentialSelection.ts";
 /**
  * Video Combo Strategy Execution
  *
@@ -20,7 +27,7 @@ import { resolveComboTargets } from "@omniroute/open-sse/services/combo.ts";
 import { getVideoProvider } from "@omniroute/open-sse/config/videoRegistry.ts";
 import { resolveVideoCredentialProvider } from "@omniroute/open-sse/handlers/videoGeneration/googleFlow.ts";
 import {
-  getProviderCredentialsWithQuotaPreflight,
+  getProviderCredentialsWithQuotaPreflight as selectRawCredentials,
   clearRecoveredProviderState,
 } from "@/sse/services/auth";
 import { isAllRateLimitedCredentials } from "@/app/api/v1/_shared/rateLimit";
@@ -42,6 +49,8 @@ import { HTTP_STATUS } from "@omniroute/open-sse/config/constants.ts";
 import { errorResponse } from "@omniroute/open-sse/utils/error.ts";
 import * as logger from "@/sse/utils/logger";
 
+const getProviderCredentialsWithQuotaPreflight = scopedCredentialSelector(selectRawCredentials);
+
 /**
  * Execute a full combo strategy for a video generation request.
  */
@@ -50,6 +59,7 @@ export async function executeVideoCombo(
   body: Record<string, unknown>,
   auth: {
     request: Request;
+    keyScope?: ComboKeyScope;
     policy: { apiKeyInfo?: { id?: string; name?: string } | null };
   },
   startTime: number,
@@ -71,12 +81,18 @@ export async function executeVideoCombo(
   // and filter to video-capable ones. Resolving up front (rather than in the
   // execution loop below) lets prompt validation run against the real
   // expanded target set instead of the unresolved combo name.
-  const videoTargets: Array<{ modelStr: string; resolved: VideoModelTarget }> = [];
-  for (const t of targets) {
+  const scoped = await scopeComboTargetsForKey(targets, auth.keyScope, comboName);
+  if (scoped.rejection) return scoped.rejection;
+  const videoTargets: Array<{
+    modelStr: string;
+    resolved: VideoModelTarget;
+    target: (typeof targets)[number];
+  }> = [];
+  for (const t of scoped.targets) {
     if (!t.modelStr) continue;
     const resolved = await resolveVideoModelTarget(t.modelStr);
     if (resolved.provider) {
-      videoTargets.push({ modelStr: t.modelStr, resolved });
+      videoTargets.push({ modelStr: t.modelStr, resolved, target: t });
     }
   }
 
@@ -111,7 +127,13 @@ export async function executeVideoCombo(
     resolveFirstSuccess = resolve;
   });
 
-  const runTarget = async (modelStr: string, resolved: VideoModelTarget): Promise<void> => {
+  const runTarget = async (
+    modelStr: string,
+    resolved: VideoModelTarget,
+    target: (typeof targets)[number]
+  ): Promise<void> => {
+    const connectionScope = targetConnectionScope(scoped.connectionScope, target);
+    const selectionOptions = target.connectionId ? { forcedConnectionId: target.connectionId } : {};
     try {
       const { provider: targetProvider, model: targetModel, isCustomModel } = resolved;
       if (!targetProvider) {
@@ -140,7 +162,11 @@ export async function executeVideoCombo(
       if (providerConfig && providerConfig.authType !== "none") {
         try {
           credentials = await getProviderCredentialsWithQuotaPreflight(
-            resolveVideoCredentialProvider(targetProvider)
+            resolveVideoCredentialProvider(targetProvider),
+            null,
+            connectionScope,
+            targetModel,
+            selectionOptions
           );
         } catch {
           lastError = { status: 502, error: `Failed to resolve credentials for ${targetProvider}` };
@@ -167,8 +193,9 @@ export async function executeVideoCombo(
           credentials = await getProviderCredentialsWithQuotaPreflight(
             targetProvider,
             null,
-            null,
-            targetModel
+            connectionScope,
+            targetModel,
+            selectionOptions
           );
         } catch {
           lastError = { status: 502, error: `Failed to resolve credentials for ${targetProvider}` };
@@ -191,9 +218,28 @@ export async function executeVideoCombo(
           return;
         }
       } else if (providerConfig?.authType === "none") {
-        credentials = await resolveLocalOverrideCredentials(targetProvider);
+        const local = await resolveLocalOverrideCredentials(
+          targetProvider,
+          connectionScope,
+          target.connectionId,
+          targetModel
+        );
+        if (local.rejection) {
+          lastError = {
+            status: local.rejection.status,
+            error: "No connection allowed for this target",
+          };
+          fallbackCount++;
+          return;
+        }
+        credentials = local.credentials;
       }
 
+      if (isCredentialDiagnosticSentinel(credentials)) {
+        lastError = { status: 403, error: "Credentials unavailable for this target" };
+        fallbackCount++;
+        return;
+      }
       const result: MediaGenerationResultLike = await handleVideoGeneration({
         body: { ...body, model: modelStr },
         credentials,
@@ -249,7 +295,9 @@ export async function executeVideoCombo(
   let selectedResult: MediaGenerationResultLike | null = null;
   let selectedFallbackCount = 0;
 
-  const tasks = videoTargets.map(({ modelStr, resolved }) => runTarget(modelStr, resolved));
+  const tasks = videoTargets.map(({ modelStr, resolved, target }) =>
+    runTarget(modelStr, resolved, target)
+  );
   await Promise.race([firstSuccess, Promise.allSettled(tasks)]);
 
   if (selectedResult) {

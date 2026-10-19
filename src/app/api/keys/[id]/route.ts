@@ -10,7 +10,10 @@ import { getConsistentMachineId } from "@/shared/utils/machineId";
 import { syncToCloud } from "@/lib/cloudSync";
 import { updateKeyPermissionsSchema } from "@/shared/validation/schemas";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
-import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
+import {
+  requireCredentialForManagementScopedKey,
+  requireManagementAuth,
+} from "@/lib/api/requireManagementAuth";
 import * as log from "@/sse/utils/logger";
 import { buildErrorBody } from "@omniroute/open-sse/utils/error.ts";
 
@@ -98,6 +101,8 @@ export async function PATCH(request, { params }) {
       chaosModeEnabled,
     } = validation.data;
 
+    const denied = await requireCredentialForManagementScopedKey(request, scopes);
+    if (denied) return denied;
     const payload: Parameters<typeof updateApiKeyPermissions>[1] = {};
     if (name !== undefined) payload.name = name;
     if (modelAccessMode !== undefined) payload.modelAccessMode = modelAccessMode;

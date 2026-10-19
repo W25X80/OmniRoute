@@ -105,6 +105,10 @@ import { evictLockoutOverflow } from "./accountFallback/lockoutEviction.ts";
 export { MODEL_LOCKOUT_EVICTION_CAP } from "./accountFallback/lockoutEviction.ts";
 export { hasPerModelFailureScope } from "./accountFallback/perModelFailureScope.ts";
 import { capScaledCooldownMs } from "./accountFallback/cooldownCap.ts";
+import {
+  concurrencyLimit429,
+  resolveConcurrencyLimitCooldownOverride,
+} from "./accountFallback/concurrencyLimit429.ts";
 import { resolveApiKeyForbiddenFallback } from "./accountFallback/nonRetryableUpstream.ts";
 import * as exactModelLock from "./accountFallback/exactModelLock.ts";
 import { isCreditsExhaustedWithSharedWallet } from "./accountFallback/sharedWalletCredits.ts";
@@ -1655,7 +1659,7 @@ export function checkFallbackError(
   headers: Headers | Record<string, string> | null = null,
   profileOverride: ProviderProfile | null = null,
   structuredError?: { code?: string | null; type?: string | null } | null,
-  rotation?: { account?: unknown } | null,
+  rotation?: { account?: unknown; concurrencyCooldownMs?: number | null } | null,
   dailyReset?: {
     timezone?: unknown;
     hour?: unknown;
@@ -2135,6 +2139,19 @@ export function checkFallbackError(
             resolveRuleMatchBody(provider, structuredError ?? null, errorStr)
           )
         : null;
+      if (configuredRule.id === "status_429" && !providerMatch) {
+        const fixedCooldownMs =
+          rotation && Object.hasOwn(rotation, "concurrencyCooldownMs")
+            ? rotation.concurrencyCooldownMs
+            : resolveConcurrencyLimitCooldownOverride(rotation?.account);
+        const concurrency = concurrencyLimit429(
+          status,
+          errorStr,
+          getUpstreamRetryHint(),
+          fixedCooldownMs
+        );
+        if (concurrency) return concurrency;
+      }
       const reason = providerMatch
         ? providerMatch.reason
         : (configuredRule.reason ?? RateLimitReason.UNKNOWN);

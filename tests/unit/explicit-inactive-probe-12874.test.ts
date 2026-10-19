@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import { EXPIRED_REPROBE_BLOCKLIST } from "../../src/lib/quota/connectionRecovery.ts";
+import { applyOperatorActivationIntent } from "../../src/lib/providers/operatorDisable.ts";
 import {
   EXPLICIT_INACTIVE_PROBE_INTERVAL_MS,
   EXPLICIT_PROBE_BLOCKLIST,
@@ -45,6 +46,23 @@ test("P-1 pin + inactive active -> probe", () => {
 test("P-2 credits_exhausted -> probe", () => {
   assert.equal(select({ pinnedRow: { ...pin, testStatus: "credits_exhausted" } }).kind, "probe");
 });
+test("operator-disabled inactive connections cannot become explicit probes", () => {
+  for (const testStatus of ["active", "success", "credits_exhausted", "expired", "error", ""]) {
+    const pinnedRow = {
+      ...pin,
+      testStatus,
+      providerSpecificData: applyOperatorActivationIntent({}, false),
+    };
+    assert.equal(select({ pinnedRow }).kind, "skip", testStatus);
+  }
+});
+test("explicit operator reactivation removes the inactive-probe refusal", () => {
+  const providerSpecificData = applyOperatorActivationIntent(
+    applyOperatorActivationIntent({}, false),
+    true
+  );
+  assert.equal(select({ pinnedRow: { ...pin, providerSpecificData } }).kind, "probe");
+});
 test("P-3 no pin -> skip", () => {
   assert.equal(select({ forcedConnectionId: null }).kind, "skip");
 });
@@ -56,16 +74,22 @@ test("P-5 banned -> skip", () => {
 });
 test("P-6 expired + no_refresh_token -> skip", () => {
   assert.equal(
-    select({ pinnedRow: { ...pin, testStatus: "expired", lastErrorType: "no_refresh_token" } }).kind,
+    select({ pinnedRow: { ...pin, testStatus: "expired", lastErrorType: "no_refresh_token" } })
+      .kind,
     "skip"
   );
 });
 test("P-7 expired + empty lastErrorType -> probe", () => {
-  assert.equal(select({ pinnedRow: { ...pin, testStatus: "expired", lastErrorType: "" } }).kind, "probe");
+  assert.equal(
+    select({ pinnedRow: { ...pin, testStatus: "expired", lastErrorType: "" } }).kind,
+    "probe"
+  );
 });
 test("P-8 error + unrecoverable_refresh_error -> skip", () => {
   assert.equal(
-    select({ pinnedRow: { ...pin, testStatus: "error", lastErrorType: "unrecoverable_refresh_error" } }).kind,
+    select({
+      pinnedRow: { ...pin, testStatus: "error", lastErrorType: "unrecoverable_refresh_error" },
+    }).kind,
     "skip"
   );
 });
@@ -81,7 +105,11 @@ test("P-11 provider not in providersToSearch -> skip", () => {
 test("P-12 unavailable + future cooldown -> skip", () => {
   assert.equal(
     select({
-      pinnedRow: { ...pin, testStatus: "unavailable", rateLimitedUntil: new Date(2_000_000_000).toISOString() },
+      pinnedRow: {
+        ...pin,
+        testStatus: "unavailable",
+        rateLimitedUntil: new Date(2_000_000_000).toISOString(),
+      },
       nowMs: 1_000_000,
     }).kind,
     "skip"
@@ -90,7 +118,11 @@ test("P-12 unavailable + future cooldown -> skip", () => {
 test("P-13 unavailable + elapsed cooldown -> probe", () => {
   assert.equal(
     select({
-      pinnedRow: { ...pin, testStatus: "unavailable", rateLimitedUntil: new Date(500_000).toISOString() },
+      pinnedRow: {
+        ...pin,
+        testStatus: "unavailable",
+        rateLimitedUntil: new Date(500_000).toISOString(),
+      },
       nowMs: 1_000_000,
     }).kind,
     "probe"
@@ -216,7 +248,10 @@ test("maybeReactivateAfterExplicitProbe no-ops when allowSuppressedConnections",
 });
 
 test("W-7 chatHelpers onRequestSuccess calls maybeReactivateAfterExplicitProbe", async () => {
-  const src = fs.readFileSync(new URL("../../src/sse/handlers/chatHelpers.ts", import.meta.url), "utf8");
+  const src = fs.readFileSync(
+    new URL("../../src/sse/handlers/chatHelpers.ts", import.meta.url),
+    "utf8"
+  );
   assert.match(src, /await maybeReactivateAfterExplicitProbe\(/);
   assert.match(src, /clearAccountError/);
 });

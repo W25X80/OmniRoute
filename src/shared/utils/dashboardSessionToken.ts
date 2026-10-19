@@ -1,3 +1,5 @@
+import { getAuthSettingsSnapshot } from "@/lib/db/authSettings";
+import { AUTH_GENERATION_SETTING, readAuthGeneration } from "@/lib/db/authSettingsSemantics";
 /**
  * Dashboard session token — the ONE verifier for the `auth_token` cookie.
  *
@@ -30,8 +32,14 @@ export type RevokedSession = { jti: string; exp: number };
  * issue time and an id, which is what `verifyDashboardSessionToken` needs to honour a password
  * change or a sign-out before the 30 days are up.
  */
-export async function mintDashboardSessionToken(secret: Uint8Array): Promise<string> {
-  return new SignJWT({ [DASHBOARD_SESSION_CLAIM]: true })
+export async function mintDashboardSessionToken(
+  secret: Uint8Array,
+  authenticatedGeneration?: string
+): Promise<string> {
+  const generation = authenticatedGeneration ?? (await getAuthSettingsSnapshot()).generation;
+  if (!generation || !readAuthGeneration({ [AUTH_GENERATION_SETTING]: generation }))
+    throw new Error("Authentication generation unavailable");
+  return new SignJWT({ [DASHBOARD_SESSION_CLAIM]: true, [AUTH_GENERATION_SETTING]: generation })
     .setProtectedHeader({ alg: "HS256" })
     .setIssuedAt()
     .setJti(crypto.randomUUID())
@@ -58,14 +66,14 @@ export function addRevokedSession(
 
 /**
  * True when a verified session was ended server-side: it predates the password change cutoff, or
- * its id was revoked at sign-out. Tokens minted before these existed have no `iat` or `jti` and
- * stay valid until the first password change. Fails closed: if the settings cannot be read the
+ * its id was revoked at sign-out, or its authenticated generation was retired. Unclassified
+ * legacy tokens fail closed. If the settings cannot be read the
  * session is not trusted.
  */
 async function isDashboardSessionEnded(payload: JWTPayload): Promise<boolean> {
   try {
-    const { getCachedSettings } = await import("@/lib/db/readCache");
-    const settings = (await getCachedSettings()) as Record<string, unknown>;
+    const { settings, generation } = await getAuthSettingsSnapshot();
+    if (!generation || readAuthGeneration(payload) !== generation) return true;
 
     const validAfter = settings[SESSIONS_VALID_AFTER_SETTING];
     if (typeof validAfter === "number" && (payload.iat ?? 0) < validAfter) return true;

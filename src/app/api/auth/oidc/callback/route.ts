@@ -1,5 +1,5 @@
+import { getAuthSettingsSnapshot } from "@/lib/db/authSettings";
 import { NextResponse } from "next/server";
-import { getCachedSettings } from "@/lib/db/readCache";
 import { updateSettings } from "@/lib/db/settings";
 import { jwtVerify, createRemoteJWKSet } from "jose";
 import { cookies } from "next/headers";
@@ -75,7 +75,8 @@ export async function GET(request: Request) {
     maxAge: 0,
   });
 
-  const settings = await getCachedSettings();
+  const authSnapshot = await getAuthSettingsSnapshot();
+  const settings = authSnapshot.settings;
 
   const enabled = settings.oidcEnabled === true;
   const rawIssuer = typeof settings.oidcIssuer === "string" ? settings.oidcIssuer.trim() : "";
@@ -233,7 +234,7 @@ export async function GET(request: Request) {
   const isHttpsRequest = fp === "https" || reqUrl.protocol === "https:";
   const useSecureCookie = forceSecureCookie || isHttpsRequest;
 
-  const jwt = await mintDashboardSessionToken(secret);
+  const jwt = await mintDashboardSessionToken(secret, authSnapshot.generation ?? "");
 
   const store = await oidcCallbackInternals.getCookieStore();
   store.set("auth_token", jwt, {

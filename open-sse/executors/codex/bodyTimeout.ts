@@ -18,12 +18,29 @@ function isBodyTimeoutError(err: unknown): boolean {
   return err instanceof Error && err.name === "BodyTimeoutError";
 }
 
-async function cancelReaderSafely(reader: ReadableStreamDefaultReader<Uint8Array>): Promise<void> {
+function cancelReaderSafely(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  reason?: unknown
+): void {
   try {
-    await reader.cancel();
+    void reader.cancel(reason).catch(() => undefined);
   } catch {
     // Upstream socket may already be closing; nothing to clean up.
   }
+}
+
+function releaseReaderSafely(reader: ReadableStreamDefaultReader<Uint8Array>): void {
+  try {
+    reader.releaseLock();
+  } catch {
+    // A native implementation may still be settling its cancelled read.
+  }
+}
+
+/** A rejected peek owns no passthrough handoff and must not await cancel acknowledgement. */
+export function cancelCodexPeekReader(reader: ReadableStreamDefaultReader<Uint8Array>): void {
+  cancelReaderSafely(reader);
+  releaseReaderSafely(reader);
 }
 
 /**
@@ -41,7 +58,7 @@ export async function readCodexPeekChunk(
     return { done, value, timedOut: false };
   } catch (err) {
     if (isBodyTimeoutError(err)) {
-      await cancelReaderSafely(reader);
+      cancelCodexPeekReader(reader);
       return { done: true, timedOut: true };
     }
     throw err;
@@ -59,30 +76,46 @@ export function buildCodexTimeoutSafePassthroughBody(
   upstreamReader: ReadableStreamDefaultReader<Uint8Array>,
   timeoutMs: number
 ): ReadableStream<Uint8Array> {
+  let closed = false;
+  let reading = false;
+  let readerReleased = false;
+  function releaseReader(): void {
+    if (readerReleased || reading) return;
+    readerReleased = true;
+    releaseReaderSafely(upstreamReader);
+  }
   return new ReadableStream<Uint8Array>({
     start(controller) {
       for (const chunk of chunks) controller.enqueue(chunk);
     },
     async pull(controller) {
+      if (closed) return;
+      reading = true;
       try {
         const { done, value } = await readStreamChunkWithTimeout(upstreamReader, timeoutMs);
+        if (closed) return;
         if (done) {
+          closed = true;
           controller.close();
           return;
         }
         if (!value) return;
         controller.enqueue(value);
       } catch (err) {
-        await cancelReaderSafely(upstreamReader);
+        if (closed) return;
+        closed = true;
+        cancelReaderSafely(upstreamReader);
         controller.error(err);
+      } finally {
+        reading = false;
+        if (closed) releaseReader();
       }
     },
     cancel(reason) {
-      try {
-        upstreamReader.cancel(reason).catch(() => {});
-      } catch {
-        // noop — upstream socket may already be closing.
-      }
+      if (closed) return;
+      closed = true;
+      cancelReaderSafely(upstreamReader, reason);
+      releaseReader();
     },
   });
 }

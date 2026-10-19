@@ -90,6 +90,14 @@ export function flattenGrokBuildNamespaceTools(body: unknown): {
     identityMap = map;
   }
 
+  if (identityMap && Array.isArray(body.tools)) {
+    for (const tool of body.tools) {
+      if (!isRecord(tool) || tool.type !== "function") continue;
+      const name = stringOrEmpty(tool.name);
+      if (name) identityMap.set(name, { namespace: "", name });
+    }
+  }
+
   const history = Array.isArray(body.input) ? flattenNamespacedHistory(body.input) : null;
   if (!identityMap && !history?.changed) return { body, identityMap: null };
 

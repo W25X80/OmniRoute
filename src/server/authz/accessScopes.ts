@@ -62,6 +62,9 @@ export function inferRequiredScope(method: string, path: string): AccessScope {
   if (matchesPrefix(p, ["/api/keys"]) && /\/reveal\/?$/.test(p)) return "admin";
 
   const isMutation = !READ_METHODS.has(m);
+  const exact = p.length > 1 && p.endsWith("/") ? p.slice(0, -1) : p;
+  if (isMutation && ["/api/settings", "/api/settings/require-login"].includes(exact))
+    return "admin";
   if (isMutation && matchesPrefix(p, ADMIN_MUTATION_PREFIXES)) return "admin";
 
   return isMutation ? "write" : "read";

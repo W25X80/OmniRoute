@@ -534,7 +534,7 @@ test("usage service covers Claude OAuth success, legacy fallback and permissions
 
   globalThis.fetch = async (url) => {
     if (String(url).includes("/api/oauth/usage")) {
-      return new Response("fallback", { status: 500 });
+      return new Response("fallback", { status: 404 });
     }
     if (String(url).endsWith("/v1/settings")) {
       return new Response(
@@ -562,16 +562,16 @@ test("usage service covers Claude OAuth success, legacy fallback and permissions
 
   globalThis.fetch = async (url) => {
     if (String(url).includes("/api/oauth/usage")) {
-      return new Response("fallback", { status: 500 });
+      return new Response("denied", { status: 403 });
     }
-    return new Response("denied", { status: 403 });
+    throw new Error("403 must not call the legacy settings endpoint");
   };
 
   const permissionsMessage: any = await usageService.getUsageForProvider({
     provider: "claude",
     accessToken: "claude-denied",
   });
-  assert.match(permissionsMessage.message, /admin permissions/i);
+  assert.match(permissionsMessage.message, /HTTP 403/i);
 });
 
 test("usage service covers Claude default-plan fallback, legacy org denial and fetch failures", async () => {
@@ -596,7 +596,7 @@ test("usage service covers Claude default-plan fallback, legacy org denial and f
 
   globalThis.fetch = async (url) => {
     if (String(url).includes("/api/oauth/usage")) {
-      return new Response("fallback", { status: 500 });
+      return new Response("fallback", { status: 404 });
     }
     if (String(url).endsWith("/v1/settings")) {
       return new Response(
@@ -625,7 +625,8 @@ test("usage service covers Claude default-plan fallback, legacy org denial and f
     provider: "claude",
     accessToken: "claude-offline",
   });
-  assert.match(fetchFailure.message, /Unable to fetch usage: claude usage offline/i);
+  assert.match(fetchFailure.message, /Unable to fetch usage: request failed/i);
+  assert.equal(fetchFailure.message.includes("claude usage offline"), false);
 });
 
 test("usage service covers Codex, Kiro and Kimi usage parsing and error branches", async () => {

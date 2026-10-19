@@ -30,6 +30,7 @@ import { POSTGRES_ARTIFACT_RECOVERY_SCHEMA_STATEMENTS } from "./artifactRecovery
 import { POSTGRES_CONVERSATION_CONCURRENCY_STATEMENTS } from "./conversationConcurrencySchema";
 import { POSTGRES_CONVERSATION_COUNT_STATEMENTS } from "./conversationNodeCounts";
 import { acquirePostgresLock } from "./locks";
+import { POSTGRES_MANAGEMENT_AUTH_STATEMENTS } from "./managementAuthSchema";
 
 interface Migration {
   version: number;
@@ -174,6 +175,11 @@ const migrations: readonly Migration[] = [
     version: 11,
     name: "conversation_node_counts",
     statements: POSTGRES_CONVERSATION_COUNT_STATEMENTS,
+  },
+  {
+    version: 12,
+    name: "management_auth_lifecycle",
+    statements: POSTGRES_MANAGEMENT_AUTH_STATEMENTS,
   },
 ];
 

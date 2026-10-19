@@ -210,7 +210,8 @@ export function isLoopbackRequest(request: RequestLike | Request | null | undefi
  * "remote".
  */
 export function getRequestPeerLocality(
-  request: RequestLike | Request | null | undefined
+  request: RequestLike | Request | null | undefined,
+  allowLegacyHostFallback = true
 ): "loopback" | "lan" | "remote" {
   if (!request || typeof request !== "object") return "remote";
 
@@ -243,7 +244,7 @@ export function getRequestPeerLocality(
   // unit-test harness) or a raw `next` launch that also bypasses every LOCAL_ONLY
   // gate in peerContext. There is no real peer to read, so keep the historical
   // URL/Host verdict rather than turning every direct handler call into a remote one.
-  return isLegacyHostLoopback(request) ? "loopback" : "remote";
+  return allowLegacyHostFallback && isLegacyHostLoopback(request) ? "loopback" : "remote";
 }
 
 function isLegacyHostLoopback(request: RequestLike | Request): boolean {
@@ -381,10 +382,8 @@ export function isManagementApiRequest(request: RequestLike | Request): boolean 
   return !isPublicApiRoute(pathname, getRequestMethod(request));
 }
 
-export async function isDashboardSessionAuthenticated(
-  request?: RequestLike | Request | null
-): Promise<boolean> {
-  if (!process.env.JWT_SECRET) return false;
+export async function getDashboardSessionPayload(request?: RequestLike | Request | null) {
+  if (!process.env.JWT_SECRET) return null;
 
   let token =
     request &&
@@ -410,9 +409,15 @@ export async function isDashboardSessionAuthenticated(
     }
   }
 
-  if (!token) return false;
+  if (!token) return null;
 
-  return (await verifyDashboardSessionToken(token)) !== null;
+  return verifyDashboardSessionToken(token);
+}
+
+export async function isDashboardSessionAuthenticated(
+  request?: RequestLike | Request | null
+): Promise<boolean> {
+  return (await getDashboardSessionPayload(request)) !== null;
 }
 
 // ──────────────── Auth Verification ────────────────
@@ -549,4 +554,15 @@ export async function isAuthRequired(
     );
     return true;
   }
+}
+
+/** Bootstrap proof never infers TCP locality from a URL or Host header. */
+export function isStrictLoopbackRequest(request: Request): boolean {
+  if (
+    ["forwarded", "x-forwarded-for", "x-real-ip", "cf-connecting-ip"].some((key) =>
+      request.headers.has(key)
+    )
+  )
+    return false;
+  return getRequestPeerLocality(request, false) === "loopback";
 }

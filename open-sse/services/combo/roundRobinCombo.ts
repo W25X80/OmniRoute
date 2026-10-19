@@ -129,6 +129,12 @@ import { resolveComboDailyReset } from "./comboDailyResetClock.ts";
 import { resolveTargetTokenLimit } from "./targetTokenLimit.ts";
 import { isProviderProbeResponse } from "../../../src/shared/utils/providerProbeResult.ts";
 import { recordLocalCircuitRefusal } from "./localCircuitRefusal.ts";
+import { looksLikeConcurrencyLimit } from "../quotaResetParsing.ts";
+import {
+  CONCURRENCY_LIMITED_REASON,
+  resolveConcurrencyLimitCooldownOverride,
+} from "../accountFallback/concurrencyLimit429.ts";
+import { readConnectionForCooldownGate } from "./executeTargetGates.ts";
 
 /**
  * Handle round-robin combo: each request goes to the next model in circular order.
@@ -1000,6 +1006,17 @@ export async function handleRoundRobinCombo({
                 }
               : undefined;
           const scopedFailure = isScopedFailure(result, errorText, structuredError);
+          // Match the common target path: only the selected account's fixed
+          // duration is carried here; account rotation gates keep their scope.
+          let concurrencyCooldownMs: number | null = null;
+          if (result.status === 429 && looksLikeConcurrencyLimit(errorText)) {
+            const selectedConnectionId =
+              result.headers.get("x-omniroute-selected-connection-id") || target.connectionId;
+            const selectedConnection = selectedConnectionId
+              ? await readConnectionForCooldownGate(selectedConnectionId, true)
+              : null;
+            concurrencyCooldownMs = resolveConcurrencyLimitCooldownOverride(selectedConnection);
+          }
           const fallbackResult = checkFallbackError(
             result.status,
             errorText,
@@ -1009,7 +1026,7 @@ export async function handleRoundRobinCombo({
             result.headers,
             profile,
             structuredError,
-            null,
+            { concurrencyCooldownMs },
             await resolveComboDailyReset(provider)
           );
           const { cooldownMs } = fallbackResult;
@@ -1140,6 +1157,7 @@ export async function handleRoundRobinCombo({
             resilienceSettings.providerCooldown.enabled &&
             provider &&
             provider !== "unknown" &&
+            fallbackResult.reason !== CONCURRENCY_LIMITED_REASON &&
             !scopedFailure &&
             !isModelScopedClaudeQuota &&
             !(

@@ -1,3 +1,8 @@
+import {
+  SYNC_TOKEN_AUTH_SELECT,
+  syncRowAuthorization,
+  syncTokenIsLive,
+} from "./syncTokenLifecycle";
 import { v4 as uuidv4 } from "uuid";
 import { getDbInstance, rowToCamel } from "./core";
 import { backupDbFile } from "./backup";
@@ -8,6 +13,7 @@ import {
   createPostgresSyncToken,
   revokePostgresSyncToken,
   touchPostgresSyncToken,
+  validatePostgresSyncToken,
 } from "./postgres/authSessionRepository";
 
 type JsonRecord = Record<string, unknown>;
@@ -17,6 +23,9 @@ export interface SyncTokenRecord {
   name: string;
   tokenHash: string;
   syncApiKeyId: string | null;
+  issuedBy: string | null;
+  expiresAt: string | null;
+  authGeneration: string | null;
   revokedAt: string | null;
   lastUsedAt: string | null;
   createdAt: string;
@@ -49,9 +58,12 @@ function toSyncTokenRecord(value: unknown): SyncTokenRecord | null {
     name: record.name,
     tokenHash: typeof record.tokenHash === "string" ? record.tokenHash : "",
     syncApiKeyId: typeof record.syncApiKeyId === "string" ? record.syncApiKeyId : null,
+    issuedBy: typeof record.issuedBy === "string" ? record.issuedBy : null,
+    expiresAt: typeof record.expiresAt === "string" ? record.expiresAt : null,
+    authGeneration: typeof record.authGeneration === "string" ? record.authGeneration : null,
     revokedAt: typeof record.revokedAt === "string" ? record.revokedAt : null,
     lastUsedAt: typeof record.lastUsedAt === "string" ? record.lastUsedAt : null,
-    createdAt: typeof record.createdAt === "string" ? record.createdAt : new Date().toISOString(),
+    createdAt: typeof record.createdAt === "string" ? record.createdAt : "",
     updatedAt: typeof record.updatedAt === "string" ? record.updatedAt : new Date().toISOString(),
   };
 }
@@ -66,7 +78,8 @@ function ensureSyncTokensTable(db: DbLike) {
       revoked_at TEXT,
       last_used_at TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
-      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      issued_by TEXT, expires_at TEXT, auth_generation TEXT
     );
 
     CREATE INDEX IF NOT EXISTS idx_sync_tokens_created_at ON sync_tokens(created_at);
@@ -114,6 +127,9 @@ export async function createSyncTokenRecord(data: {
   name: string;
   tokenHash: string;
   syncApiKeyId?: string | null;
+  issuedBy?: string | null;
+  expiresAt?: string | null;
+  authGeneration?: string | null;
 }) {
   const postgres = getSelectedPostgresDatabase();
   if (postgres) return createPostgresSyncToken(postgres, data);
@@ -126,27 +142,43 @@ export async function createSyncTokenRecord(data: {
     name: data.name,
     tokenHash: data.tokenHash,
     syncApiKeyId: data.syncApiKeyId || null,
+    issuedBy: data.issuedBy || null,
+    expiresAt: data.expiresAt || null,
+    authGeneration: data.authGeneration || null,
     revokedAt: null,
     lastUsedAt: null,
     createdAt: now,
     updatedAt: now,
   };
 
-  db.prepare(
-    `INSERT INTO sync_tokens (
-      id, name, token_hash, sync_api_key_id, revoked_at, last_used_at, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-  ).run(
-    record.id,
-    record.name,
-    record.tokenHash,
-    record.syncApiKeyId,
-    record.revokedAt,
-    record.lastUsedAt,
-    record.createdAt,
-    record.updatedAt
-  );
-
+  getDbInstance().transaction(() => {
+    if (data.authGeneration) {
+      const current = db
+        .prepare<{ value: string }>(
+          "SELECT value FROM key_value WHERE namespace='settings' AND key='managementAuthGeneration'"
+        )
+        .get();
+      if (current?.value !== JSON.stringify(data.authGeneration))
+        throw new Error("Authentication generation changed");
+    }
+    db.prepare(
+      `INSERT INTO sync_tokens (
+      id, name, token_hash, sync_api_key_id, revoked_at, last_used_at, created_at, updated_at, issued_by, expires_at, auth_generation
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      record.id,
+      record.name,
+      record.tokenHash,
+      record.syncApiKeyId,
+      record.revokedAt,
+      record.lastUsedAt,
+      record.createdAt,
+      record.updatedAt,
+      record.issuedBy,
+      record.expiresAt,
+      record.authGeneration
+    );
+  })();
   backupDbFile("pre-write");
   return record;
 }
@@ -180,4 +212,40 @@ export async function touchSyncTokenLastUsed(id: string, usedAt = new Date().toI
     .prepare("UPDATE sync_tokens SET last_used_at = ?, updated_at = ? WHERE id = ?")
     .run(usedAt, usedAt, id);
   return Number(result.changes || 0) > 0;
+}
+
+/** Authorization and optional final use acknowledgement share a coherent source snapshot. */
+export async function validateSyncTokenRecord(
+  tokenHash: string,
+  usedAt?: string
+): Promise<SyncTokenRecord | null> {
+  const postgres = getSelectedPostgresDatabase();
+  if (postgres) return validatePostgresSyncToken(postgres, tokenHash, usedAt);
+  const db = getDbInstance();
+  return db.transaction(() => {
+    const columns = new Set(
+      (db.pragma("table_info(api_keys)") as Array<{ name: string }>).map((column) => column.name)
+    );
+    let sql = SYNC_TOKEN_AUTH_SELECT;
+    for (const [column, fallback] of [
+      ["is_active", "1"],
+      ["is_banned", "0"],
+      ["revoked_at", "NULL"],
+      ["expires_at", "NULL"],
+    ]) {
+      if (!columns.has(column)) sql = sql.replace("k." + column, fallback);
+    }
+    const row = db.prepare(sql + "?").get(tokenHash) as Record<string, unknown> | undefined;
+    const record = toSyncTokenRecord(row);
+    if (!row || !record) return null;
+    const { generation, linkedKey } = syncRowAuthorization(row);
+    if (!syncTokenIsLive(record, generation, linkedKey)) return null;
+    if (usedAt)
+      db.prepare("UPDATE sync_tokens SET last_used_at=?,updated_at=? WHERE id=?").run(
+        usedAt,
+        usedAt,
+        record.id
+      );
+    return record;
+  })();
 }

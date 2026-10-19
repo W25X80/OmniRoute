@@ -1,12 +1,19 @@
-import { handleJinaFoundationProxy } from "@omniroute/open-sse/handlers/jinaFoundation.ts";
 import {
-  getProviderCredentialsWithQuotaPreflight,
-  clearRecoveredProviderState,
-} from "@/sse/services/auth";
+  isCredentialDiagnosticSentinel,
+  credentialDiagnosticResponse,
+} from "@omniroute/open-sse/services/comboKeyScope.ts";
+import { handleJinaFoundationProxy } from "@omniroute/open-sse/handlers/jinaFoundation.ts";
+import { clearRecoveredProviderState } from "@/sse/services/auth";
+import { getProviderCredentialsWithQuotaPreflight } from "@/sse/services/scopedCredentials";
 import { withInjectionGuard } from "@/middleware/promptInjectionGuard";
 import { errorResponse } from "@omniroute/open-sse/utils/error.ts";
 import { HTTP_STATUS } from "@omniroute/open-sse/config/constants.ts";
 import { enforceApiKeyPolicy } from "@/shared/utils/apiKeyPolicy";
+import {
+  isKeyScopeBlockedCredentials,
+  keyScopeBlockedResponse,
+  resolveKeyConnectionScope,
+} from "@/sse/services/keyConnectionScope";
 import { v1SegmentSchema } from "@/shared/validation/schemas";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
 import {
@@ -50,13 +57,26 @@ async function postHandler(request: Request) {
 
   const policy = await enforceApiKeyPolicy(request, "jina-ai/segment");
   if (policy.rejection) return policy.rejection;
+  // GHSA-3w2r: credential selection stays inside the key's connection scope,
+  // the same scope chat applies.
+  const scope = await resolveKeyConnectionScope(policy.apiKeyInfo);
+  if (scope.rejection) return scope.rejection;
 
-  const credentials = await getProviderCredentialsWithQuotaPreflight(JINA_FOUNDATION_PROVIDER_ID);
+  const credentials = await getProviderCredentialsWithQuotaPreflight(
+    JINA_FOUNDATION_PROVIDER_ID,
+    null,
+    scope.connectionScope
+  );
+  if (isCredentialDiagnosticSentinel(credentials))
+    return credentialDiagnosticResponse("provider", credentials)!;
   if (!credentials) {
     return errorResponse(
       HTTP_STATUS.BAD_REQUEST,
       `No credentials for provider: ${JINA_FOUNDATION_PROVIDER_ID}`
     );
+  }
+  if (isKeyScopeBlockedCredentials(credentials)) {
+    return keyScopeBlockedResponse(JINA_FOUNDATION_PROVIDER_ID, credentials);
   }
   if (isAllRateLimitedCredentials(credentials)) {
     return rateLimitedProviderResponse(JINA_FOUNDATION_PROVIDER_ID, credentials);

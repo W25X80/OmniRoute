@@ -27,6 +27,11 @@ import {
 import { getAntigravityQuotaFamily, getQuotaFetchScope } from "./antigravityQuotaFamily.ts";
 import { boundedMap } from "../../src/lib/quota/boundedMap.ts";
 import { toNumberOrNull } from "@/shared/utils/numeric";
+import {
+  currentClaudeUsageProducerId,
+  getClaudeUsageProvenance,
+  isFreshClaudeUsage,
+} from "./usage/claudeUsageProvenance.ts";
 
 type UsageFetcher = (
   connection: Parameters<typeof getUsageForProvider>[0],
@@ -41,8 +46,16 @@ let usageFetcherOverride: UsageFetcher | null = null;
 const CACHE_TTL_MS = 60_000;
 /** Drop unused force-refresh flags once inner provider caches (60s–5min) have expired. */
 const PENDING_FORCE_REFRESH_TTL_MS = CACHE_TTL_MS * 5;
-/** key → Date.now() when invalidate asked the next fetch to force-refresh. */
-const pendingForceRefresh = new Map<string, number>();
+interface PendingForceRefresh {
+  generation: number;
+  markedAt: number;
+  claudeProducerFence: number | null;
+}
+
+/** Per-connection invalidation identity is unique even for same-millisecond events. */
+const pendingForceRefresh = new Map<string, PendingForceRefresh>();
+const invalidationEpochs = new Map<string, PendingForceRefresh>();
+let nextForceRefreshGeneration = 0;
 /** key → last convert-null / throw while force-refresh was pending. */
 const pendingForceRefreshMiss = new Map<string, number>();
 
@@ -57,7 +70,12 @@ export function __agePendingForceRefreshForTests(
   connectionId: string,
   ageMs: number
 ): void {
-  pendingForceRefresh.set(connectionKey(provider, connectionId), Date.now() - ageMs);
+  const key = connectionKey(provider, connectionId);
+  const now = Date.now() - ageMs;
+  const current = pendingForceRefresh.get(key);
+  if (current) pendingForceRefresh.set(key, { ...current, markedAt: now });
+  const epoch = invalidationEpochs.get(key);
+  if (epoch) invalidationEpochs.set(key, { ...epoch, markedAt: now });
 }
 
 /** Test-only: backdate a convert-null miss so the 60s hammer-guard is unit-testable. */
@@ -74,6 +92,7 @@ export function __resetGenericQuotaFetcherForTests(): void {
   cache.clear();
   pendingForceRefresh.clear();
   pendingForceRefreshMiss.clear();
+  invalidationEpochs.clear();
 }
 
 // One entry per (provider, connection); 4096 keeps even very large account pools
@@ -93,14 +112,16 @@ function cacheKey(provider: string, connectionId: string, requestedModel?: strin
 }
 
 function dropExpiredPendingForceRefresh(key: string, now: number): boolean {
-  const stampedAt = pendingForceRefresh.get(key);
-  if (stampedAt === undefined) return true;
-  if (now - stampedAt > PENDING_FORCE_REFRESH_TTL_MS) {
+  const pending = pendingForceRefresh.get(key);
+  if (pending && now - pending.markedAt > PENDING_FORCE_REFRESH_TTL_MS) {
     pendingForceRefresh.delete(key);
     pendingForceRefreshMiss.delete(key);
-    return true;
   }
-  return false;
+  const epoch = invalidationEpochs.get(key);
+  if (epoch && now - epoch.markedAt > PENDING_FORCE_REFRESH_TTL_MS) {
+    invalidationEpochs.delete(key);
+  }
+  return !pendingForceRefresh.has(key);
 }
 
 // Lazy expiry on read — same as the provider breaker. Name stays `is*` because
@@ -128,10 +149,12 @@ function isForceRefreshMissCooling(key: string, forceRefresh: boolean, now: numb
 }
 
 /** True when a concurrent 429 re-stamped a still-live flag during fetchUsage. */
-function isConcurrentForceRefresh(key: string, refreshStamp: number | undefined): boolean {
-  const currentStamp = pendingForceRefresh.get(key);
-  if (currentStamp === refreshStamp) return false;
-  return currentStamp !== undefined && Date.now() - currentStamp <= PENDING_FORCE_REFRESH_TTL_MS;
+function isConcurrentForceRefresh(key: string, refreshGeneration: number | undefined): boolean {
+  const current = pendingForceRefresh.get(key);
+  if (current?.generation === refreshGeneration || (!current && refreshGeneration === undefined)) {
+    return false;
+  }
+  return current !== undefined && Date.now() - current.markedAt <= PENDING_FORCE_REFRESH_TTL_MS;
 }
 
 // 5min — same TTL as the original reap (CACHE_TTL_MS * 5). Expiry lazy on read
@@ -143,7 +166,7 @@ const _cacheCleanup = setInterval(() => {
   for (const key of cache.keys()) {
     cache.get(key);
   }
-  for (const key of pendingForceRefresh.keys()) {
+  for (const key of new Set([...pendingForceRefresh.keys(), ...invalidationEpochs.keys()])) {
     dropExpiredPendingForceRefresh(key, now);
   }
 }, 5 * 60_000);
@@ -406,15 +429,17 @@ export const fetchGenericQuota: QuotaFetcher = async (connectionId, connection) 
   const forceKey = connectionKey(provider, connectionId);
   const now = Date.now();
   const forceRefresh = isPendingForceRefresh(forceKey, now);
+  const forceRefreshGeneration = pendingForceRefresh.get(forceKey)?.generation;
+  const invalidationAtStart = invalidationEpochs.get(forceKey)?.generation;
   const hit = cachedQuotaIfFresh(key, forceRefresh, now);
   if (hit) return hit;
   // convert-null / throw keep the force-refresh flag (agy inner caches are
   // still stale) but must not hammer those endpoints on every routing tick.
   if (isForceRefreshMissCooling(forceKey, forceRefresh, now)) return null;
 
-  // Capture before await: a 429 during fetchUsage re-stamps this; writing
-  // the pre-429 snapshot would wipe that flag and recache stale quota.
-  const refreshStamp = pendingForceRefresh.get(forceKey);
+  // Capture the marker before await. A Claude result from a producer that
+  // predates this generation cannot satisfy a force-read, even when it joined
+  // the old in-flight promise after invalidation.
 
   let usage: unknown;
   try {
@@ -427,16 +452,44 @@ export const fetchGenericQuota: QuotaFetcher = async (connectionId, connection) 
     return null;
   }
 
+  if (provider === "claude") {
+    const provenance = getClaudeUsageProvenance(usage);
+    const latestEpoch = invalidationEpochs.get(forceKey);
+    const predatesLatestInvalidation = Boolean(
+      latestEpoch &&
+      provenance?.producerId !== null &&
+      provenance?.producerId !== undefined &&
+      provenance.producerId <= (latestEpoch.claudeProducerFence ?? Number.POSITIVE_INFINITY)
+    );
+    if (
+      !isFreshClaudeUsage(usage) ||
+      predatesLatestInvalidation ||
+      (forceRefreshGeneration !== undefined &&
+        latestEpoch?.generation !== forceRefreshGeneration &&
+        latestEpoch !== undefined &&
+        (provenance?.producerId === null ||
+          provenance?.producerId === undefined ||
+          provenance.producerId <= (latestEpoch.claudeProducerFence ?? Number.POSITIVE_INFINITY)))
+    ) {
+      markPendingForceRefreshMiss(forceKey);
+      return null;
+    }
+  }
+
   const quota = convertUsageToQuotaInfo(usage, { provider, requestedModel });
   if (!quota) {
     markPendingForceRefreshMiss(forceKey);
     return null;
   }
 
-  // Concurrent 429 re-stamped a still-live flag — do not recache the
-  // pre-429 snapshot. A vanished or expired stamp is not a 429.
-  if (isConcurrentForceRefresh(forceKey, refreshStamp)) {
+  // A fresh Claude network observation clears only the marker it actually
+  // satisfied. Existing providers retain the concurrent-refresh behavior.
+  if (isConcurrentForceRefresh(forceKey, forceRefreshGeneration)) {
     return quota;
+  }
+  const latestEpoch = invalidationEpochs.get(forceKey);
+  if (provider === "claude" && latestEpoch?.generation !== invalidationAtStart) {
+    return null;
   }
 
   pendingForceRefresh.delete(forceKey);
@@ -465,7 +518,14 @@ export function invalidateGenericQuotaCache(provider: string, connectionId: stri
   // Next fetch must bypass provider-inner usage caches (agy retrieveUserQuota /
   // weekly are 60s–5min). Without this, dropping the 60s wrapper recaches stale.
   // TTL matches those inner caches: after 5min the flag is a no-op.
-  pendingForceRefresh.set(forceKey, Date.now());
+  const markedAt = Date.now();
+  const record: PendingForceRefresh = {
+    generation: ++nextForceRefreshGeneration,
+    markedAt,
+    claudeProducerFence: provider.trim() === "claude" ? currentClaudeUsageProducerId() : null,
+  };
+  pendingForceRefresh.set(forceKey, record);
+  invalidationEpochs.set(forceKey, record);
   pendingForceRefreshMiss.delete(forceKey);
 }
 

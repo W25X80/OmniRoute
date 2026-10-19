@@ -109,6 +109,11 @@ import type { ProtectedPriorityStopCause } from "./protectedPriorityStopStatus.t
 import { isProviderProbeResponse } from "../../../src/shared/utils/providerProbeResult.ts";
 import { recordLocalCircuitRefusal } from "./localCircuitRefusal.ts";
 import { getStrategyTraits } from "./strategyRegistry.ts";
+import { looksLikeConcurrencyLimit } from "../quotaResetParsing.ts";
+import {
+  CONCURRENCY_LIMITED_REASON,
+  resolveConcurrencyLimitCooldownOverride,
+} from "../accountFallback/concurrencyLimit429.ts";
 
 export async function executeTargetAttempt(opts: {
   index: number;
@@ -879,6 +884,17 @@ export async function executeTargetAttempt(opts: {
       if (i > 0) state.fallbackCount++;
       return { ok: false, response: result };
     }
+    // The response identifies the account actually selected by an unpinned target.
+    // Carry only its fixed cooldown; account rotation gates keep their existing scope.
+    let concurrencyCooldownMs: number | null = null;
+    if (result.status === 429 && looksLikeConcurrencyLimit(errorText)) {
+      const selectedConnectionId =
+        result.headers.get("x-omniroute-selected-connection-id") || target.connectionId;
+      const selectedConnection = selectedConnectionId
+        ? await readConnectionForCooldownGate(selectedConnectionId, true)
+        : null;
+      concurrencyCooldownMs = resolveConcurrencyLimitCooldownOverride(selectedConnection);
+    }
     const fallbackResult = checkFallbackError(
       result.status,
       errorText,
@@ -888,7 +904,7 @@ export async function executeTargetAttempt(opts: {
       result.headers,
       profile,
       structuredError,
-      null,
+      { concurrencyCooldownMs },
       await resolveComboDailyReset(provider)
     );
     const { cooldownMs } = fallbackResult;
@@ -1124,6 +1140,7 @@ export async function executeTargetAttempt(opts: {
       let lockoutRecorded = false;
       if (
         !protectedPriorityTarget &&
+        fallbackResult.reason !== CONCURRENCY_LIMITED_REASON &&
         provider &&
         rawModel &&
         retry === 0 &&
@@ -1220,6 +1237,7 @@ export async function executeTargetAttempt(opts: {
     if (
       provider &&
       rawModel &&
+      fallbackResult.reason !== CONCURRENCY_LIMITED_REASON &&
       shouldRecordModelLockoutForComboFailure(scopedFailure, structuredError) &&
       !isConnectionScopedClaudeQuota
     ) {
@@ -1259,6 +1277,7 @@ export async function executeTargetAttempt(opts: {
       deps.resilienceSettings.providerCooldown.enabled &&
       provider &&
       provider !== "unknown" &&
+      fallbackResult.reason !== CONCURRENCY_LIMITED_REASON &&
       !scopedFailure &&
       !isModelScopedClaudeQuota &&
       !((result.status === 500 || result.status === 429) && hasPerModelQuota(provider, rawModel))

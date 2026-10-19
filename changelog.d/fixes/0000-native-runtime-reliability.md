@@ -3,3 +3,8 @@
 - **fix(authz):** Preserve resolved connection scopes through chat retries and reject local routing refusals without token refresh or provider health changes ([#15990](https://github.com/diegosouzapw/OmniRoute/pull/15990)).
 - **fix(sse):** Release deadline signal dependencies and isolate shared Claude request containers during OAuth and context editing ([#16974](https://github.com/diegosouzapw/OmniRoute/pull/16974), [#16648](https://github.com/diegosouzapw/OmniRoute/pull/16648)).
 - **fix(providers):** Validate Kiro OIDC regions and refuse browser context creation when proxy resolution fails ([#16280](https://github.com/diegosouzapw/OmniRoute/pull/16280), [#17011](https://github.com/diegosouzapw/OmniRoute/pull/17011)).
+- **fix(auth):** Require operator credentials for management secrets and login settings, and invalidate sessions and sync issuers when authentication settings change. Adds native schema migration 12.
+- **fix(authz):** Preserve client and connection restrictions across direct media, embeddings, modality bridges and credential selection failures, including keyless targets.
+- **fix(quota):** Separate concurrency limits from quota exhaustion, bound Claude usage polling, and keep stale observations from replacing current quota state.
+- **fix(models):** Retry one catalog generation conflict in a fresh read scope without replaying publication or remote discovery.
+- **fix(sse):** Close Codex HTTP streams at terminal Responses events and preserve declared tool identity, custom input and Claude tool lifecycle across response translations.

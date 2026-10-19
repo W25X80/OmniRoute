@@ -196,6 +196,27 @@ export function looksLikeQuotaExhausted(body: unknown): boolean {
   return QUOTA_PATTERNS.some((pat) => pat.test(text));
 }
 
+const CONCURRENCY_PATTERNS: ReadonlyArray<RegExp> = [
+  /too many (?:concurrent|simultaneous|parallel) (?:requests?|connections?|sessions?|calls?)/i,
+  /concurrent (?:requests?|connections?|sessions?) limit/i,
+  /concurrency limit/i,
+  /max(?:imum)? concurrency/i,
+  /parallel requests? limit/i,
+  /simultaneous requests? limit/i,
+  /high concurrency usage/i,
+  /并发数?过高/,
+];
+
+/** A busy account is healthy; explicit quota exhaustion always wins over contention wording. */
+export function looksLikeConcurrencyLimit(body: unknown): boolean {
+  const text = bodyToText(body);
+  return (
+    Boolean(text) &&
+    CONCURRENCY_PATTERNS.some((pattern) => pattern.test(text)) &&
+    !looksLikeQuotaExhausted(text)
+  );
+}
+
 /**
  * A declared upstream retry window at or beyond this is treated as
  * long-period exhaustion. One hour mirrors the circuit breaker's

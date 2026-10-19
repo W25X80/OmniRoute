@@ -1,4 +1,8 @@
 import {
+  requireOperatorCredential,
+  CREDENTIAL_EXPORT_FORBIDDEN_MESSAGE,
+} from "@/lib/api/operatorCredential";
+import {
   requireSqliteMaintenance,
   persistenceCapabilityResponse,
 } from "@/lib/db/persistenceCapabilities";
@@ -10,7 +14,6 @@ import fs from "fs";
 import path from "path";
 import os from "os";
 import { execFileSync } from "node:child_process";
-import { isAuthenticated } from "@/shared/utils/apiAuth";
 import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
 
 /**
@@ -19,8 +22,11 @@ import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
  * Security: Requires admin authentication.
  */
 export async function GET(request: NextRequest) {
-  if (!(await isAuthenticated(request)))
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  const verdict = await requireOperatorCredential(request, {
+    alwaysRequireAuth: true,
+    forbiddenMessage: CREDENTIAL_EXPORT_FORBIDDEN_MESSAGE,
+  });
+  if (verdict.ok === false) return verdict.response;
 
   try {
     requireSqliteMaintenance("sqlite-file-export");

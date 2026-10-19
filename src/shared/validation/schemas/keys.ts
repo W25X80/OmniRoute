@@ -71,7 +71,25 @@ export const createKeySchema = z
     requireExclusiveLeaseConnections(value, ctx);
   });
 
+export function parseSyncTokenTtlMs(ttl: string): number | null {
+  const match = /^([1-9]\d{0,6})([smhd])$/.exec(ttl.trim());
+  if (!match) return null;
+  return (
+    Number(match[1]) *
+    { s: 1000, m: 60000, h: 3600000, d: 86400000 }[match[2] as "s" | "m" | "h" | "d"]
+  );
+}
+export const MAX_SYNC_TOKEN_TTL_MS = 365 * 86400000;
+
 export const createSyncTokenSchema = z.object({
+  ttl: z
+    .string()
+    .trim()
+    .refine((value) => {
+      const ms = parseSyncTokenTtlMs(value);
+      return ms !== null && ms <= MAX_SYNC_TOKEN_TTL_MS;
+    }, "ttl must be a duration from 1s to 365d")
+    .optional(),
   name: z.string().trim().min(1, "Name is required").max(200),
 });
 

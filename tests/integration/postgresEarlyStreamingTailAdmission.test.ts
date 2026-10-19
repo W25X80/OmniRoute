@@ -228,9 +228,11 @@ test(
       assert.equal(runtime.getPersistenceRuntimeStatus().streamTails, 63);
       const { getPendingById, getPendingRequests } =
         await import("../../src/lib/usage/usageHistory.ts");
-      const healthBefore = await verification.query(
-        "SELECT test_status,is_active,rate_limited_until,last_error FROM omniroute.provider_connections WHERE id=$1",
-        [connectionId]
+      const healthBefore = await verification.transaction((tx) =>
+        tx.query(
+          "SELECT test_status,is_active,rate_limited_until,last_error FROM omniroute.provider_connections WHERE id=$1",
+          [connectionId]
+        )
       );
       for (const stream of [true, false]) {
         const controller = new AbortController();
@@ -258,9 +260,11 @@ test(
         assert.equal(runtime.getPersistenceRuntimeStatus().streamTails, 63);
         assert.deepEqual(
           (
-            await verification.query(
-              "SELECT test_status,is_active,rate_limited_until,last_error FROM omniroute.provider_connections WHERE id=$1",
-              [connectionId]
+            await verification.transaction((tx) =>
+              tx.query(
+                "SELECT test_status,is_active,rate_limited_until,last_error FROM omniroute.provider_connections WHERE id=$1",
+                [connectionId]
+              )
             )
           ).rows,
           healthBefore.rows
@@ -268,9 +272,11 @@ test(
         assert.equal(
           Number(
             (
-              await verification.query(
-                "SELECT COUNT(*) AS count FROM omniroute.usage_history WHERE api_key_id=$1",
-                [keyId]
+              await verification.transaction((tx) =>
+                tx.query(
+                  "SELECT COUNT(*) AS count FROM omniroute.usage_history WHERE api_key_id=$1",
+                  [keyId]
+                )
               )
             ).rows[0].count
           ),

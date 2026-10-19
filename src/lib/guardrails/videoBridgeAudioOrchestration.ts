@@ -1,3 +1,4 @@
+import { scopedBridgeCacheIdentity } from "./visionBridgeKeyScope";
 /**
  * Video Bridge — Audio Bridge STT orchestration (FU-06, #11654).
  *
@@ -22,6 +23,7 @@ import {
   selectAudioBridgeModel,
   type AudioCredentialCheck,
   type AudioPart,
+  type AudioTranscriptionConfig,
   type AudioTranscriptionTimedResult,
 } from "./audioBridgeHelpers";
 import { bridgeCacheKey, type BridgeCacheStore } from "./modalityBridge/bridgeCache";
@@ -47,6 +49,11 @@ export interface VideoAudioOrchestrationOptions {
   cacheKeyRef?: string;
   extractAudio?: typeof extractVideoAudioViaBroker;
   hasUsableCredentials?: AudioCredentialCheck;
+  /**
+   * GHSA-3w2r: the caller API key's scope, carried on the transcription
+   * self-loop (narrowing only). Omit for an unrestricted key.
+   */
+  keyScope?: AudioTranscriptionConfig["keyScope"];
   /** Configured STT model — `"auto"` or a fixed `provider/model` string. */
   model: string;
   /** Operator half of the dual opt-in (settings). */
@@ -101,19 +108,31 @@ function classifyStepFailure(
   return "FAILED";
 }
 
-function cacheKeyFor(ref: string, sttModel: string): string {
-  return bridgeCacheKey(ref, "video-audio-transcription", sttModel, {
-    policyVersion: "video-audio-transcription-v1",
-  });
+function cacheKeyFor(
+  ref: string,
+  sttModel: string,
+  scope?: AudioTranscriptionConfig["keyScope"]
+): string {
+  return bridgeCacheKey(
+    ref,
+    scopedBridgeCacheIdentity("video-audio-transcription", scope),
+    sttModel,
+    {
+      policyVersion: "video-audio-transcription-v1",
+    }
+  );
 }
 
 function readCache(
   options: VideoAudioOrchestrationOptions,
   sttModel: string
 ): CachedOrchestration | null {
-  if (!options.cache || !options.cacheKeyRef) return null;
+  if (!options.cache || !options.cacheKeyRef || (options.keyScope && !options.keyScope.cacheScope))
+    return null;
   try {
-    const entry = options.cache.getEntry(cacheKeyFor(options.cacheKeyRef, sttModel));
+    const entry = options.cache.getEntry(
+      cacheKeyFor(options.cacheKeyRef, sttModel, options.keyScope)
+    );
     if (!entry) return null;
     const parsed = JSON.parse(entry.value) as Partial<CachedOrchestration>;
     if (!parsed.track || !Array.isArray(parsed.track.observations)) return null;
@@ -129,9 +148,10 @@ function writeCache(
   sttModel: string,
   value: CachedOrchestration
 ): void {
-  if (!options.cache || !options.cacheKeyRef) return;
+  if (!options.cache || !options.cacheKeyRef || (options.keyScope && !options.keyScope.cacheScope))
+    return;
   try {
-    options.cache.setEntry(cacheKeyFor(options.cacheKeyRef, sttModel), {
+    options.cache.setEntry(cacheKeyFor(options.cacheKeyRef, sttModel, options.keyScope), {
       value: JSON.stringify(value),
     });
   } catch {
@@ -177,6 +197,7 @@ async function runTranscription(
       model: sttModel,
       signal: options.signal,
       timeoutMs: options.timeoutMs,
+      ...(options.keyScope ? { keyScope: options.keyScope } : {}),
     });
     return { ok: true, value };
   } catch (error) {
@@ -265,6 +286,11 @@ async function runVideoAudioSteps(
   let sttModel: string | null;
   try {
     sttModel = await selectModel(options.model, options.hasUsableCredentials);
+    if (
+      options.keyScope &&
+      (!sttModel || (await options.hasUsableCredentials?.(sttModel)) !== true)
+    )
+      return failed("PROVIDER_UNAVAILABLE", null);
   } catch {
     return failed("PROVIDER_UNAVAILABLE", null);
   }

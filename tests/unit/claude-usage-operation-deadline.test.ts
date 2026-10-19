@@ -1,7 +1,16 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { getClaudeUsage } from "../../open-sse/services/usage/claude.ts";
-import { isClaudeOauthUsageCoolingDown } from "../../open-sse/services/claudeUsageCooldown.ts";
+import {
+  isClaudeOauthUsageCoolingDown,
+  _resetClaudeOauthUsageCooldown,
+} from "../../open-sse/services/claudeUsageCooldown.ts";
+import { _resetClaudeUsagePollingState } from "../../open-sse/services/usage/claude.ts";
+
+test.beforeEach(() => {
+  _resetClaudeUsagePollingState();
+  _resetClaudeOauthUsageCooldown();
+});
 
 const turn = () => new Promise<void>((resolve) => setImmediate(resolve));
 const stalledJson = () => {
@@ -25,7 +34,7 @@ for (const stalled of ["oauth", "settings", "organization", "bootstrap"]) {
           return stalled === "bootstrap" ? stalledJson() : Response.json({});
         if (url.endsWith("oauth/usage")) {
           if (stalled === "oauth") return stalledJson();
-          return stalled === "bootstrap" ? Response.json({}) : new Response(null, { status: 403 });
+          return stalled === "bootstrap" ? Response.json({}) : new Response(null, { status: 404 });
         }
         if (url.endsWith("settings"))
           return stalled === "settings"
@@ -68,7 +77,7 @@ test("concurrent polling of one token shares bootstrap and OAuth requests", asyn
   assert.deepEqual(await first, await second);
 });
 
-test("OAuth Retry-After is honored without changing legacy fallback", async (t) => {
+test("OAuth Retry-After is honored without a legacy fallback", async (t) => {
   let legacyCalls = 0;
   t.mock.method(globalThis, "fetch", async (input: string | URL | Request) => {
     const url = String(input);
@@ -79,6 +88,6 @@ test("OAuth Retry-After is honored without changing legacy fallback", async (t) 
     return new Response(null, { status: 403 });
   });
   await getClaudeUsage("retry-after-token");
-  assert.equal(legacyCalls, 1);
+  assert.equal(legacyCalls, 0);
   assert.equal(isClaudeOauthUsageCoolingDown("retry-after-token", Date.now() + 600_000), true);
 });

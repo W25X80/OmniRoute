@@ -6,7 +6,7 @@ import { getSyncTokenById } from "@/lib/db/syncTokens";
 import { revokeSyncTokenById } from "@/lib/sync/tokens";
 
 export async function DELETE(request: Request, { params }: { params: Promise<{ id: string }> }) {
-  const authError = await requireManagementAuth(request);
+  const authError = await requireManagementAuth(request, { alwaysRequireAuth: true });
   if (authError) return authError;
 
   const auditContext = getAuditRequestContext(request);

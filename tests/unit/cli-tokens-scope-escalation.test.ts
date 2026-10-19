@@ -2,8 +2,8 @@
  * POST /api/cli/tokens must never hand out more privilege than the caller holds.
  *
  * An `admin` access token is the top of the CLI scope hierarchy, so minting one is an
- * operator action: a dashboard session, the machine-bound local CLI credential, or an
- * instance with login disabled. API keys (even with `manage`/`admin` scope) and `oma_`
+ * operator action: a dashboard session or the machine-bound local CLI credential.
+ * API keys (even with `manage`/`admin` scope) and `oma_`
  * access tokens are machine credentials that can be handed to automation — they may
  * still mint `write`/`read` tokens, but never an `admin` one.
  */
@@ -171,12 +171,13 @@ test("a dashboard session wins over a manage key sent alongside it", async () =>
   assert.equal(res.status, 200);
 });
 
-test("with login disabled the instance is open and admin can be minted", async () => {
+test("login disabled does not authorize anonymous admin issuance", async () => {
   await updateSettings({ requireLogin: false });
   try {
     const res = await mintWith({}, { name: "open-instance-admin", scope: "admin" });
-    assert.equal(res.status, 200);
-    assert.equal((await res.json()).scope, "admin");
+    assert.equal(res.status, 401);
+    assert.equal((await res.json()).token, undefined);
+    assert.equal((await liveAdminTokenNamed("open-instance-admin")).length, 0);
   } finally {
     await updateSettings({ requireLogin: true });
   }

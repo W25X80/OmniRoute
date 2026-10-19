@@ -1,3 +1,4 @@
+import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import {
@@ -24,6 +25,8 @@ const relayTokenPatchSchema = z
   .refine((value) => Object.keys(value).length > 0, "At least one update field is required");
 
 export async function GET(request: Request, { params }: { params: Promise<{ id: string }> }) {
+  const denied = await requireManagementAuth(request, { alwaysRequireAuth: true });
+  if (denied) return denied;
   const { id } = await params;
   const token = await getRelayTokenAsync(id);
   if (!token) return NextResponse.json({ error: "Token not found" }, { status: 404 });
@@ -42,6 +45,8 @@ export async function GET(request: Request, { params }: { params: Promise<{ id: 
 }
 
 export async function PATCH(request: Request, { params }: { params: Promise<{ id: string }> }) {
+  const denied = await requireManagementAuth(request, { alwaysRequireAuth: true });
+  if (denied) return denied;
   const { id } = await params;
   const rawBody = await request.json();
   const validation = validateBody(relayTokenPatchSchema, rawBody);
@@ -72,6 +77,8 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ id
 }
 
 export async function DELETE(request: Request, { params }: { params: Promise<{ id: string }> }) {
+  const denied = await requireManagementAuth(request, { alwaysRequireAuth: true });
+  if (denied) return denied;
   const { id } = await params;
   await deleteRelayTokenAsync(id);
   return NextResponse.json({ success: true });

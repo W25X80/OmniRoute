@@ -30,6 +30,7 @@ import { randomBytes, timingSafeEqual } from "node:crypto";
 
 let currentToken: string | null = null;
 let announced = false;
+let reservedToken: string | null = null;
 
 function generateToken(): string {
   return randomBytes(24).toString("base64url");
@@ -49,6 +50,7 @@ function timingSafeStringEqual(a: string, b: string): boolean {
  * configured anywhere" — a normal install with a password never sees it.
  */
 export function getOrCreateBootstrapToken(logger: Pick<Console, "log"> = console): string {
+  if (reservedToken) return reservedToken;
   if (!currentToken) {
     currentToken = generateToken();
     announced = false;
@@ -89,6 +91,31 @@ export function consumeBootstrapToken(candidate: string | null | undefined): boo
 
 /** Test helper — resets the module singleton between test cases. */
 export function __resetBootstrapTokenForTest(): void {
+  reservedToken = null;
   currentToken = null;
   announced = false;
+}
+
+/** Exclusive proof lease; unknown outcomes consume rather than replay the write. */
+export function reserveBootstrapToken(
+  candidate: string | null | undefined
+): { consume(): void; release(): void } | null {
+  if (!peekBootstrapToken(candidate) || reservedToken) return null;
+  const token = currentToken!;
+  reservedToken = token;
+  currentToken = null;
+  return {
+    consume() {
+      if (reservedToken === token) {
+        reservedToken = null;
+        announced = false;
+      }
+    },
+    release() {
+      if (reservedToken === token) {
+        reservedToken = null;
+        currentToken = token;
+      }
+    },
+  };
 }

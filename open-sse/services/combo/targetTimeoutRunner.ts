@@ -10,6 +10,7 @@
  * See _tasks/superpowers/plans/2026-07-03-blocoJ-combo-hotpath-decomposition.md (Task 1).
  */
 import { buildErrorBody, errorResponse, sanitizeErrorMessage } from "../../utils/error.ts";
+import { isLocalCredentialSelectionFailure } from "../localCredentialSelectionFailure.ts";
 import {
   COMBO_HEDGE_CANCELLED_REASON,
   COMBO_PER_MODEL_TIMEOUT_REASON,
@@ -22,6 +23,7 @@ import {
 } from "@/lib/db/persistenceRuntime";
 
 function attemptErrorResponse(error: unknown): Response {
+  if (isLocalCredentialSelectionFailure(error)) throw error;
   if (isPersistenceStreamCapacityError(error))
     return errorResponse(503, "Gateway attempt capacity is unavailable. Please retry later.", {
       code: PERSISTENCE_STREAM_CAPACITY_CODE,
@@ -195,13 +197,9 @@ export function buildTargetTimeoutRunner(deps: {
       }
     }
     try {
-      // Both branches of the race resolve (never reject): the inner
-      // handleSingleModel call has a .catch() that converts rejections into
-      // responses, and timeoutPromise always resolves. A defensive outer
-      // .catch() guards against unexpected throws in the .catch() handler
-      // itself (e.g. a broken Error.prototype.message getter) — without
-      // this, such a throw would surface as an unhandledRejection tagged
-      // "combo-per-model-timeout" in production logs.
+      // Trusted local selection failures reject to the combo's terminal owner.
+      // Other dispatch failures become responses; the defensive outer catch
+      // also protects against errors while constructing those responses.
       return await Promise.race([
         runPersistenceAttempt(
           async () => {
@@ -223,6 +221,7 @@ export function buildTargetTimeoutRunner(deps: {
         }),
         timeoutPromise,
       ]).catch((raceErr) => {
+        if (isLocalCredentialSelectionFailure(raceErr)) throw raceErr;
         // Defensive: should never fire — both race branches always resolve.
         // Include the error message so the root cause is not masked.
         const detail = raceErr instanceof Error ? raceErr.message : String(raceErr);

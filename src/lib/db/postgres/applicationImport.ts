@@ -1,3 +1,4 @@
+import { AUTH_GENERATION_SETTING, readAuthGeneration } from "../authSettingsSemantics";
 import { acquirePostgresLock } from "./locks";
 import { randomUUID } from "node:crypto";
 import {
@@ -81,6 +82,7 @@ interface TargetTable {
   parents: string[];
 }
 interface TargetSchema {
+  managementGeneration: string;
   tables: TargetTable[];
   digest: string;
 }
@@ -201,7 +203,20 @@ async function readTargetSchema(transaction: PostgresTransaction): Promise<Targe
     UNION ALL SELECT 'constraint',c.conname,pg_get_constraintdef(c.oid) FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_namespace n ON n.oid=c.connamespace WHERE n.nspname='omniroute'
     UNION ALL SELECT 'trigger',t.tgname,pg_get_triggerdef(t.oid) FROM pg_catalog.pg_trigger t JOIN pg_catalog.pg_class c ON c.oid=t.tgrelid JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='omniroute' AND NOT t.tgisinternal
     ORDER BY kind,name,definition`);
-  return { tables, digest: canonical({ tables, authority: authority.rows }) };
+  const generation = await transaction.query<{ value: string }>(
+    "SELECT value FROM omniroute.key_value WHERE namespace='settings' AND key='managementAuthGeneration'"
+  );
+  let managementGeneration: string | null = null;
+  try {
+    managementGeneration = readAuthGeneration({
+      [AUTH_GENERATION_SETTING]: JSON.parse(generation.rows[0]?.value ?? "null"),
+    });
+  } catch {
+    /* fail closed */
+  }
+  if (!managementGeneration)
+    throw new ApplicationImportError("schema", "key_value", AUTH_GENERATION_SETTING);
+  return { tables, managementGeneration, digest: canonical({ tables, authority: authority.rows }) };
 }
 
 function validUsageTimestamp(value: string): boolean {
@@ -513,6 +528,7 @@ function buildPlan(
       ...(source.rowCarrier ? { rowCarrier: source.rowCarrier } : {}),
     });
   }
+  addManagementAuthPlan(planned, schema, transformations);
   addArtifactPublicationPlan(planned, schema, artifacts, transformations);
   const sourceDigest = applicationSnapshotDigest(snapshot);
   const planDigest = canonical({
@@ -534,6 +550,76 @@ function buildPlan(
     restoreAuthority,
   };
 }
+/** Bind nullable legacy lifecycle fields and retain a target-owned epoch on old imports. */
+function addManagementAuthPlan(
+  planned: PlannedTable[],
+  schema: TargetSchema,
+  transformations: ApplicationImportReceipt["transformations"]
+): void {
+  const tokens = planned.find((table) => table.name === "sync_tokens");
+  if (tokens) {
+    const target = schema.tables.find((table) => table.name === tokens.name)!;
+    for (const name of ["issued_by", "expires_at", "auth_generation"]) {
+      if (tokens.columns.some((column) => column.name === name)) continue;
+      const column = target.columns.find((value) => value.name === name);
+      if (!column || column.type !== "text" || !column.nullable)
+        throw new ApplicationImportError("schema", tokens.name, name);
+      tokens.columns.push(column);
+      for (const row of tokens.rows) row.push(null);
+    }
+  }
+  const settings = planned.find((table) => table.name === "key_value");
+  if (!settings) return; // No portable settings: retain the pristine target's initialized epoch.
+  const at = (name: string) => settings.columns.findIndex((column) => column.name === name);
+  const namespace = at("namespace"),
+    key = at("key"),
+    value = at("value");
+  if ([namespace, key, value].some((index) => index < 0))
+    throw new ApplicationImportError("schema", "key_value");
+  const existing = settings.rows.find(
+    (row) => row[namespace] === "settings" && row[key] === AUTH_GENERATION_SETTING
+  );
+  if (existing) {
+    let generation: string | null = null;
+    try {
+      generation = readAuthGeneration({
+        [AUTH_GENERATION_SETTING]: JSON.parse(String(existing[value])),
+      });
+    } catch {
+      /* fail closed */
+    }
+    if (!generation)
+      throw new ApplicationImportError("verification", "key_value", AUTH_GENERATION_SETTING);
+    return;
+  }
+  settings.rows.push(
+    settings.columns.map((column) =>
+      column.name === "namespace"
+        ? "settings"
+        : column.name === "key"
+          ? AUTH_GENERATION_SETTING
+          : column.name === "value"
+            ? JSON.stringify(schema.managementGeneration)
+            : null
+    )
+  );
+  transformations.push({
+    table: "key_value",
+    row: settings.rows.length - 1,
+    column: "value",
+    source: null,
+    target: JSON.stringify(schema.managementGeneration),
+  });
+  settings.rows.sort((a, b) => {
+    for (const name of settings.order) {
+      const index = at(name);
+      const result = Buffer.compare(Buffer.from(String(a[index])), Buffer.from(String(b[index])));
+      if (result) return result;
+    }
+    return 0;
+  });
+}
+
 /** Keep scoped lifecycle ownership in the same atomic import and receipt as its log rows. */
 function addArtifactPublicationPlan(
   planned: PlannedTable[],
@@ -646,6 +732,19 @@ function insertionOrder(plan: ImportPlan, schema: TargetSchema): PlannedTable[] 
 }
 
 function pristineSeed(table: string, row: Record<string, unknown>): boolean {
+  if (
+    table === "key_value" &&
+    row.namespace === "settings" &&
+    row.key === AUTH_GENERATION_SETTING
+  ) {
+    try {
+      return (
+        readAuthGeneration({ [AUTH_GENERATION_SETTING]: JSON.parse(String(row.value)) }) !== null
+      );
+    } catch {
+      return false;
+    }
+  }
   const number = (key: string) => Number(row[key]);
   if (table === "quota_groups") return row.id === "group-demo" && row.name === "GroupDemo";
   if (table === "radar_settings")

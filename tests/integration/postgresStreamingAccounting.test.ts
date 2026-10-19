@@ -17,6 +17,7 @@ import { closeNativeStreamingFixture } from "../helpers/persistence/nativeStream
 import { observeNativeStreamingResources } from "../helpers/persistence/nativeStreamingResourceObserver.ts";
 import type { StreamCompletionClock } from "../../open-sse/handlers/chatCore/streamingCompletion.ts";
 import type { PostgresDatabase } from "../../src/lib/db/postgres/database.ts";
+import { closeCodexSseOnTerminal } from "../../open-sse/executors/codex/terminalStream.ts";
 
 function barrier() {
   let resolve!: () => void;
@@ -160,6 +161,7 @@ test(
     const clocks = new Map<number, StreamCompletionClock>();
     const starts = new Map<number, number>();
     const terminalSeen = new Set<number>();
+    const lingeringUpstreamsClosed = new Set<number>();
     const clientControllers = Array.from({ length: 7 }, () => new AbortController());
     const clients: Promise<string>[] = [];
     const handlerWork = new Set<Promise<void>>();
@@ -185,6 +187,15 @@ test(
       const responseId = `resp_${tag}_${index}`;
       const selectedModel = index === 6 ? faultModel : model;
       if (path.startsWith("/upstream/")) {
+        const linger = index === 1 || index === 6;
+        const closed = linger
+          ? new Promise<void>((resolve) =>
+              outgoing.once("close", () => {
+                lingeringUpstreamsClosed.add(index);
+                resolve();
+              })
+            )
+          : null;
         outgoing.writeHead(200, { "Content-Type": "text/event-stream" });
         const send = (type: string, payload: Record<string, unknown>) =>
           outgoing.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...payload })}\n\n`);
@@ -197,7 +208,6 @@ test(
             output: [],
           },
         });
-        if (index !== 6) await terminal.promise;
         const item = {
           id: `msg_${tag}_${index}`,
           type: "message",
@@ -210,7 +220,14 @@ test(
           item_id: item.id,
           output_index: 0,
           content_index: 0,
-          delta: `answer-${index}`,
+          delta: "answer-",
+        });
+        if (index !== 6) await terminal.promise;
+        send("response.output_text.delta", {
+          item_id: item.id,
+          output_index: 0,
+          content_index: 0,
+          delta: String(index),
         });
         send("response.output_item.done", { output_index: 0, item });
         send("response.completed", {
@@ -224,7 +241,16 @@ test(
             usage: { input_tokens: 100 + index, output_tokens: 10, total_tokens: 110 + index },
           },
         });
-        outgoing.end();
+        if (closed) {
+          const ping = setInterval(() => {
+            if (!outgoing.destroyed) outgoing.write(": post-terminal ping\n\n");
+          }, 10);
+          try {
+            await closed;
+          } finally {
+            clearInterval(ping);
+          }
+        } else outgoing.end();
         return;
       }
       assert.ok(path.startsWith("/gateway/"));
@@ -277,9 +303,22 @@ test(
           onDisconnect: (event) => carry?.onClientDisconnectFinalize?.(event) ?? false,
           onError: (event) => carry?.onPipelineStreamError?.(event) ?? false,
         });
-        const providerResponse = await fetch(`${baseUrl}/upstream/${index}`, {
+        const rawProviderResponse = await fetch(`${baseUrl}/upstream/${index}`, {
           signal: streamController.signal,
         });
+        let providerResponse = rawProviderResponse;
+        if (index === 1 || index === 6) {
+          const { filterNonstandardCodexSse, peekCodexSseTransientError } =
+            await import("../../open-sse/executors/codex.ts");
+          const filtered = filterNonstandardCodexSse(rawProviderResponse);
+          const peek = await peekCodexSseTransientError(filtered);
+          assert.equal(peek.matched, null);
+          assert.notEqual(peek.timedOut, true);
+          assert.ok(peek.replacementBody);
+          providerResponse = closeCodexSseOnTerminal(
+            new Response(peek.replacementBody, { headers: filtered.headers })
+          );
+        }
         const traceId = `${tag}-${index}`;
         const context = {
           traceId,
@@ -504,6 +543,7 @@ test(
       }
       // Deliberate owner rejection must not skip independent log and financial owners.
       assert.equal(await client(6), "complete");
+      await eventually(() => lingeringUpstreamsClosed.has(6));
       const failureRows = await verification.transaction(async (tx) => ({
         usage: (
           await tx.query("SELECT id FROM omniroute.usage_history WHERE api_key_id=$1", [faultKey])
@@ -525,6 +565,7 @@ test(
       await eventually(() => ready === 6);
       terminal.resolve();
       await eventually(() => optionalStarted === 6 && clocks.size === 7);
+      await eventually(() => lingeringUpstreamsClosed.has(1));
       assert.equal(runtime.getPersistenceRuntimeStatus().streamTails, 6);
       const rows = await verification.transaction(async (tx) => ({
         usage: (

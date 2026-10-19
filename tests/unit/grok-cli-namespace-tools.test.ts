@@ -206,6 +206,10 @@ test("grok-cli leaves requests without namespace tools and their responses untou
     input: "hi",
     tools: [{ type: "function", name: "exec_command", parameters: { type: "object" } }],
   };
+  const snapshot = JSON.stringify(body);
+  const flattened = flattenGrokBuildNamespaceTools(body);
+  assert.equal(flattened.body, body);
+  assert.equal(flattened.identityMap, null);
   const upstreamEvents = [
     {
       type: "response.output_item.done",
@@ -222,7 +226,166 @@ test("grok-cli leaves requests without namespace tools and their responses untou
   const item = events[0].item as JsonRecord;
   assert.equal(item.name, "exec_command");
   assert.equal("namespace" in item, false);
+  assert.equal(JSON.stringify(body), snapshot);
 });
+
+const mixedGrokCollisionName = "mcp__notion__API_post_search";
+const mixedGrokCalls = () => [
+  {
+    type: "function_call",
+    id: "fc_wire",
+    call_id: "call_wire",
+    name: "mcp__notion__API_get_self",
+    arguments: "{}",
+  },
+  {
+    type: "function_call",
+    id: "fc_bare",
+    call_id: "call_bare",
+    name: "API_get_self",
+    arguments: "{}",
+  },
+  {
+    type: "function_call",
+    id: "fc_dotted",
+    call_id: "call_dotted",
+    name: "mcp__notion.API_get_self",
+    arguments: "{}",
+  },
+  {
+    type: "function_call",
+    id: "fc_flat",
+    call_id: "call_flat",
+    name: "exec_command",
+    arguments: "{}",
+  },
+  {
+    type: "function_call",
+    id: "fc_collision",
+    call_id: "call_collision",
+    name: mixedGrokCollisionName,
+    arguments: "{}",
+  },
+];
+const mixedGrokExpectedIdentity = [
+  { namespace: "mcp__notion", name: "API_get_self" },
+  { namespace: "mcp__notion", name: "API_get_self" },
+  { namespace: "mcp__notion", name: "API_get_self" },
+  { name: "exec_command" },
+  { name: mixedGrokCollisionName },
+];
+
+for (const transport of ["json", "sse"] as const) {
+  test(`grok-cli preserves mixed flat and namespace identities in ${transport}`, async () => {
+    const body = codexBody();
+    (body.tools as JsonRecord[]).push({
+      type: "function",
+      name: mixedGrokCollisionName,
+      parameters: { type: "object", properties: {} },
+    });
+    const bodySnapshot = JSON.stringify(body);
+    const calls = mixedGrokCalls();
+    const upstream =
+      transport === "json"
+        ? () =>
+            new Response(JSON.stringify({ id: "resp_json", object: "response", output: calls }), {
+              status: 200,
+              headers: { "Content-Type": "application/json" },
+            })
+        : () =>
+            sse([
+              ...calls.map((item, output_index) => ({
+                type: "response.output_item.done",
+                output_index,
+                item,
+              })),
+              { type: "response.completed", response: { output: calls } },
+            ]);
+    const { response } = await runExecute(body, upstream);
+    const items =
+      transport === "json"
+        ? (((await response.json()) as JsonRecord).output as JsonRecord[])
+        : parseSse(await response.text())
+            .filter((event) => event.type === "response.output_item.done")
+            .map((event) => event.item as JsonRecord);
+    const identities = items.map((item) => ({
+      ...(typeof item.namespace === "string" ? { namespace: item.namespace } : {}),
+      name: item.name,
+    }));
+
+    assert.deepEqual(identities, mixedGrokExpectedIdentity);
+
+    // The exact duplicate wire declaration remains ambiguous to Grok itself.
+    // This only asserts that the proxy's explicit-flat ledger entry wins.
+    const flattened = flattenGrokBuildNamespaceTools(body);
+    assert.deepEqual(flattened.identityMap?.get(mixedGrokCollisionName), {
+      namespace: "",
+      name: mixedGrokCollisionName,
+    });
+    assert.equal(flattened.identityMap?.get("exec_command")?.namespace, "");
+    assert.equal(flattened.identityMap?.has("web_search"), false);
+    assert.equal(JSON.stringify(body), bodySnapshot);
+  });
+}
+
+function responseForBareToolName(transport: "json" | "sse", name: string): Response {
+  const call = { type: "function_call", call_id: "call_bare", name, arguments: "{}" };
+  if (transport === "json") {
+    return new Response(JSON.stringify({ id: "resp_bare", object: "response", output: [call] }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+  return sse([
+    { type: "response.output_item.done", output_index: 0, item: call },
+    { type: "response.completed", response: { output: [call] } },
+  ]);
+}
+
+async function runBareToolName(
+  body: JsonRecord,
+  transport: "json" | "sse"
+): Promise<{ item: JsonRecord; sentToolNames: string[] }> {
+  const { response, capturedBodies } = await runExecute(body, () =>
+    responseForBareToolName(transport, "API_get_self")
+  );
+  const sentToolNames = ((capturedBodies[0].tools as JsonRecord[]) ?? []).map((tool) =>
+    String(tool.name ?? "")
+  );
+  if (transport === "json") {
+    const output = ((await response.json()) as JsonRecord).output as JsonRecord[];
+    return { item: output[0], sentToolNames };
+  }
+  const item = parseSse(await response.text()).find(
+    (event) => event.type === "response.output_item.done"
+  )?.item as JsonRecord;
+  return { item, sentToolNames };
+}
+
+for (const transport of ["json", "sse"] as const) {
+  test(`grok-cli keeps a bare flat tool separate from a namespace leaf in ${transport}`, async () => {
+    const mixedBody = codexBody();
+    (mixedBody.tools as JsonRecord[]).push({
+      type: "function",
+      name: "API_get_self",
+      parameters: { type: "object", properties: {} },
+    });
+
+    const mixed = await runBareToolName(mixedBody, transport);
+    assert.equal(
+      mixed.sentToolNames.filter((name) => name === "mcp__notion__API_get_self").length,
+      1
+    );
+    assert.equal(mixed.sentToolNames.filter((name) => name === "API_get_self").length, 1);
+    assert.equal(mixed.item.name, "API_get_self");
+    assert.equal("namespace" in mixed.item, false);
+
+    // With no flat declaration, the same bare response uniquely identifies the namespace child.
+    const namespaceOnly = await runBareToolName(codexBody(), transport);
+    assert.equal(namespaceOnly.item.namespace, "mcp__notion");
+    assert.equal(namespaceOnly.item.name, "API_get_self");
+  });
+}
 
 test("grok-cli restores namespace on a leaf that already contains `__`", async () => {
   const body = codexBody();

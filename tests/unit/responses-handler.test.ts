@@ -7,8 +7,10 @@ import type { ProviderCredentials } from "../../open-sse/executors/base.ts";
 
 const TEST_DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "omniroute-responses-handler-"));
 process.env.DATA_DIR = TEST_DATA_DIR;
+process.env.OMNIROUTE_DATABASE_BACKEND = "sqlite";
 
 const core = await import("../../src/lib/db/core.ts");
+const callLogs = await import("../../src/lib/usage/callLogs.ts");
 const { handleResponsesCore } = await import("../../open-sse/handlers/responsesHandler.ts");
 
 const originalFetch = globalThis.fetch;
@@ -38,6 +40,10 @@ type ErrorPayload = {
   error?: {
     message?: string;
   };
+};
+type ParsedResponsesEvent = {
+  event: string;
+  data: JsonRecord & { item?: JsonRecord; delta?: unknown };
 };
 
 function noopLog() {
@@ -121,6 +127,25 @@ function buildToolCallSseResponse(name: string, argumentsJson: string) {
   );
 }
 
+function buildToolCallDeltaSseResponse(chunks: Record<string, unknown>[]) {
+  return new Response(
+    [...chunks.map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`), "data: [DONE]\n\n"].join(""),
+    { status: 200, headers: { "Content-Type": "text/event-stream" } }
+  );
+}
+
+function parseResponsesEventFrames(sse: string): ParsedResponsesEvent[] {
+  return sse
+    .split(/\r?\n\r?\n/)
+    .filter((frame) => frame.startsWith("event: "))
+    .flatMap((frame) => {
+      const lines = frame.split(/\r?\n/);
+      const dataLine = lines.find((line) => line.startsWith("data: "));
+      if (!dataLine) return [];
+      return [{ event: lines[0].slice(7), data: JSON.parse(dataLine.slice(6)) as JsonRecord }];
+    });
+}
+
 function buildJsonResponse(status: number, payload: unknown) {
   return new Response(JSON.stringify(payload), {
     status,
@@ -129,6 +154,11 @@ function buildJsonResponse(status: number, payload: unknown) {
 }
 
 async function resetStorage() {
+  assert.equal(
+    await callLogs.waitForCallLogSaves(2_000),
+    true,
+    "call log writes drain before DB reset"
+  );
   core.resetDbInstance();
   fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   fs.mkdirSync(TEST_DATA_DIR, { recursive: true });
@@ -565,6 +595,64 @@ test("handleResponsesCore restores custom tools nested in namespaces", async () 
   assert.match(sse, /"type":"custom_tool_call"/);
   assert.match(sse, /"input":"pong"/);
   assert.doesNotMatch(sse, /"type":"function_call","arguments"/);
+});
+
+test("handleResponsesCore buffers split provider-prefixed names until declared identity resolves", async () => {
+  const toolChunk = (name: string, argumentsDelta: string, id?: string) => ({
+    id: "chatcmpl-split-name",
+    choices: [
+      {
+        index: 0,
+        delta: {
+          tool_calls: [
+            {
+              index: 0,
+              ...(id ? { id, type: "function" } : {}),
+              function: { name, arguments: argumentsDelta },
+            },
+          ],
+        },
+        finish_reason: null,
+      },
+    ],
+  });
+  const { result, call } = await invokeResponsesCore({
+    body: {
+      model: "gpt-4o-mini",
+      input: "call exec",
+      tools: [
+        {
+          type: "function",
+          name: "exec",
+          parameters: { type: "object", properties: { cmd: { type: "string" } } },
+        },
+      ],
+    },
+    responseFactory: () =>
+      buildToolCallDeltaSseResponse([
+        toolChunk("functions.", '{"cmd":', "call_split"),
+        toolChunk("exec", '"ls"}'),
+        {
+          id: "chatcmpl-split-name",
+          choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
+        },
+      ]),
+  });
+
+  assert.ok(call);
+  assert.equal(call.body.tools[0].function.name, "exec");
+  const events = parseResponsesEventFrames(await result.response.text());
+  const added = events.filter((event) => event.event === "response.output_item.added");
+  const done = events.filter((event) => event.event === "response.output_item.done");
+  const argumentDeltas = events
+    .filter((event) => event.event === "response.function_call_arguments.delta")
+    .map((event) => event.data.delta);
+  assert.equal(added.length, 1);
+  assert.equal(added[0].data.item.name, "exec");
+  assert.equal(done.length, 1);
+  assert.equal(done[0].data.item.name, "exec");
+  assert.equal(done[0].data.item.arguments, '{"cmd":"ls"}');
+  assert.deepEqual(argumentDeltas, ['{"cmd":', '"ls"}']);
 });
 
 test("handleResponsesCore injects SSE keepalive frames for Responses streams", async (t) => {

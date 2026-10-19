@@ -1,3 +1,4 @@
+import { assertRegenerationScopes } from "@/domain/persistence/apiKeyRepository";
 import { createHash, randomUUID } from "node:crypto";
 import type {
   ApiKeyRepository,
@@ -410,13 +411,14 @@ export function createPostgresApiKeyRepository(
         };
       });
     },
-    async regenerateApiKey(id) {
+    async regenerateApiKey(id, options) {
       const generator =
         repositoryOptions.generateApiKeyWithMachine ||
         (await import("@/shared/utils/apiKey")).generateApiKeyWithMachine;
       return mutation(async (tx) => {
         const row = await keyById(tx, id);
         if (!row) return { value: null, effects: null };
+        assertRegenerationScopes(parseStringList(row.scopes), options?.expectedScopes);
         const key = generator(String(row.machine_id || "0000000000000000")).key;
         await tx.query(
           "UPDATE omniroute.api_keys SET key=$1,key_hash=$2,key_prefix=$3 WHERE id=$4",

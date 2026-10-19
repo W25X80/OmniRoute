@@ -1,9 +1,11 @@
+import {
+  isCredentialDiagnosticSentinel,
+  credentialDiagnosticResponse,
+} from "@omniroute/open-sse/services/comboKeyScope.ts";
 import { handleImageGeneration } from "@omniroute/open-sse/handlers/imageGeneration.ts";
 import { withInjectionGuard } from "@/middleware/promptInjectionGuard";
-import {
-  getProviderCredentialsWithQuotaPreflight,
-  clearRecoveredProviderState,
-} from "@/sse/services/auth";
+import { clearRecoveredProviderState } from "@/sse/services/auth";
+import { getProviderCredentialsWithQuotaPreflight } from "@/sse/services/scopedCredentials";
 import {
   parseImageModel,
   getImageProvider,
@@ -20,6 +22,15 @@ import { isAllRateLimitedCredentials } from "@/app/api/v1/_shared/rateLimit";
 import * as log from "@/sse/utils/logger";
 import { toJsonErrorPayload } from "@/shared/utils/upstreamError";
 import { enforceApiKeyPolicy } from "@/shared/utils/apiKeyPolicy";
+import {
+  createComboTargetKeyGate,
+  isKeyScopeBlockedCredentials,
+  keyScopeBlockedResponse,
+  keylessProviderRejection,
+  narrowConnectionScope,
+  resolveKeyConnectionScope,
+  withoutKeyScopeBlocked,
+} from "@/sse/services/keyConnectionScope";
 import { v1ImageGenerationSchema } from "@/shared/validation/schemas";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
 
@@ -111,7 +122,7 @@ function publicBaseUrlHeaders(headers: Headers): Record<string, string> {
   return out;
 }
 
-async function postHandler(request, context) {
+async function postHandler(request, _context) {
   let rawBody;
   try {
     rawBody = await request.json();
@@ -148,6 +159,11 @@ async function postHandler(request, context) {
   // Enforce API key policies (model restrictions + budget limits)
   const policy = await enforceApiKeyPolicy(request, body.model);
   if (policy.rejection) return policy.rejection;
+  // GHSA-3w2r: credential selection (direct, account fallback and per combo
+  // target) stays inside the key's connection scope, the same scope chat applies.
+  const scope = await resolveKeyConnectionScope(policy.apiKeyInfo);
+  if (scope.rejection) return scope.rejection;
+  const { connectionScope } = scope;
 
   const modelPrefix = body.model.includes("/")
     ? body.model.slice(0, body.model.indexOf("/"))
@@ -162,7 +178,20 @@ async function postHandler(request, context) {
     const combo = await getComboByName(body.model as string);
     if (combo) {
       const { executeImageCombo } = await import("@omniroute/open-sse/services/imageCombo");
-      return executeImageCombo(body.model as string, body, { request, policy }, startTime, log);
+      return executeImageCombo(
+        body.model as string,
+        body,
+        {
+          request,
+          policy,
+          keyScope: {
+            connectionScope,
+            isTargetAllowed: createComboTargetKeyGate(policy, body.model as string),
+          },
+        },
+        startTime,
+        log
+      );
     }
   }
 
@@ -257,20 +286,30 @@ async function postHandler(request, context) {
     );
   }
 
+  // A synced endpoint and every retry share the same computed serving set.
+  const executionScope = narrowConnectionScope(
+    connectionScope,
+    syncedEndpointRoute?.connectionIds ?? null
+  );
   // Get credentials — skip for local providers (authType: "none")
   let credentials = null;
   if (providerConfig && providerConfig.authType !== "none") {
     credentials = await getProviderCredentialsWithQuotaPreflight(
       provider,
       null,
-      null,
+      executionScope,
       requestedModel
     );
+    if (isCredentialDiagnosticSentinel(credentials))
+      return credentialDiagnosticResponse("provider", credentials)!;
     if (!credentials) {
       return errorResponse(
         HTTP_STATUS.BAD_REQUEST,
         `No credentials for image provider: ${provider}`
       );
+    }
+    if (isKeyScopeBlockedCredentials(credentials)) {
+      return keyScopeBlockedResponse(provider, credentials);
     }
     if (credentials.allRateLimited) {
       return unavailableResponse(
@@ -284,14 +323,19 @@ async function postHandler(request, context) {
     credentials = await getProviderCredentialsWithQuotaPreflight(
       provider,
       null,
-      syncedEndpointRoute?.connectionIds ?? null,
+      executionScope,
       requestedModel
     );
+    if (isCredentialDiagnosticSentinel(credentials))
+      return credentialDiagnosticResponse("provider", credentials)!;
     if (!credentials) {
       return errorResponse(
         HTTP_STATUS.BAD_REQUEST,
         `No credentials for custom image provider: ${provider}`
       );
+    }
+    if (isKeyScopeBlockedCredentials(credentials)) {
+      return keyScopeBlockedResponse(provider, credentials);
     }
     if (credentials.allRateLimited) {
       return unavailableResponse(
@@ -305,12 +349,22 @@ async function postHandler(request, context) {
     // #6928: best-effort per-connection base-URL override lookup for local
     // no-auth media providers (ComfyUI). A connection is optional here — unlike
     // the authType !== "none" branch above, we never 400 when none exists.
-    const localCredentials = await getProviderCredentialsWithQuotaPreflight(
+    // A connection outside the key's scope is never used for the override, and
+    // a connection-scoped key reaches the zero-config default only when its
+    // allowlist admits keyless providers (chat's #9057 rule).
+    const lookup = await getProviderCredentialsWithQuotaPreflight(
       provider,
       null,
-      null,
+      executionScope,
       requestedModel
     );
+    const keylessRejection = await keylessProviderRejection(
+      provider,
+      executionScope,
+      async () => lookup
+    );
+    if (keylessRejection) return keylessRejection;
+    const localCredentials = withoutKeyScopeBlocked(lookup);
     if (localCredentials && !isAllRateLimitedCredentials(localCredentials)) {
       credentials = localCredentials;
     }
@@ -320,6 +374,7 @@ async function postHandler(request, context) {
     provider,
     requestedModel,
     credentials,
+    connectionScope: executionScope,
     execute: async (attemptCredentials) => {
       let proxyInfo = null;
       if (attemptCredentials?.connectionId) {

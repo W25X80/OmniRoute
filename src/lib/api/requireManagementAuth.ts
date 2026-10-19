@@ -162,3 +162,13 @@ export async function requireManagementAuth(
     type: "invalid_request",
   });
 }
+
+/** Management-key issuance cannot inherit anonymous open-mode authorization. */
+export async function requireCredentialForManagementScopedKey(
+  request: Request,
+  scopes: readonly string[] | null | undefined
+): Promise<Response | null> {
+  return hasManageScopeShared([...(scopes ?? [])])
+    ? requireManagementAuth(request, { alwaysRequireAuth: true })
+    : null;
+}

@@ -10,11 +10,9 @@ import {
   renewExclusiveConnectionLeaseAsync,
 } from "@/lib/db/exclusiveConnectionLeases";
 import { getProviderDisplayName } from "@/lib/display/names";
-import {
-  extractApiKey,
-  getProviderCredentialsWithQuotaPreflight,
-  isValidApiKey,
-} from "@/sse/services/auth";
+import { resolveClientApiKey } from "@/sse/services/clientApiKeyResolver";
+import { resolveKeyConnectionScope } from "@/sse/services/keyConnectionScope";
+import { getProviderCredentialsWithQuotaPreflight } from "@/sse/services/scopedCredentials";
 import type { ExclusiveLeaseSelectionResult } from "@/sse/services/auth";
 import {
   buildManagedLeaseSelectionErrorResponse,
@@ -58,9 +56,9 @@ const lifecycle = (lease: Record<string, unknown>) => {
 export const OPTIONS = async (): Promise<Response> => handleCorsOptions();
 
 export async function POST(request: Request): Promise<Response> {
-  const apiKey = extractApiKey(request);
+  const { apiKey, valid } = await resolveClientApiKey(request);
   if (!apiKey) return error(401, "LEASE_AUTHENTICATION_REQUIRED", "Authentication required");
-  if (!(await isValidApiKey(apiKey))) return error(401, "LEASE_API_KEY_INVALID", "Invalid API key");
+  if (!valid) return error(401, "LEASE_API_KEY_INVALID", "Invalid API key");
   const contentType = request.headers.get("content-type")?.toLowerCase().split(";", 1)[0].trim();
   if (contentType !== "application/json") {
     return error(415, "LEASE_CONTENT_TYPE_REQUIRED", "Content-Type must be application/json");
@@ -121,10 +119,12 @@ export async function POST(request: Request): Promise<Response> {
 
     const modelInfo = acquisitionModelInfo!;
     if (!modelInfo.provider) return error(400, "LEASE_MODEL_INVALID", "The model is unavailable");
+    const scoped = await resolveKeyConnectionScope(policy.apiKeyInfo);
+    if (scoped.rejection) return scoped.rejection;
     const selection = await getProviderCredentialsWithQuotaPreflight(
       modelInfo.provider,
       null,
-      policy.apiKeyInfo.allowedConnections ?? [],
+      scoped.connectionScope,
       modelInfo.model || parsed.data.model,
       {
         lease: {

@@ -20,7 +20,11 @@ import {
   CODEX_DEFAULT_INSTRUCTIONS,
 } from "../config/codexInstructions.ts";
 import { FETCH_BODY_TIMEOUT_MS, HTTP_STATUS, PROVIDERS } from "../config/constants.ts";
-import { readCodexPeekChunk, buildCodexTimeoutSafePassthroughBody } from "./codex/bodyTimeout.ts";
+import {
+  readCodexPeekChunk,
+  buildCodexTimeoutSafePassthroughBody,
+  cancelCodexPeekReader,
+} from "./codex/bodyTimeout.ts";
 import { stripCodexPassthroughRejectedParams } from "./codex/stripPassthroughRejectedParams.ts";
 import {
   CODEX_CLI_RS_ORIGINATOR,
@@ -52,7 +56,9 @@ import {
   buildSyntheticResponsesFailureId,
   buildSyntheticResponsesFailedEvent,
 } from "../utils/responsesSequence.ts";
-import { hasCodexSsePeekProgress } from "./codex/ssePeekProgress.ts";
+import { CODEX_SSE_BLOCK_SEP_RE, hasCodexSsePeekProgress } from "./codex/ssePeekProgress.ts";
+import { closeCodexSseOnTerminal } from "./codex/terminalStream.ts";
+import { isResponsesTerminalEventType } from "../utils/responsesTerminalEvent.ts";
 import { normalizeCodexResponsesInput } from "../utils/responsesInputNormalization.ts";
 import * as prl from "../utils/providerRequestLogging.ts";
 import { createRequire } from "module";
@@ -516,12 +522,13 @@ export function codexDropNonstandardEvents(): boolean {
 // Pre-compiled: the filter's transform() runs on every chunk, so these were
 // re-allocated per block/iteration before hoisting.
 const CODEX_SSE_EVENT_LINE_RE = /^event:\s*(.+)$/m;
-const CODEX_SSE_BLOCK_SEP_RE = /\r?\n\r?\n/;
 export function filterNonstandardCodexSse(response: Response): Response {
   const contentType = response.headers.get("content-type") || "";
-  if (!response.body || !contentType.includes("text/event-stream")) {
+  if (!response.ok || !contentType.includes("text/event-stream")) {
     return response;
   }
+  const body = response.body;
+  if (!body) return response;
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
   let buffer = "";
@@ -545,10 +552,12 @@ export function filterNonstandardCodexSse(response: Response): Response {
       if (buffer && !dropBlock(buffer)) controller.enqueue(encoder.encode(buffer));
     },
   });
-  return new Response(response.body.pipeThrough(transform), {
+  const headers = new Headers(response.headers);
+  headers.delete("content-length");
+  return new Response(body.pipeThrough(transform), {
     status: response.status,
     statusText: response.statusText,
-    headers: response.headers,
+    headers,
   });
 }
 
@@ -670,11 +679,7 @@ export async function peekCodexSseTransientError(
   }
 
   if (matched) {
-    try {
-      await reader.cancel();
-    } catch {
-      // Upstream socket may already be closing; nothing to clean up.
-    }
+    cancelCodexPeekReader(reader);
     return { matched, message: extractCodexSseErrorMessage(text, matched), replacementBody: null };
   }
 
@@ -704,7 +709,7 @@ export function encodeResponseSseEvent(raw: string): { sse: string; terminal: bo
         payload = JSON.stringify(failed);
         eventType = "response.failed";
       }
-      terminal = eventType === "response.completed" || eventType === "response.failed";
+      terminal = isResponsesTerminalEventType(eventType);
     }
   } catch {
     console.warn("[codex] SSE payload parse failed, using raw payload");
@@ -837,7 +842,7 @@ export class CodexExecutor extends BaseExecutor {
       const httpResult = await super.execute(nextInput);
       if (codexDropNonstandardEvents()) {
         const resp = (httpResult as { response?: Response }).response;
-        if (resp?.body) {
+        if (resp) {
           (httpResult as { response: Response }).response = filterNonstandardCodexSse(resp);
         }
       }
@@ -885,6 +890,9 @@ export class CodexExecutor extends BaseExecutor {
           });
         }
       }
+      const finalResponse = (httpResult as { response?: Response }).response;
+      if (finalResponse)
+        (httpResult as { response: Response }).response = closeCodexSseOnTerminal(finalResponse);
       return httpResult;
     }
 

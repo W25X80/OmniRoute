@@ -1,3 +1,4 @@
+import { AUTH_GENERATION_SETTING } from "@/lib/db/authSettingsSemantics";
 import { NextResponse, type NextRequest } from "next/server";
 import { getCachedSettings } from "../../lib/db/readCache";
 import { isDraining } from "../../lib/gracefulShutdown";
@@ -154,7 +155,10 @@ async function refreshDashboardSessionIfNeeded(
     const refreshWindowSeconds = 7 * 24 * 60 * 60;
     if (exp - now >= refreshWindowSeconds) return;
 
-    const freshToken = await mintDashboardSessionToken(secret);
+    const freshToken = await mintDashboardSessionToken(
+      secret,
+      payload[AUTH_GENERATION_SETTING] as string
+    );
 
     response.cookies.set(DASHBOARD_SESSION_COOKIE, freshToken, {
       httpOnly: true,

@@ -1,3 +1,10 @@
+import {
+  targetConnectionScope,
+  scopeComboTargetsForKey,
+  isCredentialDiagnosticSentinel,
+  type ComboKeyScope,
+} from "./comboKeyScope.ts";
+import { scopedCredentialSelector } from "./scopedCredentialSelection.ts";
 /**
  * Image Combo Strategy Execution
  *
@@ -12,7 +19,7 @@ import { getComboByName, getCombos } from "@/lib/db/combos";
 import { resolveComboTargets } from "@omniroute/open-sse/services/combo.ts";
 import { getImageModelEntry, parseImageModel } from "@omniroute/open-sse/config/imageRegistry.ts";
 import {
-  getProviderCredentialsWithQuotaPreflight,
+  getProviderCredentialsWithQuotaPreflight as selectRawCredentials,
   clearRecoveredProviderState,
 } from "@/sse/services/auth";
 import { isAllRateLimitedCredentials } from "@/app/api/v1/_shared/rateLimit";
@@ -24,6 +31,8 @@ import { toJsonErrorPayload } from "@/shared/utils/upstreamError";
 import { HTTP_STATUS } from "@omniroute/open-sse/config/constants.ts";
 import { errorResponse } from "@omniroute/open-sse/utils/error.ts";
 import * as logger from "@/sse/utils/logger";
+
+const getProviderCredentialsWithQuotaPreflight = scopedCredentialSelector(selectRawCredentials);
 
 /**
  * Caller-facing shape of handleImageGeneration(). The handler is untyped and
@@ -37,6 +46,8 @@ type ImageGenerationResult =
 /** Minimum shape a combo target must expose to be iterated. */
 export interface ImageComboTarget {
   modelStr: string;
+  connectionId?: string | null;
+  allowedConnectionIds?: string[] | null;
 }
 
 /** Normalized per-target dispatch result (success or classified failure). */
@@ -130,6 +141,12 @@ export async function runImageComboTargets<T extends ImageComboTarget>(
       continue;
     }
 
+    if (isCredentialDiagnosticSentinel(credentials) && !isRateLimited(credentials)) {
+      lastError = { status: 403, error: `[${provider}] Credentials unavailable for this target` };
+      fallbackCount += 1;
+      continue;
+    }
+
     if (isRateLimited(credentials)) {
       lastError = {
         status: 429,
@@ -183,6 +200,7 @@ export async function executeImageCombo(
   body: Record<string, unknown>,
   auth: {
     request: Request;
+    keyScope?: ComboKeyScope;
     policy: { apiKeyInfo?: { id?: string; name?: string } | null };
   },
   startTime: number,
@@ -202,7 +220,9 @@ export async function executeImageCombo(
   }
 
   // 2. Filter to images-capable targets
-  const imageTargets = targets.filter((t) => {
+  const scoped = await scopeComboTargetsForKey(targets, auth.keyScope, comboName);
+  if (scoped.rejection) return scoped.rejection;
+  const imageTargets = scoped.targets.filter((t) => {
     if (!t.modelStr) return false;
     const entry = getImageModelEntry(t.modelStr);
     return entry !== null;
@@ -221,7 +241,14 @@ export async function executeImageCombo(
   //    /v1/images/edits can reuse the exact same iteration semantics (#12547).
   const run = await runImageComboTargets(imageTargets, {
     resolveProvider: (target) => parseImageModel(target.modelStr),
-    resolveCredentials: (provider) => getProviderCredentialsWithQuotaPreflight(provider),
+    resolveCredentials: (provider, target) =>
+      getProviderCredentialsWithQuotaPreflight(
+        provider,
+        null,
+        targetConnectionScope(scoped.connectionScope, target),
+        target.modelStr,
+        { ...(target.connectionId ? { forcedConnectionId: target.connectionId } : {}) }
+      ),
     dispatch: async ({ target, credentials }) =>
       (await handleImageGeneration({
         body: { ...body, model: target.modelStr },

@@ -1,3 +1,4 @@
+import { scopedBridgeCacheIdentity } from "./visionBridgeKeyScope";
 // Video Bridge pipeline seam (#11657): the per-video acquisition, sampling,
 // dedup, transcript fusion, result-cache, and metrics/abort/cleanup logic that
 // used to live inline inside `VideoBridgeGuardrail.preCall` (videoBridge.ts).
@@ -66,7 +67,10 @@ import {
   safeSetCacheEntry,
   videoBridgeAbortError,
 } from "./videoBridgeResultCache";
-import { callVisionModel as defaultCallVisionModel, type VisionModelConfig } from "./visionBridgeHelpers";
+import {
+  callVisionModel as defaultCallVisionModel,
+  type VisionModelConfig,
+} from "./visionBridgeHelpers";
 
 export interface VideoAnalysisContext {
   /** Effective prompt behavior after the no-text fallback. */
@@ -420,6 +424,7 @@ function isVideoResultCacheEntry(
 interface DescribeWithVisionModelDeps {
   broker: VideoMediaBrokerPort;
   transcription: VideoAudioTranscriptionPort;
+  visionKeyScope?: VisionModelConfig["keyScope"];
   callVisionModel?: (
     imageDataUri: string,
     config: VisionModelConfig,
@@ -455,9 +460,20 @@ async function describeWithVisionModel(
       timeoutMs: runtime.timeoutMs,
     },
     async (frameDataUri, timestampSeconds, signal) => {
-      const prompt = composeVideoFramePrompt(visionRuntime.prompt, timestampSeconds, analysis.focusHint);
+      const prompt = composeVideoFramePrompt(
+        visionRuntime.prompt,
+        timestampSeconds,
+        analysis.focusHint
+      );
       const key = cache
-        ? bridgeCacheKey(frameDataUri, `${prompt}@${timestampSeconds.toFixed(3)}`, selectedModel)
+        ? bridgeCacheKey(
+            frameDataUri,
+            scopedBridgeCacheIdentity(
+              `${prompt}@${timestampSeconds.toFixed(3)}`,
+              deps.visionKeyScope
+            ),
+            selectedModel
+          )
         : null;
       const cached = key && cache ? cache.getEntry(key) : undefined;
       if (cached) {
@@ -468,6 +484,7 @@ async function describeWithVisionModel(
       let producerModel = selectedModel;
       const caption = await callVisionModel(frameDataUri, {
         maxImages: 1,
+        ...(deps.visionKeyScope ? { keyScope: deps.visionKeyScope } : {}),
         model: selectedModel,
         onModelUsed: (model) => {
           producerModel = model;
@@ -498,11 +515,15 @@ async function describeWithVisionModel(
 export interface ProcessVideoPartDeps {
   broker: VideoMediaBrokerPort;
   transcription: VideoAudioTranscriptionPort;
+  visionKeyScope?: VisionModelConfig["keyScope"];
   cache: BridgeCacheStore | null;
   selectVideoModel: () => Promise<string | null>;
   /** Mirrors `VideoBridgeDependencies.describePart` — bypasses the internal
    * vision-model path entirely when supplied (test/override seam). */
-  overrideDescribePart?: (part: VideoPart, analysis: VideoAnalysisContext) => Promise<DescribedVideo>;
+  overrideDescribePart?: (
+    part: VideoPart,
+    analysis: VideoAnalysisContext
+  ) => Promise<DescribedVideo>;
   callVisionModel?: (
     imageDataUri: string,
     config: VisionModelConfig,
@@ -522,6 +543,7 @@ export interface ProcessVideoPartParams {
 
 export type ProcessVideoPartResult =
   | { status: "aborted" }
+  | { status: "skipped_by_key_policy" }
   | { status: "failed"; error: unknown }
   | {
       status: "processed";
@@ -566,6 +588,15 @@ export async function processVideoPart(
   try {
     const selectedModel = await waitForVideoBridgePromise(deps.selectVideoModel(), attemptSignal);
     if (attemptSignal.aborted) throw videoBridgeAbortError();
+    if (
+      deps.visionKeyScope &&
+      (!selectedModel ||
+        (await waitForVideoBridgePromise(
+          deps.visionKeyScope.hasUsableCredentials(selectedModel),
+          attemptSignal
+        )) !== true)
+    )
+      return { status: "skipped_by_key_policy" };
     const shouldLoadVideoBytes =
       Boolean(selectedModel) &&
       (Boolean(deps.cache) || (part.ref.startsWith("https://") && !deps.overrideDescribePart));
@@ -575,13 +606,25 @@ export async function processVideoPart(
             buildVideoDownloadFlightKey(part, context, VIDEO_BRIDGE_MAX_BYTES, runtime.timeoutMs),
             attemptSignal,
             (downloadSignal) =>
-              deps.broker.loadVideoPartBytes(part, VIDEO_BRIDGE_MAX_BYTES, runtime.timeoutMs, downloadSignal, {
-                fetchRemote: deps.broker.fetchRemote,
-              })
+              deps.broker.loadVideoPartBytes(
+                part,
+                VIDEO_BRIDGE_MAX_BYTES,
+                runtime.timeoutMs,
+                downloadSignal,
+                {
+                  fetchRemote: deps.broker.fetchRemote,
+                }
+              )
           )
-        : await deps.broker.loadVideoPartBytes(part, VIDEO_BRIDGE_MAX_BYTES, runtime.timeoutMs, attemptSignal, {
-            fetchRemote: deps.broker.fetchRemote,
-          })
+        : await deps.broker.loadVideoPartBytes(
+            part,
+            VIDEO_BRIDGE_MAX_BYTES,
+            runtime.timeoutMs,
+            attemptSignal,
+            {
+              fetchRemote: deps.broker.fetchRemote,
+            }
+          )
       : null;
     const contentFingerprint =
       deps.cache && videoBytes
@@ -592,7 +635,11 @@ export async function processVideoPart(
         ? createVideoResultCacheIdentity(runtime, visionRuntime, selectedModel, analysis)
         : null;
     const resultCacheKey = resultCacheIdentity
-      ? buildVideoResultCacheKey(contentFingerprint, resultCacheIdentity, part)
+      ? buildVideoResultCacheKey(
+          scopedBridgeCacheIdentity(contentFingerprint, deps.visionKeyScope),
+          resultCacheIdentity,
+          part
+        )
       : null;
     const cachedResult = resultCacheKey
       ? safeGetCacheEntry(deps.cache, resultCacheKey, context.log)
@@ -650,7 +697,12 @@ export async function processVideoPart(
             analysis,
             processingSignal,
             videoBytes ?? undefined,
-            { broker: deps.broker, transcription: deps.transcription, callVisionModel: deps.callVisionModel }
+            {
+              broker: deps.broker,
+              transcription: deps.transcription,
+              callVisionModel: deps.callVisionModel,
+              visionKeyScope: deps.visionKeyScope,
+            }
           );
       if (processingSignal.aborted) throw videoBridgeAbortError();
       const resultCacheBytes = Buffer.byteLength(described.description, "utf8");
@@ -674,7 +726,8 @@ export async function processVideoPart(
               modelUsed: described.modelUsed ?? resultCacheIdentity.model,
               samplingCandidateCount: described.sampling?.candidateCount ?? 0,
               samplingPolicyEffective: described.sampling?.policyEffective ?? "uniform",
-              samplingPolicyRequested: described.sampling?.policyRequested ?? runtime.samplingPolicy,
+              samplingPolicyRequested:
+                described.sampling?.policyRequested ?? runtime.samplingPolicy,
               transcriptCuesApplied: described.transcriptCues?.length ?? 0,
               contactSheetUsed: described.contactSheetUsed ?? false,
               ...(described.fusion ? { fusion: described.fusion } : {}),

@@ -1,7 +1,8 @@
+import { getAuthSettingsSnapshot } from "@/lib/db/authSettings";
+import { AUTH_GENERATION_SETTING } from "@/lib/db/authSettingsSemantics";
 import { NextResponse } from "next/server";
 import type { NextRequest } from "next/server";
 import { getAuditRequestContext, logAuditEvent } from "@/lib/compliance/index";
-import { getCachedSettings } from "@/lib/db/settings";
 import { cookies } from "next/headers";
 import {
   ensurePersistentManagementPasswordHash,
@@ -89,7 +90,8 @@ export async function POST(request: NextRequest) {
     if (!password) {
       return NextResponse.json({ error: "Invalid password payload" }, { status: 400 });
     }
-    const settings = await getCachedSettings();
+    const authSnapshot = await getAuthSettingsSnapshot();
+    const settings = authSnapshot.settings;
     const trustedPeerIp = process.env.OMNIROUTE_PEER_STAMP_TOKEN
       ? request.headers.get(AUTHZ_HEADER_TRUSTED_PEER_IP)
       : null;
@@ -147,6 +149,7 @@ export async function POST(request: NextRequest) {
 
     const passwordState = await ensurePersistentManagementPasswordHash({
       settings,
+      revision: authSnapshot.revision,
       source: "auth.login",
     });
     const storedHash = getStoredManagementPassword(passwordState.settings);
@@ -217,7 +220,10 @@ export async function POST(request: NextRequest) {
       const isHttpsRequest = forwardedProto === "https" || request.nextUrl?.protocol === "https:";
       const useSecureCookie = forceSecureCookie || isHttpsRequest;
 
-      const token = await mintDashboardSessionToken(getDashboardJwtSecret()!);
+      const token = await mintDashboardSessionToken(
+        getDashboardJwtSecret()!,
+        passwordState.settings[AUTH_GENERATION_SETTING] as string
+      );
 
       const cookieStore = await authRouteInternals.getCookieStore();
       cookieStore.set("auth_token", token, {

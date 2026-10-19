@@ -286,7 +286,8 @@ describe(
     it("reconstructs imports and native restores, excludes derived rows and rejects tampering", async () => {
       const raw = new Database(":memory:");
       try {
-        raw.exec(`CREATE TABLE conversation_turn_nodes(id TEXT PRIMARY KEY,conversation_id TEXT NOT NULL,role TEXT NOT NULL,first_seen_at TEXT NOT NULL,last_seen_at TEXT NOT NULL);
+        raw.exec(`CREATE TABLE key_value(namespace TEXT NOT NULL,key TEXT NOT NULL,value TEXT NOT NULL,PRIMARY KEY(namespace,key));
+        CREATE TABLE conversation_turn_nodes(id TEXT PRIMARY KEY,conversation_id TEXT NOT NULL,role TEXT NOT NULL,first_seen_at TEXT NOT NULL,last_seen_at TEXT NOT NULL);
         INSERT INTO conversation_turn_nodes VALUES('n1','orphan','user','2026-10-19','2026-10-19'),('n2','orphan','assistant','2026-10-19','2026-10-19');`);
         raw.pragma("query_only=ON");
         const snapshot = captureSqliteApplicationSnapshot(createBetterSqliteAdapter(raw));

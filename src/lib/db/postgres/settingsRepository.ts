@@ -1,3 +1,4 @@
+import { withPasswordGeneration } from "../authSettingsSemantics";
 import type {
   SettingsRecord,
   SettingsRepository,
@@ -94,6 +95,7 @@ export function createPostgresSettingsRepository(
     updates: SettingsRecord,
     updateOptions?: UpdateSettingsOptions
   ): Promise<SettingsRecord> {
+    updates = withPasswordGeneration(updates);
     // Match SQLite: detecting first setup completion includes its ordinary get behavior.
     let setupJustCompleted = false;
     if (updates.setupComplete === true) {

@@ -1,4 +1,8 @@
 import {
+  requireOperatorCredential,
+  CREDENTIAL_EXPORT_FORBIDDEN_MESSAGE,
+} from "@/lib/api/operatorCredential";
+import {
   requireSqliteMaintenance,
   persistenceCapabilityResponse,
 } from "@/lib/db/persistenceCapabilities";
@@ -15,7 +19,6 @@ import {
   countImportedRows,
   unlinkFileWithRetry,
 } from "@/lib/db/backup";
-import { isAuthRequired, isAuthenticated } from "@/shared/utils/apiAuth";
 import { getSettings } from "@/lib/db/settings";
 import { setSystemPromptConfig } from "@omniroute/open-sse/services/systemPrompt.ts";
 import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
@@ -55,11 +58,11 @@ const REQUIRED_TABLES = ["provider_connections", "provider_nodes", "combos", "ap
  * 🔒 Auth-guarded: requires JWT cookie or Bearer API key (finding #258-3).
  */
 export async function POST(request: Request) {
-  if (await isAuthRequired(request)) {
-    if (!(await isAuthenticated(request))) {
-      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-    }
-  }
+  const verdict = await requireOperatorCredential(request, {
+    alwaysRequireAuth: true,
+    forbiddenMessage: CREDENTIAL_EXPORT_FORBIDDEN_MESSAGE,
+  });
+  if (verdict.ok === false) return verdict.response;
   let tmpPath: string | null = null;
 
   try {

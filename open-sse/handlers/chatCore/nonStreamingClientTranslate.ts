@@ -32,6 +32,14 @@ import {
 import { isStripReasoningRequested } from "./headers.ts";
 import { applyClientUsageBuffer } from "./clientUsageBuffer.ts";
 import { resolveRequestToolIdentity } from "../../translator/response/openai-responses/requestToolIdentity.ts";
+import { matchesCustomToolDeclaration } from "../../utils/toolCallName.ts";
+import { ToolCallLifecycle } from "../../translator/response/openai-responses/toolCallLifecycle.ts";
+import {
+  canonicalizeDeclaredToolName,
+  collectDeclaredToolNames,
+  mergeDeclaredToolNames,
+  toolNameSideChannelNames,
+} from "../../translator/response/openai-responses/declaredToolName.ts";
 import { plaintextCollaborationFields } from "../../translator/response/openai-responses/collaborationPlaintextMarker.ts";
 
 export type { NonStreamingClientTranslateInput, NonStreamingClientTranslateResult };
@@ -130,9 +138,37 @@ export function translateNonStreamingClientResponse(
   if (clientResponseFormat === FORMATS.OPENAI_RESPONSES) {
     translatedResponse = sanitizeResponsesApiResponse(translatedResponse);
     const sanitizedOutput = translatedResponse?.output;
-    if (customToolNames && Array.isArray(sanitizedOutput)) {
+    if (responsePayloadFormat !== FORMATS.OPENAI_RESPONSES && Array.isArray(sanitizedOutput)) {
+      const declaredToolNames = mergeDeclaredToolNames(
+        collectDeclaredToolNames(finalBody),
+        customToolNames,
+        toolNameSideChannelNames(requestToolIdentityMap),
+        toolNameSideChannelNames(responseToolNameMap)
+      );
       for (const item of sanitizedOutput) {
-        if (item?.type !== "function_call" || !customToolNames.has(item.name)) continue;
+        if (item?.type !== "function_call" || typeof item.name !== "string") continue;
+        if (resolveRequestToolIdentity(requestToolIdentityMap, item.name)) continue;
+        item.name = canonicalizeDeclaredToolName(item.name, declaredToolNames).name;
+      }
+    }
+    if (customToolNames && Array.isArray(sanitizedOutput)) {
+      const customToolLifecycle = new ToolCallLifecycle({
+        customToolNames,
+        toolSchemas: responseToolSchemas,
+        requestToolIdentityMap,
+      });
+      for (const [outputIndex, item] of sanitizedOutput.entries()) {
+        if (item?.type !== "function_call" || typeof item.name !== "string") continue;
+        const syntacticCustomMatch = matchesCustomToolDeclaration({
+          customToolNames,
+          declaredFunctionSchemas: responseToolSchemas,
+          toolName: item.name,
+        });
+        const identityBackedCustomMatch =
+          !syntacticCustomMatch &&
+          resolveRequestToolIdentity(requestToolIdentityMap, item.name) !== null &&
+          customToolLifecycle.select(outputIndex, item.name, true)?.custom === true;
+        if (!syntacticCustomMatch && !identityBackedCustomMatch) continue;
 
         let rawInput = item.arguments;
         if (typeof item.arguments === "string") {

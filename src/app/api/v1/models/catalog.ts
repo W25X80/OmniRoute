@@ -4,7 +4,9 @@ import {
   hasPostgresCatalogSnapshot,
   withPostgresCatalogSnapshot,
   assertPostgresCatalogSnapshotCurrent,
+  assertPostgresCatalogSnapshotAuthority,
   capturePostgresCatalogVersion,
+  isPostgresCatalogGenerationDrift,
 } from "@/lib/db/postgres/catalogSnapshot";
 import { createCatalogConnectionExclusionFilter } from "@/lib/providerModels/copilotCatalogRejections";
 import { PROVIDER_MODELS, PROVIDER_ID_TO_ALIAS } from "@/shared/constants/models";
@@ -187,7 +189,9 @@ type CatalogBuildOptions = {
   recordDiscoveryHit?: boolean;
   refreshAiHordeCatalog?: boolean;
   openRouterCatalog?: OpenRouterCatalog;
+  onOpenRouterCatalogLoaded?: (catalog: OpenRouterCatalog) => void;
   onOpenRouterCapabilitiesPublished?: (catalog: OpenRouterCatalog) => void;
+  onOpenRouterCapabilitiesPublicationFailed?: () => void;
 };
 
 function yieldCatalogBuildTurn(): Promise<void> {
@@ -209,32 +213,80 @@ export async function getUnifiedModelsResponse(
   options: { scheduleBackgroundRefresh?: BackgroundRefreshScheduler } = {}
 ) {
   const catalogDatabase = getSelectedPostgresDatabase();
-  const execute = async () => {
-    if (catalogDatabase) {
-      const version = capturePostgresCatalogVersion();
+  const executeNative = async (database: NonNullable<typeof catalogDatabase>) => {
+    const originalVersion = capturePostgresCatalogVersion();
+    let fetchedOpenRouterCatalog: OpenRouterCatalog | undefined;
+    let publicationFailed = false;
+    let buildFailed = false;
+    const runAttempt = async (retry: boolean) => {
+      if (retry) assertPostgresCatalogSnapshotAuthority(originalVersion);
+      const version = retry ? capturePostgresCatalogVersion() : originalVersion;
       let publishedCatalog: OpenRouterCatalog | undefined;
-      const response = await buildUnifiedModelsResponseCore(request, corsHeaders, {
+      let response = await buildUnifiedModelsResponseCore(request, corsHeaders, {
+        ...(retry
+          ? {
+              publishOpenRouterCapabilities: false,
+              recordDiscoveryHit: false,
+              refreshAiHordeCatalog: false,
+            }
+          : {}),
+        openRouterCatalog: fetchedOpenRouterCatalog,
+        onOpenRouterCatalogLoaded: (catalog) => {
+          fetchedOpenRouterCatalog = catalog;
+        },
         onOpenRouterCapabilitiesPublished: (catalog) => {
           publishedCatalog = catalog;
         },
+        onOpenRouterCapabilitiesPublicationFailed: () => {
+          publicationFailed = true;
+        },
       });
+      let finalVersion = version;
       if (publishedCatalog) {
         // Acknowledged publication refreshed every SNAPSHOT_SQL operand in the parent
         // scope. Rebuild derived values once, without replaying writes or request metrics.
         // Failed/uncertain commits never reach the callback or authorize this rebuild.
-        const publishedVersion = capturePostgresCatalogVersion();
-        const rebuilt = await buildUnifiedModelsResponseCore(request, corsHeaders, {
+        finalVersion = capturePostgresCatalogVersion();
+        response = await buildUnifiedModelsResponseCore(request, corsHeaders, {
           publishOpenRouterCapabilities: false,
           recordDiscoveryHit: false,
           refreshAiHordeCatalog: false,
           openRouterCatalog: publishedCatalog,
         });
-        await assertPostgresCatalogSnapshotCurrent(publishedVersion);
-        return rebuilt;
       }
-      await assertPostgresCatalogSnapshotCurrent(version);
+      buildFailed = response.status >= 500;
+      await assertPostgresCatalogSnapshotCurrent(finalVersion);
       return response;
+    };
+
+    try {
+      return await runAttempt(false);
+    } catch (error) {
+      if (publicationFailed || buildFailed || !isPostgresCatalogGenerationDrift(error)) {
+        throw error;
+      }
+      try {
+        return await withPostgresCatalogSnapshot(database, () => runAttempt(true));
+      } catch (retryError) {
+        if (!publicationFailed && !buildFailed && isPostgresCatalogGenerationDrift(retryError)) {
+          const diagnosticHeaders = getCatalogDiagnosticsHeaders({ request });
+          return Response.json(
+            buildErrorBody(503, "Model catalog changed while preparing the response", undefined, {
+              type: "server_error",
+              code: INTERNAL_PROXY_ERROR,
+            }),
+            {
+              status: 503,
+              headers: { ...corsHeaders, ...diagnosticHeaders, "Retry-After": "1" },
+            }
+          );
+        }
+        throw retryError;
+      }
     }
+  };
+  const execute = async () => {
+    if (catalogDatabase) return executeNative(catalogDatabase);
     const diagnosticHeaders = getCatalogDiagnosticsHeaders({ request });
 
     // #6408 fast path: reject unauthorized callers first (auth state is per-request
@@ -1430,6 +1482,7 @@ async function buildUnifiedModelsResponseCore(
     ) {
       try {
         const openRouterCatalog = options.openRouterCatalog ?? (await getOpenRouterCatalog());
+        options.onOpenRouterCatalogLoaded?.(openRouterCatalog);
         const openRouterCaps: Record<string, ModelCapabilityEntry> = {};
         for (const openRouterModel of openRouterCatalog.data || []) {
           await maybeYieldCatalogBuild();
@@ -1498,7 +1551,12 @@ async function buildUnifiedModelsResponseCore(
           if (capEntry) openRouterCaps[openRouterModel.id] = capEntry;
         }
         if (options.publishOpenRouterCapabilities !== false) {
-          await upsertSyncedCapabilitiesAsync("openrouter", openRouterCaps);
+          try {
+            await upsertSyncedCapabilitiesAsync("openrouter", openRouterCaps);
+          } catch (error) {
+            options.onOpenRouterCapabilitiesPublicationFailed?.();
+            throw error;
+          }
           if (Object.keys(openRouterCaps).length > 0)
             options.onOpenRouterCapabilitiesPublished?.(openRouterCatalog);
         }

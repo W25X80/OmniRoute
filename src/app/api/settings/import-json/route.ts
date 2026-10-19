@@ -1,3 +1,8 @@
+import { IMPORT_STRIPPED_SETTINGS_KEYS } from "@/shared/constants/securityImpactingSettings";
+import {
+  requireOperatorCredential,
+  CREDENTIAL_EXPORT_FORBIDDEN_MESSAGE,
+} from "@/lib/api/operatorCredential";
 import {
   requireSqliteMaintenance,
   persistenceCapabilityResponse,
@@ -7,7 +12,6 @@ import { getDbInstance } from "@/lib/db/core";
 import { backupDbFile } from "@/lib/db/backup";
 import { clearApiKeyCaches } from "@/lib/db/apiKeys";
 import { invalidateDbCache } from "@/lib/db/readCache";
-import { isAuthRequired, isAuthenticated } from "@/shared/utils/apiAuth";
 import { runJsonMigration, type LegacyJsonData } from "@/lib/db/jsonMigration";
 import { getSettings } from "@/lib/db/settings";
 import { setSystemPromptConfig } from "@omniroute/open-sse/services/systemPrompt.ts";
@@ -24,11 +28,11 @@ import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
  * 🔒 A pre-import backup is created automatically before any data is written.
  */
 export async function POST(request: Request) {
-  if (await isAuthRequired(request)) {
-    if (!(await isAuthenticated(request))) {
-      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-    }
-  }
+  const verdict = await requireOperatorCredential(request, {
+    alwaysRequireAuth: true,
+    forbiddenMessage: CREDENTIAL_EXPORT_FORBIDDEN_MESSAGE,
+  });
+  if (verdict.ok === false) return verdict.response;
 
   try {
     requireSqliteMaintenance("legacy-json-import");
@@ -63,7 +67,14 @@ export async function POST(request: Request) {
 
     // 🔒 Zero-Trust: strip authentication config before migration
     if (data.settings) {
-      const { password: _pw, requireLogin: _rl, ...safeSettings } = data.settings;
+      const safeSettings = Object.fromEntries(
+        Object.entries(data.settings).filter(
+          ([key]) =>
+            !IMPORT_STRIPPED_SETTINGS_KEYS.includes(
+              key as (typeof IMPORT_STRIPPED_SETTINGS_KEYS)[number]
+            ) && !key.startsWith("oidc")
+        )
+      );
       data = { ...data, settings: safeSettings };
     }
 

@@ -1,22 +1,28 @@
+import { targetConnectionScope } from "@omniroute/open-sse/services/comboKeyScope.ts";
+import type { ConnectionScope } from "@omniroute/open-sse/services/connectionScope.ts";
 // Allow large audio/video file uploads — 5min for processing large files (up to 2GB)
 export const maxDuration = 300;
 import { handleAudioTranslation } from "@omniroute/open-sse/handlers/audioTranslation.ts";
+import { clearRecoveredProviderState } from "@/sse/services/auth";
+import { getProviderCredentialsWithQuotaPreflight } from "@/sse/services/scopedCredentials";
 import {
-  getProviderCredentialsWithQuotaPreflight,
-  clearRecoveredProviderState,
-} from "@/sse/services/auth";
+  resolveKeylessAudioTarget,
+  withAudioSelectionErrorBoundary,
+} from "@/sse/services/audioTargetSelection";
 import {
   parseTranslationModel,
   getTranslationProvider,
+  type AudioProvider,
 } from "@omniroute/open-sse/config/audioRegistry.ts";
 import { resolveDynamicAudioProviders } from "@/app/api/v1/_shared/audioProviderNodes";
 import { errorResponse } from "@omniroute/open-sse/utils/error.ts";
 import { HTTP_STATUS } from "@omniroute/open-sse/config/constants.ts";
 import { enforceApiKeyPolicy } from "@/shared/utils/apiKeyPolicy";
 import {
-  isAllRateLimitedCredentials,
-  rateLimitedProviderResponse,
-} from "@/app/api/v1/_shared/rateLimit";
+  createComboTargetKeyGate,
+  resolveKeyConnectionScope,
+} from "@/sse/services/keyConnectionScope";
+import { unusableCredentialsResponse } from "@/app/api/v1/_shared/keyScopedRoute";
 import { attachOmniRouteMetaToResponse } from "@/domain/omnirouteResponseMeta";
 import { generateRequestId } from "@/shared/utils/requestId";
 import { getComboByName, getCombos } from "@/lib/db/combos";
@@ -52,6 +58,60 @@ export async function OPTIONS() {
   });
 }
 
+type TranslationCredentials = Awaited<
+  ReturnType<typeof getProviderCredentialsWithQuotaPreflight>
+> | null;
+
+/**
+ * Credentials for a translation provider, bounded by the caller key's connection
+ * scope (GHSA-3w2r) — or the response that refuses the request. A keyless target
+ * retains the actual row when its policy/pin requires one; defaults need none.
+ */
+async function resolveTranslationCredentials(
+  provider: string,
+  providerConfig: AudioProvider | null,
+  connectionScope: ConnectionScope | null,
+  requestedModel: string | null,
+  forcedConnectionId?: string | null
+): Promise<
+  | { credentials: TranslationCredentials; resolvedProvider: AudioProvider | null }
+  | { response: Response }
+> {
+  if (!providerConfig) return { credentials: null, resolvedProvider: null };
+  const credentialKey = providerConfig.credentialProviderId || provider;
+  if (providerConfig.authType === "none") {
+    // A keyless provider (local default or a keyless remote) is reachable by a
+    // connection-scoped key only when its allowlist admits keyless providers or
+    // an in-scope connection serves it (chat's #9057).
+    const selected = await resolveKeylessAudioTarget({
+      provider: providerConfig,
+      operation: "translations",
+      requestedModel,
+      connectionScope,
+      forcedConnectionId,
+    });
+    return selected.rejection
+      ? { response: selected.rejection }
+      : { credentials: selected.credentials, resolvedProvider: selected.resolvedProvider };
+  }
+  // NOTE: the 2nd arg of this helper is `excludeConnectionId`, not "use this
+  // connection" — a combo target's connectionId must never be passed here.
+  const credentials = await getProviderCredentialsWithQuotaPreflight(
+    credentialKey,
+    null,
+    connectionScope,
+    null,
+    { ...(forcedConnectionId ? { forcedConnectionId } : {}) }
+  );
+  if (!credentials) {
+    return {
+      response: errorResponse(HTTP_STATUS.BAD_REQUEST, `No credentials for provider: ${provider}`),
+    };
+  }
+  const unusable = unusableCredentialsResponse(provider, credentials);
+  return unusable ? { response: unusable } : { credentials, resolvedProvider: providerConfig };
+}
+
 /**
  * Translate with one concrete `provider/model` string. Split out of POST so combo
  * fan-out can invoke it once per target.
@@ -61,7 +121,9 @@ async function translateWithModel(
   modelStr: string,
   startTime: number,
   apiKeyId?: string | null,
-  apiKeyName?: string | null
+  apiKeyName?: string | null,
+  connectionScope: ConnectionScope | null = null,
+  forcedConnectionId?: string | null
 ): Promise<Response> {
   // Translation is served by the transcription-capable nodes (Whisper-style
   // endpoints expose both), plus general chat/responses gateways. Remote hosts are
@@ -83,25 +145,24 @@ async function translateWithModel(
   const providerConfig =
     getTranslationProvider(provider) || dynamicProviders.find((dp) => dp.id === provider) || null;
 
-  // Get credentials — skip for local providers (authType: "none")
-  let credentials = null;
-  if (providerConfig && providerConfig.authType !== "none") {
-    const credentialKey = providerConfig.credentialProviderId || provider;
-    // NOTE: the 2nd arg of this helper is `excludeConnectionId`, not "use this
-    // connection" — a combo target's connectionId must never be passed here.
-    credentials = await getProviderCredentialsWithQuotaPreflight(credentialKey);
-    if (!credentials) {
-      return errorResponse(HTTP_STATUS.BAD_REQUEST, `No credentials for provider: ${provider}`);
-    }
-    if (isAllRateLimitedCredentials(credentials)) {
-      return rateLimitedProviderResponse(provider, credentials);
-    }
-  }
+  // Keyless defaults and row-bound local targets have separate selection rules.
+  const selection = await resolveTranslationCredentials(
+    provider,
+    providerConfig,
+    connectionScope,
+    resolvedModel,
+    forcedConnectionId
+  );
+  if (!("credentials" in selection)) return selection.response;
+  // The DB connection row is wider than the handler's credentials shape (it reads a subset).
+  const credentials = selection.credentials as Parameters<
+    typeof handleAudioTranslation
+  >[0]["credentials"];
 
   let response = await handleAudioTranslation({
     formData,
     credentials,
-    resolvedProvider: providerConfig,
+    resolvedProvider: selection.resolvedProvider,
     resolvedModel,
   });
 
@@ -157,7 +218,7 @@ async function translateWithModel(
  * /v1/audio/transcriptions, output is always English regardless of the
  * source audio language.
  */
-export async function POST(request) {
+async function postHandler(request) {
   let formData;
   try {
     formData = await request.formData();
@@ -182,6 +243,11 @@ export async function POST(request) {
   // request, matching the pattern every other proxied route follows (#13544).
   const apiKeyId = policy.apiKeyInfo?.id || null;
   const apiKeyName = policy.apiKeyInfo?.name || null;
+  // GHSA-3w2r: credential selection (direct and per combo target) stays inside
+  // the key's connection scope, the same scope chat applies.
+  const scope = await resolveKeyConnectionScope(policy.apiKeyInfo);
+  if (scope.rejection) return scope.rejection;
+  const { connectionScope } = scope;
 
   // A bare name (no "/") may be a combo. /v1/models advertises combos, and chat,
   // embeddings and the sibling /v1/audio/transcriptions all resolve them —
@@ -203,15 +269,17 @@ export async function POST(request) {
         return handleComboChat({
           body: { model: modelStr } as any,
           combo: combo as any,
-          handleSingleModel: async (_reqBody: any, targetModelStr: string) =>
+          handleSingleModel: async (_reqBody: any, targetModelStr: string, target?: any) =>
             translateWithModel(
               withModel(formData, targetModelStr),
               targetModelStr,
               startTime,
               apiKeyId,
-              apiKeyName
+              apiKeyName,
+              targetConnectionScope(connectionScope, target ?? {}),
+              target?.connectionId
             ),
-          isModelAvailable: undefined,
+          isModelAvailable: createComboTargetKeyGate(policy, modelStr),
           log,
           settings,
           allCombos: allCombos as any,
@@ -224,5 +292,7 @@ export async function POST(request) {
     }
   }
 
-  return translateWithModel(formData, modelStr, startTime, apiKeyId, apiKeyName);
+  return translateWithModel(formData, modelStr, startTime, apiKeyId, apiKeyName, connectionScope);
 }
+
+export const POST = withAudioSelectionErrorBoundary(postHandler);

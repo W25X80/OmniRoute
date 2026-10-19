@@ -11,6 +11,9 @@ import {
   clearReasoningCacheAll,
   lookupReasoning,
 } from "../../open-sse/services/reasoningCache.ts";
+import { extractRequestToolIdentityMap } from "../../open-sse/handlers/chatCore/requestToolIdentity.ts";
+import { collectCustomToolNamesForSourceFormat } from "../../open-sse/translator/request/openai-responses/additionalTools.ts";
+import { openaiResponsesToOpenAIRequest } from "../../open-sse/translator/request/openai-responses.ts";
 import { invalidateBufferTokensCache } from "../../open-sse/utils/usageTracking.ts";
 
 /* ── helpers ─────────────────────────────────────────────────────────────── */
@@ -44,6 +47,26 @@ function baseInput(
     isClaudeCodeCompatible: false,
     phase: "final",
     ...overrides,
+  };
+}
+
+function convertResponsesToolMetadata(tools: Record<string, unknown>[]) {
+  const input = [
+    { type: "message", role: "user", content: [{ type: "input_text", text: "run the tool" }] },
+  ];
+  const sourceBody = { model: "openai/gpt-5.5", input, tools };
+  const requestBody = openaiResponsesToOpenAIRequest(sourceBody.model, sourceBody, false, {
+    provider: "openai",
+  }) as Record<string, unknown>;
+  return {
+    requestBody,
+    customToolNames: collectCustomToolNamesForSourceFormat(
+      FORMATS.OPENAI_RESPONSES,
+      FORMATS.OPENAI_RESPONSES,
+      tools,
+      input
+    ),
+    requestToolIdentityMap: extractRequestToolIdentityMap(requestBody),
   };
 }
 
@@ -341,6 +364,272 @@ test("Responses API format: restores non-stream custom tool calls before namespa
     status: "completed",
     namespace: "functions",
   });
+});
+
+test("Responses nonstream custom calls use converted metadata for wire, bare and dotted names", () => {
+  const metadata = convertResponsesToolMetadata([
+    {
+      type: "namespace",
+      name: "functions",
+      tools: [
+        {
+          type: "custom",
+          name: "exec",
+          description: "Run a command",
+          format: { type: "grammar", syntax: "lark", definition: "command: /.+/" },
+        },
+      ],
+    },
+  ]);
+  assert.equal(metadata.customToolNames.has("functions__exec"), true);
+  assert.equal(metadata.requestToolIdentityMap?.get("functions__exec")?.namespace, "functions");
+
+  for (const [index, name] of ["functions__exec", "exec", "functions.exec"].entries()) {
+    const input = baseInput({
+      responsePayloadFormat: FORMATS.OPENAI_RESPONSES,
+      clientResponseFormat: FORMATS.OPENAI_RESPONSES,
+      sourceFormat: FORMATS.OPENAI_RESPONSES,
+      provider: "grok-cli",
+      model: "grok-4.6",
+      requestBody: metadata.requestBody,
+      customToolNames: metadata.customToolNames,
+      requestToolIdentityMap: metadata.requestToolIdentityMap,
+      responseBody: {
+        id: `resp_custom_${index}`,
+        object: "response",
+        status: "completed",
+        output: [
+          {
+            id: `fc_custom_${index}`,
+            type: "function_call",
+            call_id: `call_custom_${index}`,
+            name,
+            arguments: JSON.stringify({ input: "raw command" }),
+            status: "completed",
+          },
+        ],
+        usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+      },
+    });
+    const result = translateNonStreamingClientResponse(input);
+    const item = (result.response.output as Record<string, unknown>[])[0];
+    assert.equal(item.type, "custom_tool_call", `custom identity for provider name ${name}`);
+    assert.equal(item.input, "raw command");
+    assert.equal(item.arguments, undefined);
+    assert.equal(item.namespace, "functions");
+    assert.equal(item.name, "exec");
+  }
+});
+
+test("Responses nonstream classifies actual hash-truncated custom aliases from the identity ledger", () => {
+  const namespace = `mcp__${"n".repeat(50)}`;
+  const leaf = `custom_${"x".repeat(16)}`;
+  const metadata = convertResponsesToolMetadata([
+    {
+      type: "namespace",
+      name: namespace,
+      tools: [{ type: "custom", name: leaf, format: { type: "grammar", definition: ".*" } }],
+    },
+  ]);
+  const wireName = [...metadata.customToolNames][0];
+  assert.equal(namespace.length, 55);
+  assert.equal(leaf.length, 23);
+  assert.equal(wireName.length, 64);
+  assert.deepEqual(metadata.requestToolIdentityMap?.get(wireName), { namespace, name: leaf });
+
+  const aliases = [wireName, leaf, `${namespace}.${leaf}`];
+  const output = [
+    ...aliases.map((name, index) => ({
+      id: `fc_hash_${index}`,
+      type: "function_call",
+      call_id: `call_hash_${index}`,
+      name,
+      arguments: JSON.stringify({ input: `raw-command-${index}` }),
+      status: "completed",
+    })),
+    {
+      id: "fc_unknown_native_prefix",
+      type: "function_call",
+      call_id: "call_unknown_native_prefix",
+      name: `unrecognized.${leaf}`,
+      arguments: JSON.stringify({ input: "leave-as-function" }),
+      status: "completed",
+    },
+  ];
+  const result = translateNonStreamingClientResponse(
+    baseInput({
+      responsePayloadFormat: FORMATS.OPENAI_RESPONSES,
+      clientResponseFormat: FORMATS.OPENAI_RESPONSES,
+      sourceFormat: FORMATS.OPENAI_RESPONSES,
+      provider: "grok-cli",
+      model: "grok-4.6",
+      requestBody: metadata.requestBody,
+      customToolNames: metadata.customToolNames,
+      requestToolIdentityMap: metadata.requestToolIdentityMap,
+      responseBody: {
+        id: "resp_hash_custom_aliases",
+        object: "response",
+        status: "completed",
+        output,
+      },
+    })
+  );
+  const items = result.response.output as Record<string, unknown>[];
+  for (const [index, item] of items.slice(0, aliases.length).entries()) {
+    assert.equal(item.type, "custom_tool_call", `custom type for ledger alias ${aliases[index]}`);
+    assert.equal(item.input, `raw-command-${index}`);
+    assert.equal(item.arguments, undefined);
+    assert.equal(item.namespace, namespace);
+    assert.equal(item.name, leaf);
+  }
+  const unknown = items[3];
+  assert.equal(unknown.type, "function_call");
+  assert.equal(unknown.name, `unrecognized.${leaf}`);
+  assert.equal(unknown.arguments, JSON.stringify({ input: "leave-as-function" }));
+  assert.equal(unknown.namespace, undefined);
+});
+
+test("Responses nonstream custom classification preserves flat and ambiguous function controls", () => {
+  const flatMetadata = convertResponsesToolMetadata([
+    { type: "function", name: "exec", parameters: { type: "object", properties: {} } },
+    {
+      type: "namespace",
+      name: "functions",
+      tools: [{ type: "custom", name: "exec", format: { type: "grammar", definition: ".*" } }],
+    },
+  ]);
+  assert.equal(flatMetadata.customToolNames.has("functions__exec"), false);
+  const flatResult = translateNonStreamingClientResponse(
+    baseInput({
+      responsePayloadFormat: FORMATS.OPENAI_RESPONSES,
+      clientResponseFormat: FORMATS.OPENAI_RESPONSES,
+      sourceFormat: FORMATS.OPENAI_RESPONSES,
+      requestBody: flatMetadata.requestBody,
+      customToolNames: flatMetadata.customToolNames,
+      requestToolIdentityMap: flatMetadata.requestToolIdentityMap,
+      responseBody: {
+        id: "resp_flat",
+        object: "response",
+        status: "completed",
+        output: [
+          {
+            id: "fc_flat",
+            type: "function_call",
+            call_id: "call_flat",
+            name: "exec",
+            arguments: '{"command":"ls"}',
+            status: "completed",
+          },
+        ],
+      },
+    })
+  );
+  const flatItem = (flatResult.response.output as Record<string, unknown>[])[0];
+  assert.equal(flatItem.type, "function_call");
+  assert.equal(flatItem.name, "exec");
+  assert.equal(flatItem.arguments, '{"command":"ls"}');
+  assert.equal(flatItem.namespace, undefined);
+
+  const ambiguousMetadata = convertResponsesToolMetadata([
+    {
+      type: "namespace",
+      name: "functions",
+      tools: [{ type: "custom", name: "exec", format: { type: "grammar", definition: ".*" } }],
+    },
+    {
+      type: "namespace",
+      name: "mcp__other",
+      tools: [{ type: "custom", name: "exec", format: { type: "grammar", definition: ".*" } }],
+    },
+  ]);
+  const ambiguousResult = translateNonStreamingClientResponse(
+    baseInput({
+      responsePayloadFormat: FORMATS.OPENAI_RESPONSES,
+      clientResponseFormat: FORMATS.OPENAI_RESPONSES,
+      sourceFormat: FORMATS.OPENAI_RESPONSES,
+      requestBody: ambiguousMetadata.requestBody,
+      customToolNames: ambiguousMetadata.customToolNames,
+      requestToolIdentityMap: ambiguousMetadata.requestToolIdentityMap,
+      responseBody: {
+        id: "resp_ambiguous",
+        object: "response",
+        status: "completed",
+        output: [
+          {
+            id: "fc_ambiguous",
+            type: "function_call",
+            call_id: "call_ambiguous",
+            name: "exec",
+            arguments: '{"input":"ambiguous"}',
+            status: "completed",
+          },
+        ],
+      },
+    })
+  );
+  const ambiguousItem = (ambiguousResult.response.output as Record<string, unknown>[])[0];
+  assert.equal(ambiguousItem.type, "function_call");
+  assert.equal(ambiguousItem.name, "exec");
+  assert.equal(ambiguousItem.arguments, '{"input":"ambiguous"}');
+  assert.equal(ambiguousItem.namespace, undefined);
+
+  const namespaceMetadata = convertResponsesToolMetadata([
+    {
+      type: "namespace",
+      name: "functions",
+      tools: [
+        {
+          type: "custom",
+          name: "exec",
+          format: { type: "grammar", definition: ".*" },
+        },
+      ],
+    },
+  ]);
+  // A stale explicit-flat ledger/schema remains authoritative if the stream of
+  // request conversion metadata ever contains both aliases at this boundary.
+  const schemaGuardRequestBody = {
+    ...namespaceMetadata.requestBody,
+    tools: [
+      ...(namespaceMetadata.requestBody.tools as Record<string, unknown>[]),
+      {
+        type: "function",
+        function: { name: "exec", parameters: { type: "object", properties: {} } },
+      },
+    ],
+  };
+  const schemaGuardIdentityMap = new Map(namespaceMetadata.requestToolIdentityMap || []);
+  schemaGuardIdentityMap.set("exec", { namespace: "", name: "exec" });
+  const schemaGuardResult = translateNonStreamingClientResponse(
+    baseInput({
+      responsePayloadFormat: FORMATS.OPENAI_RESPONSES,
+      clientResponseFormat: FORMATS.OPENAI_RESPONSES,
+      sourceFormat: FORMATS.OPENAI_RESPONSES,
+      requestBody: schemaGuardRequestBody,
+      customToolNames: namespaceMetadata.customToolNames,
+      requestToolIdentityMap: schemaGuardIdentityMap,
+      responseBody: {
+        id: "resp_schema_guard",
+        object: "response",
+        status: "completed",
+        output: [
+          {
+            id: "fc_schema_guard",
+            type: "function_call",
+            call_id: "call_schema_guard",
+            name: "exec",
+            arguments: '{"command":"ls"}',
+            status: "completed",
+          },
+        ],
+      },
+    })
+  );
+  const schemaGuardItem = (schemaGuardResult.response.output as Record<string, unknown>[])[0];
+  assert.equal(schemaGuardItem.type, "function_call");
+  assert.equal(schemaGuardItem.name, "exec");
+  assert.equal(schemaGuardItem.arguments, '{"command":"ls"}');
+  assert.equal(schemaGuardItem.namespace, undefined);
 });
 
 test("Responses API format: classifies custom calls synthesized from Kiro chat output", () => {

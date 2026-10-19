@@ -1,15 +1,20 @@
-import { errorResponse, unavailableResponse } from "@omniroute/open-sse/utils/error.ts";
+import {
+  isCredentialDiagnosticSentinel,
+  credentialDiagnosticResponse,
+} from "@omniroute/open-sse/services/comboKeyScope.ts";
+import { errorResponse } from "@omniroute/open-sse/utils/error.ts";
 import { HTTP_STATUS } from "@omniroute/open-sse/config/constants.ts";
 import { getRegistryEntry } from "@omniroute/open-sse/config/providerRegistry.ts";
-import {
-  getProviderCredentialsWithQuotaPreflight,
-  clearRecoveredProviderState,
-  extractApiKey,
-  isValidApiKey,
-} from "@/sse/services/auth";
+import { clearRecoveredProviderState } from "@/sse/services/auth";
+import { getProviderCredentialsWithQuotaPreflight } from "@/sse/services/scopedCredentials";
 import { handleEmbedding } from "@omniroute/open-sse/handlers/embeddings.ts";
 import * as log from "@/sse/utils/logger";
 import { enforceApiKeyPolicy } from "@/shared/utils/apiKeyPolicy";
+import {
+  isKeyScopeBlockedCredentials,
+  keyScopeBlockedResponse,
+  resolveKeyConnectionScope,
+} from "@/sse/services/keyConnectionScope";
 import { v1EmbeddingsSchema } from "@/shared/validation/schemas";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
 
@@ -59,6 +64,10 @@ export async function POST(request, { params }) {
   // Enforce API key policies (model restrictions + budget limits)
   const policy = await enforceApiKeyPolicy(request, body.model);
   if (policy.rejection) return policy.rejection;
+  // GHSA-3w2r: credential selection stays inside the key's connection scope,
+  // the same scope chat applies.
+  const scope = await resolveKeyConnectionScope(policy.apiKeyInfo);
+  if (scope.rejection) return scope.rejection;
 
   // Validate provider match
   if (body.model) {
@@ -71,17 +80,18 @@ export async function POST(request, { params }) {
     }
   }
 
-  const credentials = await getProviderCredentialsWithQuotaPreflight(providerEntry.id);
+  const credentials = await getProviderCredentialsWithQuotaPreflight(
+    providerEntry.id,
+    null,
+    scope.connectionScope
+  );
+  if (isCredentialDiagnosticSentinel(credentials))
+    return credentialDiagnosticResponse("provider", credentials)!;
   if (!credentials) {
     return errorResponse(HTTP_STATUS.BAD_REQUEST, `No credentials for provider: ${rawProvider}`);
   }
-  if (credentials.allRateLimited) {
-    return unavailableResponse(
-      HTTP_STATUS.RATE_LIMITED,
-      `[${rawProvider}] All accounts rate limited`,
-      credentials.retryAfter,
-      credentials.retryAfterHuman
-    );
+  if (isKeyScopeBlockedCredentials(credentials)) {
+    return keyScopeBlockedResponse(rawProvider, credentials);
   }
 
   const result = await handleEmbedding({

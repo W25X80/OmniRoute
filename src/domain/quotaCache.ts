@@ -17,6 +17,7 @@
  */
 
 import { getUsageForProvider } from "@omniroute/open-sse/services/usage.ts";
+import { isFreshClaudeUsage } from "@omniroute/open-sse/services/usage/claudeUsageProvenance.ts";
 import { getCachedProviderConnectionById } from "@/lib/db/readCache";
 import { resolveProxyForConnection } from "@/lib/db/settings";
 import { runWithProxyContext } from "@omniroute/open-sse/utils/proxyFetch.ts";
@@ -1091,7 +1092,7 @@ async function refreshEntry(entry: QuotaCacheEntry) {
       getUsageForProvider(connection)
     );
 
-    if (usage?.quotas) {
+    if (usage?.quotas && (entry.provider !== "claude" || isFreshClaudeUsage(usage))) {
       await setQuotaCacheAsync(
         entry.connectionId,
         entry.provider,

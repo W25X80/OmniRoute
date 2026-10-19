@@ -1,3 +1,4 @@
+import { assertRegenerationScopes } from "@/domain/persistence/apiKeyRepository";
 import { getSelectedControlPlane } from "./controlPlaneContext";
 import {
   assertExclusiveLeaseKeyPolicy,
@@ -778,9 +779,12 @@ export async function createApiKey(
   return apiKey;
 }
 
-export async function regenerateApiKey(id: string) {
+export async function regenerateApiKey(
+  id: string,
+  options?: { expectedScopes?: readonly string[] }
+) {
   const selected = getSelectedControlPlane();
-  if (selected) return selected.apiKeys.regenerateApiKey(id);
+  if (selected) return selected.apiKeys.regenerateApiKey(id, options);
 
   const db = getDbInstance() as ApiKeysDbLike;
   const stmt = getPreparedStatements(db);
@@ -797,18 +801,24 @@ export async function regenerateApiKey(id: string) {
   const updateStmt = db.prepare(
     "UPDATE api_keys SET key = ?, key_hash = ?, key_prefix = ? WHERE id = ?"
   );
-  updateStmt.run(newKey, newHash, newPrefix, id);
+  const replaced = getDbInstance().transaction(() => {
+    const current = stmt.getKeyById.get(id) as ApiKeyRow | undefined;
+    if (!current) throw new Error("API key is unavailable");
+    assertRegenerationScopes(parseStringList(current.scopes), options?.expectedScopes);
+    updateStmt.run(newKey, newHash, newPrefix, id);
+    return current;
+  })();
 
   // Invalidate all caches
   clearApiKeyCaches();
 
-  await deleteRedisAuthCacheEntries(row.key_hash, newHash);
+  await deleteRedisAuthCacheEntries(replaced.key_hash, newHash);
 
   const { logAuditEvent } = await import("@/lib/compliance");
   logAuditEvent({
     action: "apiKey.regenerate",
     target: id,
-    details: { name: String(row.name || "") },
+    details: { name: String(replaced.name || "") },
   });
 
   return { id, key: newKey };

@@ -61,7 +61,6 @@ const { openRouterCapabilityEntry } =
   await import("../../../src/app/api/v1/models/catalogOpenrouter");
 const { GET } = await import("../../../src/app/api/v1/models/route");
 const { createManagementSessionToken } = await import("../../helpers/managementSession");
-const dashboardToken = await createManagementSessionToken();
 const { barrier, catalogFixture, createCatalogFixture } = (await import(
   fixtureUrl
 )) as typeof import("../../helpers/persistence/nativeModelsCatalogFenceFixture");
@@ -94,17 +93,20 @@ function prepare(empty = false) {
   catalogFixture.catalog = { data: empty ? [] : [model] } as typeof catalogFixture.catalog;
   return createCatalogFixture();
 }
-function request(authorized = true) {
+function request(token?: string) {
   return new Request("http://localhost/api/v1/models?prefix=canonical", {
     headers: {
       "user-agent": "claude-cli/fence-test",
-      ...(authorized ? { cookie: "auth_token=" + dashboardToken } : {}),
+      ...(token ? { cookie: "auth_token=" + token } : {}),
     },
   });
 }
-function run(f: ReturnType<typeof createCatalogFixture>, authorized = true) {
+async function run(f: ReturnType<typeof createCatalogFixture>, authorized = true) {
+  const token = authorized
+    ? await withPostgresControlPlane(f.binding, () => createManagementSessionToken())
+    : undefined;
   return withPostgresControlPlane(f.binding, () =>
-    snapshot.withPostgresCatalogSnapshot(f.database, () => GET(request(authorized)))
+    snapshot.withPostgresCatalogSnapshot(f.database, () => GET(request(token)))
   );
 }
 async function ids(response: Response) {
@@ -151,13 +153,12 @@ test("native GET rebuilds old derived rows after acknowledged nonempty capabilit
   assert.equal(catalogFixture.aiHordeRefreshes, 1);
 });
 
-test("native GET without capability rows rejects an independently changed policy", async () => {
-  const f = prepare(true);
+test("native GET retries after acknowledged publication without repeating owned effects", async () => {
+  const f = prepare();
   const entered = barrier(),
     release = barrier();
-  catalogFixture.gate = { entered, release };
+  f.gateProviderListRawCall(2, entered, release);
   const pending = run(f);
-  const rejected = assert.rejects(pending, /Catalog policy changed/);
   await entered.promise;
   try {
     await withPostgresControlPlane(f.binding, () =>
@@ -168,8 +169,36 @@ test("native GET without capability rows rejects an independently changed policy
   } finally {
     release.resolve();
   }
-  await rejected;
+  const result = await ids(await pending);
+  assert.equal(f.capabilityWrites(), 1, "acknowledged capability publication is not replayed");
+  assert.ok(!result.includes("openai/gpt-4o"), "retry uses the newer policy snapshot");
+  assert.ok(result.includes("openrouter/" + model.id));
+  assert.equal(catalogFixture.fetches, 1, "retry reuses the provider catalog");
+  assert.equal(catalogFixture.discoveryHits, 1, "retry does not repeat the request metric");
+  assert.equal(catalogFixture.aiHordeRefreshes, 1, "retry does not repeat AI Horde refresh");
+});
+
+test("native GET retries one same-authority policy change from a fresh snapshot", async () => {
+  const f = prepare(true);
+  const entered = barrier(),
+    release = barrier();
+  catalogFixture.gate = { entered, release };
+  const pending = run(f);
+  await entered.promise;
+  try {
+    await withPostgresControlPlane(f.binding, () =>
+      snapshot.withPostgresCatalogSnapshot(f.database, () =>
+        setModelIsHiddenAsync("openai", "gpt-4o", true)
+      )
+    );
+  } finally {
+    release.resolve();
+  }
+  const result = await ids(await pending);
   assert.equal(f.capabilityWrites(), 0);
+  assert.ok(!result.includes("openai/gpt-4o"), "retry must use the newly hidden model policy");
+  assert.equal(catalogFixture.fetches, 1, "retry reuses the already fetched provider catalog");
+  assert.equal(catalogFixture.discoveryHits, 1, "retry does not duplicate the discovery metric");
 });
 
 test("native GET with its own acknowledged capability publication still succeeds without policy drift", async () => {
@@ -197,6 +226,103 @@ test("native GET never retries an uncertain capability COMMIT", async () => {
   await assert.rejects(run(f), /Catalog policy changed/);
   assert.equal(f.capabilityWrites(), 1);
   assert.equal(catalogFixture.fetches, 1);
+});
+
+test("native GET rechecks dashboard authentication after a generation change", async () => {
+  const f = prepare(true);
+  const entered = barrier(),
+    release = barrier();
+  catalogFixture.gate = { entered, release };
+  const pending = run(f);
+  await entered.promise;
+  try {
+    f.rotateManagementAuthGeneration();
+  } finally {
+    release.resolve();
+  }
+  const response = await pending;
+  assert.equal(response.status, 401);
+  assert.equal(f.capabilityWrites(), 0);
+  assert.equal(catalogFixture.fetches, 1, "denied retry does not refetch the provider catalog");
+  assert.equal(catalogFixture.discoveryHits, 1, "denied retry does not repeat the metric");
+});
+
+test("native GET returns a sanitized retryable response after repeated generation churn", async () => {
+  const f = prepare(true);
+  f.driftAfterNextCatalogSnapshotLoad(2);
+  const response = await run(f);
+  assert.equal(response.status, 503);
+  assert.equal(response.headers.get("retry-after"), "1");
+  const body = (await response.json()) as {
+    error?: { message?: string };
+    data?: unknown;
+  };
+  assert.equal(body.error?.message, "Model catalog changed while preparing the response");
+  assert.equal(body.data, undefined, "no catalog from either rejected generation is returned");
+  assert.equal(catalogFixture.fetches, 1, "the retry reuses the first provider catalog");
+  assert.equal(catalogFixture.discoveryHits, 1, "the retry does not duplicate the metric");
+  assert.equal(f.capabilityWrites(), 0);
+});
+
+test("native GET does not retry a generation drift against a replacement authority", async () => {
+  const singleBuild = prepare(true);
+  await run(singleBuild);
+  const singleBuildProviderListCalls = singleBuild.providerListCalls();
+
+  const f = prepare(true);
+  const entered = barrier(),
+    release = barrier();
+  f.driftAfterNextCatalogSnapshotLoad();
+  f.gateCatalogSnapshotLoad(2, entered, release);
+  const pending = run(f);
+  await entered.promise;
+  try {
+    f.replaceCatalogAuthority();
+  } finally {
+    release.resolve();
+  }
+  const outcome = await pending.then(
+    (response) => ({ status: response.status, error: undefined as unknown }),
+    (error: unknown) => ({ status: undefined, error })
+  );
+  const violations: string[] = [];
+  if (outcome.error === undefined) {
+    violations.push(`unexpected fulfilled catalog response HTTP ${outcome.status}`);
+  } else if (!String(outcome.error).includes("Catalog authority changed")) {
+    violations.push(`unexpected rejection: ${String(outcome.error)}`);
+  }
+  if (f.providerListCalls() !== singleBuildProviderListCalls) {
+    violations.push(
+      `provider-list calls ${f.providerListCalls()} exceed single-build baseline ${singleBuildProviderListCalls}`
+    );
+  }
+  assert.deepEqual(violations, [], violations.join("; "));
+  assert.equal(f.capabilityWrites(), 0);
+  assert.equal(catalogFixture.fetches, 1, "authority change is rejected before a second build");
+  assert.equal(catalogFixture.discoveryHits, 1);
+});
+
+test("native GET does not retry a failed capability publication after independent drift", async () => {
+  const f = prepare();
+  const entered = barrier(),
+    release = barrier();
+  catalogFixture.gate = { entered, release };
+  f.rejectNextCapabilityCommit();
+  const pending = run(f);
+  await entered.promise;
+  try {
+    await withPostgresControlPlane(f.binding, () =>
+      snapshot.withPostgresCatalogSnapshot(f.database, () =>
+        setModelIsHiddenAsync("openai", "gpt-4o", true)
+      )
+    );
+  } finally {
+    release.resolve();
+  }
+  await assert.rejects(pending, /Catalog policy changed/);
+  assert.equal(f.capabilityWrites(), 1);
+  assert.equal(catalogFixture.fetches, 1, "failed publication blocks retry and refetch");
+  assert.equal(catalogFixture.discoveryHits, 1);
 });
 
 test("ordinary capability consumers retain acknowledged read-own-writes", async () => {

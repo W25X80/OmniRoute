@@ -13,7 +13,7 @@ import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
  * require an `admin` credential (a read/write token gets 403 before here).
  *
  * Minting never hands out more privilege than the caller holds: an `admin` token is
- * operator-only (dashboard session, local CLI, or login disabled). Machine credentials —
+ * operator-only (dashboard session or authenticated local CLI). Machine credentials —
  * manage/admin-scoped API keys and `oma_` access tokens — top out at `write`, so a key
  * given to automation cannot turn itself into an admin token that outlives it.
  */
@@ -22,7 +22,7 @@ import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
 const MACHINE_CREDENTIAL_MINT_CEILING: AccessScope = "write";
 
 export async function GET(request: Request) {
-  const authError = await requireManagementAuth(request);
+  const authError = await requireManagementAuth(request, { alwaysRequireAuth: true });
   if (authError) return authError;
   return NextResponse.json({ tokens: await listAccessTokensAsync() });
 }
@@ -34,7 +34,7 @@ const createSchema = z.object({
 });
 
 export async function POST(request: Request) {
-  const authError = await requireManagementAuth(request);
+  const authError = await requireManagementAuth(request, { alwaysRequireAuth: true });
   if (authError) return authError;
 
   let rawBody: unknown;
@@ -54,7 +54,7 @@ export async function POST(request: Request) {
   if (!scopeSatisfies(MACHINE_CREDENTIAL_MINT_CEILING, requestedScope)) {
     let operator: Awaited<ReturnType<typeof resolveOperatorCredential>>;
     try {
-      operator = await resolveOperatorCredential(request);
+      operator = await resolveOperatorCredential(request, { alwaysRequireAuth: true });
     } catch {
       return createErrorResponse({
         status: 503,

@@ -96,6 +96,10 @@ import {
 } from "@omniroute/open-sse/services/accountFallback.ts";
 import { copilotRejectionFlag, lockCopilotModelNotSupported } from "./copilotModelNotSupportedLock";
 import { isSharedWalletCredits402 } from "@omniroute/open-sse/services/accountFallback/sharedWalletCredits.ts";
+import {
+  CONCURRENCY_LIMITED_REASON,
+  resolveConcurrencyLimitCooldownOverride,
+} from "@omniroute/open-sse/services/accountFallback/concurrencyLimit429.ts";
 import { postOutputFailureReachesLockout } from "@omniroute/open-sse/services/accountFallback/postOutputFailureStreak.ts";
 import { isOpencodeFreeTierRefusalForProvider } from "@omniroute/open-sse/executors/opencodeGeoBlock.ts";
 import { isOpencodeFreeTierSkipped } from "@omniroute/open-sse/services/opencodeFreeTierSkip.ts";
@@ -2743,7 +2747,7 @@ export async function markAccountUnavailable(
       options.headers ?? null,
       effectiveProviderProfile,
       options.structuredError ?? null,
-      null,
+      { concurrencyCooldownMs: resolveConcurrencyLimitCooldownOverride(conn) },
       await resolveDailyResetForProvider(provider)
     );
 
@@ -2969,6 +2973,7 @@ export async function markAccountUnavailable(
         isModelScopedClaudeQuota) &&
       provider &&
       provider !== "codex" &&
+      fallbackResult.reason !== CONCURRENCY_LIMITED_REASON &&
       model &&
       isModelScopedFailure(status, isNvidiaModelGone, fallbackResult, errorText, model)
     ) {
@@ -3078,7 +3083,10 @@ export async function markAccountUnavailable(
     }
     const { shouldFallback, cooldownMs: rawCooldownMs, newBackoffLevel, reason } = result;
     if (!shouldFallback) return { shouldFallback: false, cooldownMs: 0 };
-    const providerErrorType = classifyProviderError(status, errorText, provider);
+    const providerErrorType =
+      reason === CONCURRENCY_LIMITED_REASON
+        ? reason
+        : classifyProviderError(status, errorText, provider);
 
     if (
       isAlibabaModelStudioProvider(provider) &&
@@ -3344,7 +3352,9 @@ export async function markAccountUnavailable(
       lastErrorType: providerErrorType,
       errorCode: status,
       lastErrorAt: new Date().toISOString(),
-      backoffLevel: newBackoffLevel ?? backoffLevel,
+      ...(reason !== CONCURRENCY_LIMITED_REASON
+        ? { backoffLevel: newBackoffLevel ?? backoffLevel }
+        : {}),
     };
     const persistUnavailableState = options.persistUnavailableState !== false;
 
@@ -3470,7 +3480,7 @@ type AuthRequestLike = {
   headers?: AuthRequestHeaders | null;
   url?: string | null;
 };
-function readNonEmptyUrlToken(request: AuthRequestLike): string | null {
+export function readNonEmptyUrlToken(request: AuthRequestLike): string | null {
   if (typeof request?.url !== "string" || request.url.trim().length === 0) return null;
 
   try {

@@ -1,7 +1,10 @@
 import { NextResponse } from "next/server";
 import { getApiKeyById } from "@/lib/db/apiKeys";
 import { isApiKeyRevealEnabled } from "@/lib/apiKeyExposure";
-import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
+import {
+  requireCredentialForManagementScopedKey,
+  requireManagementAuth,
+} from "@/lib/api/requireManagementAuth";
 import * as log from "@/sse/utils/logger";
 
 // GET /api/keys/[id]/reveal - Reveal full API key for explicit copy actions
@@ -21,6 +24,8 @@ export async function GET(request, { params }) {
       return NextResponse.json({ error: "Key not found" }, { status: 404 });
     }
 
+    const denied = await requireCredentialForManagementScopedKey(request, key.scopes);
+    if (denied) return denied;
     return NextResponse.json({ key: key.key });
   } catch (error) {
     log.error("keys", "Error revealing key", error);

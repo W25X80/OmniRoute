@@ -79,6 +79,7 @@ test(
         { version: 9, name: "conversation_concurrency", digest_length: 64 },
         { version: 10, name: "indexed_artifact_recovery_retirement", digest_length: 64 },
         { version: 11, name: "conversation_node_counts", digest_length: 64 },
+        { version: 12, name: "management_auth_lifecycle", digest_length: 64 },
       ]);
       // Commit the genuine migration prefix, stopping only after successful version-4 SQL.
       await first.transaction((tx) => tx.query("DROP SCHEMA omniroute CASCADE"));
@@ -152,7 +153,7 @@ test(
       assert.deepEqual(upgradedHistory.slice(0, 4), version4History);
       assert.deepEqual(
         upgradedHistory.map((row) => row.version),
-        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
       );
       assert.equal(upgradedHistory[4].name, "artifact_publication_ownership");
       assert.deepEqual(await oldQueue(), version4Queue);

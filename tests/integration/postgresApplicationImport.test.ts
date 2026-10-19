@@ -126,7 +126,7 @@ test(
         async () => {
           const receipt = await importApplicationSnapshot(database, snapshot);
           assert.equal(receipt.sourceDigest, sourceDigest);
-          assert.equal(receipt.rowCount, 11);
+          assert.equal(receipt.rowCount, 12);
           const durationValues = await database.transaction(async (tx) => ({
             aggregate: (
               await tx.query("SELECT duration_ms FROM omniroute.compression_analytics WHERE id=21")

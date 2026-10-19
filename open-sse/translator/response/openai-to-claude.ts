@@ -224,6 +224,136 @@ function stopTextBlock(state, results) {
   state.textBlockStarted = false;
 }
 
+// ── Tool-call keying ──────────────────────────────────────────────────────
+// OpenAI streams key tool-call fragments by `index`, make `id` optional and let
+// a provider reuse an index for a second call. `state.toolCalls` is keyed by the
+// upstream index unless a NEW call reuses an occupied one: that call gets a
+// fresh negative key (never collides with a real index) and the upstream index
+// is remapped to it, so later id-less fragments follow the new call.
+function isDistinctToolCall(existing, tc, incomingName: string): boolean {
+  // Before publication a synthetic call adopts its first real id. After a
+  // named block opens, a conflicting name still identifies a reused index.
+  if (tc.id) {
+    if (existing.upstreamId) return tc.id !== existing.upstreamId;
+    return Boolean(
+      existing.startEmitted && incomingName && existing.name && incomingName !== existing.name
+    );
+  }
+  return Boolean(
+    incomingName && existing.name && incomingName !== existing.name && existing.argBuffer
+  );
+}
+
+function resolveToolCallKey(state, tc, incomingName: string): number {
+  const upstreamIdx = typeof tc.index === "number" ? tc.index : 0;
+  if (!(state._toolIdxRemap instanceof Map)) state._toolIdxRemap = new Map();
+  const key = state._toolIdxRemap.get(upstreamIdx) ?? upstreamIdx;
+  const existing = state.toolCalls.get(key);
+  if (!existing || !isDistinctToolCall(existing, tc, incomingName)) return key;
+  const fresh = typeof state._toolKeySeq === "number" ? state._toolKeySeq : -1;
+  state._toolKeySeq = fresh - 1;
+  state._toolIdxRemap.set(upstreamIdx, fresh);
+  return fresh;
+}
+
+function createToolCallEntry(tc, incomingName: string) {
+  return {
+    // An id-less call still needs an addressable tool_use id (sanitizeToolId
+    // mints a random one); a real id arriving before the block opens wins.
+    id: sanitizeToolId(tc.id || undefined),
+    upstreamId: tc.id || "",
+    syntheticId: !tc.id,
+    name: incomingName,
+    blockIndex: undefined,
+    // Shimmed tools buffer their raw args and emit a single corrected
+    // input_json_delta at content_block_stop time (see finish handler).
+    shimmed: incomingName ? hasToolCallShim(incomingName) : false,
+    argBuffer: "",
+    startEmitted: false,
+    // Arguments arrived before any id/name: hold them until the call is known.
+    awaitingIdentity: !tc.id && !incomingName,
+  };
+}
+
+function adoptToolCallIdentity(
+  toolInfo,
+  tc,
+  incomingName: string,
+  toolNameMap?: Map<string, string> | null
+): void {
+  if (tc.id && !toolInfo.startEmitted && (toolInfo.syntheticId || !toolInfo.id)) {
+    toolInfo.id = sanitizeToolId(tc.id);
+    toolInfo.upstreamId = tc.id;
+    toolInfo.syntheticId = false;
+  }
+  // A late real id is useful for subsequent reuse detection, but the id of an
+  // already published block is immutable.
+  if (tc.id && !toolInfo.upstreamId) toolInfo.upstreamId = tc.id;
+  // The Responses hub writes completed-call summaries into this same map
+  // before forwarding a done-only arguments chunk. Preserve that owner identity.
+  let summaryName = typeof toolInfo.function?.name === "string" ? toolInfo.function.name : "";
+  if (summaryName.startsWith(CLAUDE_OAUTH_TOOL_PREFIX))
+    summaryName = summaryName.slice(CLAUDE_OAUTH_TOOL_PREFIX.length);
+  const knownName = incomingName || restoreClaudeToolName(summaryName, toolNameMap);
+  if (knownName && !toolInfo.startEmitted && !toolInfo.name) {
+    toolInfo.name = knownName;
+    toolInfo.shimmed = hasToolCallShim(knownName);
+  }
+  if (tc.id || knownName) toolInfo.awaitingIdentity = false;
+}
+
+function ensureToolBlockIndex(state, toolInfo, results): void {
+  if (typeof toolInfo.blockIndex === "number") return;
+  stopThinkingBlock(state, results);
+  stopTextBlock(state, results);
+  toolInfo.blockIndex = state.nextBlockIndex++;
+}
+
+// Emit content_block_start, then replay arguments held before the block opened
+// (shimmed tools emit their corrected arguments at stop time instead).
+function emitToolUseStart(state, toolInfo, results): void {
+  ensureToolBlockIndex(state, toolInfo, results);
+  toolInfo.startEmitted = true;
+  results.push({
+    type: "content_block_start",
+    index: toolInfo.blockIndex,
+    content_block: { type: "tool_use", id: toolInfo.id, name: toolInfo.name || "", input: {} },
+  });
+  if (toolInfo.argBuffer && !toolInfo.shimmed) {
+    results.push({
+      type: "content_block_delta",
+      index: toolInfo.blockIndex,
+      delta: { type: "input_json_delta", partial_json: toolInfo.argBuffer },
+    });
+  }
+}
+
+const EARLY_EOF_MESSAGE = "Upstream stream ended without a terminal marker";
+
+// EOF without any finish_reason is a truncated turn, not a success: close the
+// open blocks and end with an Anthropic `error` event instead of fabricating an
+// `end_turn`. state.upstreamError makes stream.ts record the failure (same
+// contract as the openai→responses flush, #15309).
+function flushTruncatedClaudeStream(state) {
+  if (!state.messageStartSent || state.claudeFinishEmitted || state.upstreamError) return null;
+  state.claudeFinishEmitted = true;
+  const results = [];
+  stopThinkingBlock(state, results);
+  stopTextBlock(state, results);
+  for (const [, toolInfo] of state.toolCalls) {
+    if (!toolInfo.startEmitted || typeof toolInfo.blockIndex !== "number") continue;
+    results.push({ type: "content_block_stop", index: toolInfo.blockIndex });
+  }
+  state.upstreamError = {
+    status: 502,
+    type: "server_error",
+    code: "stream_early_eof",
+    message: EARLY_EOF_MESSAGE,
+  };
+  results.push({ type: "error", error: { type: "api_error", message: EARLY_EOF_MESSAGE } });
+  return results;
+}
+
 // First numeric value among `candidates`, else 0. Used to read usage fields
 // that upstreams report under either Chat Completions or Responses naming.
 function firstNumber(...candidates: unknown[]): number {
@@ -287,7 +417,7 @@ function trackUsageFromChunk(chunk, state) {
 
 // Convert OpenAI stream chunk to Claude format
 export function openaiToClaudeResponse(chunk, state) {
-  if (!chunk && !state.pendingClaudeFinishChoice) return null;
+  if (!chunk && !state.pendingClaudeFinishChoice) return flushTruncatedClaudeStream(state);
 
   const results = [];
   const chunkUsage = chunk?.usage;
@@ -566,61 +696,33 @@ export function openaiToClaudeResponse(chunk, state) {
   // Tool calls
   if (delta?.tool_calls) {
     for (const tc of delta.tool_calls) {
-      const idx = tc.index ?? 0;
-
       // Strip the Claude OAuth prefix from an incoming tool name (if any).
       const incomingName = (() => {
         let n = tc.function?.name || "";
         if (n.startsWith(CLAUDE_OAUTH_TOOL_PREFIX)) n = n.slice(CLAUDE_OAUTH_TOOL_PREFIX.length);
         return restoreClaudeToolName(n, state.toolNameMap);
       })();
+      const idx = resolveToolCallKey(state, tc, incomingName);
 
-      // A tool call is identified by its id. Some OpenAI-compatible upstreams
-      // (GLM 5.2) stream the id and function.name in SEPARATE SSE chunks. The
-      // Claude protocol cannot patch a content_block_start after it is emitted,
-      // so we register the tool call on the id chunk but DEFER content_block_start
-      // until the name arrives (#2077 / decolua/9router#2077).
-      if (tc.id && !state.toolCalls.has(idx)) {
-        stopThinkingBlock(state, results);
-        stopTextBlock(state, results);
-
-        const sanitizedId = sanitizeToolId(tc.id);
-        state.toolCalls.set(idx, {
-          id: sanitizedId,
-          name: incomingName,
-          blockIndex: state.nextBlockIndex++,
-          // Shimmed tools buffer their raw args and emit a single corrected
-          // input_json_delta at content_block_stop time (see finish handler).
-          shimmed: incomingName ? hasToolCallShim(incomingName) : false,
-          argBuffer: "",
-          startEmitted: false,
-        });
+      // Register on the first fragment carrying an id, a name or arguments (the
+      // id is optional in the OpenAI schema). Some upstreams (GLM 5.2) stream the
+      // id and function.name in SEPARATE SSE chunks. The Claude protocol cannot
+      // patch a content_block_start after it is emitted, so content_block_start
+      // is DEFERRED until the name arrives (#2077 / decolua/9router#2077).
+      if (!state.toolCalls.has(idx) && (tc.id || incomingName || tc.function?.arguments)) {
+        state.toolCalls.set(idx, createToolCallEntry(tc, incomingName));
       }
 
       const toolInfo = state.toolCalls.get(idx);
       if (toolInfo) {
         // Capture a late-arriving id or name (streamed after the initial chunk).
-        if (tc.id && !toolInfo.id) toolInfo.id = sanitizeToolId(tc.id);
-        if (incomingName && !toolInfo.startEmitted && !toolInfo.name) {
-          toolInfo.name = incomingName;
-          toolInfo.shimmed = hasToolCallShim(incomingName);
-        }
+        adoptToolCallIdentity(toolInfo, tc, incomingName, state.toolNameMap);
+        if (!toolInfo.awaitingIdentity) ensureToolBlockIndex(state, toolInfo, results);
 
-        // Emit content_block_start once we have a name. If arguments arrive before
-        // any name was ever seen, start the block anyway with the (empty) name so
-        // the input_json_delta stays well-formed.
-        if (!toolInfo.startEmitted && (toolInfo.name || tc.function?.arguments != null)) {
-          toolInfo.startEmitted = true;
-          results.push({
-            type: "content_block_start",
-            index: toolInfo.blockIndex,
-            content_block: {
-              type: "tool_use",
-              id: toolInfo.id,
-              name: toolInfo.name || "",
-              input: {},
-            },
-          });
+        // Arguments and an id can both precede the name. Buffer them until the
+        // immutable block header can carry its real name (#2077).
+        if (!toolInfo.startEmitted && !toolInfo.awaitingIdentity && toolInfo.name) {
+          emitToolUseStart(state, toolInfo, results);
         }
       }
 
@@ -633,8 +735,8 @@ export function openaiToClaudeResponse(chunk, state) {
           let deltaStr = nextArgs.slice(existingArgs.length);
           toolInfo.argBuffer = nextArgs;
 
-          if (toolInfo.shimmed || !deltaStr) {
-            // Suppress passthrough for shimmed tools; emit one corrective delta at finish.
+          if (!toolInfo.startEmitted || toolInfo.shimmed || !deltaStr) {
+            // Held until the block opens, or (shimmed) one corrective delta at finish.
             continue;
           }
 
@@ -682,9 +784,15 @@ export function openaiToClaudeResponse(chunk, state) {
     // dropped the held text silently — for a single-chunk response whose block
     // never closes, that is the ENTIRE answer replaced by an empty message.
     // Release whatever is still held before the terminal blocks are emitted.
+    // The same goes for an unclosed <invoke>/<tool_call> tag and the DSML holdback:
+    // no further chunk can complete them, so they were prose and must reach the client.
     const flushedPreamble =
       (state._directiveStripper?.flush?.() ?? "") +
-      (state._systemPreambleStripper?.flush?.() ?? "");
+      (state._systemPreambleStripper?.flush?.() ?? "") +
+      (state._xmlInvokeBuffer ?? "") +
+      (state._dsmlHoldback ?? "");
+    state._xmlInvokeBuffer = "";
+    state._dsmlHoldback = undefined;
     if (flushedPreamble) {
       if (!state.textBlockStarted || state.textBlockClosed) {
         state.textBlockIndex = state.nextBlockIndex++;
@@ -734,19 +842,7 @@ export function openaiToClaudeResponse(chunk, state) {
       // A tool call whose name/args never arrived (only an id chunk was seen)
       // still has a reserved block index but no content_block_start. Emit it now
       // so the terminal content_block_stop is not orphaned (#2077 edge case).
-      if (!toolInfo.startEmitted) {
-        toolInfo.startEmitted = true;
-        results.push({
-          type: "content_block_start",
-          index: toolInfo.blockIndex,
-          content_block: {
-            type: "tool_use",
-            id: toolInfo.id,
-            name: toolInfo.name || "",
-            input: {},
-          },
-        });
-      }
+      if (!toolInfo.startEmitted) emitToolUseStart(state, toolInfo, results);
 
       // For shimmed tools, emit one corrective input_json_delta with the
       // fully patched JSON before closing the block.

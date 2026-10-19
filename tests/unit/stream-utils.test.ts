@@ -224,6 +224,121 @@ test("createSSEStream passthrough normalizes tool-call finishes and reports the 
   assert.equal(onCompletePayload.clientPayload._streamed, true);
 });
 
+test("passthrough accumulates split tool names for onComplete without changing outbound fragments", async () => {
+  let onCompletePayload = null;
+  const makeChunk = (choices, usage?) =>
+    `data: ${JSON.stringify({
+      id: "chatcmpl_split_tool_names",
+      object: "chat.completion.chunk",
+      created: 1,
+      model: "gpt-4.1-mini",
+      choices,
+      ...(usage ? { usage } : {}),
+    })}\n\n`;
+  const text = await readTransformed(
+    [
+      makeChunk([
+        {
+          index: 0,
+          delta: {
+            tool_calls: [
+              {
+                index: 0,
+                id: "call_exec",
+                type: "function",
+                function: { name: "functions__", arguments: '{"command":' },
+              },
+              {
+                index: 1,
+                id: "call_search",
+                type: "function",
+                function: { name: "mcp__notion__API_get_", arguments: '{"user":' },
+              },
+            ],
+          },
+          finish_reason: null,
+        },
+      ]),
+      makeChunk([
+        {
+          index: 0,
+          delta: {
+            tool_calls: [
+              {
+                index: 0,
+                function: { name: "functions__exec", arguments: '"ls"}' },
+              },
+              {
+                index: 1,
+                function: { name: "mcp__notion__API_get_self", arguments: '"me"}' },
+              },
+            ],
+          },
+          finish_reason: null,
+        },
+      ]),
+      makeChunk([
+        {
+          index: 0,
+          delta: {
+            tool_calls: [
+              { index: 0, function: { name: "exec", arguments: "" } },
+              { index: 1, function: { name: "API_get_self", arguments: "" } },
+            ],
+          },
+          finish_reason: null,
+        },
+      ]),
+      makeChunk([{ index: 0, delta: {}, finish_reason: "stop" }], {
+        prompt_tokens: 5,
+        completion_tokens: 3,
+        total_tokens: 8,
+      }),
+    ],
+    {
+      mode: "passthrough",
+      sourceFormat: FORMATS.OPENAI,
+      provider: "openai-compatible",
+      model: "gpt-4.1-mini",
+      body: { messages: [{ role: "user", content: "run both tools" }] },
+      onComplete(payload) {
+        onCompletePayload = payload;
+      },
+    }
+  );
+
+  const outboundNameFragments = parseJsonDataPayloads(text)
+    .flatMap((payload) => payload.choices ?? [])
+    .flatMap((choice) => choice.delta?.tool_calls ?? [])
+    .map((toolCall) => [toolCall.index, toolCall.function?.name]);
+  assert.deepEqual(outboundNameFragments, [
+    [0, "functions__"],
+    [1, "mcp__notion__API_get_"],
+    [0, "functions__exec"],
+    [1, "mcp__notion__API_get_self"],
+    [0, "exec"],
+    [1, "API_get_self"],
+  ]);
+
+  const choice = onCompletePayload.responseBody.choices[0];
+  assert.equal(choice.finish_reason, "tool_calls");
+  assert.deepEqual(
+    choice.message.tool_calls.map((toolCall) => ({
+      id: toolCall.id,
+      name: toolCall.function.name,
+      arguments: toolCall.function.arguments,
+    })),
+    [
+      { id: "call_exec", name: "functions__exec", arguments: '{"command":"ls"}' },
+      {
+        id: "call_search",
+        name: "mcp__notion__API_get_self",
+        arguments: '{"user":"me"}',
+      },
+    ]
+  );
+});
+
 test("createSSEStream passthrough converts textual tool-call content into structured call log tool_calls", async () => {
   let onCompletePayload = null;
   const toolArgs = JSON.stringify({

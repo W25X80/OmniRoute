@@ -1,3 +1,9 @@
+import {
+  isCredentialDiagnosticSentinel,
+  credentialDiagnosticResponse,
+} from "@omniroute/open-sse/services/comboKeyScope.ts";
+import { targetConnectionScope } from "@omniroute/open-sse/services/comboKeyScope.ts";
+import type { ConnectionScope } from "@omniroute/open-sse/services/connectionScope.ts";
 import { handleEmbedding } from "@omniroute/open-sse/handlers/embeddings.ts";
 import {
   parseEmbeddingModel,
@@ -7,16 +13,26 @@ import {
   type EmbeddingProviderNodeRow,
   type EmbeddingProvider,
 } from "@omniroute/open-sse/config/embeddingRegistry.ts";
-import { errorResponse, unavailableResponse } from "@omniroute/open-sse/utils/error.ts";
+import { errorResponse } from "@omniroute/open-sse/utils/error.ts";
 import { HTTP_STATUS } from "@omniroute/open-sse/config/constants.ts";
 import * as log from "@/sse/utils/logger";
 import { toJsonErrorPayload } from "@/shared/utils/upstreamError";
+import { clearRecoveredProviderState, markAccountUnavailable } from "@/sse/services/auth";
+import { getProviderCredentials } from "@/sse/services/scopedCredentials";
 import {
-  getProviderCredentials,
-  clearRecoveredProviderState,
-  markAccountUnavailable,
-} from "@/sse/services/auth";
+  isKeyScopeBlockedCredentials,
+  keyScopeBlockedResponse,
+  keylessProviderRejection,
+  keyAdmitsKeylessProviders,
+  noActiveCredentialsResponse,
+  narrowConnectionScope,
+} from "@/sse/services/keyConnectionScope";
 import { getCachedProviderNodes } from "@/lib/db/readCache";
+import {
+  isProviderNodePrefixReserved,
+  selectCompatibleNodeForPrefix,
+  type CompatibleNodeLike,
+} from "@/lib/providerNodePrefixes";
 import { getComboByName, getCombos } from "@/lib/db/combos";
 import { getProviderConnections } from "@/lib/db/providers";
 import { getUserDatabaseSettings } from "@/lib/db/databaseSettings";
@@ -40,15 +56,17 @@ import { resolveAlibabaProviderEmbeddingUrl } from "@/shared/constants/alibabaPr
  * A local server (llama.cpp, LM Studio, …) embeds with whatever model it loaded and
  * ignores the request's `model`, so two connections of the same local provider are
  * NOT interchangeable accounts. Never pick a connection whose configured default model
- * names a different model: returns the ids of the remaining active connections, or
- * null (no restriction) when no connection declares a conflicting default model.
+ * names a different model. The returned IDs are a computed physical-account scope:
+ * even an empty inventory means no eligible account, never an unrestricted pool.
  */
 async function localConnectionsServingModel(
   provider: string,
   model: string | null
 ): Promise<string[] | null> {
   if (!model) return null;
-  const connections = await getProviderConnections({ provider, isActive: true });
+  // Model compatibility is independent of active/cooldown state. The selector
+  // owns those gates, including explicitly requested recoverable inactive probes.
+  const connections = await getProviderConnections({ provider });
   const normalize = (value: string) => value.replace(/^\/+/, "");
   const eligible = connections.filter((connection) => {
     const defaultModel = connection.defaultModel;
@@ -56,7 +74,7 @@ async function localConnectionsServingModel(
       ? true
       : normalize(defaultModel) === normalize(model);
   });
-  return eligible.length === connections.length ? null : eligible.map((c) => String(c.id));
+  return eligible.map((c) => String(c.id));
 }
 
 type ValidatedEmbeddingBody = Record<string, unknown> & { model: string };
@@ -82,8 +100,17 @@ export interface EmbeddingHandlerOptions {
   apiKeyId?: string | null;
   apiKeyName?: string | null;
   connectionId?: string | null;
+  forcedConnectionId?: string | null;
   resolvedProvider?: EmbeddingProvider | null;
   resolvedModel?: string | null;
+  /**
+   * GHSA-3w2r: the caller API key's connection scope (null/undefined =
+   * unscoped). Every credential lookup below — and every combo target — is
+   * bounded by it, the same scope chat applies.
+   */
+  connectionScope?: ConnectionScope | null;
+  /** GHSA-3w2r: combo per-target model gate for the caller key (undefined = none). */
+  isComboTargetAllowed?: (targetModelStr: string) => Promise<boolean>;
 }
 
 export async function createEmbeddingResponse(
@@ -144,9 +171,14 @@ export async function createEmbeddingResponse(
             return createEmbeddingResponse(newBody, {
               ...options,
               connectionId: target?.connectionId || options.connectionId,
+              forcedConnectionId: target?.connectionId,
+              connectionScope: targetConnectionScope(
+                options.connectionScope ?? { kind: "unrestricted" },
+                target ?? {}
+              ),
             });
           },
-          isModelAvailable: undefined,
+          isModelAvailable: options.isComboTargetAllowed,
           log,
           settings,
           allCombos: allCombos as any,
@@ -158,10 +190,27 @@ export async function createEmbeddingResponse(
       log.error("EMBED", `Combo resolution failed for ${modelStr}: ${err}`);
     }
   }
+  type EmbeddingNodeForRouting = EmbeddingProviderNodeRow & CompatibleNodeLike;
   let dynamicProviders: ReturnType<typeof buildDynamicEmbeddingProvider>[] = [];
+  let dynamicNodeByPrefix = new Map<string, EmbeddingNodeForRouting>();
   try {
-    const nodes = (await getCachedProviderNodes()) as unknown as EmbeddingProviderNodeRow[];
-    dynamicProviders = (Array.isArray(nodes) ? nodes : [])
+    const nodes = (await getCachedProviderNodes()) as unknown as EmbeddingNodeForRouting[];
+    const nodeSnapshot = Array.isArray(nodes) ? nodes : [];
+    const nodesByPrefix = new Map<string, EmbeddingNodeForRouting[]>();
+    for (const node of nodeSnapshot) {
+      if (typeof node.prefix !== "string" || node.prefix.length === 0) continue;
+      const prefixNodes = nodesByPrefix.get(node.prefix) ?? [];
+      prefixNodes.push(node);
+      nodesByPrefix.set(node.prefix, prefixNodes);
+    }
+    for (const [prefix, prefixNodes] of nodesByPrefix) {
+      if (isProviderNodePrefixReserved(prefix)) continue;
+      const winner = selectCompatibleNodeForPrefix(prefixNodes, prefix);
+      if (!winner?.id) continue;
+      const winnerNode = prefixNodes.find((node) => node.id === winner.id);
+      if (winnerNode) dynamicNodeByPrefix.set(prefix, winnerNode);
+    }
+    dynamicProviders = [...dynamicNodeByPrefix.values()]
       .filter((n) => {
         const validTypes = ["chat", "responses", "embeddings"];
         if (!validTypes.includes(n.apiType || "")) return false;
@@ -215,7 +264,14 @@ export async function createEmbeddingResponse(
     dynamicProviders.find((dp) => dp.id === provider) ||
     getEmbeddingProvider(provider) ||
     null;
-  let credentialsProviderId = provider;
+  const selectedDynamicNode =
+    !options.resolvedProvider &&
+    !syncedEndpointRoute &&
+    dynamicProviders.some((dynamicProvider) => dynamicProvider.id === provider)
+      ? dynamicNodeByPrefix.get(provider)
+      : undefined;
+  let credentialsProviderId = selectedDynamicNode?.id || provider;
+  const keyConnections = options.connectionScope ?? null;
 
   // #11088: synced-endpoint route — the connection advertising this endpoint
   // supplies credentials and its configured base URL directly.
@@ -223,22 +279,20 @@ export async function createEmbeddingResponse(
     credentials = await getProviderCredentials(
       provider,
       null,
-      syncedEndpointRoute.connectionIds,
-      syncedEndpointRoute.model
+      narrowConnectionScope(keyConnections, syncedEndpointRoute.connectionIds),
+      syncedEndpointRoute.model,
+      { ...(options.forcedConnectionId ? { forcedConnectionId: options.forcedConnectionId } : {}) }
     );
+    if (isCredentialDiagnosticSentinel(credentials))
+      return credentialDiagnosticResponse("provider", credentials)!;
     if (!credentials) {
       return errorResponse(
         HTTP_STATUS.BAD_REQUEST,
         `No credentials for embedding provider: ${provider}`
       );
     }
-    if ("allRateLimited" in credentials && credentials.allRateLimited) {
-      return unavailableResponse(
-        HTTP_STATUS.RATE_LIMITED,
-        `[${provider}] All accounts rate limited`,
-        credentials.retryAfter,
-        credentials.retryAfterHuman
-      );
+    if (isKeyScopeBlockedCredentials(credentials)) {
+      return keyScopeBlockedResponse(provider, credentials);
     }
 
     const providerSpecificData = (credentials as { providerSpecificData?: Record<string, unknown> })
@@ -288,13 +342,15 @@ export async function createEmbeddingResponse(
 
   if (!providerConfig) {
     try {
-      const allNodes = (await getCachedProviderNodes()) as unknown as EmbeddingProviderNodeRow[];
-      const matchingNode = (Array.isArray(allNodes) ? allNodes : []).find(
-        (n) =>
-          n.prefix === provider &&
-          (n.apiType === "chat" || n.apiType === "responses" || n.apiType === "embeddings") &&
-          n.baseUrl
-      );
+      const candidateNode = dynamicNodeByPrefix.get(provider);
+      const matchingNode =
+        candidateNode &&
+        (candidateNode.apiType === "chat" ||
+          candidateNode.apiType === "responses" ||
+          candidateNode.apiType === "embeddings") &&
+        candidateNode.baseUrl
+          ? candidateNode
+          : null;
       if (matchingNode) {
         const baseUrl = String(matchingNode.baseUrl).replace(/\/+$/, "");
         // #6925: a private/LAN node reaching this fallback (e.g. a matching
@@ -346,92 +402,115 @@ export async function createEmbeddingResponse(
   }
 
   if (!credentials && providerConfig.authType !== "none") {
-    credentials = await getProviderCredentials(credentialsProviderId);
+    credentials = await getProviderCredentials(
+      credentialsProviderId,
+      null,
+      keyConnections,
+      resolvedModel,
+      { ...(options.forcedConnectionId ? { forcedConnectionId: options.forcedConnectionId } : {}) }
+    );
+    if (isCredentialDiagnosticSentinel(credentials))
+      return credentialDiagnosticResponse("provider", credentials)!;
     if (!credentials) {
       return errorResponse(
         HTTP_STATUS.BAD_REQUEST,
         formatMissingEmbeddingCredentialsError(provider)
       );
     }
-    if ("allRateLimited" in credentials && credentials.allRateLimited) {
-      return unavailableResponse(
-        HTTP_STATUS.RATE_LIMITED,
-        `[${provider}] All accounts rate limited`,
-        credentials.retryAfter,
-        credentials.retryAfterHuman
-      );
-    }
-    if ("allExpired" in credentials && credentials.allExpired) {
-      const expiredStatus = (credentials as { expiredStatus?: string }).expiredStatus;
-      const quota = expiredStatus === "credits_exhausted";
-      const reason = quota ? "credits exhausted" : "authentication expired";
-      return errorResponse(
-        quota ? HTTP_STATUS.PAYMENT_REQUIRED : HTTP_STATUS.UNAUTHORIZED,
-        `[${provider}] All ${credentials.expiredCount || 1} connection(s) ${reason} — please reconnect in the dashboard`
-      );
-    }
+
     // #13945: blockedByKeyPolicy is the third credential-diagnostic sentinel
     // (alongside allRateLimited/allExpired above) — without this check a
     // truthy sentinel would reach the embeddings executor below with no
-    // apiKey/accessToken. Defensive: this call site does not pass
-    // allowedConnections today, so the sentinel cannot fire yet, but it
-    // guards the same contract the moment that scope is wired in (mirrors
-    // #13832's blockedByKeyPolicy handling in the chat path).
-    if ("blockedByKeyPolicy" in credentials && credentials.blockedByKeyPolicy) {
-      return errorResponse(
-        HTTP_STATUS.BAD_REQUEST,
-        formatMissingEmbeddingCredentialsError(provider)
-      );
+    // apiKey/accessToken. It fires now that the key's connection scope is
+    // wired in (GHSA-3w2r) and answers the same 403 as chat (#13832).
+    if (isKeyScopeBlockedCredentials(credentials)) {
+      return keyScopeBlockedResponse(provider, credentials);
     }
   } else if (
-    provider === "ollama-local" ||
-    provider === "lmstudio" ||
-    provider === "llama-cpp" ||
-    provider === "lemonade"
+    !credentials &&
+    (provider === "ollama-local" ||
+      provider === "lmstudio" ||
+      provider === "llama-cpp" ||
+      provider === "lemonade")
   ) {
     // Local providers are key-optional, but a configured connection can provide
     // a custom host or API key (e.g. Lemonade bearer auth). Hydrate that optional
     // connection without imposing an authentication requirement, then keep the
-    // static localhost default when no connection exists.
-    // An empty allowlist means "no filter" to getProviderCredentials, so a request
-    // that no connection serves must skip connection selection entirely.
-    const servingIds = await localConnectionsServingModel(credentialsProviderId, resolvedModel);
-    const localCredentials =
-      servingIds && servingIds.length === 0
-        ? null
-        : await getProviderCredentials(credentialsProviderId, null, servingIds);
+    // static localhost default only with separate noauth/unrestricted admission.
+    // Keep the serving operand through selection; never reselect a broader pool
+    // merely to prove keyless access. The selected record supplies the dispatch host.
+    const localScope = narrowConnectionScope(
+      keyConnections,
+      await localConnectionsServingModel(credentialsProviderId, resolvedModel)
+    );
+    const localCredentials = await getProviderCredentials(
+      credentialsProviderId,
+      null,
+      localScope,
+      resolvedModel,
+      { ...(options.forcedConnectionId ? { forcedConnectionId: options.forcedConnectionId } : {}) }
+    );
+    if (isCredentialDiagnosticSentinel(localCredentials))
+      return credentialDiagnosticResponse(provider, localCredentials)!;
+    credentials = localCredentials;
+    const forcedConnectionId = options.forcedConnectionId?.trim();
     if (
-      localCredentials &&
-      !("allRateLimited" in localCredentials) &&
-      !("allExpired" in localCredentials)
+      !credentials &&
+      ((forcedConnectionId && forcedConnectionId !== "noauth") ||
+        !keyAdmitsKeylessProviders(keyConnections))
     ) {
-      credentials = localCredentials;
+      return noActiveCredentialsResponse(provider);
     }
   } else if (!credentials && providerConfig.authType === "none") {
     // #13234: private-host nodes are classified no-auth so a keyless
     // LAN Ollama still works (#6925). A stored API key on that same
     // node must still ride outbound, matching dashboard Check.
-    const keyedCredentials = await getProviderCredentials(credentialsProviderId);
-    if (
-      keyedCredentials &&
-      !("allRateLimited" in keyedCredentials) &&
-      !("allExpired" in keyedCredentials)
-    ) {
-      const token =
-        (typeof (keyedCredentials as { apiKey?: unknown }).apiKey === "string" &&
-          (keyedCredentials as { apiKey?: string }).apiKey) ||
-        (typeof (keyedCredentials as { accessToken?: unknown }).accessToken === "string" &&
-          (keyedCredentials as { accessToken?: string }).accessToken) ||
-        "";
-      if (token) {
-        credentials = keyedCredentials;
-        providerConfig = {
-          ...providerConfig,
-          authType: "apikey",
-          authHeader: "bearer",
-        };
-      }
+    const forcedConnectionId = options.forcedConnectionId?.trim() || null;
+    const forcedSyntheticNoauth =
+      forcedConnectionId === "noauth" && keyAdmitsKeylessProviders(keyConnections);
+    const unforcedNoauthOnly =
+      !forcedConnectionId &&
+      keyConnections?.kind === "connections" &&
+      keyConnections.ids.length === 1 &&
+      keyConnections.ids[0] === "noauth";
+    const skipOptionalPhysicalSelection = forcedSyntheticNoauth || unforcedNoauthOnly;
+    const keyedCredentials = skipOptionalPhysicalSelection
+      ? null
+      : await getProviderCredentials(credentialsProviderId, null, keyConnections, resolvedModel, {
+          ...(forcedConnectionId ? { forcedConnectionId } : {}),
+        });
+    if (isCredentialDiagnosticSentinel(keyedCredentials))
+      return credentialDiagnosticResponse(provider, keyedCredentials)!;
+    credentials = keyedCredentials;
+    if (!credentials && forcedConnectionId && forcedConnectionId !== "noauth") {
+      return noActiveCredentialsResponse(provider);
     }
+    const token =
+      (typeof (keyedCredentials as { apiKey?: unknown } | null)?.apiKey === "string" &&
+        (keyedCredentials as { apiKey?: string } | null)?.apiKey) ||
+      (typeof (keyedCredentials as { accessToken?: unknown } | null)?.accessToken === "string" &&
+        (keyedCredentials as { accessToken?: string } | null)?.accessToken) ||
+      "";
+    if (token) {
+      providerConfig = {
+        ...providerConfig,
+        authType: "apikey",
+        authHeader: "bearer",
+      };
+    }
+  }
+
+  // GHSA-3w2r: a run without any connection (local default, private-host node)
+  // is keyless. A connection-scoped key reaches it only when its allowlist
+  // admits keyless providers or an in-scope connection serves the provider —
+  // chat's #9057 rule. Unscoped callers are not affected.
+  if (!credentials && providerConfig.authType === "none") {
+    const keylessRejection = await keylessProviderRejection(provider, keyConnections, () =>
+      getProviderCredentials(credentialsProviderId, null, keyConnections, resolvedModel, {
+        ...(options.forcedConnectionId ? { forcedConnectionId: options.forcedConnectionId } : {}),
+      })
+    );
+    if (keylessRejection) return keylessRejection;
   }
 
   // Alibaba's embedding endpoint is connection-scoped: workspace and region
@@ -505,7 +584,7 @@ export async function createEmbeddingResponse(
       // account on a hard upstream failure (previously always null on /v1/embeddings).
       connectionId:
         (credentials as { connectionId?: string } | null)?.connectionId ||
-        options.connectionId ||
+        (!options.forcedConnectionId ? options.connectionId : null) ||
         connectionIdForProxy ||
         null,
     });

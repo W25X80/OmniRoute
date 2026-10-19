@@ -5,6 +5,10 @@
  * (visionBridge.ts already imports getBestVisionModel from visionBridgeRouter.ts).
  */
 
+import {
+  connectionScopeFromConfiguredIds,
+  type ConnectionScope,
+} from "@omniroute/open-sse/services/connectionScope.ts";
 import { resolveProviderId } from "@/shared/constants/providers";
 import { isNoAuthProviderKey } from "@/shared/utils/noAuthProviders";
 import { SYNTHETIC_NOAUTH_CONNECTION_ID } from "@omniroute/open-sse/services/autoCombo/resilienceCandidateFilter.ts";
@@ -129,6 +133,15 @@ async function getPrefixToNode(): Promise<Map<string, string> | null> {
   }
 }
 
+function filterAllowedConnections(rows: any[], allowed: Set<string> | null): any[] {
+  return allowed ? rows.filter((c: any) => allowed.has(String(c?.id))) : rows;
+}
+
+/** The synthetic no-auth connection counts only when the key scope names it. */
+function isSyntheticNoAuthAllowed(allowed: Set<string> | null): boolean {
+  return !allowed || allowed.has(SYNTHETIC_NOAUTH_CONNECTION_ID);
+}
+
 /**
  * Resolve whether `provider/model` has at least one usable active connection.
  * Returns `null` when the credential store is unavailable (unit tests / early boot).
@@ -152,10 +165,26 @@ async function getPrefixToNode(): Promise<Map<string, string> | null> {
  * is treated as usable (the key requirement does not apply — a noauth row
  * carries no API key by design).
  */
-export async function hasUsableCredentialsForModel(model: string): Promise<boolean | null> {
+export async function hasUsableCredentialsForModel(
+  model: string,
+  options: {
+    /**
+     * API-key connection scope: when a non-empty list is given, only those
+     * connection ids count, and the synthetic no-auth connection only when the
+     * list names it (same rule as credential selection in chat).
+     */
+    allowedConnectionIds?: string[] | null;
+    /** Resolved scope is tagged so an empty intersection remains deny. */
+    connectionScope?: ConnectionScope;
+  } = {}
+): Promise<boolean | null> {
   const rawProvider = typeof model === "string" ? model.split("/")[0]?.trim() : "";
   if (!rawProvider) return null;
   const provider = resolveProviderId(rawProvider);
+  const scope =
+    options.connectionScope ?? connectionScopeFromConfiguredIds(options.allowedConnectionIds);
+  if (scope.kind === "deny") return false;
+  const allowed = scope.kind === "connections" ? new Set(scope.ids) : null;
   const isNoAuth = isNoAuthProviderKey(rawProvider, provider);
   try {
     const { getProviderConnections } = await loadProvidersModule();
@@ -163,8 +192,9 @@ export async function hasUsableCredentialsForModel(model: string): Promise<boole
     const providerIds = resolveProviderCredentialIds(provider, prefixToNode);
     let sawStoredRow = false;
     for (const providerId of providerIds) {
-      const connections = await getProviderConnections({ provider: providerId, isActive: true });
-      if (!Array.isArray(connections)) return null;
+      const rows = await getProviderConnections({ provider: providerId, isActive: true });
+      if (!Array.isArray(rows)) return null;
+      const connections = filterAllowedConnections(rows, allowed);
       // This candidate has no rows — the next candidate (mapped node id) may
       // still hold the operator's connection.
       if (connections.length === 0) continue;
@@ -180,7 +210,7 @@ export async function hasUsableCredentialsForModel(model: string): Promise<boole
     // unusable; no-auth providers still work through the synthetic "noauth"
     // connection (and a noauth provider with stored rows can only have been
     // rejected via a terminal status in the loop above).
-    return isNoAuth && !sawStoredRow;
+    return isNoAuth && !sawStoredRow && isSyntheticNoAuthAllowed(allowed);
   } catch {
     return null;
   }

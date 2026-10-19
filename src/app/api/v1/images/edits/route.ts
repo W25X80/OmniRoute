@@ -1,4 +1,14 @@
 import {
+  isCredentialDiagnosticSentinel,
+  credentialDiagnosticResponse,
+} from "@omniroute/open-sse/services/comboKeyScope.ts";
+import {
+  resolveKeyConnectionScope,
+  createComboTargetKeyGate,
+  targetConnectionScope,
+} from "@/sse/services/keyConnectionScope";
+import type { ConnectionScope } from "@omniroute/open-sse/services/connectionScope.ts";
+import {
   handleAdobeFireflyImageGeneration,
   handleCodexImageEdit,
   handleImageGeneration,
@@ -12,10 +22,8 @@ import {
   isFalImageEditModel,
 } from "@omniroute/open-sse/handlers/imageGeneration/providers/fal.ts";
 import { createInjectionGuard } from "@/middleware/promptInjectionGuard";
-import {
-  getProviderCredentialsWithQuotaPreflight,
-  clearRecoveredProviderState,
-} from "@/sse/services/auth";
+import { clearRecoveredProviderState } from "@/sse/services/auth";
+import { getProviderCredentialsWithQuotaPreflight } from "@/sse/services/scopedCredentials";
 import { executeImageWithCredentialFallback } from "@/sse/services/imageCredentialRetry";
 import {
   parseImageModel,
@@ -228,7 +236,7 @@ function buildAdobeFireflyEditDataUrls(
 async function handleAdobeFireflyEditRequest(params: {
   parsed: ReturnType<typeof parseImageModel>;
   providerConfig: NonNullable<ReturnType<typeof getImageProvider>>;
-  allowedConnections: string[] | null;
+  connectionScope: ConnectionScope | null;
   resolvedModel: string;
   prompt: string;
   size: string | null;
@@ -240,7 +248,7 @@ async function handleAdobeFireflyEditRequest(params: {
   const {
     parsed,
     providerConfig,
-    allowedConnections,
+    connectionScope,
     resolvedModel,
     prompt,
     size,
@@ -253,21 +261,15 @@ async function handleAdobeFireflyEditRequest(params: {
   const credentials = await getProviderCredentialsWithQuotaPreflight(
     parsed.provider,
     null,
-    allowedConnections,
+    connectionScope,
     resolvedModel
   );
+  if (isCredentialDiagnosticSentinel(credentials))
+    return credentialDiagnosticResponse("provider", credentials)!;
   if (!credentials) {
     return errorResponse(
       HTTP_STATUS.UNAUTHORIZED,
       `No credentials for provider: ${parsed.provider}`
-    );
-  }
-  if (credentials.allRateLimited) {
-    return unavailableResponse(
-      HTTP_STATUS.RATE_LIMITED,
-      `[${parsed.provider}] All accounts rate limited`,
-      credentials.retryAfter,
-      credentials.retryAfterHuman
     );
   }
 
@@ -308,7 +310,7 @@ async function handleAdobeFireflyEditRequest(params: {
 async function handleSyntxEditRequest(params: {
   parsed: ReturnType<typeof parseImageModel>;
   providerConfig: NonNullable<ReturnType<typeof getImageProvider>>;
-  allowedConnections: string[] | null;
+  connectionScope: ConnectionScope | null;
   resolvedModel: string;
   prompt: string;
   size: string | null;
@@ -320,7 +322,7 @@ async function handleSyntxEditRequest(params: {
   const {
     parsed,
     providerConfig,
-    allowedConnections,
+    connectionScope,
     resolvedModel,
     prompt,
     size,
@@ -333,9 +335,11 @@ async function handleSyntxEditRequest(params: {
   const credentials = await getProviderCredentialsWithQuotaPreflight(
     parsed.provider,
     null,
-    allowedConnections,
+    connectionScope,
     resolvedModel
   );
+  if (isCredentialDiagnosticSentinel(credentials))
+    return credentialDiagnosticResponse("provider", credentials)!;
   if (!credentials) {
     return errorResponse(
       HTTP_STATUS.UNAUTHORIZED,
@@ -397,13 +401,16 @@ interface ImageEditContext {
   imageBytes: Buffer | null;
   imageMime: string | null;
   imageInputCount: number;
-  allowedConnections: string[] | null;
+  connectionScope: ConnectionScope | null;
+  isTargetAllowed?: (model: string) => Promise<boolean>;
   request: Request;
 }
 
 /** A combo target that resolved to an edit-capable provider/node. */
 interface EditComboTarget {
   modelStr: string;
+  connectionId?: string | null;
+  allowedConnectionIds?: string[] | null;
   parsed: ReturnType<typeof parseImageModel>;
   providerConfig: ReturnType<typeof getImageProvider> | null;
   /** Credential/connection lookup key (built-in provider id, or custom node id). */
@@ -649,6 +656,7 @@ async function executeImageEditCombo(comboName: string, ctx: ImageEditContext): 
         ? ((t as { modelStr: string }).modelStr as string)
         : "";
     if (!raw.trim()) continue;
+    if (ctx.isTargetAllowed && !(await ctx.isTargetAllowed(raw))) continue;
     let resolved: string;
     try {
       resolved = await resolveImageModelPrefix(raw);
@@ -660,7 +668,14 @@ async function executeImageEditCombo(comboName: string, ctx: ImageEditContext): 
     const providerConfig = parsed.provider ? getImageProvider(parsed.provider) : null;
     const capability = classifyImageEditTarget(resolved, parsed, providerConfig);
     if (!capability) continue;
-    editTargets.push({ modelStr: resolved, parsed, providerConfig, credKey: capability.credKey });
+    editTargets.push({
+      modelStr: resolved,
+      parsed,
+      providerConfig,
+      credKey: capability.credKey,
+      connectionId: t.connectionId,
+      allowedConnectionIds: t.allowedConnectionIds,
+    });
   }
 
   if (editTargets.length === 0) {
@@ -676,8 +691,9 @@ async function executeImageEditCombo(comboName: string, ctx: ImageEditContext): 
       getProviderCredentialsWithQuotaPreflight(
         target.credKey,
         null,
-        ctx.allowedConnections,
-        target.modelStr
+        targetConnectionScope(ctx.connectionScope ?? { kind: "unrestricted" }, target),
+        target.modelStr,
+        { ...(target.connectionId ? { forcedConnectionId: target.connectionId } : {}) }
       ),
     isRateLimited: isAllRateLimitedCredentials,
     dispatch: ({ target, credentials }) => dispatchImageEditTarget(target, credentials, ctx),
@@ -769,11 +785,8 @@ async function postHandler(request: Request, _context?: unknown) {
     if (combo) {
       const comboPolicy = await enforceApiKeyPolicy(request, fullModel);
       if (comboPolicy.rejection) return comboPolicy.rejection;
-      const comboAllowedConnections =
-        comboPolicy.apiKeyInfo?.allowedConnections &&
-        comboPolicy.apiKeyInfo.allowedConnections.length > 0
-          ? comboPolicy.apiKeyInfo.allowedConnections
-          : null;
+      const scoped = await resolveKeyConnectionScope(comboPolicy.apiKeyInfo);
+      if (scoped.rejection) return scoped.rejection;
       return executeImageEditCombo(fullModel, {
         prompt,
         size,
@@ -782,7 +795,8 @@ async function postHandler(request: Request, _context?: unknown) {
         imageBytes,
         imageMime,
         imageInputCount,
-        allowedConnections: comboAllowedConnections,
+        connectionScope: scoped.connectionScope,
+        isTargetAllowed: createComboTargetKeyGate(comboPolicy, fullModel),
         request,
       });
     }
@@ -810,10 +824,9 @@ async function postHandler(request: Request, _context?: unknown) {
   const policy = await enforceApiKeyPolicy(request, fullModel);
   if (policy.rejection) return policy.rejection;
 
-  const allowedConnections =
-    policy.apiKeyInfo?.allowedConnections && policy.apiKeyInfo.allowedConnections.length > 0
-      ? policy.apiKeyInfo.allowedConnections
-      : null;
+  const scoped = await resolveKeyConnectionScope(policy.apiKeyInfo);
+  if (scoped.rejection) return scoped.rejection;
+  const connectionScope = scoped.connectionScope;
 
   const parsed = parseImageModel(resolvedModel);
   const providerConfig = parsed.provider ? getImageProvider(parsed.provider) : null;
@@ -851,23 +864,18 @@ async function postHandler(request: Request, _context?: unknown) {
     const credentials = await getProviderCredentialsWithQuotaPreflight(
       parsed.provider,
       null,
-      allowedConnections,
+      connectionScope,
       resolvedModel
     );
+    if (isCredentialDiagnosticSentinel(credentials))
+      return credentialDiagnosticResponse("provider", credentials)!;
     if (!credentials) {
       return errorResponse(
         HTTP_STATUS.UNAUTHORIZED,
         `No credentials for provider: ${parsed.provider}`
       );
     }
-    if (credentials.allRateLimited) {
-      return unavailableResponse(
-        HTTP_STATUS.RATE_LIMITED,
-        `[${parsed.provider}] All accounts rate limited`,
-        credentials.retryAfter,
-        credentials.retryAfterHuman
-      );
-    }
+
     const credentialDetails = credentials as {
       connectionId?: unknown;
       providerSpecificData?: unknown;
@@ -928,38 +936,33 @@ async function postHandler(request: Request, _context?: unknown) {
     const credentials = await getProviderCredentialsWithQuotaPreflight(
       parsed.provider,
       null,
-      allowedConnections,
+      connectionScope,
       resolvedModel
     );
+    if (isCredentialDiagnosticSentinel(credentials))
+      return credentialDiagnosticResponse("provider", credentials)!;
     if (!credentials) {
       return errorResponse(
         HTTP_STATUS.UNAUTHORIZED,
         `No credentials for provider: ${parsed.provider}`
       );
     }
-    if (credentials.allRateLimited) {
-      return unavailableResponse(
-        HTTP_STATUS.RATE_LIMITED,
-        `[${parsed.provider}] All accounts rate limited`,
-        credentials.retryAfter,
-        credentials.retryAfterHuman
-      );
-    }
 
-    const result = await handleFalAIImageEdit({
-      provider: parsed.provider,
-      model: parsed.model,
-      providerConfig,
-      body: {
-        prompt,
-        size: size ?? undefined,
-        response_format: responseFormat ?? undefined,
-        n: 1,
-      },
-      images,
-      credentials,
-      log,
-    });
+    const result: { success: boolean; data?: unknown; error?: unknown; status?: number } =
+      await handleFalAIImageEdit({
+        provider: parsed.provider,
+        model: parsed.model,
+        providerConfig,
+        body: {
+          prompt,
+          size: size ?? undefined,
+          response_format: responseFormat ?? undefined,
+          n: 1,
+        },
+        images,
+        credentials,
+        log,
+      });
 
     if (result.success) {
       await clearRecoveredProviderState(credentials);
@@ -976,7 +979,7 @@ async function postHandler(request: Request, _context?: unknown) {
     return handleAdobeFireflyEditRequest({
       parsed,
       providerConfig,
-      allowedConnections,
+      connectionScope,
       resolvedModel,
       prompt,
       size,
@@ -991,7 +994,7 @@ async function postHandler(request: Request, _context?: unknown) {
     return handleSyntxEditRequest({
       parsed,
       providerConfig,
-      allowedConnections,
+      connectionScope,
       resolvedModel,
       prompt,
       size,
@@ -1010,21 +1013,15 @@ async function postHandler(request: Request, _context?: unknown) {
     const credentials = await getProviderCredentialsWithQuotaPreflight(
       parsed.provider,
       null,
-      allowedConnections,
+      connectionScope,
       resolvedModel
     );
+    if (isCredentialDiagnosticSentinel(credentials))
+      return credentialDiagnosticResponse("provider", credentials)!;
     if (!credentials) {
       return errorResponse(
         HTTP_STATUS.UNAUTHORIZED,
         `No credentials for provider: ${parsed.provider}`
-      );
-    }
-    if (credentials.allRateLimited) {
-      return unavailableResponse(
-        HTTP_STATUS.RATE_LIMITED,
-        `[${parsed.provider}] All accounts rate limited`,
-        credentials.retryAfter,
-        credentials.retryAfterHuman
       );
     }
 
@@ -1056,9 +1053,11 @@ async function postHandler(request: Request, _context?: unknown) {
     const credentials = await getProviderCredentialsWithQuotaPreflight(
       parsed.provider,
       null,
-      allowedConnections,
+      connectionScope,
       resolvedModel
     );
+    if (isCredentialDiagnosticSentinel(credentials))
+      return credentialDiagnosticResponse("provider", credentials)!;
     if (!credentials) {
       return errorResponse(
         HTTP_STATUS.UNAUTHORIZED,
@@ -1087,6 +1086,7 @@ async function postHandler(request: Request, _context?: unknown) {
       provider: parsed.provider,
       requestedModel: resolvedModel,
       credentials,
+      connectionScope,
       execute: (creds) =>
         handleImageGeneration({
           body: {
@@ -1137,21 +1137,15 @@ async function postHandler(request: Request, _context?: unknown) {
   const credentials = await getProviderCredentialsWithQuotaPreflight(
     customProviderId,
     null,
-    allowedConnections,
+    connectionScope,
     resolvedModel
   );
+  if (isCredentialDiagnosticSentinel(credentials))
+    return credentialDiagnosticResponse("provider", credentials)!;
   if (!credentials) {
     return errorResponse(
       HTTP_STATUS.BAD_REQUEST,
       `No credentials for custom image provider: ${customProviderId}`
-    );
-  }
-  if (credentials.allRateLimited) {
-    return unavailableResponse(
-      HTTP_STATUS.RATE_LIMITED,
-      `[${customProviderId}] All accounts rate limited`,
-      credentials.retryAfter,
-      credentials.retryAfterHuman
     );
   }
 

@@ -11,7 +11,10 @@ import { syncToCloud } from "@/lib/cloudSync";
 import { createKeySchema } from "@/shared/validation/schemas";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
 import { isApiKeyRevealEnabled, maskStoredApiKey } from "@/lib/apiKeyExposure";
-import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
+import {
+  requireCredentialForManagementScopedKey,
+  requireManagementAuth,
+} from "@/lib/api/requireManagementAuth";
 import { normalizeSelfServiceScopesForCreate } from "@/shared/constants/selfServiceScopes";
 import * as log from "@/sse/utils/logger";
 
@@ -85,9 +88,11 @@ export async function POST(request) {
       expiresAt,
     } = validation.data;
 
-    // Always get machineId from server
-    const machineId = await getConsistentMachineId();
     const normalizedScopes = normalizeSelfServiceScopesForCreate(scopes);
+    const denied = await requireCredentialForManagementScopedKey(request, normalizedScopes);
+    if (denied) return denied;
+    // Always get machineId from server, after credential admission.
+    const machineId = await getConsistentMachineId();
     const apiKey = await createApiKey(name, machineId, normalizedScopes, {
       modelAccessMode,
       allowedModels,

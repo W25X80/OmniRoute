@@ -533,11 +533,6 @@
       "count": 1
     }
   },
-  "open-sse/services/videoCombo.ts": {
-    "@typescript-eslint/no-unused-vars": {
-      "count": 1
-    }
-  },
   "open-sse/transformer/responsesTransformer.ts": {
     "@typescript-eslint/no-unused-vars": {
       "count": 3
@@ -988,11 +983,6 @@
       "count": 1
     }
   },
-  "src/app/api/relay/tokens/[id]/route.ts": {
-    "@typescript-eslint/no-unused-vars": {
-      "count": 2
-    }
-  },
   "src/app/api/search/stats/route.ts": {
     "@typescript-eslint/no-unused-vars": {
       "count": 1
@@ -1038,17 +1028,7 @@
       "count": 1
     }
   },
-  "src/app/api/v1/audio/speech/route.ts": {
-    "@typescript-eslint/no-unused-vars": {
-      "count": 1
-    }
-  },
   "src/app/api/v1/chat/completions/route.ts": {
-    "@typescript-eslint/no-unused-vars": {
-      "count": 1
-    }
-  },
-  "src/app/api/v1/embeddings/route.ts": {
     "@typescript-eslint/no-unused-vars": {
       "count": 1
     }
@@ -1058,15 +1038,7 @@
       "count": 1
     }
   },
-  "src/app/api/v1/images/generations/route.ts": {
-    "@typescript-eslint/no-unused-vars": {
-      "count": 1
-    }
-  },
   "src/app/api/v1/messages/count_tokens/route.ts": {
-    "@typescript-eslint/no-unused-vars": {
-      "count": 2
-    },
     "no-restricted-imports": {
       "count": 1
     }
@@ -1082,41 +1054,6 @@
     }
   },
   "src/app/api/v1/models/catalogOpenrouter.ts": {
-    "@typescript-eslint/no-unused-vars": {
-      "count": 1
-    }
-  },
-  "src/app/api/v1/moderations/route.ts": {
-    "@typescript-eslint/no-unused-vars": {
-      "count": 1
-    }
-  },
-  "src/app/api/v1/music/generations/route.ts": {
-    "@typescript-eslint/no-unused-vars": {
-      "count": 1
-    }
-  },
-  "src/app/api/v1/ocr/route.ts": {
-    "@typescript-eslint/no-unused-vars": {
-      "count": 1
-    }
-  },
-  "src/app/api/v1/providers/[provider]/embeddings/route.ts": {
-    "@typescript-eslint/no-unused-vars": {
-      "count": 2
-    }
-  },
-  "src/app/api/v1/rerank/route.ts": {
-    "@typescript-eslint/no-unused-vars": {
-      "count": 2
-    }
-  },
-  "src/app/api/v1/search/route.ts": {
-    "@typescript-eslint/no-unused-vars": {
-      "count": 3
-    }
-  },
-  "src/app/api/v1/videos/generations/route.ts": {
     "@typescript-eslint/no-unused-vars": {
       "count": 1
     }

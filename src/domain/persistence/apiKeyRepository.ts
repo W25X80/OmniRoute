@@ -104,7 +104,10 @@ export interface ApiKeyRepository {
     scopes?: string[],
     options?: CreateApiKeyOptions
   ): Promise<ApiKeyRecord>;
-  regenerateApiKey(id: string): Promise<{ id: string; key: string } | null>;
+  regenerateApiKey(
+    id: string,
+    options?: { expectedScopes?: readonly string[] }
+  ): Promise<{ id: string; key: string } | null>;
   updateApiKeyPermissions(id: string, update: string[] | ApiKeyPermissionsUpdate): Promise<boolean>;
   deleteApiKey(id: string): Promise<boolean>;
   revokeApiKey(id: string): Promise<boolean>;
@@ -125,4 +128,18 @@ export interface ApiKeyRepository {
   ): Promise<string | null>;
   getExclusiveLeaseConnectionIds(): Promise<Set<string>>;
   clearApiKeyCaches(): void;
+}
+
+export class ApiKeyScopeConflictError extends Error {
+  constructor() {
+    super("API key scopes changed; refresh before regenerating");
+    this.name = "ApiKeyScopeConflictError";
+  }
+}
+export function assertRegenerationScopes(
+  actual: readonly string[],
+  expected?: readonly string[]
+): void {
+  if (expected && JSON.stringify([...actual].sort()) !== JSON.stringify([...expected].sort()))
+    throw new ApiKeyScopeConflictError();
 }

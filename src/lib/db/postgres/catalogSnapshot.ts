@@ -397,6 +397,58 @@ export interface PostgresCatalogVersion {
   readonly generation: string;
 }
 
+type CatalogSnapshotGuardKind =
+  "scope_changed" | "authority_changed" | "epoch_missing" | "generation_changed";
+const CATALOG_SNAPSHOT_GUARD_ERROR = Symbol.for("omniroute.postgres.catalog-snapshot-guard-error");
+
+class PostgresCatalogSnapshotGuardError extends Error {
+  constructor(
+    readonly kind: CatalogSnapshotGuardKind,
+    message: string
+  ) {
+    super(message);
+    this.name = "PostgresCatalogSnapshotGuardError";
+    Object.defineProperty(this, CATALOG_SNAPSHOT_GUARD_ERROR, { value: true });
+  }
+}
+
+/** Next server bundles can contain separate module identities in the same process. */
+export function isPostgresCatalogGenerationDrift(
+  error: unknown
+): error is PostgresCatalogSnapshotGuardError {
+  if (!error || typeof error !== "object") return false;
+  const candidate = error as {
+    [CATALOG_SNAPSHOT_GUARD_ERROR]?: unknown;
+    kind?: unknown;
+  };
+  return (
+    candidate[CATALOG_SNAPSHOT_GUARD_ERROR] === true && candidate.kind === "generation_changed"
+  );
+}
+
+function assertCatalogSnapshotAuthority(
+  expected: PostgresCatalogVersion,
+  current: CatalogScope
+): void {
+  if (expected.identity !== current.identity)
+    throw new PostgresCatalogSnapshotGuardError(
+      "scope_changed",
+      "Catalog authority changed during request preparation"
+    );
+  if (expected.authority !== current.rows.authority)
+    throw new PostgresCatalogSnapshotGuardError(
+      "authority_changed",
+      "Catalog authority changed during request preparation"
+    );
+}
+
+/** Keep a retry within the identity and authority captured by the original build. */
+export function assertPostgresCatalogSnapshotAuthority(expected: PostgresCatalogVersion): void {
+  const database = getSelectedPostgresDatabase();
+  if (!database) throw new Error("PostgreSQL catalog owner is not selected");
+  assertCatalogSnapshotAuthority(expected, scope(database));
+}
+
 /** Bind derived values before yielding; acknowledged writes may replace the scope's rows. */
 export function capturePostgresCatalogVersion(): PostgresCatalogVersion {
   const database = getSelectedPostgresDatabase();
@@ -417,8 +469,7 @@ export async function assertPostgresCatalogSnapshotCurrent(
   if (!database) return;
   const current = scope(database);
   const captured = expected ?? capturePostgresCatalogVersion();
-  if (captured.identity !== current.identity || captured.authority !== current.rows.authority)
-    throw new Error("Catalog authority changed during request preparation");
+  assertCatalogSnapshotAuthority(captured, current);
   const version = await database.transaction(async (transaction) => {
     const result = await transaction.query<{
       authority_id: string;
@@ -426,12 +477,21 @@ export async function assertPostgresCatalogSnapshotCurrent(
     }>("SELECT authority_id,generation FROM omniroute.api_key_policy_epoch WHERE singleton");
     return result.rows[0];
   });
-  if (
-    !version ||
-    version.authority_id !== captured.authority ||
-    version.generation !== captured.generation
-  )
-    throw new Error("Catalog policy changed during request preparation");
+  if (!version)
+    throw new PostgresCatalogSnapshotGuardError(
+      "epoch_missing",
+      "Catalog policy epoch is unavailable during request preparation"
+    );
+  if (version.authority_id !== captured.authority)
+    throw new PostgresCatalogSnapshotGuardError(
+      "authority_changed",
+      "Catalog authority changed during request preparation"
+    );
+  if (version.generation !== captured.generation)
+    throw new PostgresCatalogSnapshotGuardError(
+      "generation_changed",
+      "Catalog policy changed during request preparation"
+    );
 }
 
 /** Pure leaves resolve environment flags from the same request authority as catalog rows. */

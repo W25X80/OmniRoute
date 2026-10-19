@@ -1,3 +1,9 @@
+import { acquirePostgresLock } from "./locks";
+import {
+  SYNC_TOKEN_AUTH_SELECT,
+  syncRowAuthorization,
+  syncTokenIsLive,
+} from "../syncTokenLifecycle";
 import { randomUUID } from "node:crypto";
 import {
   encrypt,
@@ -156,6 +162,9 @@ type SyncRow = {
   name: string;
   token_hash: string;
   sync_api_key_id: string | null;
+  issued_by: string | null;
+  expires_at: string | null;
+  auth_generation: string | null;
   revoked_at: string | null;
   last_used_at: string | null;
   created_at: string;
@@ -169,6 +178,9 @@ function syncRecord(row: SyncRow | undefined): SyncTokenRecord | null {
     name: row.name,
     tokenHash: row.token_hash,
     syncApiKeyId: row.sync_api_key_id,
+    issuedBy: row.issued_by,
+    expiresAt: row.expires_at,
+    authGeneration: row.auth_generation,
     revokedAt: row.revoked_at,
     lastUsedAt: row.last_used_at,
     createdAt: row.created_at,
@@ -208,15 +220,35 @@ export async function createPostgresSyncToken(
     name: string;
     tokenHash: string;
     syncApiKeyId?: string | null;
+    issuedBy?: string | null;
+    expiresAt?: string | null;
+    authGeneration?: string | null;
   }
 ): Promise<SyncTokenRecord> {
   const now = new Date().toISOString();
   return database.transaction(async (transaction) => {
+    await acquirePostgresLock(transaction, "settings");
+    if (input.authGeneration) {
+      const current = await transaction.query<{ value: string }>(
+        "SELECT value FROM omniroute.key_value WHERE namespace='settings' AND key='managementAuthGeneration'"
+      );
+      if (current.rows[0]?.value !== JSON.stringify(input.authGeneration))
+        throw new Error("Authentication generation changed");
+    }
     const { rows } = await transaction.query<SyncRow>(
       `INSERT INTO omniroute.sync_tokens
-       (id, name, token_hash, sync_api_key_id, created_at, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $5) RETURNING *`,
-      [randomUUID(), input.name, input.tokenHash, input.syncApiKeyId || null, now]
+       (id, name, token_hash, sync_api_key_id, created_at, updated_at, issued_by, expires_at, auth_generation)
+       VALUES ($1, $2, $3, $4, $5, $5, $6, $7, $8) RETURNING *`,
+      [
+        randomUUID(),
+        input.name,
+        input.tokenHash,
+        input.syncApiKeyId || null,
+        now,
+        input.issuedBy || null,
+        input.expiresAt || null,
+        input.authGeneration || null,
+      ]
     );
     return syncRecord(rows[0])!;
   });
@@ -247,5 +279,36 @@ export async function touchPostgresSyncToken(
       [usedAt, id]
     );
     return (result.rowCount || 0) > 0;
+  });
+}
+
+export async function validatePostgresSyncToken(
+  database: PostgresDatabase,
+  tokenHash: string,
+  usedAt?: string
+): Promise<SyncTokenRecord | null> {
+  return database.transaction(async (tx) => {
+    if (usedAt) {
+      await acquirePostgresLock(tx, "settings");
+      await acquirePostgresLock(tx, "keyPolicy", "shared");
+    }
+    const sql =
+      SYNC_TOKEN_AUTH_SELECT.replace("FROM sync_tokens", "FROM omniroute.sync_tokens")
+        .replace("JOIN key_value", "JOIN omniroute.key_value")
+        .replace("JOIN api_keys", "JOIN omniroute.api_keys") +
+      "$1" +
+      (usedAt ? " FOR UPDATE OF t" : "");
+    const { rows } = await tx.query<SyncRow & Record<string, unknown>>(sql, [tokenHash]);
+    const row = rows[0],
+      record = syncRecord(row);
+    if (!row || !record) return null;
+    const { generation, linkedKey } = syncRowAuthorization(row);
+    if (!syncTokenIsLive(record, generation, linkedKey)) return null;
+    if (usedAt)
+      await tx.query("UPDATE omniroute.sync_tokens SET last_used_at=$1,updated_at=$1 WHERE id=$2", [
+        usedAt,
+        record.id,
+      ]);
+    return record;
   });
 }

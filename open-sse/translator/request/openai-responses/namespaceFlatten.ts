@@ -39,3 +39,14 @@ export function flattenNamespaceToolName(nsName: string, leaf: string): string {
   const hash = createHash("sha256").update(qualified).digest("hex").slice(0, 7);
   return `${qualified.slice(0, MAX_TOOL_NAME_LEN - 8)}_${hash}`;
 }
+
+/** Resolve a namespaced Responses tool choice only when its flattened wire tool exists. */
+export function resolveNamespacedToolChoiceName(
+  namespace: unknown,
+  name: string,
+  declaredNames: ReadonlySet<string>
+): string {
+  if (typeof namespace !== "string" || !namespace || !name) return name;
+  const qualified = flattenNamespaceToolName(namespace, name);
+  return declaredNames.has(qualified) ? qualified : name;
+}

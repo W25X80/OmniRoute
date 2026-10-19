@@ -1,13 +1,20 @@
-import { handleModeration } from "@omniroute/open-sse/handlers/moderations.ts";
 import {
-  getProviderCredentialsWithQuotaPreflight,
-  clearRecoveredProviderState,
-} from "@/sse/services/auth";
+  isCredentialDiagnosticSentinel,
+  credentialDiagnosticResponse,
+} from "@omniroute/open-sse/services/comboKeyScope.ts";
+import { handleModeration } from "@omniroute/open-sse/handlers/moderations.ts";
+import { clearRecoveredProviderState } from "@/sse/services/auth";
+import { getProviderCredentialsWithQuotaPreflight } from "@/sse/services/scopedCredentials";
 import { withInjectionGuard } from "@/middleware/promptInjectionGuard";
 import { parseModerationModel } from "@omniroute/open-sse/config/moderationRegistry.ts";
 import { errorResponse } from "@omniroute/open-sse/utils/error.ts";
 import { HTTP_STATUS } from "@omniroute/open-sse/config/constants.ts";
 import { enforceApiKeyPolicy } from "@/shared/utils/apiKeyPolicy";
+import {
+  isKeyScopeBlockedCredentials,
+  keyScopeBlockedResponse,
+  resolveKeyConnectionScope,
+} from "@/sse/services/keyConnectionScope";
 import { v1ModerationSchema } from "@/shared/validation/schemas";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
 import {
@@ -31,7 +38,7 @@ export async function OPTIONS() {
  * POST /v1/moderations — content moderation
  * OpenAI Moderations API compatible.
  */
-async function postHandler(request, context) {
+async function postHandler(request, _context) {
   let rawBody;
   try {
     rawBody = await request.json();
@@ -50,17 +57,30 @@ async function postHandler(request, context) {
   // Enforce API key policies (model restrictions + budget limits)
   const policy = await enforceApiKeyPolicy(request, model);
   if (policy.rejection) return policy.rejection;
+  // GHSA-3w2r: credential selection stays inside the key's connection scope,
+  // the same scope chat applies.
+  const scope = await resolveKeyConnectionScope(policy.apiKeyInfo);
+  if (scope.rejection) return scope.rejection;
 
   const { provider } = parseModerationModel(model);
 
   // Default to openai if no provider prefix
   const resolvedProvider = provider || "openai";
-  const credentials = await getProviderCredentialsWithQuotaPreflight(resolvedProvider);
+  const credentials = await getProviderCredentialsWithQuotaPreflight(
+    resolvedProvider,
+    null,
+    scope.connectionScope
+  );
+  if (isCredentialDiagnosticSentinel(credentials))
+    return credentialDiagnosticResponse("provider", credentials)!;
   if (!credentials) {
     return errorResponse(
       HTTP_STATUS.BAD_REQUEST,
       `No credentials for provider: ${resolvedProvider}`
     );
+  }
+  if (isKeyScopeBlockedCredentials(credentials)) {
+    return keyScopeBlockedResponse(resolvedProvider, credentials);
   }
   if (isAllRateLimitedCredentials(credentials)) {
     return rateLimitedProviderResponse(resolvedProvider, credentials);

@@ -57,6 +57,7 @@ export const COMBO_COOLDOWN_RETRYABLE_REASONS: ReadonlySet<string> = new Set([
   "overloaded",
   "server_error",
   "circuit_open",
+  "concurrency_limited",
 ]);
 
 export interface ComboCooldownWaitSettings {

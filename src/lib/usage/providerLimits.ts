@@ -25,6 +25,12 @@ import { supportsProviderQuota } from "@/shared/utils/providerQuotaVisibility";
 import { mergeProviderLimitsCacheEntry, toProviderLimitsCacheEntry } from "./providerLimitsCache";
 import { getCredentialRefreshExecutor } from "@omniroute/open-sse/executors/credential.ts";
 import { getUsageForProvider } from "@omniroute/open-sse/services/usage.ts";
+import {
+  copyClaudeUsageProvenance,
+  getClaudeUsageProvenance,
+  isClaudeUsageDisplayOnly,
+  isFreshClaudeUsage,
+} from "@omniroute/open-sse/services/usage/claudeUsageProvenance.ts";
 import { cooldownUntilMs } from "@omniroute/open-sse/services/accountFallback.ts";
 import { rotationGroupFor } from "@omniroute/open-sse/services/refreshSerializer.ts";
 import {
@@ -53,6 +59,53 @@ import {
 export { shouldAttemptRotatingRefresh } from "./providerLimits/credentialRefresh";
 type JsonRecord = Record<string, unknown>;
 type SyncSource = "manual" | "scheduled";
+
+function sanitizeUsageForProvider(
+  provider: string,
+  usage: JsonRecord,
+  liveModelIds: string[]
+): JsonRecord {
+  const sanitized = sanitizeUsageQuotasForProvider(provider, usage, liveModelIds);
+  return provider === "claude" ? copyClaudeUsageProvenance(usage, sanitized) : sanitized;
+}
+
+function isDisplayOnlyClaudeUsage(provider: string, usage: JsonRecord): boolean {
+  return provider === "claude" && isClaudeUsageDisplayOnly(usage);
+}
+
+function canPublishProviderUsage(provider: string, usage: JsonRecord): boolean {
+  return provider !== "claude" || isFreshClaudeUsage(usage);
+}
+
+function usageObservedAt(usage: JsonRecord): number | null {
+  return getClaudeUsageProvenance(usage)?.observedAt ?? null;
+}
+
+function displayClaudeUsageWithNewestCache(
+  usage: JsonRecord,
+  previous: ProviderLimitsCacheEntry | null
+): JsonRecord {
+  if (!previous) return usage;
+  const observedAt = usageObservedAt(usage);
+  const previousAt = Date.parse(previous.fetchedAt);
+  const usePrevious =
+    !isRecord(usage.quotas) ||
+    (observedAt !== null && Number.isFinite(previousAt) && previousAt > observedAt);
+  if (!usePrevious) return usage;
+  return copyClaudeUsageProvenance(usage, {
+    ...usage,
+    quotas: previous.quotas,
+    modelQuotas: previous.modelQuotas,
+    plan: previous.plan ?? usage.plan ?? null,
+    bankedResetCredits: previous.bankedResetCredits,
+    paidCredits: previous.paidCredits,
+    billing: previous.billing,
+    _stale: true,
+    _staleSince: previous.fetchedAt,
+    _staleReason: "Claude usage was not freshly observed.",
+    message: null,
+  });
+}
 
 const PROVIDER_LIMITS_APIKEY_PROVIDERS = new Set([
   "glm",
@@ -787,26 +840,32 @@ async function fetchLiveProviderLimitsWithOptions(
     // mirroring the OAuth branch below (proxyInfo?.proxy ?? null). Without this, API-key
     // usage egresses on the host IP, ignoring the connection's assigned proxy.
     const apiKeyProxy = await resolveProxyForConnection(connectionId);
-    const usage = sanitizeUsageQuotasForProvider(
+    const fetchedUsage = (await runWithProxyContext(apiKeyProxy?.proxy ?? null, () =>
+      getUsageForProvider(connection as unknown as JsonRecord, {
+        ...options,
+        allowStaleDisplay: true,
+      })
+    )) as JsonRecord;
+    const usage = sanitizeUsageForProvider(
       connection.provider,
-      (await runWithProxyContext(apiKeyProxy?.proxy ?? null, () =>
-        getUsageForProvider(connection as unknown as JsonRecord, options)
-      )) as JsonRecord,
+      fetchedUsage,
       await refreshLiveModelIds(connection.provider)
     );
-    if (isRecord(usage.quotas)) {
-      await setQuotaCacheAsync(
-        connectionId,
-        connection.provider,
-        usage.quotas,
-        isRecord(usage.modelQuotas) ? usage.modelQuotas : {}
-      );
+    if (canPublishProviderUsage(connection.provider, usage)) {
+      if (isRecord(usage.quotas)) {
+        await setQuotaCacheAsync(
+          connectionId,
+          connection.provider,
+          usage.quotas,
+          isRecord(usage.modelQuotas) ? usage.modelQuotas : {}
+        );
+      }
+      connection = await syncExpiredStatusIfNeeded(connection, usage);
+      connection = await syncClaudeExtraUsageStateIfNeeded(connection, usage);
+      connection = await syncClaudeBootstrapIfNeeded(connection, usage);
+      connection = await syncAntigravitySubscriptionIfNeeded(connection, usage);
+      connection = await maybeClearRecoveredQuotaState(connection, usage);
     }
-    connection = await syncExpiredStatusIfNeeded(connection, usage);
-    connection = await syncClaudeExtraUsageStateIfNeeded(connection, usage);
-    connection = await syncClaudeBootstrapIfNeeded(connection, usage);
-    connection = await syncAntigravitySubscriptionIfNeeded(connection, usage);
-    connection = await maybeClearRecoveredQuotaState(connection, usage);
     return { connection, usage };
   }
 
@@ -827,9 +886,13 @@ async function fetchLiveProviderLimitsWithOptions(
         await syncToCloudIfEnabled();
       }
 
-      let usageData = sanitizeUsageQuotasForProvider(
+      const fetchedUsage = (await getUsageForProvider(conn as unknown as JsonRecord, {
+        ...options,
+        allowStaleDisplay: true,
+      })) as JsonRecord;
+      let usageData = sanitizeUsageForProvider(
         conn.provider,
-        (await getUsageForProvider(conn as unknown as JsonRecord, options)) as JsonRecord,
+        fetchedUsage,
         await refreshLiveModelIds(conn.provider)
       );
 
@@ -846,9 +909,13 @@ async function fetchLiveProviderLimitsWithOptions(
         if (forced.refreshed) {
           conn = forced.connection;
           await syncToCloudIfEnabled();
-          usageData = sanitizeUsageQuotasForProvider(
+          const refreshedUsage = (await getUsageForProvider(conn as unknown as JsonRecord, {
+            ...options,
+            allowStaleDisplay: true,
+          })) as JsonRecord;
+          usageData = sanitizeUsageForProvider(
             conn.provider,
-            (await getUsageForProvider(conn as unknown as JsonRecord, options)) as JsonRecord,
+            refreshedUsage,
             await refreshLiveModelIds(conn.provider)
           );
         }
@@ -924,19 +991,21 @@ async function fetchLiveProviderLimitsWithOptions(
     );
     if (data) connection = { ...connection, providerSpecificData: data };
   }
-  if (isRecord(result.usage.quotas)) {
-    await setQuotaCacheAsync(
-      connectionId,
-      connection.provider,
-      result.usage.quotas,
-      isRecord(result.usage.modelQuotas) ? result.usage.modelQuotas : {}
-    );
+  if (canPublishProviderUsage(connection.provider, result.usage)) {
+    if (isRecord(result.usage.quotas)) {
+      await setQuotaCacheAsync(
+        connectionId,
+        connection.provider,
+        result.usage.quotas,
+        isRecord(result.usage.modelQuotas) ? result.usage.modelQuotas : {}
+      );
+    }
+    connection = await syncExpiredStatusIfNeeded(connection, result.usage);
+    connection = await syncClaudeExtraUsageStateIfNeeded(connection, result.usage);
+    connection = await syncClaudeBootstrapIfNeeded(connection, result.usage);
+    connection = await syncAntigravitySubscriptionIfNeeded(connection, result.usage);
+    connection = await maybeClearRecoveredQuotaState(connection, result.usage);
   }
-  connection = await syncExpiredStatusIfNeeded(connection, result.usage);
-  connection = await syncClaudeExtraUsageStateIfNeeded(connection, result.usage);
-  connection = await syncClaudeBootstrapIfNeeded(connection, result.usage);
-  connection = await syncAntigravitySubscriptionIfNeeded(connection, result.usage);
-  connection = await maybeClearRecoveredQuotaState(connection, result.usage);
 
   return {
     connection,
@@ -957,14 +1026,65 @@ export async function fetchAndPersistProviderLimits(
     forceRefresh: source === "manual",
     allowRotatingRefresh: opts.allowRotatingRefresh,
   });
-  const newCache = toProviderLimitsCacheEntry(usage, source);
   const previous = await getProviderLimitsCacheAsync(connectionId);
+  if (!canPublishProviderUsage(connection.provider, usage)) {
+    if (isDisplayOnlyClaudeUsage(connection.provider, usage)) {
+      const displayUsage = displayClaudeUsageWithNewestCache(usage, previous);
+      const observedAt = usageObservedAt(usage);
+      const displayCache =
+        previous ??
+        toProviderLimitsCacheEntry(
+          displayUsage,
+          "display-only",
+          observedAt === null ? undefined : new Date(observedAt).toISOString()
+        );
+      return { connection, usage: displayUsage, cache: displayCache };
+    }
+
+    if (previous && typeof usage.message === "string") {
+      return {
+        connection,
+        usage: copyClaudeUsageProvenance(usage, {
+          ...usage,
+          quotas: previous.quotas,
+          modelQuotas: previous.modelQuotas,
+          plan: previous.plan ?? usage.plan ?? null,
+          bankedResetCredits: previous.bankedResetCredits,
+          paidCredits: previous.paidCredits,
+          billing: previous.billing,
+          message: null,
+          _stale: true,
+          _staleSince: previous.fetchedAt,
+          _staleReason: usage.message,
+        }),
+        cache: previous,
+      };
+    }
+
+    const unavailableUsage: JsonRecord = {
+      message:
+        typeof usage.message === "string"
+          ? usage.message
+          : "Claude usage has no fresh observation.",
+      bootstrap: null,
+    };
+    const unavailableCache =
+      previous ??
+      toProviderLimitsCacheEntry(unavailableUsage, "not-fresh", new Date(0).toISOString());
+    return {
+      connection,
+      usage: copyClaudeUsageProvenance(usage, unavailableUsage),
+      cache: unavailableCache,
+    };
+  }
+
+  const newCache = toProviderLimitsCacheEntry(usage, source);
   const cache = mergeProviderLimitsCacheEntry(connection.provider, newCache, previous);
 
   // Don't persist error-only entries (429 etc.) — would wipe prior good cache.
   // Serve the prior entry instead; only successful fetches update the cache.
   if (cache === previous && newCache.message) {
-    const staleUsage: JsonRecord = {
+    const staleUsage: JsonRecord = copyClaudeUsageProvenance(usage, {
       ...usage,
       quotas: previous.quotas,
       modelQuotas: previous.modelQuotas,
@@ -976,14 +1096,14 @@ export async function fetchAndPersistProviderLimits(
       _stale: true,
       _staleSince: previous.fetchedAt,
       _staleReason: newCache.message,
-    };
+    });
     return { connection, usage: staleUsage, cache: previous };
   }
 
-  const mergedUsage: JsonRecord = {
+  const mergedUsage: JsonRecord = copyClaudeUsageProvenance(usage, {
     ...usage,
     ...(cache.billing ? { billing: cache.billing } : {}),
-  };
+  });
   await setProviderLimitsCacheAsync(connectionId, cache);
   return { connection, usage: mergedUsage, cache };
 }
@@ -1009,12 +1129,27 @@ export async function syncAllProviderLimits(
   const caches: Record<string, ProviderLimitsCacheEntry> = {};
   const errors: Record<string, string> = {};
 
+  type SyncCacheResult =
+    | {
+        connectionId: string;
+        cache: ProviderLimitsCacheEntry | null;
+        publish: false;
+      }
+    | {
+        connectionId: string;
+        cache: ProviderLimitsCacheEntry;
+        publish: true;
+      };
   const recordResult = async (
     connectionId: string,
-    result: PromiseSettledResult<{ connectionId: string; cache: ProviderLimitsCacheEntry }>
+    result: PromiseSettledResult<SyncCacheResult>
   ) => {
     if (result.status === "fulfilled") {
-      const { cache } = result.value;
+      const { cache, publish } = result.value;
+      if (!publish) {
+        if (cache) caches[connectionId] = cache;
+        return;
+      }
       const previous = await getProviderLimitsCacheAsync(connectionId);
       if (cache === previous) {
         caches[connectionId] = cache;
@@ -1028,7 +1163,7 @@ export async function syncAllProviderLimits(
     errors[connectionId] = reason?.message || "Failed to refresh provider limits";
   };
 
-  const fetchOne = async (connection: ProviderConnectionLike) => {
+  const fetchOne = async (connection: ProviderConnectionLike): Promise<SyncCacheResult> => {
     const existingCache = await getProviderLimitsCacheAsync(connection.id);
     await refreshLiveModelIds(connection.provider);
     const forceRefresh =
@@ -1037,9 +1172,12 @@ export async function syncAllProviderLimits(
     const { usage } = await fetchLiveProviderLimitsWithOptions(connection.id, {
       forceRefresh,
     });
+    if (!canPublishProviderUsage(connection.provider, usage)) {
+      return { connectionId: connection.id, cache: existingCache, publish: false };
+    }
     const nextCache = toProviderLimitsCacheEntry(usage, source);
     const cache = mergeProviderLimitsCacheEntry(connection.provider, nextCache, existingCache);
-    return { connectionId: connection.id, cache };
+    return { connectionId: connection.id, cache, publish: true };
   };
 
   // OAuth connections are processed STRICTLY SEQUENTIALLY (chunk size 1) with a
@@ -1053,7 +1191,7 @@ export async function syncAllProviderLimits(
 
   const recordChunk = async (
     chunk: ProviderConnectionLike[],
-    results: PromiseSettledResult<{ connectionId: string; cache: ProviderLimitsCacheEntry }>[]
+    results: PromiseSettledResult<SyncCacheResult>[]
   ) => {
     for (const [index, result] of results.entries()) {
       const connectionId = chunk[index]?.id;

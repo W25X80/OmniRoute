@@ -45,6 +45,7 @@ import { getKimiUsage } from "./usage/kimi.ts";
 import { getCodexUsage } from "./usage/codex.ts";
 import { throttleQuotaFetch } from "./quotaFetchThrottle.ts";
 import { getClaudeUsage, getClaudePlanLabel } from "./usage/claude.ts";
+import { redactClaudeUsageForPolicy } from "./usage/claudeUsageProvenance.ts";
 import { getKiroUsage, buildKiroUsageResult, discoverKiroProfileArn } from "./usage/kiro.ts";
 // Re-exported para os testes kiro-* (importam de services/usage).
 export { buildKiroUsageResult, discoverKiroProfileArn } from "./usage/kiro.ts";
@@ -125,7 +126,7 @@ export type { UsageFetcherProvider } from "./usage/fetcherProviders.ts";
  */
 export async function getUsageForProvider(
   connection: UsageProviderConnection,
-  options: { forceRefresh?: boolean } = {}
+  options: { forceRefresh?: boolean; allowStaleDisplay?: boolean } = {}
 ) {
   const { id, provider, accessToken, apiKey, providerSpecificData, projectId, email } = connection;
 
@@ -159,8 +160,10 @@ export async function getUsageForProvider(
         id,
         options
       );
-    case "claude":
-      return await getClaudeUsage(accessToken);
+    case "claude": {
+      const usage = await getClaudeUsage(accessToken, options);
+      return options.allowStaleDisplay ? usage : redactClaudeUsageForPolicy(usage);
+    }
     case "codex":
       // /me/status and the quota-cache refresh reach this fetch with no
       // caller-side pacing. Gate the start here so those paths, and any later

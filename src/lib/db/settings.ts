@@ -1,3 +1,4 @@
+import { withPasswordGeneration } from "./authSettingsSemantics";
 /**
  * db/settings.js — Settings, pricing, and proxy config.
  */
@@ -171,6 +172,7 @@ export async function updateSettings(
   updates: Record<string, unknown>,
   options?: { expectedRevision?: number }
 ) {
+  updates = withPasswordGeneration(updates);
   const selected = getSelectedControlPlane();
   if (selected) {
     const result = await selected.settings.update(updates, options);

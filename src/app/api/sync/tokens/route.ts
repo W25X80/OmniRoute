@@ -1,8 +1,9 @@
+import { authorizeSyncTokenIssuer } from "@/lib/sync/issuer";
 import { NextResponse } from "next/server";
 import { getAuditRequestContext, logAuditEvent } from "@/lib/compliance/index";
 import { createErrorResponse, createErrorResponseFromUnknown } from "@/lib/api/errorResponse";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
-import { createSyncTokenSchema } from "@/shared/validation/schemas";
+import { createSyncTokenSchema, parseSyncTokenTtlMs } from "@/shared/validation/schemas";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
 import {
   issueSyncToken,
@@ -11,7 +12,7 @@ import {
 } from "@/lib/sync/tokens";
 
 export async function GET(request: Request) {
-  const authError = await requireManagementAuth(request);
+  const authError = await requireManagementAuth(request, { alwaysRequireAuth: true });
   if (authError) return authError;
 
   try {
@@ -26,8 +27,8 @@ export async function GET(request: Request) {
 }
 
 export async function POST(request: Request) {
-  const authError = await requireManagementAuth(request);
-  if (authError) return authError;
+  const issuer = await authorizeSyncTokenIssuer(request);
+  if (issuer.ok === false) return issuer.response;
 
   const auditContext = getAuditRequestContext(request);
 
@@ -51,12 +52,19 @@ export async function POST(request: Request) {
     const issued = await issueSyncToken({
       name: validation.data.name,
       syncApiKeyId,
+      issuedBy: issuer.issuer,
+      authGeneration: issuer.generation,
+      expiresAt: validation.data.ttl
+        ? new Date(Date.now() + parseSyncTokenTtlMs(validation.data.ttl)!).toISOString()
+        : undefined,
     });
 
     const tokenSummary = {
       id: issued.record.id,
       name: issued.record.name,
       syncApiKeyId: issued.record.syncApiKeyId,
+      issuedBy: issued.record.issuedBy,
+      expiresAt: issued.record.expiresAt,
       revokedAt: issued.record.revokedAt,
       lastUsedAt: issued.record.lastUsedAt,
       createdAt: issued.record.createdAt,

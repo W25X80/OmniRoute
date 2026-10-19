@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 const genericModule = await import("../../open-sse/services/genericQuotaFetcher.ts");
 const preflightModule = await import("../../open-sse/services/quotaPreflight.ts");
+const provenanceModule = await import("../../open-sse/services/usage/claudeUsageProvenance.ts");
 
 const {
   convertUsageToQuotaInfo,
@@ -16,6 +17,8 @@ const {
   __resetGenericQuotaFetcherForTests,
 } = genericModule;
 const { getQuotaFetcher } = preflightModule;
+const { beginClaudeUsageProducer, currentClaudeUsageGeneration, setClaudeUsageProvenance } =
+  provenanceModule;
 
 function usageShape(remainingPercentage: number) {
   return {
@@ -177,6 +180,78 @@ test("convertUsageToQuotaInfo skips Antigravity quota entries with an unknown fr
 test.afterEach(() => {
   __setGenericUsageFetcherForTests(null);
   __resetGenericQuotaFetcherForTests();
+});
+
+test("Claude force invalidation fences pre-invalidation joins across same-clock markers", async (t) => {
+  const connectionId = `claude-force-${Date.now()}`;
+  const fixedNow = 1_900_000_000_000;
+  t.mock.method(Date, "now", () => fixedNow);
+  let resolveOld!: (value: unknown) => void;
+  const oldResult = new Promise<unknown>((resolve) => {
+    resolveOld = resolve;
+  });
+  const oldProducerId = beginClaudeUsageProducer();
+  const oldGeneration = currentClaudeUsageGeneration();
+  const oldUsage = setClaudeUsageProvenance(usageShape(20), {
+    source: "oauth",
+    observedAt: fixedNow,
+    producerId: oldProducerId,
+    generation: oldGeneration,
+  });
+  let calls = 0;
+  const forceFlags: boolean[] = [];
+  __setGenericUsageFetcherForTests(async (_conn, options) => {
+    calls += 1;
+    forceFlags.push(options?.forceRefresh === true);
+    if (calls <= 2) return oldResult;
+    const producerId = beginClaudeUsageProducer();
+    return setClaudeUsageProvenance(usageShape(75), {
+      source: "oauth",
+      observedAt: fixedNow + 1,
+      producerId,
+      generation: currentClaudeUsageGeneration(),
+    });
+  });
+
+  const connection = { provider: "claude", id: connectionId, accessToken: "opaque" };
+  const preInvalidationPoll = fetchGenericQuota(connectionId, connection);
+  invalidateGenericQuotaCache("claude", connectionId);
+  invalidateGenericQuotaCache("claude", connectionId);
+  const forcedJoin = fetchGenericQuota(connectionId, connection);
+  assert.deepEqual(forceFlags, [false, true]);
+
+  resolveOld(oldUsage);
+  assert.equal(await preInvalidationPoll, null);
+  assert.equal(await forcedJoin, null, "a joined old producer is unknown after invalidation");
+  assert.equal(calls, 2, "joined work does not start a duplicate Claude poll");
+
+  __agePendingForceRefreshMissForTests("claude", connectionId, 60_001);
+  const fresh = await fetchGenericQuota(connectionId, connection);
+  assert.ok(fresh, "a post-invalidation network observation may satisfy the marker");
+  assert.equal(forceFlags[2], true);
+  assert.equal(calls, 3);
+  assert.equal(await fetchGenericQuota(connectionId, connection), fresh);
+  assert.equal(calls, 3, "only the fresh result enters the 60s generic cache");
+});
+
+test("Claude success memo and 429 stale observations stay unknown in generic preflight", async () => {
+  const connectionId = `claude-nonfresh-${Date.now()}`;
+  let calls = 0;
+  __setGenericUsageFetcherForTests(async () => {
+    calls += 1;
+    const producerId = beginClaudeUsageProducer();
+    return setClaudeUsageProvenance(usageShape(95), {
+      source: calls === 1 ? "success-memo" : "stale-429",
+      observedAt: Date.now() - 10_000,
+      producerId,
+      generation: currentClaudeUsageGeneration(),
+    });
+  });
+
+  const connection = { provider: "claude", id: connectionId, accessToken: "opaque" };
+  assert.equal(await fetchGenericQuota(connectionId, connection), null);
+  assert.equal(await fetchGenericQuota(connectionId, connection), null);
+  assert.equal(calls, 2, "nonfresh observations are never cached as a routing quota");
 });
 
 test("fetchGenericQuota caches a hit inside the 60s window", async () => {

@@ -1,14 +1,26 @@
+import {
+  isCredentialDiagnosticSentinel,
+  credentialDiagnosticResponse,
+} from "@omniroute/open-sse/services/comboKeyScope.ts";
 import { handleAudioSpeech } from "@omniroute/open-sse/handlers/audioSpeech.ts";
 import { withInjectionGuard } from "@/middleware/promptInjectionGuard";
+import { clearRecoveredProviderState } from "@/sse/services/auth";
+import { getProviderCredentialsWithQuotaPreflight } from "@/sse/services/scopedCredentials";
 import {
-  getProviderCredentialsWithQuotaPreflight,
-  clearRecoveredProviderState,
-} from "@/sse/services/auth";
+  resolveKeylessAudioTarget,
+  withAudioSelectionErrorBoundary,
+} from "@/sse/services/audioTargetSelection";
 import { parseSpeechModel, getSpeechProvider } from "@omniroute/open-sse/config/audioRegistry.ts";
 import { resolveDynamicAudioProviders } from "@/app/api/v1/_shared/audioProviderNodes";
 import { errorResponse } from "@omniroute/open-sse/utils/error.ts";
 import { HTTP_STATUS } from "@omniroute/open-sse/config/constants.ts";
 import { enforceApiKeyPolicy } from "@/shared/utils/apiKeyPolicy";
+import {
+  createComboTargetKeyGate,
+  isKeyScopeBlockedCredentials,
+  keyScopeBlockedResponse,
+  resolveKeyConnectionScope,
+} from "@/sse/services/keyConnectionScope";
 import { v1AudioSpeechSchema } from "@/shared/validation/schemas";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
 import {
@@ -36,7 +48,7 @@ export async function OPTIONS() {
  * POST /v1/audio/speech — text-to-speech
  * OpenAI TTS API compatible. Returns audio stream.
  */
-async function postHandler(request, context) {
+async function postHandler(request, _context) {
   let rawBody;
   try {
     rawBody = await request.json();
@@ -54,6 +66,11 @@ async function postHandler(request, context) {
   // Enforce API key policies (model restrictions + budget limits)
   const policy = await enforceApiKeyPolicy(request, body.model);
   if (policy.rejection) return policy.rejection;
+  // GHSA-3w2r: credential selection (direct and per combo target) stays inside
+  // the key's connection scope, the same scope chat applies.
+  const scope = await resolveKeyConnectionScope(policy.apiKeyInfo);
+  if (scope.rejection) return scope.rejection;
+  const { connectionScope } = scope;
 
   // Detect a combo name and divert to full speech combo execution, mirroring
   // the images route. Checks before parseSpeechModel so a combo name is never
@@ -64,7 +81,10 @@ async function postHandler(request, context) {
     const combo = await getComboByName(body.model);
     if (combo) {
       const { executeSpeechCombo } = await import("@omniroute/open-sse/services/speechCombo");
-      return executeSpeechCombo(body.model, body, startTime);
+      return executeSpeechCombo(body.model, body, startTime, {
+        connectionScope,
+        isTargetAllowed: createComboTargetKeyGate(policy, body.model),
+      });
     }
   }
 
@@ -81,20 +101,42 @@ async function postHandler(request, context) {
   }
 
   // Check provider config — hardcoded first, then dynamic
-  const providerConfig =
+  let providerConfig =
     getSpeechProvider(provider) || dynamicProviders.find((dp) => dp.id === provider) || null;
 
-  // Get credentials — skip for local providers (authType: "none")
+  // Keyless defaults and row-bound local targets have separate selection rules.
   let credentials = null;
   if (providerConfig && providerConfig.authType !== "none") {
     const credentialKey = providerConfig.credentialProviderId || provider;
-    credentials = await getProviderCredentialsWithQuotaPreflight(credentialKey);
+    credentials = await getProviderCredentialsWithQuotaPreflight(
+      credentialKey,
+      null,
+      connectionScope
+    );
+    if (isCredentialDiagnosticSentinel(credentials))
+      return credentialDiagnosticResponse("provider", credentials)!;
     if (!credentials) {
       return errorResponse(HTTP_STATUS.BAD_REQUEST, `No credentials for provider: ${provider}`);
+    }
+    if (isKeyScopeBlockedCredentials(credentials)) {
+      return keyScopeBlockedResponse(provider, credentials);
     }
     if (isAllRateLimitedCredentials(credentials)) {
       return rateLimitedProviderResponse(provider, credentials);
     }
+  } else if (providerConfig) {
+    // GHSA-3w2r: a keyless provider (local default or a keyless remote) is
+    // reachable by a connection-scoped key only when its allowlist admits
+    // keyless providers or an in-scope connection serves it (chat's #9057).
+    const selected = await resolveKeylessAudioTarget({
+      provider: providerConfig,
+      operation: "speech",
+      requestedModel: resolvedModel,
+      connectionScope,
+    });
+    if (selected.rejection) return selected.rejection;
+    credentials = selected.credentials;
+    providerConfig = selected.resolvedProvider;
   }
 
   let response = await handleAudioSpeech({
@@ -156,4 +198,4 @@ async function postHandler(request, context) {
   return response;
 }
 
-export const POST = withInjectionGuard(postHandler);
+export const POST = withAudioSelectionErrorBoundary(withInjectionGuard(postHandler));

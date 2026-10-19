@@ -690,8 +690,8 @@ async function handleChatImplementation(
   // masked prefix/last4. These debug lines get copied verbatim into bug reports
   // and support tickets, so any key fragment is sensitive.
   const authHeader = request.headers.get("Authorization");
-  const apiKey = extractApiKey(request);
-  if (authHeader && apiKey) {
+  const presentedApiKey = extractApiKey(request);
+  if (authHeader && presentedApiKey) {
     log.debug("AUTH", "API key provided");
   } else {
     log.debug("AUTH", "No API key provided (local mode)");
@@ -776,6 +776,7 @@ async function handleChatImplementation(
       correlationId: reqId,
     });
   }
+  const apiKey = policy.apiKey;
   const apiKeyInfo = policy.apiKeyInfo;
   let managedLease: ManagedLeaseDispatchContext | null = null;
   if (isExclusiveLeaseManagedKey(apiKeyInfo)) {
@@ -1271,6 +1272,7 @@ async function handleChatImplementation(
           apiKeyInfo,
           telemetry,
           {
+            authorizationApiKey: apiKey,
             sessionId,
             sessionAffinityKey,
             forceLiveComboTest: isComboLiveTest,
@@ -1365,6 +1367,7 @@ async function handleChatImplementation(
               apiKeyInfo,
               telemetry,
               {
+                authorizationApiKey: apiKey,
                 sessionId,
                 sessionAffinityKey,
                 emergencyFallbackTried: true,
@@ -1456,6 +1459,7 @@ async function handleChatImplementation(
     apiKeyInfo,
     telemetry,
     {
+      authorizationApiKey: apiKey,
       sessionId,
       sessionAffinityKey,
       forceLiveComboTest: isComboLiveTest,
@@ -1516,6 +1520,7 @@ async function handleSingleModelChat(
   apiKeyInfo: any = null,
   telemetry: any = null,
   runtimeOptions: {
+    authorizationApiKey?: string | null;
     emergencyFallbackTried?: boolean;
     forceLiveComboTest?: boolean;
     sessionId?: string | null;
@@ -1611,6 +1616,7 @@ async function handleSingleModelChat(
           apiKeyInfo,
           telemetry,
           {
+            authorizationApiKey: runtimeOptions.authorizationApiKey,
             sessionId: "", // safety-net redirect doesn't have session context
             forceLiveComboTest: false,
             authorizationContextModel: runtimeOptions.authorizationContextModel ?? modelStr,
@@ -1668,7 +1674,7 @@ async function handleSingleModelChat(
   })();
   const resolvedModelGate = resolvedPolicy.createVisibleResolvedModelGate({
     apiKeyInfo,
-    apiKey: extractApiKey(request),
+    apiKey: runtimeOptions.authorizationApiKey,
     contextModel: runtimeOptions.authorizationContextModel,
     comboGrantsTargets: runtimeOptions.comboGrantsTargets,
     provider,

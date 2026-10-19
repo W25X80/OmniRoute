@@ -1,4 +1,5 @@
 import { updateProviderConnection } from "@/lib/db/providers";
+import { isOperatorDisabled } from "@/lib/providers/operatorDisable";
 import { EXPIRED_REPROBE_BLOCKLIST } from "@/lib/quota/connectionRecovery";
 
 export const EXPLICIT_PROBE_BLOCKLIST = EXPIRED_REPROBE_BLOCKLIST;
@@ -18,10 +19,11 @@ export function isRecoverableInactiveConnection(
     testStatus?: string | null;
     lastErrorType?: string | null;
     rateLimitedUntil?: string | null;
+    providerSpecificData?: unknown;
   },
   nowMs: number = Date.now()
 ): boolean {
-  if (conn.isActive !== false) return false;
+  if (conn.isActive !== false || isOperatorDisabled(conn)) return false;
   const status = (conn.testStatus || "").trim().toLowerCase();
   if (status === "banned") return false;
   const err = (conn.lastErrorType || "").trim().toLowerCase();
@@ -47,6 +49,7 @@ export function selectExplicitInactiveProbe(params: {
     testStatus?: string | null;
     lastErrorType?: string | null;
     rateLimitedUntil?: string | null;
+    providerSpecificData?: unknown;
   } | null;
   providersToSearch: string[];
   allowedConnectionIds: string[] | null;

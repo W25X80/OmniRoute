@@ -23,15 +23,21 @@ function hasUsableCachedData(cache: ProviderLimitsCacheEntry | null | undefined)
 export function toProviderLimitsCacheEntry(
   usage: JsonRecord,
   source: string,
-  fetchedAt = new Date().toISOString()
+  fetchedAt?: string
 ): ProviderLimitsCacheEntry {
   const bankedResetCredits = Number(usage.bankedResetCredits);
+  const observedAt =
+    usage._stale === true && typeof usage._staleSince === "string"
+      ? usage._staleSince
+      : usage._cached === true && typeof usage._cachedAt === "string"
+        ? usage._cachedAt
+        : null;
   return {
     quotas: isRecord(usage.quotas) ? usage.quotas : null,
     ...(isRecord(usage.modelQuotas) ? { modelQuotas: usage.modelQuotas } : {}),
     plan: usage.plan ?? null,
     message: typeof usage.message === "string" ? usage.message : null,
-    fetchedAt,
+    fetchedAt: observedAt ?? fetchedAt ?? new Date().toISOString(),
     source,
     bankedResetCredits: Number.isFinite(bankedResetCredits) ? bankedResetCredits : undefined,
     paidCredits: parseCodexPaidCredits(usage.paidCredits),

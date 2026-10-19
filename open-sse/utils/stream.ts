@@ -64,6 +64,8 @@ import { createStreamFailureAborter } from "./streamFailureBoundary.ts";
 import { createReasoningStreamObserver } from "./responsesReasoningObservation.ts";
 import { recordToolLatency } from "../services/toolLatencyTracker.ts";
 import { extractToolSchemaMap } from "../translator/response/openai-responses/toolSchemas.ts";
+import { collectDeclaredToolNames } from "../translator/response/openai-responses/declaredToolName.ts";
+import { appendToolCallNameDelta } from "./toolCallName.ts";
 import {
   generateSessionId,
   markToolFinish,
@@ -246,6 +248,8 @@ type TranslateState = ReturnType<typeof initState> & {
   accumulatedReasoning?: string;
   /** #6951 — per-tool JSON Schema (from request `tools[]`), keyed by tool name. */
   toolSchemas?: Map<string, Record<string, unknown>> | null;
+  /** Every tool name declared by this request, including tools without schemas. */
+  declaredToolNames?: Set<string> | null;
   customToolNames?: ReadonlySet<string>;
   requestToolIdentityMap?: Map<string, { namespace: string; name: string }> | null;
   upstreamError?: {
@@ -906,6 +910,7 @@ export function createSSEStream(options: StreamOptions = {}) {
           accumulatedContent: "",
           accumulatedReasoning: "",
           toolSchemas: extractToolSchemaMap(body),
+          declaredToolNames: collectDeclaredToolNames(body),
           customToolNames,
           requestToolIdentityMap,
         }
@@ -2435,8 +2440,12 @@ export function createSSEStream(options: StreamOptions = {}) {
                         });
                       } else {
                         if (tc?.id) existing.id = existing.id || String(tc.id);
-                        if (tc?.function?.name && !existing.function.name)
-                          existing.function.name = tc.function.name;
+                        if (tc?.function?.name) {
+                          existing.function.name = appendToolCallNameDelta(
+                            existing.function.name,
+                            tc.function.name
+                          );
+                        }
                         existing.function.arguments += deltaArgs;
                       }
                     }

@@ -17,6 +17,7 @@ const settingsDb = await import("../../src/lib/db/settings.ts");
 const settingsRoute = await import("../../src/app/api/settings/route.ts");
 const logoutRoute = await import("../../src/app/api/auth/logout/route.ts");
 const sessionToken = await import("../../src/shared/utils/dashboardSessionToken.ts");
+const authState = await import("../../src/lib/db/authSettings.ts");
 
 const {
   DASHBOARD_SESSION_COOKIE,
@@ -31,9 +32,13 @@ const {
 const secret = getDashboardJwtSecret()!;
 const nowSeconds = () => Math.floor(Date.now() / 1000);
 
-/** A session token as an older release minted it (no id) or issued `ageSeconds` ago. */
+/** Normal fixtures bind the actual epoch; older-release fixtures remain unclassified. */
 async function sessionIssuedAgo(ageSeconds: number, withJti = false): Promise<string> {
-  const jwt = new SignJWT({ authenticated: true })
+  const generation = withJti ? (await authState.getAuthSettingsSnapshot()).generation : null;
+  const jwt = new SignJWT({
+    authenticated: true,
+    ...(generation ? { managementAuthGeneration: generation } : {}),
+  })
     .setProtectedHeader({ alg: "HS256" })
     .setIssuedAt(nowSeconds() - ageSeconds)
     .setExpirationTime("30d");
@@ -68,11 +73,11 @@ test("a minted session carries an issue time and an id and verifies", async () =
   );
 });
 
-test("sessions issued before the cutoff stop verifying, later ones and older-release tokens follow the cutoff", async () => {
+test("classified sessions follow the cutoff and unclassified legacy sessions are retired", async () => {
   const oldSession = await sessionIssuedAgo(120, true);
   const legacySession = await sessionIssuedAgo(120, false);
   assert.ok(await verifyDashboardSessionToken(oldSession));
-  assert.ok(await verifyDashboardSessionToken(legacySession));
+  assert.equal(await verifyDashboardSessionToken(legacySession), null);
 
   await settingsDb.updateSettings({ [SESSIONS_VALID_AFTER_SETTING]: nowSeconds() - 60 });
 

@@ -1,19 +1,29 @@
+import { randomUUID } from "node:crypto";
 import { NextResponse } from "next/server";
 import { cookies } from "next/headers";
-import { isFeatureFlagEnabled } from "@/shared/utils/featureFlags";
-import { getSettings, updateSettings } from "@/lib/db/settings";
+import { getAuthSettingsSnapshot } from "@/lib/db/authSettings";
+import { AUTH_GENERATION_SETTING } from "@/lib/db/authSettingsSemantics";
+import { isPostgresErrorKind } from "@/lib/db/postgres/database";
+import { authorizeLoginSettingsWrite } from "@/lib/api/loginSettingsAuth";
+import { createErrorResponseFromUnknown } from "@/lib/api/errorResponse";
 import {
+  DASHBOARD_SESSION_COOKIE,
+  SESSIONS_VALID_AFTER_SETTING,
+  getDashboardJwtSecret,
+  mintDashboardSessionToken,
+  verifyDashboardSessionToken,
+} from "@/shared/utils/dashboardSessionToken";
+import { isFeatureFlagEnabled } from "@/shared/utils/featureFlags";
+import { getSettings, updateSettings, SettingsRevisionConflictError } from "@/lib/db/settings";
+import {
+  ensurePersistentManagementPasswordHash,
+  getStoredManagementPassword,
+  verifyManagementPassword,
   hasManagementPasswordConfigured,
   hashManagementPassword,
 } from "@/lib/auth/managementPassword";
 import { consumeBootstrapToken } from "@/lib/auth/bootstrapToken";
-import { isAuthenticated } from "@/shared/utils/apiAuth";
 import { BOOTSTRAP_TOKEN_HEADER } from "@/server/authz/headers";
-import {
-  getDashboardJwtSecret,
-  verifyDashboardSessionToken,
-  DASHBOARD_SESSION_COOKIE,
-} from "@/shared/utils/dashboardSessionToken";
 import { getNodeRuntimeSupport } from "@/shared/utils/nodeRuntimeSupport.ts";
 import { updateRequireLoginSchema } from "@/shared/validation/schemas";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
@@ -32,14 +42,6 @@ async function checkSessionAuthenticated(): Promise<boolean> {
 function getNodeCompatibility() {
   const { nodeVersion, nodeCompatible } = getNodeRuntimeSupport();
   return { nodeVersion, nodeCompatible };
-}
-
-function hasConfiguredPassword(settings: Record<string, unknown>) {
-  return hasManagementPasswordConfigured(settings);
-}
-
-function isBootstrapSecurityWindow(settings: Record<string, unknown>) {
-  return !hasConfiguredPassword(settings);
 }
 
 export async function GET() {
@@ -88,56 +90,93 @@ export async function GET() {
  * Unauthenticated writes are only allowed during the initial bootstrap window.
  */
 export async function POST(request: Request) {
-  const settings = await getSettings();
-  if (!isBootstrapSecurityWindow(settings) && !(await isAuthenticated(request))) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
-
-  let rawBody;
+  let authority: Awaited<ReturnType<typeof authorizeLoginSettingsWrite>> | undefined;
+  let mutationStarted = false;
   try {
-    rawBody = await request.json();
-  } catch {
-    return NextResponse.json(
-      {
-        error: {
-          message: "Invalid request",
-          details: [{ field: "body", message: "Invalid JSON body" }],
-        },
-      },
-      { status: 400 }
-    );
-  }
-
-  try {
+    const snapshot = await getAuthSettingsSnapshot();
+    const rawBody = await request.json();
     const validation = validateBody(updateRequireLoginSchema, rawBody);
-    if (isValidationFailure(validation)) {
+    if (isValidationFailure(validation))
       return NextResponse.json({ error: validation.error }, { status: 400 });
+    authority = await authorizeLoginSettingsWrite(request, snapshot);
+    if (authority.ok === false) return authority.response;
+    const { requireLogin, password, currentPassword } = validation.data;
+    let revision = snapshot.revision;
+    if (password && authority.operator === "dashboard_session") {
+      if (!hasManagementPasswordConfigured(snapshot.settings)) {
+        authority.proof?.release();
+        return NextResponse.json(
+          { error: "Password recovery requires the local CLI" },
+          { status: 403 }
+        );
+      }
+      const state = await ensurePersistentManagementPasswordHash({
+        settings: snapshot.settings,
+        revision,
+        source: "settings.require_login_password_change",
+      });
+      revision = state.revision;
+      if (
+        !currentPassword ||
+        !(await verifyManagementPassword(
+          currentPassword,
+          getStoredManagementPassword(state.settings)
+        ))
+      ) {
+        return NextResponse.json({ error: "Invalid current password" }, { status: 403 });
+      }
     }
-    const body = validation.data;
-    const { requireLogin, password } = body;
-
-    const updates: Record<string, any> = {};
-
-    if (typeof requireLogin === "boolean") {
-      updates.requireLogin = requireLogin;
-    }
-
+    const updates: Record<string, unknown> = {};
+    if (typeof requireLogin === "boolean") updates.requireLogin = requireLogin;
     if (password) {
-      const hashedPassword = await hashManagementPassword(password);
-      updates.password = hashedPassword;
+      updates.password = await hashManagementPassword(password);
+      updates[AUTH_GENERATION_SETTING] = randomUUID();
+      updates[SESSIONS_VALID_AFTER_SETTING] = Math.floor(Date.now() / 1000);
     }
-
-    await updateSettings(updates);
-    // #14296: one-shot — a Docker/NAT-forwarded operator that authenticated
-    // this write via the bootstrap token cannot replay it for a second write.
-    // A no-op when the header is absent or stale (never matches).
+    mutationStarted = true;
+    await updateSettings(updates, { expectedRevision: revision });
+    authority.proof?.consume();
     consumeBootstrapToken(request.headers.get(BOOTSTRAP_TOKEN_HEADER));
-    return NextResponse.json({ success: true });
+    const response = NextResponse.json({ success: true });
+    const secret = getDashboardJwtSecret();
+    if (password && authority.operator === "dashboard_session" && secret) {
+      const forwardedProto = (request.headers.get("x-forwarded-proto") || "")
+        .split(",")[0]
+        .trim()
+        .toLowerCase();
+      response.cookies.set(
+        DASHBOARD_SESSION_COOKIE,
+        await mintDashboardSessionToken(secret, updates[AUTH_GENERATION_SETTING] as string),
+        {
+          httpOnly: true,
+          secure:
+            process.env.AUTH_COOKIE_SECURE === "true" ||
+            forwardedProto === "https" ||
+            new URL(request.url).protocol === "https:",
+          sameSite: "lax",
+          path: "/",
+          maxAge: 30 * 86400,
+        }
+      );
+    }
+    return response;
   } catch (error) {
-    console.error("[API] Error updating require-login settings:", error);
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : "Failed to update settings" },
-      { status: 500 }
-    );
+    if (authority?.ok) {
+      if (
+        !mutationStarted ||
+        error instanceof SettingsRevisionConflictError ||
+        isPostgresErrorKind(error, "transaction_failed")
+      )
+        authority.proof?.release();
+      else authority.proof?.consume();
+    }
+    if (error instanceof SyntaxError)
+      return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
+    if (error instanceof SettingsRevisionConflictError)
+      return NextResponse.json(
+        { error: "Settings changed; refresh before retrying" },
+        { status: 409 }
+      );
+    return createErrorResponseFromUnknown(error, "Failed to update login settings");
   }
 }

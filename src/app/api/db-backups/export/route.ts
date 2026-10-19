@@ -1,4 +1,8 @@
 import {
+  requireOperatorCredential,
+  CREDENTIAL_EXPORT_FORBIDDEN_MESSAGE,
+} from "@/lib/api/operatorCredential";
+import {
   requireSqliteMaintenance,
   persistenceCapabilityResponse,
 } from "@/lib/db/persistenceCapabilities";
@@ -7,7 +11,6 @@ import path from "path";
 import fs from "fs";
 import os from "os";
 import { getDbInstance, SQLITE_FILE } from "@/lib/db/core";
-import { isAuthRequired, isAuthenticated } from "@/shared/utils/apiAuth";
 import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
 
 /**
@@ -19,11 +22,11 @@ import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
  * 🔒 Auth-guarded: requires JWT cookie or Bearer API key (finding #258-2).
  */
 export async function GET(request: Request) {
-  if (await isAuthRequired(request)) {
-    if (!(await isAuthenticated(request))) {
-      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-    }
-  }
+  const verdict = await requireOperatorCredential(request, {
+    alwaysRequireAuth: true,
+    forbiddenMessage: CREDENTIAL_EXPORT_FORBIDDEN_MESSAGE,
+  });
+  if (verdict.ok === false) return verdict.response;
   try {
     requireSqliteMaintenance("sqlite-file-export");
     if (!SQLITE_FILE || !fs.existsSync(SQLITE_FILE)) {

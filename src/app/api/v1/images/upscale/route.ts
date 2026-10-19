@@ -1,3 +1,8 @@
+import {
+  isCredentialDiagnosticSentinel,
+  credentialDiagnosticResponse,
+} from "@omniroute/open-sse/services/comboKeyScope.ts";
+import { resolveKeyConnectionScope } from "@/sse/services/keyConnectionScope";
 import { handleImageUpscale } from "@omniroute/open-sse/handlers/imageUpscale.ts";
 import {
   getUpscaleProvider,
@@ -6,10 +11,8 @@ import {
 } from "@omniroute/open-sse/config/upscaleRegistry.ts";
 import { extractUpscaleSourceImage } from "@omniroute/open-sse/handlers/imageUpscale/shared.ts";
 import { withInjectionGuard } from "@/middleware/promptInjectionGuard";
-import {
-  getProviderCredentialsWithQuotaPreflight,
-  clearRecoveredProviderState,
-} from "@/sse/services/auth";
+import { clearRecoveredProviderState } from "@/sse/services/auth";
+import { getProviderCredentialsWithQuotaPreflight } from "@/sse/services/scopedCredentials";
 import {
   errorResponse,
   sanitizeErrorMessage,
@@ -143,10 +146,9 @@ async function postHandler(request: Request) {
   const policy = await enforceApiKeyPolicy(request, String(body.model ?? ""));
   if (policy.rejection) return policy.rejection;
 
-  const allowedConnections =
-    policy.apiKeyInfo?.allowedConnections && policy.apiKeyInfo.allowedConnections.length > 0
-      ? policy.apiKeyInfo.allowedConnections
-      : null;
+  const scoped = await resolveKeyConnectionScope(policy.apiKeyInfo);
+  if (scoped.rejection) return scoped.rejection;
+  const connectionScope = scoped.connectionScope;
 
   const { provider, model } = parseUpscaleModel(String(body.model ?? ""));
   if (!provider || !model) {
@@ -189,9 +191,11 @@ async function postHandler(request: Request) {
   const credentialsResult = await getProviderCredentialsWithQuotaPreflight(
     provider,
     null,
-    allowedConnections,
+    connectionScope,
     `${provider}/${model}`
   );
+  if (isCredentialDiagnosticSentinel(credentialsResult))
+    return credentialDiagnosticResponse("provider", credentialsResult)!;
   if (!credentialsResult) {
     return errorResponse(
       HTTP_STATUS.BAD_REQUEST,

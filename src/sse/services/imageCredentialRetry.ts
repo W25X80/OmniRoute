@@ -1,7 +1,13 @@
+import {
+  connectionScopePermits,
+  UNRESTRICTED_CONNECTION_SCOPE,
+} from "@omniroute/open-sse/services/connectionScope.ts";
+import type { ConnectionScope } from "@omniroute/open-sse/services/connectionScope.ts";
 import { classify429 } from "@omniroute/open-sse/services/antigravity429Engine.ts";
 import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error.ts";
 
-import { getProviderCredentialsWithQuotaPreflight } from "./auth";
+import { getProviderCredentialsWithQuotaPreflight } from "@/sse/services/scopedCredentials";
+import { isCredentialDiagnosticSentinel } from "./credentialSentinel";
 import { checkAndRefreshToken } from "./tokenRefresh";
 import * as log from "../utils/logger";
 
@@ -25,13 +31,18 @@ interface ImageCredentialRetryOptions {
   requestedModel: string | null;
   credentials: any;
   execute: (credentials: any) => Promise<ImageGenerationResult>;
+  // GHSA-3w2r: the caller key's connection scope. Account fallback must stay
+  // inside it exactly like the first selection did. null = unscoped.
+  connectionScope?: ConnectionScope | null;
+  forcedConnectionId?: string | null;
   // Injectable so unit tests can drive multi-account fallback deterministically
   // without a live DB-backed credential store; production always uses the real
   // getProviderCredentialsWithQuotaPreflight-backed selectNextCredentials below.
   selectNextCredentials?: (
     provider: string,
     requestedModel: string | null,
-    excludedConnectionIds: Set<string>
+    excludedConnectionIds: Set<string>,
+    connectionScope: ConnectionScope | null
   ) => Promise<any>;
 }
 
@@ -48,7 +59,9 @@ function connectionIdOf(credentials: any): string | null {
 }
 
 function isCredentialSentinel(credentials: any): boolean {
-  return Boolean(credentials?.allRateLimited || credentials?.allExpired);
+  // Includes the key-scope sentinel (blockedByKeyPolicy): it carries no secret
+  // and must never be dispatched.
+  return isCredentialDiagnosticSentinel(credentials);
 }
 
 /**
@@ -77,9 +90,10 @@ export function isAntigravityImageQuotaExhausted(
 async function defaultSelectNextCredentials(
   provider: string,
   requestedModel: string | null,
-  excludedConnectionIds: Set<string>
+  excludedConnectionIds: Set<string>,
+  connectionScope: ConnectionScope | null
 ) {
-  return getProviderCredentialsWithQuotaPreflight(provider, null, null, requestedModel, {
+  return getProviderCredentialsWithQuotaPreflight(provider, null, connectionScope, requestedModel, {
     excludeConnectionIds: Array.from(excludedConnectionIds),
   });
 }
@@ -96,12 +110,25 @@ export async function executeImageWithCredentialFallback({
   requestedModel,
   credentials,
   execute,
+  connectionScope = UNRESTRICTED_CONNECTION_SCOPE,
+  forcedConnectionId = null,
   selectNextCredentials = defaultSelectNextCredentials,
 }: ImageCredentialRetryOptions): Promise<ImageCredentialRetryResult> {
+  connectionScope ??= UNRESTRICTED_CONNECTION_SCOPE;
+  if (connectionScope.kind === "deny")
+    return {
+      credentials,
+      result: { success: false, status: 403, error: "No connection permitted" },
+    };
   // Local/no-auth image providers intentionally have no credential row. They
   // still need one direct attempt, but there is no account identity to refresh
   // or rotate after a 401.
   if (!credentials) {
+    if (!connectionScopePermits(connectionScope, "noauth"))
+      return {
+        credentials,
+        result: { success: false, status: 403, error: "No connection permitted" },
+      };
     return { credentials, result: await execute(credentials) };
   }
 
@@ -112,6 +139,7 @@ export async function executeImageWithCredentialFallback({
 
   while (currentCredentials && !isCredentialSentinel(currentCredentials)) {
     const connectionId = connectionIdOf(currentCredentials);
+    if (!connectionScopePermits(connectionScope, connectionId ?? undefined)) break;
     if (connectionId && excludedConnectionIds.has(connectionId)) break;
     if (connectionId) excludedConnectionIds.add(connectionId);
 
@@ -123,22 +151,33 @@ export async function executeImageWithCredentialFallback({
         connectionId,
         error: sanitizeErrorMessage(error instanceof Error ? error : new Error(String(error))),
       });
-      if (!connectionId) throw error;
+      if (!connectionId || forcedConnectionId) throw error;
       currentCredentials = await selectNextCredentials(
         provider,
         requestedModel,
-        excludedConnectionIds
+        excludedConnectionIds,
+        connectionScope
       );
       continue;
     }
 
+    const refreshedId = connectionIdOf(currentCredentials);
+    if (
+      isCredentialSentinel(currentCredentials) ||
+      !connectionScopePermits(connectionScope, refreshedId ?? undefined) ||
+      refreshedId !== connectionId
+    )
+      break;
+    if (refreshedId && refreshedId !== connectionId && excludedConnectionIds.has(refreshedId))
+      break;
+    if (refreshedId) excludedConnectionIds.add(refreshedId);
     lastCredentials = currentCredentials;
     lastResult = await execute(currentCredentials);
     const shouldTryAnotherAccount =
       Number(lastResult.status) === 401 ||
       lastResult.retryable === true ||
       isAntigravityImageQuotaExhausted(provider, lastResult);
-    if (lastResult.success || !shouldTryAnotherAccount || !connectionId) {
+    if (lastResult.success || !shouldTryAnotherAccount || !connectionId || forcedConnectionId) {
       return { credentials: lastCredentials, result: lastResult };
     }
 
@@ -149,7 +188,8 @@ export async function executeImageWithCredentialFallback({
     currentCredentials = await selectNextCredentials(
       provider,
       requestedModel,
-      excludedConnectionIds
+      excludedConnectionIds,
+      connectionScope
     );
   }
 
