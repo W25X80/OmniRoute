@@ -81,6 +81,10 @@ test(
     let keyId = "",
       connectionId = "",
       openAiConnectionId = "";
+    let withdrawPendingRequest:
+      (typeof import("../../src/lib/usage/usageHistory.ts"))["trackPendingRequest"] | undefined;
+    let pendingControlId: string | undefined;
+    let pendingControlModel = "";
     const permits: PersistenceTailPermit[] = [];
     const originalFetch = globalThis.fetch;
     let fetchCalls = 0,
@@ -229,8 +233,48 @@ test(
       assert.equal(runtime.getPersistenceRuntimeStatus().streamTails, 64);
       await permits.pop()!.release();
       assert.equal(runtime.getPersistenceRuntimeStatus().streamTails, 63);
-      const { getPendingById, getPendingRequests } =
-        await import("../../src/lib/usage/usageHistory.ts");
+      const pendingHistory = await import("../../src/lib/usage/usageHistory.ts");
+      const { getPendingById, getPendingRequests } = pendingHistory;
+      withdrawPendingRequest = pendingHistory.trackPendingRequest;
+      pendingControlModel = `native-tail-pending-control-${tag}`;
+      pendingControlId = pendingHistory.trackPendingRequest(
+        pendingControlModel,
+        "glm",
+        connectionId,
+        true
+      );
+      assert.ok(pendingControlId, "the fixture owns a pending control row");
+      const pendingControlKey = `${pendingControlModel} (glm)`;
+      const glmPendingKey = "glm-4.7 (glm)";
+      const assertPendingControlAlive = () => {
+        const detail = getPendingById().get(pendingControlId!);
+        assert.ok(detail, "the owned positive control remains in the ID map");
+        assert.equal(detail.connectionId, connectionId);
+        assert.equal(detail.model, pendingControlModel);
+        assert.equal(getPendingRequests().byModel[pendingControlKey], 1);
+        assert.equal(getPendingRequests().byAccount[connectionId]?.[pendingControlKey], 1);
+      };
+      const normalizedCounts = (counts: Record<string, number>) =>
+        Object.fromEntries(
+          Object.entries(counts)
+            .filter(([, count]) => count !== 0)
+            .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+        );
+      const pendingSnapshot = () => {
+        const pending = getPendingRequests();
+        const accounts = Object.entries(pending.byAccount)
+          .flatMap(([account, counts]) => {
+            const normalized = normalizedCounts(counts);
+            return Object.keys(normalized).length > 0 ? ([[account, normalized]] as const) : [];
+          })
+          .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0));
+        return {
+          byModel: normalizedCounts(pending.byModel),
+          byAccount: Object.fromEntries(accounts),
+          pendingIds: [...getPendingById().keys()].sort(),
+        };
+      };
+      assertPendingControlAlive();
       const healthBefore = await verification.transaction((tx) =>
         tx.query(
           "SELECT test_status,is_active,rate_limited_until,last_error FROM omniroute.provider_connections WHERE id=$1",
@@ -239,11 +283,44 @@ test(
       );
       for (const stream of [true, false]) {
         const controller = new AbortController();
-        const pendingBefore = {
-          size: getPendingById().size,
-          byModel: JSON.stringify(getPendingRequests().byModel),
-          byAccount: JSON.stringify(getPendingRequests().byAccount),
-        };
+        assertPendingControlAlive();
+        const pending = getPendingRequests();
+        const existingGlmModelCount = Object.hasOwn(pending.byModel, glmPendingKey)
+          ? pending.byModel[glmPendingKey]
+          : undefined;
+        const existingGlmAccountCount = pending.byAccount[connectionId]?.[glmPendingKey];
+        assert.ok(
+          existingGlmModelCount === undefined || existingGlmModelCount === 0,
+          "the isolated fixture has no live global GLM model request before zero seeding"
+        );
+        assert.ok(
+          existingGlmAccountCount === undefined || existingGlmAccountCount === 0,
+          "the fixture connection has no live GLM request before zero seeding"
+        );
+        const zeroProbeId = pendingHistory.trackPendingRequest(
+          "glm-4.7",
+          "glm",
+          connectionId,
+          true
+        );
+        assert.ok(zeroProbeId, "the zero-marker probe owns an exact pending ID");
+        pendingHistory.trackPendingRequest(
+          "glm-4.7",
+          "glm",
+          connectionId,
+          false,
+          undefined,
+          zeroProbeId
+        );
+        assert.equal(Object.hasOwn(getPendingRequests().byModel, glmPendingKey), true);
+        assert.equal(getPendingRequests().byModel[glmPendingKey], 0);
+        assert.equal(
+          Object.hasOwn(getPendingRequests().byAccount[connectionId], glmPendingKey),
+          true
+        );
+        assert.equal(getPendingRequests().byAccount[connectionId][glmPendingKey], 0);
+        assert.equal(getPendingById().has(zeroProbeId), false);
+        const pendingBefore = pendingSnapshot();
         const local = await serve(stream, controller.signal, "glm", {
           kind: "connections",
           ids: ["unselected-connection"],
@@ -258,9 +335,12 @@ test(
         assert.equal(runtime.getPersistenceRuntimeStatus().streamTails, 63);
         controller.abort();
         await new Promise<void>((resolve) => setImmediate(resolve));
-        assert.equal(getPendingById().size, pendingBefore.size);
-        assert.equal(JSON.stringify(getPendingRequests().byModel), pendingBefore.byModel);
-        assert.equal(JSON.stringify(getPendingRequests().byAccount), pendingBefore.byAccount);
+        assert.deepEqual(
+          pendingSnapshot(),
+          pendingBefore,
+          "scope refusal preserves live counts and exact pending owner IDs while zero cells may be pruned"
+        );
+        assertPendingControlAlive();
         assert.equal(runtime.getPersistenceRuntimeStatus().streamTails, 63);
         assert.deepEqual(
           (
@@ -375,7 +455,20 @@ test(
       await Promise.allSettled(permits.map((permit) => permit.release()));
       t.mock.restoreAll();
       try {
-        await closeNativeStreamingFixture(runtime);
+        try {
+          if (pendingControlId && withdrawPendingRequest) {
+            withdrawPendingRequest(
+              pendingControlModel,
+              "glm",
+              connectionId,
+              false,
+              undefined,
+              pendingControlId
+            );
+          }
+        } finally {
+          await closeNativeStreamingFixture(runtime);
+        }
       } finally {
         try {
           if (verification) {
