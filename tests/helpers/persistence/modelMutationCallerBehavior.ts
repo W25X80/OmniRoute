@@ -252,7 +252,8 @@ export async function runModelMutationCallerBehavior(
         const removedId = id("old-import");
         const manualId = id("manual-retained");
         const mediaId = id("speech-retained");
-        const discoveredId = id("new-discovered");
+        // Declared chat metadata wins even when an ID matches embedding-name inference.
+        const discoveredId = id("e5-new-discovered");
         const connectionId = id("import-account");
         await fixture.selected(async () => {
           await models.replaceCustomModels("openai", [
@@ -279,7 +280,13 @@ export async function runModelMutationCallerBehavior(
             providerId: "openai",
             connectionId,
             mode: "sync",
-            fetchedModels: [{ id: discoveredId, name: "Discovered fixture" }],
+            fetchedModels: [
+              {
+                id: discoveredId,
+                name: "Discovered fixture",
+                supportedEndpoints: ["chat"],
+              },
+            ],
           });
           assert.deepEqual(
             result.persistedModels.map((entry) => entry.id),
