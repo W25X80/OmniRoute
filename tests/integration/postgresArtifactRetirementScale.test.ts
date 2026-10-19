@@ -31,6 +31,32 @@ function barrier() {
   return { promise, release };
 }
 
+function stopBeforeMigrationStatement(database: PostgresDatabase, statementPrefix: string) {
+  const stopped = new Error(`controlled migration boundary: ${statementPrefix}`);
+  let markerHits = 0;
+  const bounded = {
+    transaction<T>(body: (tx: PostgresTransaction) => Promise<T>) {
+      return database.transaction(async (tx) => {
+        try {
+          return await body({
+            async query<Row>(sql: string, values?: unknown[]) {
+              if (sql.startsWith(statementPrefix)) {
+                markerHits += 1;
+                throw stopped;
+              }
+              return tx.query<Row>(sql, values);
+            },
+          });
+        } catch (error) {
+          if (error !== stopped) throw error;
+          return undefined as T;
+        }
+      });
+    },
+  } as PostgresDatabase;
+  return { database: bounded, markerHits: () => markerHits };
+}
+
 test(
   "indexed retirement preserves all states and admits concurrent history and artifact writers",
   { skip: !postgresTestsEnabled, timeout: 120000 },
@@ -73,7 +99,66 @@ test(
     let writing: Promise<unknown> | undefined;
     let attaching: Promise<unknown> | undefined;
     try {
-      await migratePostgresSchema(fixture);
+      await fixture.transaction((tx) => tx.query("DROP SCHEMA IF EXISTS omniroute CASCADE"));
+      const beforeVersion10 = stopBeforeMigrationStatement(
+        fixture,
+        "CREATE INDEX artifact_recovery_retirement_owner_idx"
+      );
+      await migratePostgresSchema(beforeVersion10.database);
+      assert.equal(beforeVersion10.markerHits(), 1, "migration 10 boundary must be reached once");
+      const historyV9 = await fixture.transaction((tx) =>
+        tx.query<{ version: number; name: string; checksum: string; applied_at: string }>(
+          "SELECT version,name,checksum,applied_at::text AS applied_at FROM omniroute.schema_migrations ORDER BY version"
+        )
+      );
+      assert.deepEqual(
+        historyV9.rows.map((row) => row.version),
+        [1, 2, 3, 4, 5, 6, 7, 8, 9]
+      );
+      assert.deepEqual(
+        historyV9.rows.map((row) => row.name),
+        [
+          "routing_repositories",
+          "control_plane",
+          "server_persistence",
+          "file_content_chunks",
+          "artifact_publication_ownership",
+          "fractional_compression_durations",
+          "indexed_conversation_retention",
+          "durable_artifact_recovery",
+          "conversation_concurrency",
+        ]
+      );
+      for (const row of historyV9.rows) {
+        assert.match(row.checksum, /^[0-9a-f]{64}$/);
+        assert.notEqual(row.applied_at, "");
+      }
+      const assertMigrationBoundaryObjects = async (retirementIndexExpected: boolean) => {
+        const objects = await fixture.transaction((tx) =>
+          tx.query<{ retirement_index: string | null; node_counts: string | null }>(
+            `SELECT to_regclass('omniroute.artifact_recovery_retirement_owner_idx') AS retirement_index,
+              to_regclass('omniroute.conversation_node_counts') AS node_counts`
+          )
+        );
+        assert.equal(Boolean(objects.rows[0]?.retirement_index), retirementIndexExpected);
+        assert.equal(objects.rows[0]?.node_counts ?? null, null);
+        const authColumns = await fixture.transaction((tx) =>
+          tx.query<{ column_name: string }>(
+            `SELECT column_name FROM information_schema.columns
+             WHERE table_schema='omniroute' AND table_name='sync_tokens'
+               AND column_name=ANY($1::text[]) ORDER BY column_name`,
+            [["issued_by", "expires_at", "auth_generation"]]
+          )
+        );
+        assert.deepEqual(authColumns.rows, []);
+        const authGeneration = await fixture.transaction((tx) =>
+          tx.query(
+            "SELECT value FROM omniroute.key_value WHERE namespace='settings' AND key='managementAuthGeneration'"
+          )
+        );
+        assert.deepEqual(authGeneration.rows, []);
+      };
+      await assertMigrationBoundaryObjects(false);
       const trigger = await fixture.transaction((tx) =>
         tx.query<{ prosrc: string }>(
           "SELECT prosrc FROM pg_proc WHERE oid='omniroute.revoke_call_artifact_intent()'::regprocedure"
@@ -84,10 +169,7 @@ test(
         .match(/UPDATE[\s\S]*?;/)![0]
         .replaceAll("OLD.id", "$1")
         .replaceAll("OLD.insertion_order", "$2");
-      // Reconstruct the genuine schema-9 prefix: only migration 10's new index is removed.
       await fixture.transaction(async (tx) => {
-        await tx.query("DROP INDEX omniroute.artifact_recovery_retirement_owner_idx");
-        await tx.query("DELETE FROM omniroute.schema_migrations WHERE version=10");
         await tx.query(
           `INSERT INTO omniroute.call_logs(id,timestamp,insertion_order,artifact_relpath)
           SELECT 'retire-'||n,to_char('2026-08-01'::timestamp+n*interval '1 second','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),n,
@@ -110,21 +192,50 @@ test(
         await tx.query("ANALYZE omniroute.call_logs");
         await tx.query("ANALYZE omniroute.artifact_deletion_queue");
       });
-      const historyBefore = await fixture.transaction((tx) =>
-        tx.query("SELECT version,name,checksum FROM omniroute.schema_migrations ORDER BY version")
-      );
       const before = nodes(await explain(revoke, ["absent-owner", "1"]));
       assert.ok(
         before.some((n) => n["Node Type"] === "Seq Scan"),
         "the schema-9 trigger lookup scans the queue despite the active-owner index"
       );
-      await migratePostgresSchema(fixture);
-      await migratePostgresSchema(fixture);
-      const historyAfter = await fixture.transaction((tx) =>
-        tx.query("SELECT version,name,checksum FROM omniroute.schema_migrations ORDER BY version")
+      const beforeVersion11 = stopBeforeMigrationStatement(
+        fixture,
+        "CREATE TABLE omniroute.conversation_node_counts"
       );
-      assert.deepEqual(historyAfter.rows.slice(0, 9), historyBefore.rows);
-      assert.equal(historyAfter.rows.length, 10);
+      await migratePostgresSchema(beforeVersion11.database);
+      assert.equal(beforeVersion11.markerHits(), 1, "migration 11 boundary must be reached");
+      const historyV10 = await fixture.transaction((tx) =>
+        tx.query<{ version: number; name: string; checksum: string; applied_at: string }>(
+          "SELECT version,name,checksum,applied_at::text AS applied_at FROM omniroute.schema_migrations ORDER BY version"
+        )
+      );
+      assert.deepEqual(
+        historyV10.rows.map((row) => row.version),
+        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+      );
+      assert.deepEqual(historyV10.rows.slice(0, 9), historyV9.rows);
+      assert.equal(historyV10.rows[9].name, "indexed_artifact_recovery_retirement");
+      assert.match(historyV10.rows[9].checksum, /^[0-9a-f]{64}$/);
+      assert.notEqual(historyV10.rows[9].applied_at, "");
+      await assertMigrationBoundaryObjects(true);
+      const indexAfterUpgrade = await fixture.transaction((tx) =>
+        tx.query<{ retirement_index: string | null }>(
+          "SELECT to_regclass('omniroute.artifact_recovery_retirement_owner_idx') AS retirement_index"
+        )
+      );
+      assert.ok(indexAfterUpgrade.rows[0]?.retirement_index);
+      await migratePostgresSchema(beforeVersion11.database);
+      assert.equal(
+        beforeVersion11.markerHits(),
+        2,
+        "repeated bounded upgrade must validate version 10 and reach migration 11 again"
+      );
+      const historyAfterRepeat = await fixture.transaction((tx) =>
+        tx.query<{ version: number; name: string; checksum: string; applied_at: string }>(
+          "SELECT version,name,checksum,applied_at::text AS applied_at FROM omniroute.schema_migrations ORDER BY version"
+        )
+      );
+      assert.deepEqual(historyAfterRepeat.rows, historyV10.rows);
+      await assertMigrationBoundaryObjects(true);
       for (const owner of ["retire-1", "retire-2", "retire-3", "absent-owner"]) {
         const plan = nodes(
           await explain(revoke, [owner, owner === "absent-owner" ? "1" : owner.slice(7)])

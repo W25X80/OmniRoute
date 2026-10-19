@@ -30,6 +30,13 @@ test(
         await tx.query("DROP SCHEMA IF EXISTS omniroute CASCADE");
       });
       await migratePostgresSchema(db);
+      const generationRows = await db.transaction((tx) =>
+        tx.query<{ value: string }>(
+          "SELECT value FROM omniroute.key_value WHERE namespace='settings' AND key='managementAuthGeneration'"
+        )
+      );
+      assert.equal(generationRows.rows.length, 1);
+      const targetGeneration = generationRows.rows[0].value;
       source.exec(`CREATE TABLE key_value(namespace TEXT,key TEXT,value TEXT);
       CREATE TABLE conversation_turn_nodes(id TEXT PRIMARY KEY,conversation_id TEXT NOT NULL,parent_id TEXT,
         role TEXT NOT NULL,content_hash TEXT NOT NULL DEFAULT '',last_correlation_id TEXT,
@@ -59,7 +66,42 @@ test(
         bytes
       );
       assert.equal(receipt.tableCounts.conversation_turn_nodes, 5002);
-      assert.equal(receipt.rowCount, 5002);
+      assert.equal(receipt.tableCounts.key_value, 1);
+      assert.equal(receipt.rowCount, 5003);
+      assert.equal(
+        receipt.rowCount,
+        Object.values(receipt.tableCounts).reduce((sum, count) => sum + count, 0)
+      );
+      assert.deepEqual(
+        receipt.transformations.filter(
+          (change) => change.table === "key_value" && change.column === "value"
+        ),
+        [
+          {
+            table: "key_value",
+            row: 0,
+            column: "value",
+            source: null,
+            target: targetGeneration,
+          },
+        ]
+      );
+      assert.deepEqual(
+        (
+          await db.transaction((tx) =>
+            tx.query<{ namespace: string; key: string; value: string }>(
+              "SELECT namespace,key,value FROM omniroute.key_value WHERE namespace='settings' AND key='managementAuthGeneration'"
+            )
+          )
+        ).rows,
+        [
+          {
+            namespace: "settings",
+            key: "managementAuthGeneration",
+            value: targetGeneration,
+          },
+        ]
+      );
       assert.equal(
         (await verifyApplicationImport(db, snapshot, bytes)).planDigest,
         receipt.planDigest

@@ -208,13 +208,11 @@ test(
           const keyRoute = await import("../../src/app/api/cli-tools/keys/route.ts");
           const accessTokens = await import("../../src/lib/db/accessTokens.ts");
           const { isAuthRequired } = await import("../../src/shared/utils/apiAuth.ts");
-          const { SignJWT } = await import("jose");
+          const { decodeJwt } = await import("jose");
+          const { mintDashboardSessionToken } =
+            await import("../../src/shared/utils/dashboardSessionToken.ts");
+          const { getAuthSettingsSnapshot } = await import("../../src/lib/db/authSettings.ts");
           const jwtEnvironment = process.env.JWT_SECRET;
-          const session = await new SignJWT({ authenticated: true })
-            .setProtectedHeader({ alg: "HS256" })
-            .setIssuedAt()
-            .setExpirationTime("1h")
-            .sign(new TextEncoder().encode(first.bootstrapSecrets.jwtSecret));
           process.env.JWT_SECRET = first.bootstrapSecrets.jwtSecret;
           try {
             await first.run(async () => {
@@ -229,6 +227,14 @@ test(
                 const victim = await keys.createApiKey("native-cli-operator", "native-cli", [
                   "admin",
                 ]);
+                const session = await mintDashboardSessionToken(
+                  new TextEncoder().encode(first.bootstrapSecrets.jwtSecret)
+                );
+                const currentAuth = await getAuthSettingsSnapshot();
+                assert.equal(
+                  (decodeJwt(session) as Record<string, unknown>).managementAuthGeneration,
+                  currentAuth.generation
+                );
                 const before = await accessTokens.listAccessTokensAsync();
                 const deniedRequest = new Request("http://localhost/api/cli/tokens", {
                   method: "POST",

@@ -17,7 +17,13 @@ import { closeNativeStreamingFixture } from "../helpers/persistence/nativeStream
 import { observeNativeStreamingResources } from "../helpers/persistence/nativeStreamingResourceObserver.ts";
 import { continuationNativeFixture } from "../helpers/persistence/continuationNativeIntegrationFixture.ts";
 import type { StreamCompletionClock } from "../../open-sse/handlers/chatCore/streamingCompletion.ts";
-import type { PostgresDatabase } from "../../src/lib/db/postgres/database.ts";
+import type {
+  PostgresDatabase,
+  PostgresTransaction,
+  PostgresTransactionOptions,
+} from "../../src/lib/db/postgres/database.ts";
+
+const STREAM_CASE_COUNT = 10;
 
 function persistenceFailureTag(error: unknown) {
   const knownKinds = new Set([
@@ -47,6 +53,33 @@ function barrier() {
     resolve = done;
   });
   return { promise, resolve };
+}
+type ContinuationReadGate = {
+  responseId: string;
+  pauseAfter: "empty-ready-row" | "privacy-read" | "observe-only";
+  entered: ReturnType<typeof barrier>;
+  release: ReturnType<typeof barrier>;
+  pauseBeforeSecondKeyPolicyLock?: boolean;
+  freshPrivacyEntered?: ReturnType<typeof barrier>;
+  releaseFreshPrivacy?: ReturnType<typeof barrier>;
+  keyPolicySharedLocks: number;
+  readyReads: number;
+  privacyReads: number;
+  firstReadyRowCount?: number;
+};
+function makeContinuationReadGate(
+  responseId: string,
+  pauseAfter: ContinuationReadGate["pauseAfter"]
+): ContinuationReadGate {
+  return {
+    responseId,
+    pauseAfter,
+    entered: barrier(),
+    release: barrier(),
+    keyPolicySharedLocks: 0,
+    readyReads: 0,
+    privacyReads: 0,
+  };
 }
 async function withDeadline<T>(work: Promise<T>, timeoutMs: number): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -177,7 +210,7 @@ test(
     let bodyFailureElapsedMs: number | undefined;
     const elapsed = () => Math.round((performance.now() - fixtureStartedAt) * 1000) / 1000;
     const recordPhase = (index: number, phase: GatewayPhase) => {
-      if (!Number.isInteger(index) || index < 0 || index >= 7) return;
+      if (!Number.isInteger(index) || index < 0 || index >= STREAM_CASE_COUNT) return;
       const history = phaseHistory.get(index) ?? [];
       if (history.length >= 16) {
         phaseHistoryTruncated = true;
@@ -216,7 +249,7 @@ test(
             firstFailures: [...firstFailures.values()],
             phaseHistoryTruncated,
             maxPhasesPerIndex: 16,
-            maxIndices: 7,
+            maxIndices: STREAM_CASE_COUNT,
           })}`
         );
     });
@@ -276,10 +309,12 @@ test(
       faultKey = "",
       deletedKey = "",
       incompleteKey = "",
-      completedKey = "";
-    const terminals = Array.from({ length: 7 }, barrier);
-    const upstreamEofs = Array.from({ length: 7 }, barrier);
-    const preparationEntered = Array.from({ length: 7 }, barrier);
+      completedKey = "",
+      freshPrivacyKey = "",
+      freshDeleteKey = "";
+    const terminals = Array.from({ length: STREAM_CASE_COUNT }, barrier);
+    const upstreamEofs = Array.from({ length: STREAM_CASE_COUNT }, barrier);
+    const preparationEntered = Array.from({ length: STREAM_CASE_COUNT }, barrier);
     const preparations = new Map<number, boolean>();
     const principals = new Map<number, string>();
     const readyIndices = new Set<number>();
@@ -301,11 +336,17 @@ test(
       number,
       ReturnType<typeof import("../../open-sse/utils/streamHandler.ts").createStreamController>
     >();
-    const clientControllers = Array.from({ length: 7 }, () => new AbortController());
+    const clientControllers = Array.from(
+      { length: STREAM_CASE_COUNT },
+      () => new AbortController()
+    );
     const clients: Promise<string>[] = [];
     const handlerWork = new Set<Promise<void>>();
+    const continuationReaders: Promise<unknown>[] = [];
     let ready = 0,
       optionalStarted = 0;
+    const optionalRequestIds = new Set<string>();
+    let continuationReadGate: ContinuationReadGate | undefined;
     const originalFetch = globalThis.fetch;
     let baseUrl = "";
     let shutdown: Promise<void> | undefined;
@@ -316,7 +357,9 @@ test(
         .catch((error) => {
           const candidateIndex = Number((incoming.url ?? "").split("/").at(-1));
           const index =
-            Number.isInteger(candidateIndex) && candidateIndex >= 0 && candidateIndex < 7
+            Number.isInteger(candidateIndex) &&
+            candidateIndex >= 0 &&
+            candidateIndex < STREAM_CASE_COUNT
               ? candidateIndex
               : null;
           recordFailure("handler", index, error);
@@ -330,9 +373,14 @@ test(
         const index = Number(path.split("/").at(-1));
         let input = "";
         for await (const chunk of incoming) input += chunk;
-        const { previous_response_id: previousId, mutate } = JSON.parse(input) as {
+        const {
+          previous_response_id: previousId,
+          mutate,
+          holdHandoff,
+        } = JSON.parse(input) as {
           previous_response_id: string;
           mutate?: boolean;
+          holdHandoff?: boolean;
         };
         // Independent module instance models separate Next server bundles in one process.
         const { resolvePreviousResponseStateAsync } = await import(
@@ -346,9 +394,82 @@ test(
           resolvePreviousResponseStateAsync,
           originalStore.resolvePreviousResponseStateAsync
         );
-        const state = await runtime!.runPersistenceRequest(() =>
-          resolvePreviousResponseStateAsync(previousId, principals.get(index))
-        );
+        const state = await runtime!.runPersistenceRequest(async () => {
+          const apiKeyId = principals.get(index);
+          if (!holdHandoff || continuationReadGate?.responseId !== previousId)
+            return resolvePreviousResponseStateAsync(previousId, apiKeyId);
+          const { getSelectedControlPlane, withPostgresControlPlane } =
+            await import("../../src/lib/db/controlPlaneContext.ts");
+          const binding = getSelectedControlPlane();
+          assert.ok(binding?.database);
+          const gate = continuationReadGate;
+          // Wrap real transaction queries and pause only after their actual result returns.
+          const intercepted = new Proxy(binding.database, {
+            get(target, property, receiver) {
+              if (property !== "transaction") return Reflect.get(target, property, receiver);
+              return <T>(
+                body: (transaction: PostgresTransaction) => Promise<T>,
+                options?: PostgresTransactionOptions
+              ) =>
+                target.transaction(
+                  (transaction) =>
+                    body({
+                      noteAdvisoryLock: (owner, mode) =>
+                        transaction.noteAdvisoryLock?.(owner, mode),
+                      query: async <Row = Record<string, unknown>>(
+                        sql: string,
+                        values?: unknown[]
+                      ) => {
+                        const isCurrentGate =
+                          continuationReadGate === gate && previousId === gate.responseId;
+                        const isSharedKeyPolicyLock =
+                          sql.includes("pg_advisory_xact_lock_shared(18765,$1)") &&
+                          values?.[0] === 5;
+                        if (isCurrentGate && isSharedKeyPolicyLock) {
+                          gate.keyPolicySharedLocks++;
+                          if (
+                            gate.pauseBeforeSecondKeyPolicyLock &&
+                            gate.keyPolicySharedLocks === 2
+                          ) {
+                            gate.freshPrivacyEntered?.resolve();
+                            await gate.releaseFreshPrivacy?.promise;
+                          }
+                        }
+                        const result = await transaction.query<Row>(sql, values);
+                        if (!isCurrentGate) return result;
+                        const isReadyLookup =
+                          sql.includes("FROM omniroute.call_logs") &&
+                          sql.includes("detail_state='ready'") &&
+                          values?.[0] === previousId;
+                        if (isReadyLookup) {
+                          gate.readyReads++;
+                          if (gate.readyReads === 1) gate.firstReadyRowCount = result.rows.length;
+                          if (gate.pauseAfter === "empty-ready-row" && gate.readyReads === 1) {
+                            gate.entered.resolve();
+                            await gate.release.promise;
+                          }
+                        }
+                        const isPrivacyRead =
+                          sql.includes("SELECT no_log FROM omniroute.api_keys") &&
+                          values?.[0] === apiKeyId;
+                        if (isPrivacyRead) {
+                          gate.privacyReads++;
+                          if (gate.pauseAfter === "privacy-read" && gate.privacyReads === 1) {
+                            gate.entered.resolve();
+                            await gate.release.promise;
+                          }
+                        }
+                        return result;
+                      },
+                    }),
+                  options
+                );
+            },
+          }) as PostgresDatabase;
+          return withPostgresControlPlane({ ...binding, database: intercepted }, () =>
+            resolvePreviousResponseStateAsync(previousId, apiKeyId)
+          );
+        });
         if (mutate && state) {
           (state.input[0] as { content: string }).content = "changed-by-reader";
           const item = state.output[0] as { content: { text: string }[] };
@@ -357,7 +478,20 @@ test(
         }
         outgoing.setHeader("Content-Type", "application/json");
         outgoing.end(
-          JSON.stringify({ found: state !== null, input: state?.input, output: state?.output })
+          JSON.stringify({
+            found: state !== null,
+            input: state?.input,
+            output: state?.output,
+            handoff:
+              holdHandoff && continuationReadGate?.responseId === previousId
+                ? {
+                    readyReads: continuationReadGate.readyReads,
+                    privacyReads: continuationReadGate.privacyReads,
+                    keyPolicySharedLocks: continuationReadGate.keyPolicySharedLocks,
+                    firstReadyRowCount: continuationReadGate.firstReadyRowCount,
+                  }
+                : undefined,
+          })
         );
         return;
       }
@@ -368,7 +502,7 @@ test(
         return;
       }
       const index = Number(path.split("/").at(-1));
-      assert.ok(Number.isInteger(index) && index >= 0 && index < 7);
+      assert.ok(Number.isInteger(index) && index >= 0 && index < STREAM_CASE_COUNT);
       const responseId = `resp_${tag}_${index}`;
       const selectedModel = index === 6 ? faultModel : model;
       if (path.startsWith("/upstream/")) {
@@ -670,6 +804,18 @@ test(
         );
         completedKey = String(completed.id);
         keyIds.push(completedKey);
+        const freshPrivacy = await apiKeys!.createApiKey(
+          `stream-fresh-privacy-${tag}`,
+          "private-stream-fixture"
+        );
+        freshPrivacyKey = String(freshPrivacy.id);
+        keyIds.push(freshPrivacyKey);
+        const freshDelete = await apiKeys!.createApiKey(
+          `stream-fresh-delete-${tag}`,
+          "private-stream-fixture"
+        );
+        freshDeleteKey = String(freshDelete.id);
+        keyIds.push(freshDeleteKey);
         principals.set(0, mainKey);
         principals.set(1, deletedKey);
         principals.set(2, incompleteKey);
@@ -677,6 +823,9 @@ test(
         principals.set(4, mainKey);
         principals.set(5, completedKey);
         principals.set(6, faultKey);
+        principals.set(7, mainKey);
+        principals.set(8, freshPrivacyKey);
+        principals.set(9, freshDeleteKey);
         const connection = await providers!.createProviderConnection({
           provider: "openai",
           name: `stream-${tag}`,
@@ -715,9 +864,12 @@ test(
       };
       await runtime.runPersistenceRequest(() =>
         pluginHooks!.registerHook("onStreamComplete", plugin, async (payload) => {
-          const data = payload as { model?: string };
-          if (data.model === model)
+          const data = payload as { model?: string; requestId?: string };
+          if (data.model === model) {
+            // Accounting owners, including call-log publication and seed retirement, run first.
+            if (typeof data.requestId === "string") optionalRequestIds.add(data.requestId);
             await fetch(`${baseUrl}/optional`, { signal: AbortSignal.timeout(12000) });
+          }
         })
       );
       async function client(index: number): Promise<string> {
@@ -751,11 +903,12 @@ test(
       async function continueFrom(
         index: number,
         previousId = `resp_${tag}_${index}`,
-        mutate = false
+        mutate = false,
+        holdHandoff = false
       ) {
         const response = await fetch(`${baseUrl}/continue/${index}`, {
           method: "POST",
-          body: JSON.stringify({ previous_response_id: previousId, mutate }),
+          body: JSON.stringify({ previous_response_id: previousId, mutate, holdHandoff }),
           headers: { "Content-Type": "application/json" },
         });
         assert.equal(response.status, 200);
@@ -763,7 +916,20 @@ test(
           found: boolean;
           input?: unknown[];
           output?: unknown[];
+          handoff?: {
+            readyReads: number;
+            privacyReads: number;
+            keyPolicySharedLocks: number;
+            firstReadyRowCount?: number;
+          };
         }>;
+      }
+      function observeContinuationReader<T>(reader: Promise<T>): Promise<T> {
+        continuationReaders.push(reader);
+        // Attach immediately to prevent a barrier-time rejection becoming unhandled.
+        // The original promise is still awaited normally at each oracle.
+        void reader.catch(() => {});
+        return reader;
       }
       function startClient(index: number) {
         recordPhase(index, "client_started");
@@ -771,6 +937,77 @@ test(
         clients.push(work);
         void work.catch((error) => recordFailure("client", index, error));
         return work;
+      }
+      async function assertFreshPrivacyFallbackDenial(
+        index: number,
+        apiKeyId: string,
+        label: string,
+        commitPolicyMutation: () => Promise<void>
+      ) {
+        fixtureStage = `index${index}_fresh_privacy_fallback`;
+        startClient(index);
+        await eventually(() => readyIndices.has(index));
+        terminals[index].resolve();
+        await eventually(() => terminalSeen.has(index));
+        assert.equal(preparations.get(index), true);
+        const responseId = `resp_${tag}_${index}`;
+        const gate = makeContinuationReadGate(responseId, "privacy-read");
+        gate.pauseBeforeSecondKeyPolicyLock = true;
+        gate.freshPrivacyEntered = barrier();
+        gate.releaseFreshPrivacy = barrier();
+        continuationReadGate = gate;
+        const reader = observeContinuationReader(continueFrom(index, responseId, false, true));
+        await withDeadline(gate.entered.promise, 6000);
+        assert.equal(gate.firstReadyRowCount, 0);
+        assert.equal(gate.readyReads, 1);
+        assert.equal(gate.privacyReads, 1);
+        assert.equal(gate.keyPolicySharedLocks, 1);
+        upstreamEofs[index].resolve();
+        await eventually(
+          async () =>
+            (
+              await verification!.transaction((tx) =>
+                tx.query<{ detail_state: string }>(
+                  "SELECT detail_state FROM omniroute.call_logs WHERE response_id=$1",
+                  [responseId]
+                )
+              )
+            ).rows[0]?.detail_state === "ready"
+        );
+        await eventually(() => optionalRequestIds.has(`${tag}-${index}`));
+        gate.release.resolve();
+        assert.ok(gate.freshPrivacyEntered);
+        await withDeadline(gate.freshPrivacyEntered.promise, 6000);
+        assert.equal(gate.readyReads, 2);
+        assert.equal(gate.privacyReads, 1);
+        assert.equal(gate.keyPolicySharedLocks, 2);
+        const publishedArtifact = await verification!.transaction((tx) =>
+          tx.query<{
+            api_key_id: string | null;
+            artifact_relpath: string | null;
+            detail_state: string;
+          }>(
+            "SELECT api_key_id,artifact_relpath,detail_state FROM omniroute.call_logs WHERE response_id=$1",
+            [responseId]
+          )
+        );
+        assert.equal(publishedArtifact.rows[0]?.api_key_id, apiKeyId);
+        assert.equal(publishedArtifact.rows[0]?.detail_state, "ready");
+        const publishedReference = publishedArtifact.rows[0]?.artifact_relpath;
+        assert.ok(publishedReference);
+        assert.ok(continuationNativeFixture.references.has(publishedReference));
+        await commitPolicyMutation();
+        assert.ok(gate.releaseFreshPrivacy);
+        gate.releaseFreshPrivacy.resolve();
+        const result = await withDeadline(reader, 6000);
+        assert.equal(result.found, false, `${label} denies fallback artifact after artifact IO`);
+        assert.deepEqual(result.handoff, {
+          readyReads: 2,
+          privacyReads: 2,
+          keyPolicySharedLocks: 2,
+          firstReadyRowCount: 0,
+        });
+        continuationReadGate = undefined;
       }
       startClient(0);
       await eventually(() => ready === 1);
@@ -790,7 +1027,26 @@ test(
         (reread.output?.[0] as { content: { text: string }[] }).content[0].text,
         "answer-0"
       );
-      assert.equal((await continueFrom(6, `resp_${tag}_0`)).found, false);
+      const noWitnessGate = {
+        responseId: `resp_${tag}_0`,
+        pauseAfter: "observe-only" as const,
+        entered: barrier(),
+        release: barrier(),
+        keyPolicySharedLocks: 0,
+        readyReads: 0,
+        privacyReads: 0,
+        firstReadyRowCount: undefined as number | undefined,
+      };
+      continuationReadGate = noWitnessGate;
+      const wrongPrincipal = await continueFrom(6, noWitnessGate.responseId, false, true);
+      assert.equal(wrongPrincipal.found, false);
+      assert.deepEqual(wrongPrincipal.handoff, {
+        readyReads: 1,
+        privacyReads: 1,
+        keyPolicySharedLocks: 1,
+        firstReadyRowCount: 0,
+      });
+      continuationReadGate = undefined;
       assert.equal((await continueFrom(0)).found, true);
       assert.equal(clocks.size, 0);
       assert.equal(continuationNativeFixture.putCalls, 0);
@@ -915,8 +1171,7 @@ test(
         diagnosePersistenceFailure("index4-held-transaction", error)
       );
       await withDeadline(cancelReadLocked.promise, 6000);
-      const waitingRead = continueFrom(4);
-      void waitingRead.catch(() => {});
+      const waitingRead = observeContinuationReader(continueFrom(4));
       await eventually(
         async () =>
           (
@@ -948,14 +1203,29 @@ test(
       terminals[5].resolve();
       await eventually(() => terminalSeen.has(5));
       assert.equal(preparations.get(5), true);
-      assert.equal((await continueFrom(5)).found, true);
+      const firstHandoff = {
+        responseId: `resp_${tag}_5`,
+        pauseAfter: "empty-ready-row" as const,
+        entered: barrier(),
+        release: barrier(),
+        keyPolicySharedLocks: 0,
+        readyReads: 0,
+        privacyReads: 0,
+        firstReadyRowCount: undefined as number | undefined,
+      };
+      continuationReadGate = firstHandoff;
+      const beforeSeedCaptureRead = observeContinuationReader(
+        continueFrom(5, firstHandoff.responseId, false, true)
+      );
+      await withDeadline(firstHandoff.entered.promise, 6000);
+      assert.equal(firstHandoff.firstReadyRowCount, 0);
+      assert.equal(firstHandoff.readyReads, 1);
       const completedPipeline = pipelineControllers.get(5);
       assert.ok(completedPipeline);
       assert.equal(completedPipeline.signal.aborted, false);
       clientControllers[5].abort();
       await eventually(() => abortedIndices.has(5));
       assert.equal(completedPipeline.signal.aborted, false);
-      assert.equal((await continueFrom(5)).found, true);
       await eventually(() => upstreamCancelled.has(5));
       assert.equal(upstreamCancelled.has(5), true);
       // The upstream EOF is still held: cancellation must finish the actual SSE
@@ -994,6 +1264,26 @@ test(
             )
           ).rows[0]?.detail_state === "ready"
       );
+      await eventually(() => optionalRequestIds.has(`${tag}-5`));
+      firstHandoff.release.resolve();
+      const beforeSeedCapture = await withDeadline(beforeSeedCaptureRead, 6000);
+      assert.equal(
+        beforeSeedCapture.found,
+        true,
+        "durable continuation survives publication before seed capture"
+      );
+      assert.deepEqual(beforeSeedCapture.handoff, {
+        readyReads: 2,
+        privacyReads: 2,
+        keyPolicySharedLocks: 2,
+        firstReadyRowCount: 0,
+      });
+      continuationReadGate = undefined;
+      assert.equal(
+        (await continueFrom(5)).found,
+        true,
+        "completed response remains readable after client disconnect"
+      );
       assert.equal(
         (await continueFrom(5)).found,
         true,
@@ -1012,6 +1302,194 @@ test(
         apiKeys!.updateApiKeyPermissions(completedKey, { noLog: true })
       );
       assert.equal((await continueFrom(5)).found, false);
+
+      fixtureStage = "index7_privacy_handoff";
+      startClient(7);
+      await eventually(() => readyIndices.has(7));
+      terminals[7].resolve();
+      await eventually(() => terminalSeen.has(7));
+      assert.equal(preparations.get(7), true);
+      const afterSeedCaptureGate = {
+        responseId: `resp_${tag}_7`,
+        pauseAfter: "privacy-read" as const,
+        entered: barrier(),
+        release: barrier(),
+        keyPolicySharedLocks: 0,
+        readyReads: 0,
+        privacyReads: 0,
+        firstReadyRowCount: undefined as number | undefined,
+      };
+      continuationReadGate = afterSeedCaptureGate;
+      const afterSeedCaptureRead = observeContinuationReader(
+        continueFrom(7, afterSeedCaptureGate.responseId, false, true)
+      );
+      await withDeadline(afterSeedCaptureGate.entered.promise, 6000);
+      assert.equal(afterSeedCaptureGate.firstReadyRowCount, 0);
+      assert.equal(afterSeedCaptureGate.readyReads, 1);
+      assert.equal(afterSeedCaptureGate.privacyReads, 1);
+      upstreamEofs[7].resolve();
+      await eventually(
+        async () =>
+          (
+            await verification!.transaction((tx) =>
+              tx.query<{ detail_state: string }>(
+                "SELECT detail_state FROM omniroute.call_logs WHERE response_id=$1",
+                [afterSeedCaptureGate.responseId]
+              )
+            )
+          ).rows[0]?.detail_state === "ready"
+      );
+      await eventually(() => optionalRequestIds.has(`${tag}-7`));
+      afterSeedCaptureGate.release.resolve();
+      const afterSeedCapture = await withDeadline(afterSeedCaptureRead, 6000);
+      assert.equal(
+        afterSeedCapture.found,
+        true,
+        "durable continuation survives publication after seed capture"
+      );
+      assert.deepEqual(afterSeedCapture.handoff, {
+        readyReads: 2,
+        privacyReads: 2,
+        keyPolicySharedLocks: 2,
+        firstReadyRowCount: 0,
+      });
+      continuationReadGate = undefined;
+
+      await assertFreshPrivacyFallbackDenial(8, freshPrivacyKey, "fresh no_log", async () => {
+        await runtime!.runPersistenceRequest(() =>
+          apiKeys!.updateApiKeyPermissions(freshPrivacyKey, { noLog: true })
+        );
+        const changedPrivacy = await verification!.transaction((tx) =>
+          tx.query<{ no_log: number }>("SELECT no_log FROM omniroute.api_keys WHERE id=$1", [
+            freshPrivacyKey,
+          ])
+        );
+        assert.equal(changedPrivacy.rows[0]?.no_log, 1);
+      });
+      await assertFreshPrivacyFallbackDenial(9, freshDeleteKey, "deleted principal", async () => {
+        const deleted = await runtime!.runPersistenceRequest(() =>
+          apiKeys!.deleteApiKey(freshDeleteKey)
+        );
+        assert.equal(deleted, true);
+        const principal = await verification!.transaction((tx) =>
+          tx.query("SELECT id FROM omniroute.api_keys WHERE id=$1", [freshDeleteKey])
+        );
+        assert.equal(principal.rowCount, 0);
+      });
+
+      const { clearOwnedPendingContinuationState, seedOwnedPendingContinuationState } =
+        await import("../../src/lib/db/responsesContinuationStore.ts");
+      const pendingPipeline = (label: string) => ({
+        clientRawRequest: { effectiveInput: [{ role: "user", content: `input-${label}` }] },
+        clientResponse: {
+          output: [
+            {
+              type: "message",
+              role: "assistant",
+              content: [{ type: "output_text", text: `output-${label}` }],
+            },
+          ],
+        },
+      });
+      const seedPending = (responseId: string, label: string) =>
+        runtime!.runPersistenceRequest(() =>
+          seedOwnedPendingContinuationState(responseId, mainKey, pendingPipeline(label), false)
+        );
+
+      const replacementId = `resp_${tag}_replacement`;
+      const replacementSeedA = await seedPending(replacementId, "A");
+      assert.ok(replacementSeedA);
+      const replacementGate = makeContinuationReadGate(replacementId, "privacy-read");
+      continuationReadGate = replacementGate;
+      const replacementReaderA = observeContinuationReader(
+        continueFrom(7, replacementId, false, true)
+      );
+      await withDeadline(replacementGate.entered.promise, 6000);
+      assert.equal(replacementGate.firstReadyRowCount, 0);
+      assert.equal(replacementGate.readyReads, 1);
+      assert.equal(replacementGate.privacyReads, 1);
+      const replacementSeedB = await seedPending(replacementId, "B");
+      assert.ok(replacementSeedB);
+      assert.notEqual(replacementSeedA.nonce, replacementSeedB.nonce);
+      replacementGate.release.resolve();
+      const staleReaderResult = await withDeadline(replacementReaderA, 6000);
+      assert.equal(staleReaderResult.found, false, "reader A cannot return replacement seed B");
+      assert.deepEqual(staleReaderResult.handoff, {
+        readyReads: 2,
+        privacyReads: 1,
+        keyPolicySharedLocks: 1,
+        firstReadyRowCount: 0,
+      });
+      continuationReadGate = undefined;
+      const replacementReaderB = await continueFrom(7, replacementId);
+      assert.equal(replacementReaderB.found, true, "reader A cleanup preserves replacement seed B");
+      assert.equal((replacementReaderB.input?.[0] as { content: string }).content, "input-B");
+      assert.equal(
+        (replacementReaderB.output?.[0] as { content: { text: string }[] }).content[0].text,
+        "output-B"
+      );
+      await runtime!.runPersistenceRequest(() =>
+        clearOwnedPendingContinuationState(replacementSeedB)
+      );
+
+      const expiredId = `resp_${tag}_expired`;
+      const { getSelectedControlPlane, withPostgresControlPlane } =
+        await import("../../src/lib/db/controlPlaneContext.ts");
+      const selectedBinding = getSelectedControlPlane();
+      assert.ok(selectedBinding?.database);
+      const actualDateNow = Date.now;
+      const backdatedNow = actualDateNow() - 120_000;
+      let expiredSeed: Awaited<ReturnType<typeof seedOwnedPendingContinuationState>>;
+      Date.now = () => backdatedNow;
+      try {
+        expiredSeed = withPostgresControlPlane(selectedBinding, () =>
+          seedOwnedPendingContinuationState(expiredId, mainKey, pendingPipeline("expired"), false)
+        );
+      } finally {
+        Date.now = actualDateNow;
+      }
+      assert.ok(expiredSeed);
+      const expiredGate = makeContinuationReadGate(expiredId, "observe-only");
+      continuationReadGate = expiredGate;
+      const expiredReader = observeContinuationReader(continueFrom(7, expiredId, false, true));
+      const expiredResult = await withDeadline(expiredReader, 6000);
+      assert.equal(expiredResult.found, false, "expired seed cannot be revived");
+      assert.deepEqual(expiredResult.handoff, {
+        readyReads: 2,
+        privacyReads: 1,
+        keyPolicySharedLocks: 1,
+        firstReadyRowCount: 0,
+      });
+      continuationReadGate = undefined;
+      if (expiredSeed)
+        await runtime!.runPersistenceRequest(() => clearOwnedPendingContinuationState(expiredSeed));
+
+      const cancelledId = `resp_${tag}_cancelled`;
+      const cancelledSeed = await seedPending(cancelledId, "cancelled");
+      assert.ok(cancelledSeed);
+      const cancelledGate = makeContinuationReadGate(cancelledId, "privacy-read");
+      continuationReadGate = cancelledGate;
+      const cancelledReader = observeContinuationReader(continueFrom(7, cancelledId, false, true));
+      await withDeadline(cancelledGate.entered.promise, 6000);
+      assert.equal(cancelledGate.firstReadyRowCount, 0);
+      assert.equal(cancelledGate.readyReads, 1);
+      assert.equal(cancelledGate.privacyReads, 1);
+      await runtime!.runPersistenceRequest(() => clearOwnedPendingContinuationState(cancelledSeed));
+      cancelledGate.release.resolve();
+      const cancelledResult = await withDeadline(cancelledReader, 6000);
+      assert.equal(
+        cancelledResult.found,
+        false,
+        "cancelled seed without ready artifact stays absent"
+      );
+      assert.deepEqual(cancelledResult.handoff, {
+        readyReads: 2,
+        privacyReads: 1,
+        keyPolicySharedLocks: 1,
+        firstReadyRowCount: 0,
+      });
+      continuationReadGate = undefined;
+      assert.equal((await continueFrom(7, cancelledId)).found, false);
 
       fixtureStage = "index3_preterminal_abort";
       startClient(3);
@@ -1077,6 +1555,8 @@ test(
       fixtureStage = "fixture_cleanup";
       try {
         try {
+          continuationReadGate?.release.resolve();
+          continuationReadGate?.releaseFreshPrivacy?.resolve();
           for (const terminal of terminals) terminal.resolve();
           for (const eof of upstreamEofs) eof.resolve();
           releasePolicy.resolve();
@@ -1084,9 +1564,16 @@ test(
           continuationNativeFixture.releasePut();
           optional.resolve();
           for (const controller of clientControllers) controller.abort();
-          server.closeAllConnections();
-          if (server.listening)
-            await withDeadline(new Promise<void>((resolve) => server.close(() => resolve())), 2000);
+          try {
+            server.closeAllConnections();
+            if (server.listening)
+              await withDeadline(
+                new Promise<void>((resolve) => server.close(() => resolve())),
+                2000
+              );
+          } finally {
+            await withDeadline(Promise.allSettled(continuationReaders), 15000);
+          }
           await withDeadline(
             Promise.all([
               Promise.allSettled(clients),

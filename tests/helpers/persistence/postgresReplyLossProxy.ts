@@ -34,6 +34,7 @@ export async function createPostgresReplyLossProxy(options: PostgresReplyLossPro
   let dropped = false;
 
   const server = createServer((client) => {
+    client.setNoDelay(true);
     let secureClient: TLSSocket | undefined;
     let upstream: Socket | undefined;
     let disconnected = false;
@@ -146,6 +147,7 @@ export async function createPostgresReplyLossProxy(options: PostgresReplyLossPro
       secureClient = new TLSSocket(client, { isServer: true, secureContext });
       own(secureClient);
       upstream = createConnection({ host: "127.0.0.1", port: options.upstreamPort });
+      upstream.setNoDelay(true);
       own(upstream);
       // TLS decryption yields the StartupMessage; the direct upstream sees no SSLRequest.
       if (options.dropCommitAfterQuery) secureClient.on("data", observeFrontend);

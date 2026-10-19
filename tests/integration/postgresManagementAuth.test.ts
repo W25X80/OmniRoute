@@ -702,7 +702,10 @@ test(
               });
               const refreshing = withPostgresControlPlane(
                 { ...binding, database: refreshDatabase },
-                () => pipeline.runAuthzPipeline(request("/dashboard", undefined, credential, "GET"))
+                () =>
+                  pipeline.runAuthzPipeline(request("/dashboard", undefined, credential, "GET"), {
+                    enforce: true,
+                  })
               );
               try {
                 await bounded(refreshEntered.promise);
@@ -721,7 +724,8 @@ test(
               assert.equal(decodeJwt(refreshed).managementAuthGeneration, oldEpoch);
               assert.equal(await sessions.verifyDashboardSessionToken(refreshed), null);
               const stable = await pipeline.runAuthzPipeline(
-                request("/dashboard", undefined, await cookie(true), "GET")
+                request("/dashboard", undefined, await cookie(true), "GET"),
+                { enforce: true }
               );
               const stableCookie = /auth_token=([^;]+)/.exec(
                 stable.headers.get("set-cookie") ?? ""
@@ -1107,7 +1111,7 @@ test(
                   [headers.PEER_IP_HEADER]: process.env.OMNIROUTE_PEER_STAMP_TOKEN + "|127.0.0.1",
                 }
               );
-              const admitted = await pipeline.runAuthzPipeline(recover);
+              const admitted = await pipeline.runAuthzPipeline(recover, { enforce: true });
               assert.equal(admitted.headers.get("x-middleware-next"), "1");
               const cliForwarded = forwardedHeaders(admitted);
               assert.equal(cliForwarded.has(headers.PEER_IP_HEADER), false);

@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { z } from "zod";
+import { AUTH_GENERATION_SETTING, readAuthGeneration } from "../authSettingsSemantics";
 import type { SqliteAdapter } from "../adapters/types";
 import type { PostgresDatabase } from "./database";
 import { acquirePostgresLock } from "./locks";
@@ -186,7 +187,16 @@ export interface RoutingImportReceipt {
   alreadyImported: boolean;
 }
 
-/** Atomic import into an empty routing target. A matching receipt reconciles a lost COMMIT reply. */
+function storedAuthGeneration(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  try {
+    return readAuthGeneration({ [AUTH_GENERATION_SETTING]: JSON.parse(value) });
+  } catch {
+    return null;
+  }
+}
+
+/** Atomic import into a schema-seeded routing target. A matching receipt reconciles a lost COMMIT reply. */
 export async function importRoutingSnapshot(
   database: PostgresDatabase,
   input: unknown
@@ -209,12 +219,47 @@ export async function importRoutingSnapshot(
       }
       return { digest: sourceDigest, rowCount, alreadyImported: true };
     }
-    for (const name of tableNames) {
+    const sourceGenerations = snapshot.tables.key_value.filter(
+      (record) => record.namespace === "settings" && record.key === AUTH_GENERATION_SETTING
+    );
+    if (
+      sourceGenerations.length > 1 ||
+      sourceGenerations.some((record) => !storedAuthGeneration(record.value))
+    ) {
+      throw new Error("Invalid routing snapshot");
+    }
+    const targetSettings = await transaction.query<{
+      namespace: string;
+      key: string;
+      value: string;
+    }>("SELECT namespace,key,value FROM omniroute.key_value LIMIT 2");
+    if (targetSettings.rows.length !== 1) {
+      throw new Error("PostgreSQL routing import requires an empty target");
+    }
+    const targetGeneration = targetSettings.rows[0];
+    if (
+      targetGeneration.namespace !== "settings" ||
+      targetGeneration.key !== AUTH_GENERATION_SETTING
+    ) {
+      throw new Error("PostgreSQL routing import requires an empty target");
+    }
+    if (!storedAuthGeneration(targetGeneration.value)) {
+      throw new Error("PostgreSQL routing target has an invalid management generation seed");
+    }
+    for (const name of tableNames.filter((table) => table !== "key_value")) {
       const { rows } = await transaction.query<{ occupied: boolean }>(
         `SELECT EXISTS (SELECT 1 FROM omniroute.${name}) AS occupied`
       );
       if (rows[0].occupied) throw new Error("PostgreSQL routing import requires an empty target");
     }
+    // The portable receipt binds the raw v1 source; only the target-owned auth epoch is omitted
+    // from new writes. Preserve every other source row and the target seed bytes as captured.
+    const writeTables: RoutingSnapshot["tables"] = {
+      ...snapshot.tables,
+      key_value: snapshot.tables.key_value.filter(
+        (record) => record.namespace !== "settings" || record.key !== AUTH_GENERATION_SETTING
+      ),
+    };
     // Parent rows precede mappings and assignments. Names/columns come only from the static manifest.
     const order: TableName[] = [
       "combos",
@@ -226,8 +271,8 @@ export async function importRoutingSnapshot(
     ];
     for (const name of order) {
       const columns = tables[name];
-      for (let start = 0; start < snapshot.tables[name].length; start += 100) {
-        const batch = snapshot.tables[name].slice(start, start + 100);
+      for (let start = 0; start < writeTables[name].length; start += 100) {
+        const batch = writeTables[name].slice(start, start + 100);
         await transaction.query(
           `INSERT INTO omniroute.${name} (${columns.join(",")}) VALUES ${batch
             .map(

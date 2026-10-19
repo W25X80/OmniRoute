@@ -63,7 +63,7 @@ type SyncSource = "manual" | "scheduled";
 function sanitizeUsageForProvider(
   provider: string,
   usage: JsonRecord,
-  liveModelIds: string[]
+  liveModelIds: ReadonlySet<string>
 ): JsonRecord {
   const sanitized = sanitizeUsageQuotasForProvider(provider, usage, liveModelIds);
   return provider === "claude" ? copyClaudeUsageProvenance(usage, sanitized) : sanitized;

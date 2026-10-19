@@ -137,16 +137,37 @@ function observeBinding(
   return { ...binding, database, apiKeys };
 }
 
-function openRouterTransport(models: Array<Record<string, unknown>>, calls: string[]) {
+type CatalogFetches = {
+  openRouter: string[];
+  aiHorde: string[];
+  unexpected: number;
+};
+
+function emptyCatalogFetches(): CatalogFetches {
+  return { openRouter: [], aiHorde: [], unexpected: 0 };
+}
+
+async function catalogTransport(models: Array<Record<string, unknown>>, calls: CatalogFetches) {
+  const { resetAiHordeImageCatalog } =
+    await import("@omniroute/open-sse/services/aihordeImageCatalog");
+  resetAiHordeImageCatalog();
   const original = globalThis.fetch;
   globalThis.fetch = async (input: RequestInfo | URL) => {
     const url = input instanceof Request ? input.url : String(input);
-    calls.push(url);
-    assert.equal(url, "https://openrouter.ai/api/v1/models", "unexpected outbound request");
-    return Response.json({ data: models });
+    if (url === "https://openrouter.ai/api/v1/models") {
+      calls.openRouter.push(url);
+      return Response.json({ data: models });
+    }
+    if (url === "https://aihorde.net/api/v2/status/models?type=image") {
+      calls.aiHorde.push(url);
+      return Response.json([]);
+    }
+    calls.unexpected++;
+    assert.fail("unexpected outbound catalog request");
   };
   return () => {
     globalThis.fetch = original;
+    resetAiHordeImageCatalog();
   };
 }
 
@@ -385,7 +406,7 @@ test(
           );
           created.push({ keyId: rows.keyId, connectionId: rows.connectionId });
           const probe = emptyProbe();
-          const fetches: string[] = [];
+          const fetches = emptyCatalogFetches();
           let policyUpdated = false;
           const hooks: CatalogHooks = {
             async beforeGuard(ordinal) {
@@ -400,7 +421,7 @@ test(
               policyUpdated = true;
             },
           };
-          const restoreFetch = openRouterTransport(
+          const restoreFetch = await catalogTransport(
             [
               {
                 id: rawModelId,
@@ -444,7 +465,11 @@ test(
             probe.targetPolicyDecisions.includes(false),
             "the retry applies the committed restriction"
           );
-          assert.deepEqual(fetches, ["https://openrouter.ai/api/v1/models"]);
+          assert.deepEqual(fetches.openRouter, ["https://openrouter.ai/api/v1/models"]);
+          assert.deepEqual(fetches.aiHorde, [
+            "https://aihorde.net/api/v2/status/models?type=image",
+          ]);
+          assert.equal(fetches.unexpected, 0);
           assert.equal(probe.capabilityWriteQueries, 1);
           assert.equal(probe.capabilityWriteCommits, 1);
         }
@@ -460,7 +485,7 @@ test(
         );
         created.push({ keyId: rows.keyId, connectionId: rows.connectionId });
         const probe = emptyProbe();
-        const fetches: string[] = [];
+        const fetches = emptyCatalogFetches();
         const hooks: CatalogHooks = {
           async beforeGuard(ordinal) {
             if (ordinal > 2) return;
@@ -471,7 +496,7 @@ test(
             );
           },
         };
-        const restoreFetch = openRouterTransport(
+        const restoreFetch = await catalogTransport(
           [
             {
               id: rawModelId,
@@ -496,7 +521,9 @@ test(
         assert.equal(response.status, 503);
         assert.equal(response.headers.get("Retry-After"), "1");
         assert.equal(probe.guardReads, 2);
-        assert.deepEqual(fetches, ["https://openrouter.ai/api/v1/models"]);
+        assert.deepEqual(fetches.openRouter, ["https://openrouter.ai/api/v1/models"]);
+        assert.deepEqual(fetches.aiHorde, ["https://aihorde.net/api/v2/status/models?type=image"]);
+        assert.equal(fetches.unexpected, 0);
         assert.equal(probe.capabilityWriteQueries, 1);
         assert.equal(probe.capabilityWriteCommits, 1);
       });
@@ -513,7 +540,7 @@ test(
           );
           created.push({ keyId: rows.keyId, connectionId: rows.connectionId });
           const probe = emptyProbe();
-          const fetches: string[] = [];
+          const fetches = emptyCatalogFetches();
           const authority = await writer!.transaction(async (tx) => {
             const result = await tx.query<{ authority_id: string }>(
               "SELECT authority_id FROM omniroute.api_key_policy_epoch WHERE singleton"
@@ -538,7 +565,7 @@ test(
                 );
             },
           };
-          const restoreFetch = openRouterTransport(
+          const restoreFetch = await catalogTransport(
             [
               {
                 id: rawModelId,
@@ -579,7 +606,11 @@ test(
             2,
             "only the original and acknowledged-publication builds authenticate"
           );
-          assert.deepEqual(fetches, ["https://openrouter.ai/api/v1/models"]);
+          assert.deepEqual(fetches.openRouter, ["https://openrouter.ai/api/v1/models"]);
+          assert.deepEqual(fetches.aiHorde, [
+            "https://aihorde.net/api/v2/status/models?type=image",
+          ]);
+          assert.equal(fetches.unexpected, 0);
           assert.equal(probe.capabilityWriteQueries, 1);
           assert.equal(probe.capabilityWriteCommits, 1);
         }
@@ -633,7 +664,7 @@ test(
     let previousRequireAuthForModels: unknown;
     const rawModelId = "fixture/commit-unknown-" + randomUUID();
     const targetModelId = "openrouter/" + rawModelId;
-    const fetches: string[] = [];
+    const fetches = emptyCatalogFetches();
     const cleanupActions: CleanupAction[] = [];
     for (const [name, value] of previous) {
       cleanupActions.push({
@@ -739,7 +770,7 @@ test(
       });
       const { getUnifiedModelsResponse } = await import("../../src/app/api/v1/models/catalog.ts");
       const probe = emptyProbe();
-      const restoreFetch = openRouterTransport(
+      const restoreFetch = await catalogTransport(
         [
           {
             id: rawModelId,
@@ -762,7 +793,9 @@ test(
         );
       }, [{ label: "restore OpenRouter test transport", run: restoreFetch }]);
       assert.equal(proxy.dropped(), true, "the isolated proxy dropped the actual COMMIT reply");
-      assert.deepEqual(fetches, ["https://openrouter.ai/api/v1/models"]);
+      assert.deepEqual(fetches.openRouter, ["https://openrouter.ai/api/v1/models"]);
+      assert.deepEqual(fetches.aiHorde, ["https://aihorde.net/api/v2/status/models?type=image"]);
+      assert.equal(fetches.unexpected, 0);
       assert.equal(
         probe.guardReads,
         1,

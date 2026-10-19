@@ -571,6 +571,9 @@ export async function resolvePreviousResponseStateAsync(
     if (seed) clearOwnedPendingContinuationState(seed);
     return null;
   }
+  // This is only a witness that the first empty SQL snapshot may race the
+  // pending-to-durable handoff. Never use it as continuation payload authority.
+  const initialPendingSeed = selectedPendingSeed(responseId, apiKeyId);
   const row = await database.transaction(
     async (transaction) =>
       (
@@ -607,6 +610,35 @@ export async function resolvePreviousResponseStateAsync(
     return pending ? cloneLogPayload(pending) : null;
   });
   if (!authorized && pendingSeed) clearOwnedPendingContinuationState(pendingSeed);
+  if (!authorized && !row && (initialPendingSeed || pendingSeed)) {
+    // Publication can commit and retire the bridge after the first empty
+    // SELECT. Give that observed handoff one fresh durable-only read; never
+    // recover from either the captured seed or a later replacement seed.
+    const retryRow = await database.transaction(
+      async (transaction) =>
+        (
+          await transaction.query<{
+            artifact_relpath: string | null;
+            api_key_id: string | null;
+            video_content_removed: number;
+          }>(
+            `SELECT artifact_relpath,api_key_id,video_content_removed FROM omniroute.call_logs
+       WHERE response_id=$1 AND detail_state='ready' ORDER BY timestamp DESC LIMIT 1`,
+            [responseId]
+          )
+        ).rows[0]
+    );
+    if (!retryRow || retryRow.api_key_id !== apiKeyId || !retryRow.artifact_relpath) return null;
+    const retryArtifact = await readCallArtifactAsync(retryRow.artifact_relpath);
+    const retryState =
+      retryArtifact.state === "ready" && retryArtifact.artifact?.pipeline
+        ? extractContinuationState(
+            retryArtifact.artifact.pipeline as ContinuationPipeline,
+            retryRow.video_content_removed === 1
+          )
+        : null;
+    return withSelectedContinuationPrivacy(apiKeyId, () => retryState);
+  }
   return authorized;
 }
 

@@ -90,8 +90,51 @@ test(
       assert.ok(JSON.stringify(snapshot).length < 16384);
       await database.transaction((tx) => tx.query("DROP SCHEMA IF EXISTS omniroute CASCADE"));
       await migratePostgresSchema(database);
+      const generationRows = await database.transaction((tx) =>
+        tx.query<{ value: string }>(
+          "SELECT value FROM omniroute.key_value WHERE namespace='settings' AND key='managementAuthGeneration'"
+        )
+      );
+      assert.equal(generationRows.rows.length, 1);
+      const targetGeneration = generationRows.rows[0].value;
       const imported = await importApplicationSnapshot(database, snapshot, [], undefined, blobs);
-      assert.equal(imported.rowCount, 1);
+      assert.equal(imported.rowCount, 2);
+      assert.equal(imported.tableCounts.files, 1);
+      assert.equal(imported.tableCounts.key_value, 1);
+      assert.equal(
+        imported.rowCount,
+        Object.values(imported.tableCounts).reduce((sum, count) => sum + count, 0)
+      );
+      assert.deepEqual(
+        imported.transformations.filter(
+          (change) => change.table === "key_value" && change.column === "value"
+        ),
+        [
+          {
+            table: "key_value",
+            row: 0,
+            column: "value",
+            source: null,
+            target: targetGeneration,
+          },
+        ]
+      );
+      assert.deepEqual(
+        (
+          await database.transaction((tx) =>
+            tx.query<{ namespace: string; key: string; value: string }>(
+              "SELECT namespace,key,value FROM omniroute.key_value WHERE namespace='settings' AND key='managementAuthGeneration'"
+            )
+          )
+        ).rows,
+        [
+          {
+            namespace: "settings",
+            key: "managementAuthGeneration",
+            value: targetGeneration,
+          },
+        ]
+      );
       await verifyApplicationImport(database, snapshot);
       const exported = await capturePostgresApplicationSnapshot(database, { blobSink: sink });
       assert.ok(JSON.stringify(exported).length < 65536);

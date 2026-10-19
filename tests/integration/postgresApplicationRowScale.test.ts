@@ -5,8 +5,27 @@ import path from "node:path";
 import os from "node:os";
 import { spawn } from "node:child_process";
 import Database from "better-sqlite3";
-import { postgresTestsEnabled } from "../helpers/persistence/postgresTestDatabase.ts";
+import { migratePostgresSchema } from "../../src/lib/db/postgres/migrations.ts";
+import {
+  createTestPostgresDatabase,
+  postgresTestsEnabled,
+} from "../helpers/persistence/postgresTestDatabase.ts";
 const enabled = postgresTestsEnabled && process.env.RUN_PG_IMPORT_MAX_ROWS === "1";
+
+type ImportReceipt = {
+  rowCount: number;
+  tableCounts: Record<string, number>;
+  transformations: {
+    table: string;
+    column: string;
+    row: number;
+    source: unknown;
+    target: unknown;
+  }[];
+  alreadyImported: boolean;
+  planDigest: string;
+};
+
 test(
   "offline CLI preserves 2600000 history rows with bounded carriers and reconciles the receipt",
   { skip: !enabled, timeout: 3600000 },
@@ -15,6 +34,7 @@ test(
     const source = path.join(root, "source.sqlite"),
       bundle = path.join(root, "bundle", "bundle.json");
     const raw = new Database(source);
+    let database: Awaited<ReturnType<typeof createTestPostgresDatabase>> | undefined;
     let completed = false;
     try {
       raw.exec(`CREATE TABLE key_value(namespace TEXT,key TEXT,value TEXT);
@@ -22,6 +42,15 @@ CREATE TABLE conversation_turn_nodes(id TEXT PRIMARY KEY,conversation_id TEXT NO
 WITH RECURSIVE n(v) AS (SELECT 1 UNION ALL SELECT v+1 FROM n WHERE v<2600000)
 INSERT INTO conversation_turn_nodes SELECT printf('%064d',v),printf('%064d',1),printf('%064d',v-1),'assistant',printf('%064d',v),'request-correlation','2026-10-12T12:00:00.000Z','2026-10-12T12:00:00.000Z' FROM n;`);
       raw.close();
+      database = await createTestPostgresDatabase({ transactionTimeoutMs: 1800000 });
+      await migratePostgresSchema(database);
+      const generationRows = await database.transaction((tx) =>
+        tx.query<{ value: string }>(
+          "SELECT value FROM omniroute.key_value WHERE namespace='settings' AND key='managementAuthGeneration'"
+        )
+      );
+      assert.equal(generationRows.rows.length, 1);
+      const targetGeneration = generationRows.rows[0].value;
       await import("node:fs/promises").then((fs) =>
         fs.mkdir(path.dirname(bundle), { mode: 0o700 })
       );
@@ -41,7 +70,9 @@ INSERT INTO conversation_turn_nodes SELECT printf('%064d',v),printf('%064d',1),p
         OMNIROUTE_POSTGRES_TRANSACTION_TIMEOUT_MS: "1800000",
         NODE_OPTIONS: "--max-old-space-size=4096",
       };
-      async function cli(action) {
+      async function cli(action: "capture"): Promise<unknown>;
+      async function cli(action: "import" | "verify"): Promise<ImportReceipt>;
+      async function cli(action: "capture" | "import" | "verify"): Promise<unknown> {
         const args = [
           "--import",
           "tsx/esm",
@@ -96,12 +127,49 @@ INSERT INTO conversation_turn_nodes SELECT printf('%064d',v),printf('%064d',1),p
         });
         console.log(JSON.stringify({ scaleAction: action, milliseconds: Date.now() - start }));
         const lines = output.trim().split("\n");
-        return JSON.parse(lines.at(-1));
+        const receipt = lines.at(-1);
+        if (!receipt) throw new Error("scale command returned no JSON result");
+        return JSON.parse(receipt);
       }
       await cli("capture");
       const initial = await cli("import");
-      assert.equal(initial.rowCount, 2600000);
+      assert.equal(initial.rowCount, 2600001);
       assert.equal(initial.tableCounts.conversation_turn_nodes, 2600000);
+      assert.equal(initial.tableCounts.key_value, 1);
+      assert.equal(
+        initial.rowCount,
+        Object.values(initial.tableCounts).reduce((sum, count) => sum + count, 0)
+      );
+      assert.deepEqual(
+        initial.transformations.filter(
+          (change) => change.table === "key_value" && change.column === "value"
+        ),
+        [
+          {
+            table: "key_value",
+            row: 0,
+            column: "value",
+            source: null,
+            target: targetGeneration,
+          },
+        ]
+      );
+      assert.deepEqual(
+        (
+          await database.transaction((tx) =>
+            tx.query<{ namespace: string; key: string; value: string }>(
+              "SELECT namespace,key,value FROM omniroute.key_value WHERE namespace='settings' AND key='managementAuthGeneration'"
+            )
+          )
+        ).rows,
+        [
+          {
+            namespace: "settings",
+            key: "managementAuthGeneration",
+            value: targetGeneration,
+          },
+        ]
+      );
       assert.equal(initial.alreadyImported, false);
       const again = await cli("import");
       assert.equal(again.alreadyImported, true);
@@ -112,6 +180,7 @@ INSERT INTO conversation_turn_nodes SELECT printf('%064d',v),printf('%064d',1),p
       completed = true;
     } finally {
       if (raw.open) raw.close();
+      await database?.close();
       await rm(root, { recursive: true, force: true });
     }
     assert.ok(completed);

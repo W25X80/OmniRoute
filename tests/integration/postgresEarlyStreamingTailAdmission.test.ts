@@ -15,7 +15,10 @@ import { streamingNativeFixture } from "../helpers/persistence/streamingNativeIn
 import { closeNativeStreamingFixture } from "../helpers/persistence/nativeStreamingFixtureShutdown.ts";
 import type { PersistenceTailPermit } from "../../src/lib/db/persistenceRuntime.ts";
 import type { PostgresDatabase } from "../../src/lib/db/postgres/database.ts";
-import type { ConnectionScope } from "../../open-sse/services/connectionScope.ts";
+import {
+  CONNECTION_SCOPE_DENIED_CODE,
+  type ConnectionScope,
+} from "../../open-sse/services/connectionScope.ts";
 
 // Real runtime, PostgreSQL engine/catalog, handleChatCore, provider executor and stream owners.
 // Only provider HTTP and S3 bytes are controlled; this is not AWS/provider acceptance evidence.
@@ -247,7 +250,8 @@ test(
         });
         assert.equal(local.success, false);
         assert.equal(local.response.status, 403);
-        assert.equal((await local.response.json()).error.code, "connection_scope_denied");
+        assert.equal(local.errorCode, CONNECTION_SCOPE_DENIED_CODE);
+        assert.equal((await local.response.json()).error.code, "permission_denied");
         assert.equal(executorCalls, 0, "a local scope refusal must not reach the executor");
         assert.equal(fetchCalls, 0, "a local scope refusal must not spend upstream work");
         assert.equal(getEventListeners(controller.signal, "abort").length, 0);

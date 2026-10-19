@@ -17,14 +17,63 @@ import {
   importApplicationSnapshot,
   verifyApplicationImport,
   capturePostgresApplicationSnapshot,
+  type ApplicationImportReceipt,
 } from "../../src/lib/db/postgres/applicationImport.ts";
 import { migratePostgresSchema } from "../../src/lib/db/postgres/migrations.ts";
-import type { PostgresTransaction } from "../../src/lib/db/postgres/database.ts";
+import type { PostgresDatabase, PostgresTransaction } from "../../src/lib/db/postgres/database.ts";
 import { openStoredFileContent } from "../../src/lib/db/postgres/serviceFileContent.ts";
 import {
   createTestPostgresDatabase,
   postgresTestsEnabled,
 } from "../helpers/persistence/postgresTestDatabase.ts";
+
+const AUTH_GENERATION_SETTING = "managementAuthGeneration";
+
+async function readManagementGeneration(database: PostgresDatabase): Promise<string> {
+  const { rows } = await database.transaction((transaction) =>
+    transaction.query<{ value: string }>(
+      "SELECT value FROM omniroute.key_value WHERE namespace='settings' AND key=$1",
+      [AUTH_GENERATION_SETTING]
+    )
+  );
+  assert.equal(rows.length, 1);
+  return rows[0].value;
+}
+
+async function assertLegacyGenerationReceipt(
+  database: PostgresDatabase,
+  receipt: ApplicationImportReceipt,
+  targetGeneration: string
+): Promise<void> {
+  assert.equal(receipt.tableCounts.key_value, 1);
+  assert.equal(
+    receipt.rowCount,
+    Object.values(receipt.tableCounts).reduce((sum, count) => sum + count, 0)
+  );
+  assert.deepEqual(
+    receipt.transformations.filter(
+      (change) => change.table === "key_value" && change.column === "value"
+    ),
+    [
+      {
+        table: "key_value",
+        row: 0,
+        column: "value",
+        source: null,
+        target: targetGeneration,
+      },
+    ]
+  );
+  const { rows } = await database.transaction((transaction) =>
+    transaction.query<{ namespace: string; key: string; value: string }>(
+      "SELECT namespace,key,value FROM omniroute.key_value WHERE namespace='settings' AND key=$1",
+      [AUTH_GENERATION_SETTING]
+    )
+  );
+  assert.deepEqual(rows, [
+    { namespace: "settings", key: AUTH_GENERATION_SETTING, value: targetGeneration },
+  ]);
+}
 
 async function readLogicalFileContent(transaction: PostgresTransaction, id: string) {
   const content = await openStoredFileContent(transaction, id);
@@ -244,6 +293,7 @@ test(
         async () => {
           await database.transaction((tx) => tx.query("DROP SCHEMA omniroute CASCADE"));
           await migratePostgresSchema(database);
+          const targetGeneration = await readManagementGeneration(database);
           const fileRaw = new Database(":memory:"),
             fileSource = createBetterSqliteAdapter(fileRaw);
           const chunks = new Map<string, Uint8Array>();
@@ -338,7 +388,9 @@ test(
               undefined,
               { source: reader, memoryBudgetBytes: NATIVE_BLOB_LIMITS.importMemoryBudgetBytes }
             );
-            assert.equal(imported.rowCount, 2);
+            assert.equal(imported.rowCount, 3);
+            assert.equal(imported.tableCounts.files, 2);
+            await assertLegacyGenerationReceipt(database, imported, targetGeneration);
             await verifyApplicationImport(database, fileSnapshot);
             const native = await capturePostgresApplicationSnapshot(database, { blobSink: sink });
             assert.ok(JSON.stringify(native).length < 65536);
@@ -372,6 +424,7 @@ test(
         async () => {
           await database.transaction((tx) => tx.query("DROP SCHEMA omniroute CASCADE"));
           await migratePostgresSchema(database);
+          const targetGeneration = await readManagementGeneration(database);
           const rawFiles = new Database(":memory:");
           const sourceFiles = createBetterSqliteAdapter(rawFiles);
           const expected = new Map<string, Buffer | null>([
@@ -410,7 +463,9 @@ test(
             sourceFiles.pragma("query_only=ON");
             const logical = captureSqliteApplicationSnapshot(sourceFiles);
             const receipt = await importApplicationSnapshot(database, logical);
-            assert.equal(receipt.rowCount, 4);
+            assert.equal(receipt.rowCount, 5);
+            assert.equal(receipt.tableCounts.files, 4);
+            await assertLegacyGenerationReceipt(database, receipt, targetGeneration);
             await verifyApplicationImport(database, logical);
             const observed = await database.transaction(async (tx) => {
               const rows = (
