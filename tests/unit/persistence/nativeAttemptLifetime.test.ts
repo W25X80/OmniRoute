@@ -48,6 +48,132 @@ const { executeWithUpstreamStartTimeout } =
   await import("../../../open-sse/handlers/chatCore/upstreamTimeouts.ts");
 const log = { warn() {}, info() {}, error() {}, debug() {} };
 
+for (const mode of ["streaming", "nonStreaming"] as const) {
+  for (const pinned of [false, true]) {
+    test(`${mode} ${pinned ? "pinned" : "unleased"} local refusal preserves scope without provider side effects`, () =>
+      scenario(async () => {
+        const errors = await import("../../../open-sse/utils/error.ts");
+        const { CONNECTION_SCOPE_DENIED_CODE } =
+          await import("../../../open-sse/services/connectionScope.ts");
+        const refusal = errors.createErrorResult(
+          403,
+          "No eligible connection",
+          null,
+          CONNECTION_SCOPE_DENIED_CODE,
+          "connection_scope_error"
+        );
+        const effects: string[] = [];
+        let finalized = 0;
+        let pipelineCalls = 0;
+        const connectionScope = { kind: "connections", ids: ["inside"] } as const;
+        const forbidden = (name: string) => () => {
+          effects.push(name);
+          throw new Error(`Forbidden local-refusal side effect: ${name}`);
+        };
+        const globals = {
+          ...errors,
+          CONNECTION_SCOPE_DENIED_CODE,
+          getSelectedPostgresDatabase,
+          getSelectedControlPlane: () => ({}),
+          runProviderExecutionPipeline: async (input: {
+            policy: { allowAccountRotation: boolean };
+            connection: { connectionScope: unknown };
+          }) => {
+            pipelineCalls++;
+            assert.equal(input.connection.connectionScope, connectionScope);
+            assert.equal(input.policy.allowAccountRotation, !pinned);
+            return {
+              kind: "error",
+              result: refusal,
+              model: "model",
+              connectionId: "outside",
+            };
+          },
+          runNonStreamingProviderLeg: (
+            await import("../../../open-sse/handlers/chatCore/nonStreamingProviderLeg.ts")
+          ).runNonStreamingProviderLeg,
+          getProviderCredentials: forbidden("select"),
+          updateFromHeaders: forbidden("rate-limit-headers"),
+          updateFromResponseBody: forbidden("rate-limit-body"),
+          writeTerminalStatus: forbidden("terminal-status"),
+          updateProviderConnection: forbidden("connection-write"),
+          lockModel: forbidden("model-lock"),
+          recordCoreOwnedAntigravityQuotaState: forbidden("quota-state"),
+          shouldIsolateProbeFailures: () => false,
+          normalizeHeaders: (headers: Headers) => Object.fromEntries(headers),
+          resolveEffectiveServiceTier: () => undefined,
+          buildClaudePromptCacheLogMeta: () => undefined,
+          updatePendingScope: forbidden("upstream-pending-stage"),
+          trackPendingRequest: forbidden("provider-failure-pending"),
+        };
+        const functionName =
+          mode === "streaming" ? "runStreamingResponse" : "runNonStreamingResponse";
+        const owner = await controlledOwnerModule<
+          Record<
+            string,
+            (
+              deps: Record<string, unknown>
+            ) => Promise<{ response: { status: number; errorCode: string } }>
+          >
+        >(
+          new URL(`../../../open-sse/handlers/chatCore/${mode}Response.ts`, import.meta.url),
+          {},
+          globals,
+          (source) => source.slice(source.indexOf(`export async function ${functionName}(`))
+        );
+        let failure: unknown;
+        const result = await runtime
+          .runPersistenceRequest(() =>
+            runtime.runPersistenceAttempt(() =>
+              owner[functionName]({
+                provider: "codex",
+                model: "model",
+                effectiveModel: "model",
+                forcedConnectionId: pinned ? "outside" : undefined,
+                currentModel: "model",
+                stream: mode === "streaming",
+                connectionId: "outside",
+                credentials: { connectionId: "outside" },
+                getCurrentConnectionId: () => "outside",
+                triedModels: new Set(),
+                translatedBody: {},
+                syncExecuteTranslatedBody() {},
+                executor: {
+                  execute: forbidden("execute"),
+                  refreshCredentials: forbidden("refresh"),
+                },
+                executeProviderRequest: forbidden("execute"),
+                executeRefreshCredentials: forbidden("refresh"),
+                applyProviderFailureClassification: forbidden("classification"),
+                persistAttemptLogs: forbidden("provider-log"),
+                persistFailureUsage: forbidden("usage"),
+                resolveEffectiveServiceTier: () => undefined,
+                reqLogger: { logTargetRequest: forbidden("provider-log") },
+                onConnectionScopeRefusal() {
+                  assert.equal(getSelectedPersistenceIdentity(), fixture.authority);
+                  finalized++;
+                },
+                connectionScope,
+              })
+            )
+          )
+          .catch((error) => {
+            failure = error;
+            return undefined;
+          });
+        assert.deepEqual(effects, [], "local refusal must not reach a provider side effect");
+        assert.equal(failure, undefined);
+        assert.ok(result);
+        assert.equal(result.response.status, 403);
+        assert.equal(result.response.errorCode, CONNECTION_SCOPE_DENIED_CODE);
+        assert.equal(finalized, 1);
+        assert.equal(pipelineCalls, 1, "the actual runner must forward scope and pin policy");
+        assert.equal(runtime.getPersistenceRuntimeStatus().attemptOperations, 0);
+        assert.equal(runtime.getPersistenceRuntimeStatus().backgroundOperations, 0);
+      }));
+  }
+}
+
 test("debounced learned limits persist after their scheduling request ends", () =>
   scenario(async () => {
     let timer: (() => Promise<void>) | undefined;

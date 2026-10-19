@@ -77,3 +77,12 @@ export function finalizePendingScope(scope: PendingRequestScope, metadata: Pendi
     finalizePendingRequest(scope.model, scope.provider, scope.connectionId, retainedMetadata);
   }
 }
+
+/** A local refusal owns only its known request ID, never another pending request's identity. */
+export function finalizePendingScopeById(
+  scope: PendingRequestScope,
+  metadata: PendingRequestMetadata
+) {
+  if (!scope.id) return null;
+  return finalizePendingRequestById(scope.id, protectPendingMetadata(scope, metadata));
+}

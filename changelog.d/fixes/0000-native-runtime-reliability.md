@@ -1,0 +1,5 @@
+- **fix(dashboard):** Refresh monitoring health in fresh persistence scopes and keep stale refreshes from repopulating reset caches.
+- **fix(db):** Maintain exact conversation node counts for native PostgreSQL history pagination, preserve orphan history, and select one latest call when timestamps tie. Adds native schema migration 11 with an offline backfill.
+- **fix(authz):** Preserve resolved connection scopes through chat retries and reject local routing refusals without token refresh or provider health changes ([#15990](https://github.com/diegosouzapw/OmniRoute/pull/15990)).
+- **fix(sse):** Release deadline signal dependencies and isolate shared Claude request containers during OAuth and context editing ([#16974](https://github.com/diegosouzapw/OmniRoute/pull/16974), [#16648](https://github.com/diegosouzapw/OmniRoute/pull/16648)).
+- **fix(providers):** Validate Kiro OIDC regions and refuse browser context creation when proxy resolution fails ([#16280](https://github.com/diegosouzapw/OmniRoute/pull/16280), [#17011](https://github.com/diegosouzapw/OmniRoute/pull/17011)).

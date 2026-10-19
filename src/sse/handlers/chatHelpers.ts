@@ -451,6 +451,7 @@ export async function executeChatWithBreaker({
   videoBridgeLog = undefined,
   fallbackAttempts = undefined,
   forcedConnectionId = null,
+  connectionScope = undefined,
   // optional resume flag from a rehydrated previous_response_id —
   // forwarded to handleChatCore, which notes it under the attempt store.
   previousResponseResumed = undefined,
@@ -528,6 +529,7 @@ export async function executeChatWithBreaker({
             previousResponseResumed,
             fallbackAttempts,
             forcedConnectionId,
+            connectionScope,
             skipResourcePressureGuard: true,
             onCredentialsRefreshed: async (newCreds: any) => {
               await updateProviderCredentials(credentials.connectionId, {

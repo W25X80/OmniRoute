@@ -73,21 +73,23 @@ function toMultiTurnConversationRow(value: unknown): MultiTurnConversationRow {
   };
 }
 
-const MULTI_TURN_CONVERSATION_SELECT = `
+const CONVERSATION_WITH_METADATA = `
   SELECT ac.*, latest.id as last_call_log_id, latest.model as last_model,
          latest.provider as last_provider, latest.status as last_status,
          latest.artifact_relpath as last_artifact_relpath,
          latest.api_key_id as last_api_key_id
-  FROM omniroute.agentic_conversations ac
+`;
+const LATEST_CONVERSATION_CALL = `
   LEFT JOIN LATERAL (
     SELECT cl1.id, cl1.session_tag, cl1.model, cl1.provider, cl1.status,
            cl1.artifact_relpath, cl1.api_key_id
     FROM omniroute.call_logs cl1
-    WHERE cl1.session_tag=ac.id AND cl1.timestamp = (
-      SELECT MAX(cl2.timestamp) FROM omniroute.call_logs cl2 WHERE cl2.session_tag = ac.id
-    )
+    WHERE cl1.session_tag=ac.id
+    ORDER BY cl1.timestamp DESC,cl1.insertion_order DESC LIMIT 1
   ) latest ON true
 `;
+const MULTI_TURN_CONVERSATION_SELECT = `${CONVERSATION_WITH_METADATA}
+  FROM omniroute.agentic_conversations ac ${LATEST_CONVERSATION_CALL}`;
 
 export function createPostgresAgenticConversationsRepository(database: PostgresDatabase) {
   function operation<T>(
@@ -250,18 +252,18 @@ export function createPostgresAgenticConversationsRepository(database: PostgresD
       const result = await operation(
         false,
         async (tx) => {
-          const floor =
-            "WHERE EXISTS(SELECT 1 FROM omniroute.conversation_turn_nodes n WHERE n.conversation_id=ac.id OFFSET 1 LIMIT 1)";
+          const eligible = `FROM omniroute.agentic_conversations ac
+            JOIN omniroute.conversation_node_counts n ON n.conversation_id=ac.id
+            WHERE n.node_count>=2`;
           const total = Number(
-            (
-              await tx.query<{ c: string }>(
-                `SELECT count(*) AS c FROM omniroute.agentic_conversations ac ${floor}`
-              )
-            ).rows[0].c
+            (await tx.query<{ c: string }>(`SELECT count(*) AS c ${eligible}`)).rows[0].c
           );
           const rows = (
             await tx.query(
-              `${MULTI_TURN_CONVERSATION_SELECT} ${floor} ORDER BY ac.last_seen_at DESC,ac.insertion_order LIMIT $1 OFFSET $2`,
+              `WITH page AS MATERIALIZED (SELECT ac.* ${eligible}
+                 ORDER BY ac.last_seen_at DESC,ac.insertion_order LIMIT $1 OFFSET $2)
+               ${CONVERSATION_WITH_METADATA} FROM page ac ${LATEST_CONVERSATION_CALL}
+               ORDER BY ac.last_seen_at DESC,ac.insertion_order`,
               [Math.max(1, Math.min(filter.limit ?? 50, 200)), Math.max(0, filter.offset ?? 0)]
             )
           ).rows;

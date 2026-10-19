@@ -1,4 +1,8 @@
-import { intersectAllowedConnectionIds } from "./chat/connectionConstraints.ts";
+import { resolveKeyConnectionScope } from "@/lib/api/keyConnectionScope";
+import {
+  CONNECTION_SCOPE_DENIED_CODE,
+  connectionScopeIds,
+} from "@omniroute/open-sse/services/connectionScope.ts";
 import { hasQoderCallerTools } from "@omniroute/open-sse/services/qoderCapabilities";
 import { randomUUID } from "crypto";
 import { resolveChatRequestBody } from "./requestBody";
@@ -217,7 +221,6 @@ import {
   shouldRetrySameAccountTransport,
   sameAccountTransportRetryDelayMs,
 } from "../services/sameAccountTransportRetry";
-import { constrainConnectionsToQuota, resolveQuotaKeyScope } from "../../lib/quota/quotaKey";
 import { checkConnectionCapacity } from "../utils/backpressure";
 import {
   buildManagedLeaseErrorResponse,
@@ -1172,23 +1175,15 @@ async function handleChatImplementation(
       const resolvedModel = modelInfo.model || modelString;
       const githubGate = await ghComboGate(comboPreselectedCredentials, provider, resolvedModel);
       if (githubGate !== null) return githubGate;
-      let allowedConnections = intersectAllowedConnectionIds(
-        apiKeyInfo?.allowedConnections ?? null,
+      const connectionScope = await resolveKeyConnectionScope(
+        apiKeyInfo,
         comboPinAllowlist(true, target?.connectionId ?? null, target?.allowedConnectionIds ?? null)
       );
 
-      // A4: quota-exclusive keys must only use the pool's connection(s).
-      if (apiKeyInfo?.allowedQuotas && apiKeyInfo.allowedQuotas.length > 0) {
-        const quotaScope = await resolveQuotaKeyScope(apiKeyInfo.allowedQuotas);
-        allowedConnections = constrainConnectionsToQuota(
-          allowedConnections ?? [],
-          quotaScope.connectionIds
-        );
-      }
-
-      if (Array.isArray(allowedConnections) && allowedConnections.length === 0) {
+      if (connectionScope.kind === "deny") {
         return false;
       }
+      const allowedConnections = connectionScopeIds(connectionScope);
 
       const creds = await getProviderCredentialsWithQuotaPreflight(
         provider,
@@ -1691,19 +1686,10 @@ async function handleSingleModelChat(
       ? runtimeOptions.forcedConnectionId.trim()
       : "";
   const hasForcedConnection = forcedConnectionId.length > 0;
-  let effectiveAllowedConnections = intersectAllowedConnectionIds(
-    apiKeyInfo?.allowedConnections ?? null,
+  const connectionScope = await resolveKeyConnectionScope(
+    apiKeyInfo,
     comboPinAllowlist(isCombo, forcedConnectionId || null, runtimeOptions.allowedConnectionIds)
   );
-
-  // A4: quota-exclusive keys must only use the pool's connection(s).
-  if (apiKeyInfo?.allowedQuotas && apiKeyInfo.allowedQuotas.length > 0) {
-    const quotaScope = await resolveQuotaKeyScope(apiKeyInfo.allowedQuotas);
-    effectiveAllowedConnections = constrainConnectionsToQuota(
-      effectiveAllowedConnections ?? [],
-      quotaScope.connectionIds
-    );
-  }
 
   const bypassReason = forceLiveComboTest
     ? "combo live test"
@@ -1776,13 +1762,14 @@ async function handleSingleModelChat(
   // it persists (and only decreases) across `continue requestAttemptLoop` retries.
   let requestRetryBudgetLeftMs = retrySettings.budgetMs;
 
-  if (Array.isArray(effectiveAllowedConnections) && effectiveAllowedConnections.length === 0) {
+  if (connectionScope.kind === "deny") {
     log.debug("AUTH", `${provider}/${model} filtered out by connection-level routing constraints`);
     return errorResponse(
       HTTP_STATUS.SERVICE_UNAVAILABLE,
       "No eligible connections matched the requested routing constraints"
     );
   }
+  const effectiveAllowedConnections = connectionScopeIds(connectionScope);
 
   // 3. Credential retry loop
   let requestRetryAttempt = 0;
@@ -2176,6 +2163,7 @@ async function handleSingleModelChat(
             previousResponseResumed: runtimeOptions.previousResponseResumed,
             fallbackAttempts: runtimeOptions.fallbackAttempts,
             forcedConnectionId: hasForcedConnection ? forcedConnectionId : null, // #14116
+            connectionScope,
           },
           runtimeOptions
         );
@@ -2261,6 +2249,10 @@ async function handleSingleModelChat(
       }
 
       // A hard-lease rejection must not mutate account state or retry.
+      if (result.errorCode === CONNECTION_SCOPE_DENIED_CODE) {
+        releaseOAuthSession();
+        return result.response;
+      }
       if (
         runtimeOptions.managedLease &&
         (result.errorType === "lease_error" || String(result.errorCode || "").startsWith("LEASE_"))

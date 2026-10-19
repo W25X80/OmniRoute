@@ -1,4 +1,5 @@
 import { projectFailureUsageErrorCode } from "./failureUsage.ts";
+import { CONNECTION_SCOPE_DENIED_CODE } from "../../services/connectionScope.ts";
 import { getSelectedPostgresDatabase } from "@/lib/db/controlPlaneContext";
 
 export { extractSystemRoleMessages, relocateDirectiveOnlyMessages } from "./claudeSystemRole.ts";
@@ -152,6 +153,9 @@ export async function runStreamingResponse(deps: StreamingDeps) {
     body,
     clientRawRequest,
     comboStrategy,
+    onConnectionScopeRefusal,
+    connectionScope,
+    forcedConnectionId,
     connectionId,
     contextEditingEnabled,
     credentials,
@@ -216,7 +220,8 @@ export async function runStreamingResponse(deps: StreamingDeps) {
   try {
     const pipelineOutcome = await runProviderExecutionPipeline({
       policy: {
-        allowAccountRotation: !managedLease && comboStrategy !== "context-relay",
+        allowAccountRotation:
+          !managedLease && !forcedConnectionId && comboStrategy !== "context-relay",
         allowModelFallback: true,
         expectedConnectionId: managedLease
           ? String(getCurrentConnectionId() || connectionId || "") || undefined
@@ -230,6 +235,7 @@ export async function runStreamingResponse(deps: StreamingDeps) {
         stream,
       },
       connection: {
+        connectionScope,
         initialConnectionId: String(getCurrentConnectionId() || connectionId || ""),
         getCurrentConnectionId: () => getCurrentConnectionId() || undefined,
         getCredentials: () => (credentials || {}) as Record<string, unknown>,
@@ -318,6 +324,25 @@ export async function runStreamingResponse(deps: StreamingDeps) {
     pipelineRecovered = true;
     currentModel = pipelineOutcome.model;
     upstreamDiagnostic = pipelineOutcome.upstreamDiagnostic;
+    if (
+      pipelineOutcome.kind === "error" &&
+      pipelineOutcome.result.errorCode === CONNECTION_SCOPE_DENIED_CODE
+    ) {
+      onConnectionScopeRefusal(pipelineOutcome.result);
+      return {
+        response: pipelineOutcome.result,
+        carry: {
+          translatedBody,
+          currentModel,
+          effectiveServiceTier,
+          finalBody,
+          pipelineRecovered,
+          providerHeaders,
+          providerResponse,
+          providerUrl,
+        },
+      };
+    }
     if (pipelineOutcome.kind === "error") {
       providerResponse = pipelineOutcome.result.response;
       providerUrl = "";

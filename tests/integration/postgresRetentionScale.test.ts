@@ -1,3 +1,7 @@
+import {
+  insertConversationFixture,
+  deleteConversationFixture,
+} from "../helpers/persistence/conversationHistoryFixture.ts";
 import assert from "node:assert/strict";
 import { after, before, describe, it } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
@@ -58,9 +62,12 @@ describe(
         ["after", "2026-10-01T00:00:00.000001Z"],
       ];
       await database.transaction(async (tx) => {
-        await tx.query("TRUNCATE omniroute.conversation_turn_nodes");
+        await tx.query(
+          "TRUNCATE omniroute.conversation_turn_nodes,omniroute.conversation_node_counts"
+        );
         await tx.query("SET LOCAL TIME ZONE 'America/Los_Angeles'");
-        for (const [id, timestamp] of samples) await tx.query(insert, [id, timestamp]);
+        for (const [id, timestamp] of samples)
+          await insertConversationFixture(tx, insert, [id, timestamp]);
         await tx.query("SET LOCAL TIME ZONE 'UTC'");
         const rows = await tx.query<{ id: string; last_seen_at: string; matches: boolean }>(
           `SELECT id,last_seen_at,last_seen_at_retention=last_seen_at::timestamptz AS matches
@@ -95,7 +102,9 @@ describe(
         "yesterday",
         "tomorrow",
       ]) {
-        await assert.rejects(database.transaction((tx) => tx.query(insert, ["invalid", invalid])));
+        await assert.rejects(
+          database.transaction((tx) => insertConversationFixture(tx, insert, ["invalid", invalid]))
+        );
         await assert.rejects(
           database.transaction((tx) =>
             tx.query(
@@ -116,10 +125,13 @@ describe(
       if (queryOnly) {
         // Separates runtime query qualification from the offline migration budget.
         // Committed fixture batches avoid imposing one enormous INSERT on either.
-        await database.transaction((tx) => tx.query("TRUNCATE omniroute.conversation_turn_nodes"));
+        await database.transaction((tx) =>
+          tx.query("TRUNCATE omniroute.conversation_turn_nodes,omniroute.conversation_node_counts")
+        );
         for (let start = 0; start < scale; start += 100_000) {
           await database.transaction((tx) =>
-            tx.query(
+            insertConversationFixture(
+              tx,
               `INSERT INTO omniroute.conversation_turn_nodes(id,conversation_id,role,first_seen_at,last_seen_at)
              SELECT lpad(n::text,64,'0'),'scale','user',$3,$3
              FROM generate_series($1::integer,$2::integer) n`,
@@ -137,12 +149,15 @@ describe(
         await database.transaction((tx) => tx.query("ANALYZE omniroute.conversation_turn_nodes"));
       } else
         await database.transaction(async (tx) => {
-          await tx.query("TRUNCATE omniroute.conversation_turn_nodes");
+          await tx.query(
+            "TRUNCATE omniroute.conversation_turn_nodes,omniroute.conversation_node_counts"
+          );
           await tx.query(
             "ALTER TABLE omniroute.conversation_turn_nodes DROP COLUMN last_seen_at_retention CASCADE"
           );
           await tx.query("DROP FUNCTION omniroute.set_turn_node_retention_timestamp() CASCADE");
-          await tx.query(
+          await insertConversationFixture(
+            tx,
             `INSERT INTO omniroute.conversation_turn_nodes(id,conversation_id,role,first_seen_at,last_seen_at)
         SELECT lpad(n::text,64,'0'),'scale','user',$2,$2 FROM generate_series(1,$1::integer) n`,
             [scale, fresh]
@@ -300,8 +315,11 @@ describe(
 
     it("commits bounded batches, resumes the backlog and revisits a locked oldest row", async () => {
       await database.transaction(async (tx) => {
-        await tx.query("TRUNCATE omniroute.conversation_turn_nodes");
         await tx.query(
+          "TRUNCATE omniroute.conversation_turn_nodes,omniroute.conversation_node_counts"
+        );
+        await insertConversationFixture(
+          tx,
           `INSERT INTO omniroute.conversation_turn_nodes(id,conversation_id,role,first_seen_at,last_seen_at)
         SELECT lpad(n::text,64,'0'),'backlog','user',$1,$1 FROM generate_series(1,102001) n`,
           [old]
@@ -343,7 +361,7 @@ describe(
         1,
         "next pass revisits the unlocked row"
       );
-      await database.transaction((tx) => tx.query(insert, ["late-old", old]));
+      await database.transaction((tx) => insertConversationFixture(tx, insert, ["late-old", old]));
       assert.equal(
         await cleanup.deleteBefore(target, cutoff),
         1,
@@ -352,7 +370,9 @@ describe(
     });
 
     it("retains a concurrently refreshed node and later expires it at the configured cutoff", async () => {
-      await database.transaction((tx) => tx.query(insert, ["active-writer", old]));
+      await database.transaction((tx) =>
+        insertConversationFixture(tx, insert, ["active-writer", old])
+      );
       let release!: () => void;
       let updated!: () => void;
       const barrier = new Promise<void>((resolve) => {
@@ -383,13 +403,16 @@ describe(
 
     it("server cancellation rolls back a partially executed batch and the next pass resumes", async () => {
       await database.transaction(async (tx) => {
-        await tx.query("TRUNCATE omniroute.conversation_turn_nodes");
         await tx.query(
+          "TRUNCATE omniroute.conversation_turn_nodes,omniroute.conversation_node_counts"
+        );
+        await insertConversationFixture(
+          tx,
           `INSERT INTO omniroute.conversation_turn_nodes(id,conversation_id,role,first_seen_at,last_seen_at)
            SELECT 'cancel-'||lpad(n::text,4,'0'),'cancel','user',$1,$1 FROM generate_series(1,1200) n`,
           [old]
         );
-        await tx.query(insert, ["cancel-fresh", fresh]);
+        await insertConversationFixture(tx, insert, ["cancel-fresh", fresh]);
         // Sequence progress is visible outside the cancelled transaction, so the
         // oracle proves cancellation after some deletions, not before the batch.
         await tx.query("CREATE SEQUENCE omniroute.test_retention_delete_progress");
@@ -492,14 +515,19 @@ describe(
 
     it("preflights invalid historical timestamps atomically and backfills old public text verbatim", async () => {
       await database.transaction(async (tx) => {
-        await tx.query("TRUNCATE omniroute.conversation_turn_nodes");
+        await tx.query(
+          "TRUNCATE omniroute.conversation_turn_nodes,omniroute.conversation_node_counts"
+        );
         await tx.query(
           "ALTER TABLE omniroute.conversation_turn_nodes DROP COLUMN last_seen_at_retention CASCADE"
         );
         await tx.query("DROP FUNCTION omniroute.set_turn_node_retention_timestamp() CASCADE");
-        await tx.query(insert, ["old-offset", "2026-10-01T01:00:00.123456+02:00"]);
-        await tx.query(insert, ["old-utc", "2026-10-01 01:00:00"]);
-        await tx.query(insert, ["invalid", "not-a-date"]);
+        await insertConversationFixture(tx, insert, [
+          "old-offset",
+          "2026-10-01T01:00:00.123456+02:00",
+        ]);
+        await insertConversationFixture(tx, insert, ["old-utc", "2026-10-01 01:00:00"]);
+        await insertConversationFixture(tx, insert, ["invalid", "not-a-date"]);
       });
       const migrate = () =>
         database.transaction(async (tx) => {
@@ -512,10 +540,15 @@ describe(
           "SELECT 1 FROM information_schema.columns WHERE table_schema='omniroute' AND table_name='conversation_turn_nodes' AND column_name='last_seen_at_retention'"
         );
         assert.equal(columns.rowCount, 0, "failed preflight leaves no partial schema");
-        await tx.query("DELETE FROM omniroute.conversation_turn_nodes WHERE id='invalid'");
+        await deleteConversationFixture(
+          tx,
+          "DELETE FROM omniroute.conversation_turn_nodes WHERE id='invalid'"
+        );
       });
       for (const relative of ["now", "today", "yesterday", "tomorrow"]) {
-        await database.transaction((tx) => tx.query(insert, ["relative", relative]));
+        await database.transaction((tx) =>
+          insertConversationFixture(tx, insert, ["relative", relative])
+        );
         await assert.rejects(
           migrate(),
           (error: { sqlState?: string }) => error.sqlState === "22007"
@@ -525,7 +558,10 @@ describe(
             "SELECT 1 FROM information_schema.columns WHERE table_schema='omniroute' AND table_name='conversation_turn_nodes' AND column_name='last_seen_at_retention'"
           );
           assert.equal(columns.rowCount, 0);
-          await tx.query("DELETE FROM omniroute.conversation_turn_nodes WHERE id='relative'");
+          await deleteConversationFixture(
+            tx,
+            "DELETE FROM omniroute.conversation_turn_nodes WHERE id='relative'"
+          );
         });
       }
       const beforeRewrite = await database.transaction((tx) =>
@@ -561,9 +597,14 @@ describe(
       process.env.STORAGE_ENCRYPTION_KEY = "isolated-retention-encryption-key";
       try {
         await database.transaction(async (tx) => {
-          await tx.query("TRUNCATE omniroute.conversation_turn_nodes");
-          await tx.query(insert, ["microsecond", "2026-10-01T00:00:00.123456+02:00"]);
-          await tx.query(insert, ["unbounded", "infinity"]);
+          await tx.query(
+            "TRUNCATE omniroute.conversation_turn_nodes,omniroute.conversation_node_counts"
+          );
+          await insertConversationFixture(tx, insert, [
+            "microsecond",
+            "2026-10-01T00:00:00.123456+02:00",
+          ]);
+          await insertConversationFixture(tx, insert, ["unbounded", "infinity"]);
         });
         const snapshot = await capturePostgresApplicationSnapshot(database);
         const history = snapshot.tables.find((table) => table.name === target.table)!;

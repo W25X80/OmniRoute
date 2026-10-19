@@ -15,6 +15,7 @@ import { streamingNativeFixture } from "../helpers/persistence/streamingNativeIn
 import { closeNativeStreamingFixture } from "../helpers/persistence/nativeStreamingFixtureShutdown.ts";
 import type { PersistenceTailPermit } from "../../src/lib/db/persistenceRuntime.ts";
 import type { PostgresDatabase } from "../../src/lib/db/postgres/database.ts";
+import type { ConnectionScope } from "../../open-sse/services/connectionScope.ts";
 
 // Real runtime, PostgreSQL engine/catalog, handleChatCore, provider executor and stream owners.
 // Only provider HTTP and S3 bytes are controlled; this is not AWS/provider acceptance evidence.
@@ -157,7 +158,12 @@ test(
         for (let index = 0; index < 64; index++)
           permits.push(await runtime!.acquirePersistenceTail());
       });
-      const serve = (stream = true, signal?: AbortSignal, provider: "glm" | "openai" = "glm") =>
+      const serve = (
+        stream = true,
+        signal?: AbortSignal,
+        provider: "glm" | "openai" = "glm",
+        connectionScope?: ConnectionScope
+      ) =>
         runtime!.runPersistenceRequest(async () => {
           const model = provider === "glm" ? "glm-4.7" : "gpt-4o-mini";
           const selectedConnectionId = provider === "glm" ? connectionId : openAiConnectionId;
@@ -183,6 +189,7 @@ test(
                 : {}),
             },
             connectionId: selectedConnectionId,
+            connectionScope,
             apiKeyInfo: { id: keyId, name: "private-native-tail-fixture" },
             log: { debug() {}, info() {}, warn() {}, error() {} },
             skipResourcePressureGuard: true,
@@ -219,6 +226,58 @@ test(
       assert.equal(runtime.getPersistenceRuntimeStatus().streamTails, 64);
       await permits.pop()!.release();
       assert.equal(runtime.getPersistenceRuntimeStatus().streamTails, 63);
+      const { getPendingById, getPendingRequests } =
+        await import("../../src/lib/usage/usageHistory.ts");
+      const healthBefore = await verification.query(
+        "SELECT test_status,is_active,rate_limited_until,last_error FROM omniroute.provider_connections WHERE id=$1",
+        [connectionId]
+      );
+      for (const stream of [true, false]) {
+        const controller = new AbortController();
+        const pendingBefore = {
+          size: getPendingById().size,
+          byModel: JSON.stringify(getPendingRequests().byModel),
+          byAccount: JSON.stringify(getPendingRequests().byAccount),
+        };
+        const local = await serve(stream, controller.signal, "glm", {
+          kind: "connections",
+          ids: ["unselected-connection"],
+        });
+        assert.equal(local.success, false);
+        assert.equal(local.response.status, 403);
+        assert.equal((await local.response.json()).error.code, "connection_scope_denied");
+        assert.equal(executorCalls, 0, "a local scope refusal must not reach the executor");
+        assert.equal(fetchCalls, 0, "a local scope refusal must not spend upstream work");
+        assert.equal(getEventListeners(controller.signal, "abort").length, 0);
+        assert.equal(runtime.getPersistenceRuntimeStatus().streamTails, 63);
+        controller.abort();
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        assert.equal(getPendingById().size, pendingBefore.size);
+        assert.equal(JSON.stringify(getPendingRequests().byModel), pendingBefore.byModel);
+        assert.equal(JSON.stringify(getPendingRequests().byAccount), pendingBefore.byAccount);
+        assert.equal(runtime.getPersistenceRuntimeStatus().streamTails, 63);
+        assert.deepEqual(
+          (
+            await verification.query(
+              "SELECT test_status,is_active,rate_limited_until,last_error FROM omniroute.provider_connections WHERE id=$1",
+              [connectionId]
+            )
+          ).rows,
+          healthBefore.rows
+        );
+        assert.equal(
+          Number(
+            (
+              await verification.query(
+                "SELECT COUNT(*) AS count FROM omniroute.usage_history WHERE api_key_id=$1",
+                [keyId]
+              )
+            ).rows[0].count
+          ),
+          0,
+          "local refusal must not create upstream failure usage"
+        );
+      }
       for (const mode of [
         "upstream-error",
         "transport-error",

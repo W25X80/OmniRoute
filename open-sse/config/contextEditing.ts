@@ -53,7 +53,7 @@ export function applyContextEditingToBody(
 
   const existing =
     body.context_management && typeof body.context_management === "object"
-      ? (body.context_management as Record<string, unknown>)
+      ? { ...(body.context_management as Record<string, unknown>) }
       : {};
 
   const edits: ContextEditingEdit[] = Array.isArray(existing.edits)

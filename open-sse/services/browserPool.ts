@@ -252,8 +252,12 @@ export async function resolvePlaywrightProxy(
     }
     return proxy;
   } catch (err) {
-    console.warn("[BrowserPool] Failed to resolve proxy from DB:", err);
-    return undefined;
+    throw new Error(
+      "[BrowserPool] Proxy resolution failed; refusing direct connection (fail-closed)",
+      {
+        cause: err,
+      }
+    );
   }
 }
 

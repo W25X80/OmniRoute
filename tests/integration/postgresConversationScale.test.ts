@@ -1,3 +1,4 @@
+import { insertConversationFixture } from "../helpers/persistence/conversationHistoryFixture.ts";
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createPostgresAgenticConversationsRepository } from "../../src/lib/db/postgres/agenticConversationsRepository.ts";
@@ -38,7 +39,8 @@ test(
       );
       for (let start = 1; start <= nodes; start += 10000) {
         await setup.transaction((tx) =>
-          tx.query(
+          insertConversationFixture(
+            tx,
             `INSERT INTO omniroute.conversation_turn_nodes(id,conversation_id,parent_id,role,content_hash,first_seen_at,last_seen_at)
          SELECT 'scale-node-'||n,'scale-root-'||(n%$3+1),NULL,'user',repeat('a',64),'2026-10-15T00:00:00Z','2026-10-15T00:00:00Z'
          FROM generate_series($1::int,$2::int) n`,
@@ -54,7 +56,12 @@ test(
             [start, Math.min(logs, start + 9999), roots]
           )
         );
-      for (const table of ["agentic_conversations", "conversation_turn_nodes", "call_logs"])
+      for (const table of [
+        "agentic_conversations",
+        "conversation_turn_nodes",
+        "conversation_node_counts",
+        "call_logs",
+      ])
         await setup.transaction((tx) => tx.query(`ANALYZE omniroute.${table}`));
     } finally {
       await setup.close();

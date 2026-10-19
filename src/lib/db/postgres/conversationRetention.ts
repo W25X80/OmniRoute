@@ -1,4 +1,5 @@
 import type { PostgresTransaction } from "./database";
+import { subtractConversationNodeCounts } from "./conversationNodeCounts";
 import {
   advanceConversationHistory,
   lockConversationCreation,
@@ -29,6 +30,7 @@ export async function deleteExpiredConversationNodes(tx: PostgresTransaction, cu
       [roots, cutoff]
     );
     deleted = result.rowCount ?? 0;
+    await subtractConversationNodeCounts(tx, result.rows);
     await advanceConversationHistory(
       tx,
       result.rows.map((row) => row.conversation_id)
@@ -50,16 +52,18 @@ export async function deleteExpiredConversationNodes(tx: PostgresTransaction, cu
   ).rows;
   for (const { conversation_id: id } of orphans) {
     if (!(await lockConversationCreation(tx, id, true))) continue;
-    const result = await tx.query(
+    const result = await tx.query<{ conversation_id: string }>(
       `WITH expired AS MATERIALIZED (
          SELECT ctid FROM omniroute.conversation_turn_nodes n
          WHERE conversation_id=$1 AND last_seen_at_retention<$2::timestamptz
            AND NOT EXISTS(SELECT 1 FROM omniroute.agentic_conversations a WHERE a.id=$1)
          ORDER BY last_seen_at_retention,id LIMIT 1000 FOR UPDATE SKIP LOCKED)
-       DELETE FROM omniroute.conversation_turn_nodes WHERE ctid=ANY(ARRAY(SELECT ctid FROM expired))`,
+       DELETE FROM omniroute.conversation_turn_nodes WHERE ctid=ANY(ARRAY(SELECT ctid FROM expired))
+       RETURNING conversation_id`,
       [id, cutoff]
     );
     deleted += result.rowCount ?? 0;
+    await subtractConversationNodeCounts(tx, result.rows);
   }
   return deleted;
 }

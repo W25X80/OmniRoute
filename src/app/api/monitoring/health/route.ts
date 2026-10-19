@@ -9,7 +9,10 @@ import { AI_PROVIDERS } from "@/shared/constants/providers";
 import { isAuthenticated } from "@/shared/utils/apiAuth";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 import { getArtifactReconciliationStatus } from "@/lib/usage/artifactReconciliationStatus";
-import { getPersistenceBackgroundMetrics } from "@/lib/db/persistenceRuntime";
+import {
+  getPersistenceBackgroundMetrics,
+  runPersistenceBackgroundWork,
+} from "@/lib/db/persistenceRuntime";
 
 /**
  * GET /api/monitoring/health — System health overview
@@ -23,17 +26,22 @@ import { getPersistenceBackgroundMetrics } from "@/lib/db/persistenceRuntime";
 // fill, scrapes always receive the last payload immediately. An expired entry
 // is refreshed in the background — never by awaiting live credential probes.
 let healthPayloadCache: { payload: unknown; expiresAt: number } | null = null;
-let healthPayloadRefreshInFlight = false;
+let healthPayloadRefreshInFlight: Promise<unknown> | null = null;
 let healthPayloadCacheGeneration = 0;
 const HEALTH_PAYLOAD_TTL_MS = 1000;
 
+function invalidateHealthPayloadCache(): void {
+  healthPayloadCache = null;
+  healthPayloadRefreshInFlight = null;
+  healthPayloadCacheGeneration += 1;
+}
+
 /** Test-only: drop the in-process health payload cache. */
 export function __test_resetMonitoringHealthPayloadCache(): void {
-  healthPayloadCache = null;
-  healthPayloadRefreshInFlight = false;
-  healthPayloadCacheGeneration += 1;
+  invalidateHealthPayloadCache();
   deepHealthVerdictCache = null;
-  deepHealthRefreshInFlight = false;
+  deepHealthRefreshInFlight = null;
+  deepHealthCacheGeneration += 1;
 }
 
 /** Test-only: seed the deep-health verdict cache (proves TTL + status passthrough). */
@@ -49,7 +57,8 @@ function isDeepHealthOptedIn(request: Request): boolean {
   return new URL(request.url).searchParams.get("deep") === "1";
 }
 let deepHealthVerdictCache: { verdict: unknown; expiresAt: number } | null = null;
-let deepHealthRefreshInFlight = false;
+let deepHealthRefreshInFlight: Promise<void> | null = null;
+let deepHealthCacheGeneration = 0;
 
 // GHSA-mvf8-qc78-5mxm: the full health payload fingerprints the host (version,
 // node version, pid, memory, provider config). An anonymous caller — the common
@@ -67,20 +76,30 @@ function serveHealthPayload(fullView: boolean, payload: unknown) {
   return NextResponse.json(fullView ? payload : publicHealthView(payload));
 }
 
+function refreshHealthPayload(): Promise<unknown> {
+  if (healthPayloadRefreshInFlight) return healthPayloadRefreshInFlight;
+  const generation = healthPayloadCacheGeneration;
+  const work = runPersistenceBackgroundWork(
+    async () => {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      return rebuildHealthPayload(generation);
+    },
+    { owner: "monitoring.refresh" }
+  );
+  healthPayloadRefreshInFlight = work;
+  const clear = () => {
+    if (healthPayloadRefreshInFlight === work) healthPayloadRefreshInFlight = null;
+  };
+  void work.then(clear, clear);
+  return work;
+}
+
 function scheduleHealthPayloadRefresh(): void {
-  if (healthPayloadRefreshInFlight) return;
-  healthPayloadRefreshInFlight = true;
-  setImmediate(() => {
-    rebuildHealthPayload()
-      .catch((error) => {
-        console.warn(
-          "[API] GET /api/monitoring/health background refresh failed:",
-          error instanceof Error ? error.message : error
-        );
-      })
-      .finally(() => {
-        healthPayloadRefreshInFlight = false;
-      });
+  void refreshHealthPayload().catch((error) => {
+    console.warn(
+      "[API] GET /api/monitoring/health background refresh failed:",
+      error instanceof Error ? error.message : error
+    );
   });
 }
 
@@ -95,14 +114,17 @@ function withDeepHealth(payload: unknown, wantDeep: boolean): unknown {
 function refreshDeepHealthVerdict(): void {
   if (deepHealthRefreshInFlight) return;
   if (deepHealthVerdictCache && Date.now() <= deepHealthVerdictCache.expiresAt) return;
-  deepHealthRefreshInFlight = true;
-  setImmediate(() => {
-    void (async () => {
+  const generation = deepHealthCacheGeneration;
+  const work = runPersistenceBackgroundWork(
+    async () => {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      if (generation !== deepHealthCacheGeneration) return;
       try {
         const { probeDeepHealth, DEEP_HEALTH_VERDICT_TTL_MS, DEEP_HEALTH_PROBE_TIMEOUT_MS } =
           await import("@/lib/monitoring/observability");
         const { getCachedSettings } = await import("@/lib/db/readCache");
         const settings = (await getCachedSettings()) as Record<string, unknown>;
+        if (generation !== deepHealthCacheGeneration) return;
         const deepHealthUrl =
           typeof settings.deepHealthUrl === "string" ? settings.deepHealthUrl : "";
         if (!deepHealthUrl) return;
@@ -112,14 +134,26 @@ function refreshDeepHealthVerdict(): void {
           timeoutMs: DEEP_HEALTH_PROBE_TIMEOUT_MS,
           token: deepHealthToken,
         });
-        deepHealthVerdictCache = { verdict, expiresAt: Date.now() + DEEP_HEALTH_VERDICT_TTL_MS };
+        if (generation === deepHealthCacheGeneration) {
+          deepHealthVerdictCache = { verdict, expiresAt: Date.now() + DEEP_HEALTH_VERDICT_TTL_MS };
+        }
       } catch {
-        deepHealthVerdictCache = null;
-      } finally {
-        deepHealthRefreshInFlight = false;
+        if (generation === deepHealthCacheGeneration) deepHealthVerdictCache = null;
       }
-    })();
-  });
+    },
+    { owner: "monitoring.deep" }
+  );
+  deepHealthRefreshInFlight = work;
+  void work
+    .catch((error) => {
+      console.warn(
+        "[API] GET /api/monitoring/health deep refresh failed:",
+        error instanceof Error ? error.message : error
+      );
+    })
+    .finally(() => {
+      if (deepHealthRefreshInFlight === work) deepHealthRefreshInFlight = null;
+    });
 }
 
 export async function GET(request: Request) {
@@ -135,11 +169,11 @@ export async function GET(request: Request) {
   }
 
   try {
-    const payload = await rebuildHealthPayload();
+    const payload = await refreshHealthPayload();
     return serveHealthPayload(fullView, withDeepHealth(payload, wantDeep));
   } catch (error) {
     console.error("[API] GET /api/monitoring/health error:", error);
-    return NextResponse.json({
+    return serveHealthPayload(fullView, {
       status: "degraded",
       error: "Health check partially unavailable",
       timestamp: new Date().toISOString(),
@@ -165,8 +199,7 @@ export async function GET(request: Request) {
   }
 }
 
-async function rebuildHealthPayload(): Promise<unknown> {
-  const generation = healthPayloadCacheGeneration;
+async function rebuildHealthPayload(generation: number): Promise<unknown> {
   const readHealthValue = <T>(label: string, reader: () => T, fallback: T): T => {
     try {
       return reader();
@@ -366,7 +399,7 @@ export async function DELETE(request: Request) {
     const resetCount = before.length;
 
     resetAllCircuitBreakers();
-    healthPayloadCache = null; // a reset just happened — don't serve a stale GET snapshot
+    invalidateHealthPayloadCache();
 
     console.log(`[API] DELETE /api/monitoring/health — Reset ${resetCount} circuit breakers`);
 

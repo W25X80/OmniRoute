@@ -34,6 +34,14 @@
 // is interpolated into upstream URLs.
 export const AWS_REGION_PATTERN = /^[a-z]{2}-[a-z]+-\d{1,2}$/;
 
+/** Keep credential-bearing regional endpoints on AWS, including the fallback path. */
+export function safeAwsRegion(region: unknown, fallback = "us-east-1"): string {
+  const normalized = normalizeRegion(region);
+  if (AWS_REGION_PATTERN.test(normalized)) return normalized;
+  const safeFallback = normalizeRegion(fallback);
+  return AWS_REGION_PATTERN.test(safeFallback) ? safeFallback : "us-east-1";
+}
+
 /**
  * Regions where the Amazon Q Developer *profile* is currently hosted (AWS docs: "Supported
  * Regions for the Q Developer console and Q Developer profile"). These are the guaranteed

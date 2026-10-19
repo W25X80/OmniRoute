@@ -35,6 +35,39 @@ function toolUseEdits(body: Record<string, unknown> | undefined) {
   return (cm?.edits ?? []).filter((e) => e?.type === CLEAR_TOOL_USES_STRATEGY);
 }
 
+for (const credentials of [
+  { apiKey: "claude-key" },
+  { accessToken: "sk-ant-oat-isolation-test" },
+]) {
+  test(`Context Editing preserves the replay body with ${credentials.apiKey ? "API-key" : "OAuth"} auth`, async () => {
+    const body = {
+      model: "claude-opus-4-8",
+      max_tokens: 1024,
+      messages: [{ role: "user", content: "hi" }],
+      tool_choice: { type: "auto" },
+      context_management: { edits: [{ type: CLEAR_THINKING_STRATEGY, keep: "all" }] },
+    };
+    const before = structuredClone(body);
+    const { bodies, restore } = mockFetchCapture();
+    try {
+      await new DefaultExecutor("claude").execute({
+        model: body.model,
+        body,
+        stream: false,
+        credentials,
+        clientHeaders: { "x-app": "cli", "x-omniroute-effort": "off" },
+        contextEditing: { enabled: true },
+      });
+    } finally {
+      restore();
+    }
+    const outbound = bodies.find((candidate) => candidate.model === body.model);
+    assert.ok(outbound, "the provider request must reach fetch");
+    assert.equal(toolUseEdits(outbound).length, 1, "the outbound body must contain the edit");
+    assert.deepEqual(body, before, "a fallback must receive the original client body");
+  });
+}
+
 test("#5312: generic Claude OAuth clients do not get implicit adaptive thinking", async () => {
   const { bodies, restore } = mockFetchCapture();
   try {

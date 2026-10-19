@@ -1,6 +1,7 @@
 import type { ConversationTurnIndex } from "../agenticConversations";
 import type { PostgresTransaction } from "./database";
 import { acquirePostgresLock } from "./locks";
+import { addConversationNodeCount } from "./conversationNodeCounts";
 export { acquireConversationCreationLock as lockConversationCreation } from "./locks";
 
 /** Ordinary writers coexist; only an explicit whole-history reset takes this gate exclusively. */
@@ -126,5 +127,6 @@ export async function insertConversationChunks(
     );
     inserted += result.rowCount ?? 0;
   }
+  await addConversationNodeCount(tx, id, inserted);
   return inserted;
 }

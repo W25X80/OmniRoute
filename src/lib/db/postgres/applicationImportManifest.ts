@@ -161,3 +161,6 @@ export const APPLICATION_IMPORT_SOURCE_METADATA = [
 
 /** Physical file representation is accounted separately from portable logical tables. */
 export { POSTGRES_FILE_CONTENT_TABLES as APPLICATION_IMPORT_NATIVE_FILE_TABLES } from "./fileContentSchema";
+
+/** Reconstructed from logical history; never restored as a second source of truth. */
+export const APPLICATION_IMPORT_DERIVED_TABLES = ["conversation_node_counts"] as const;

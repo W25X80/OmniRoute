@@ -34,6 +34,7 @@
 import { recordEarlyKeepaliveBytes } from "./earlyKeepaliveByteBuffer.ts";
 import { SYNTHETIC_RESPONSES_SEQUENCE_NUMBER } from "./responsesSequence.ts";
 import { withUpstreamErrorDetail } from "./upstreamErrorDetail.ts";
+import { mergeAbortSignals } from "../executors/base/mergeAbortSignals.ts";
 
 const ENCODER = new TextEncoder();
 const KEEPALIVE_FRAME = ENCODER.encode(": keepalive\n\n");
@@ -322,7 +323,7 @@ export function __getDeadlineTokenRegistrySizeForTests(): number {
 /**
  * Route-side half of the slow-path deadline contract. Creates the internal
  * deadline controller and returns it alongside a request whose signal follows
- * both the client signal and the deadline (`AbortSignal.any`), so the handler
+ * both the client signal and the deadline (a self-cleaning merge), so the handler
  * observes a deadline abort exactly like a client disconnect.
  *
  * The wrapped request MUST be the one the route hands downstream (admission,
@@ -352,7 +353,7 @@ export function withDeadlineSignal(request: Request): {
 } {
   const deadlineController = new AbortController();
   const combined = request.signal
-    ? AbortSignal.any([request.signal, deadlineController.signal])
+    ? mergeAbortSignals(request.signal, deadlineController.signal)
     : deadlineController.signal;
   const headers = new Headers(request.headers);
   // Internal routing token only (never logged, never forwarded upstream — the
@@ -587,6 +588,12 @@ export async function withEarlyStreamKeepalive(
 
       const onAbort = () => {
         if (aborted) return;
+        // The merge's listener is registered before onExpired. Preserve the
+        // expiry frame when its abort reaches this handler first.
+        if (deadlineEnabled && deadlineController?.signal.aborted) {
+          onExpired();
+          return;
+        }
         aborted = true;
         stopDeadline();
         stopKeepalive();

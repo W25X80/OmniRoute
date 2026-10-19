@@ -78,6 +78,7 @@ test(
         { version: 8, name: "durable_artifact_recovery", digest_length: 64 },
         { version: 9, name: "conversation_concurrency", digest_length: 64 },
         { version: 10, name: "indexed_artifact_recovery_retirement", digest_length: 64 },
+        { version: 11, name: "conversation_node_counts", digest_length: 64 },
       ]);
       // Commit the genuine migration prefix, stopping only after successful version-4 SQL.
       await first.transaction((tx) => tx.query("DROP SCHEMA omniroute CASCADE"));

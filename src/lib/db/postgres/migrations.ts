@@ -28,6 +28,7 @@ import { POSTGRES_CONFIG_AUDIT_INDEX_STATEMENTS } from "./configAuditSchema";
 import { POSTGRES_RETENTION_SCHEMA_STATEMENTS } from "./retentionSchema";
 import { POSTGRES_ARTIFACT_RECOVERY_SCHEMA_STATEMENTS } from "./artifactRecoverySchema";
 import { POSTGRES_CONVERSATION_CONCURRENCY_STATEMENTS } from "./conversationConcurrencySchema";
+import { POSTGRES_CONVERSATION_COUNT_STATEMENTS } from "./conversationNodeCounts";
 import { acquirePostgresLock } from "./locks";
 
 interface Migration {
@@ -168,6 +169,11 @@ const migrations: readonly Migration[] = [
       // log IDs have a selective prefix, including parameters from OLD.id.
       'CREATE INDEX artifact_recovery_retirement_owner_idx ON omniroute.artifact_deletion_queue(call_log_order,call_log_id COLLATE "C") WHERE call_log_id IS NOT NULL',
     ],
+  },
+  {
+    version: 11,
+    name: "conversation_node_counts",
+    statements: POSTGRES_CONVERSATION_COUNT_STATEMENTS,
   },
 ];
 

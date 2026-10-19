@@ -10,7 +10,13 @@ import {
   APPLICATION_IMPORT_TABLES,
   APPLICATION_IMPORT_NATIVE_ONLY,
   APPLICATION_IMPORT_NATIVE_FILE_TABLES,
+  APPLICATION_IMPORT_DERIVED_TABLES,
 } from "./applicationImportManifest";
+import {
+  rebuildConversationNodeCounts,
+  verifyConversationNodeCounts,
+  verifyConversationNodeCountSchema,
+} from "./conversationNodeCounts";
 import {
   ApplicationImportError,
   APPLICATION_SNAPSHOT_LIMITS,
@@ -125,7 +131,8 @@ const logicalTables = new Set<string>([
   ...APPLICATION_IMPORT_NATIVE_ONLY,
 ]);
 const fileContentTables = new Set<string>(APPLICATION_IMPORT_NATIVE_FILE_TABLES);
-const allTables = new Set<string>([...logicalTables, ...fileContentTables]);
+const derivedTables = new Set<string>(APPLICATION_IMPORT_DERIVED_TABLES);
+const allTables = new Set<string>([...logicalTables, ...fileContentTables, ...derivedTables]);
 
 async function readTargetSchema(transaction: PostgresTransaction): Promise<TargetSchema> {
   const columns = await transaction.query<{
@@ -169,6 +176,24 @@ async function readTargetSchema(transaction: PostgresTransaction): Promise<Targe
     grouped.set(row.table, table);
   }
   if ([...allTables].some((name) => !grouped.has(name))) throw new ApplicationImportError("schema");
+  const counts = grouped.get("conversation_node_counts")!;
+  if (
+    counts.parents.length ||
+    counts.primary.length !== 1 ||
+    counts.primary[0] !== "conversation_id" ||
+    counts.columns.length !== 2 ||
+    counts.columns.some(
+      (column, index) =>
+        column.name !== ["conversation_id", "node_count"][index] ||
+        column.type !== ["text", "bigint"][index] ||
+        column.nullable ||
+        column.defaultExpression ||
+        column.identity ||
+        column.generated
+    )
+  )
+    throw new ApplicationImportError("schema", "conversation_node_counts");
+  await verifyConversationNodeCountSchema(transaction);
   const tables = [...grouped.values()];
   const authority = await transaction.query<
     Record<string, unknown>
@@ -760,6 +785,7 @@ async function verifyPlan(
   rowSource?: ApplicationRowSource
 ): Promise<void> {
   await getStoredFileContentBounds(transaction);
+  await verifyConversationNodeCounts(transaction);
   for (const table of plan.tables) {
     const count = (
       await transaction.query<{ count: string }>(
@@ -1092,6 +1118,7 @@ export async function importApplicationSnapshot(
         await transaction.query(`ALTER SEQUENCE ${qualified} RESTART WITH ${maximum + 1n}`);
       }
     }
+    await rebuildConversationNodeCounts(transaction);
     await verifyPlan(transaction, plan, rowSource);
     const tableCounts = Object.fromEntries(
       plan.tables.map((table) => [table.name, table.rowCarrier?.rowCount ?? table.rows.length])
@@ -1193,6 +1220,13 @@ export async function capturePostgresApplicationSnapshot(
       rows: [],
     };
     for (const table of schema.tables) {
+      if (derivedTables.has(table.name)) {
+        snapshot.excluded.push({
+          name: table.name,
+          reason: "derived history cardinality verified and reconstructed from logical nodes",
+        });
+        continue;
+      }
       if (fileContentTables.has(table.name)) {
         snapshot.excluded.push({
           name: table.name,
@@ -1368,6 +1402,7 @@ export async function capturePostgresApplicationSnapshot(
       });
     }
     snapshot.metadataTables.push(sequences);
+    await verifyConversationNodeCounts(transaction);
     return checkedApplicationSnapshot(snapshot);
   });
 }

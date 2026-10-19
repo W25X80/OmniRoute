@@ -224,25 +224,28 @@ describe(
       }
     });
 
-    it("latest-log ties retain the existing join cardinality and pagination", async () => {
+    it("latest-log ties preserve one root per page with the most recently stored call", async () => {
       const { id, node } = await seed();
       const child = randomUUID();
       await history.insertConversationTurnNodes(id, null, [
         { id: child, parentId: node, role: "user", contentHash: child },
       ]);
+      const logIds = [randomUUID(), randomUUID()];
       await database.transaction(async (tx) => {
         for (let i = 0; i < 2; i++)
           await tx.query(
             "INSERT INTO omniroute.call_logs(id,timestamp,session_tag) VALUES($1,$2,$3)",
-            [randomUUID(), "2099-01-01T00:00:00Z", id]
+            [logIds[i], "2099-01-01T00:00:00Z", id]
           );
       });
       const page = await history.listMultiTurnConversations({ limit: 200 });
-      assert.equal(page.rows.filter((row) => row.id === id).length, 2);
+      assert.equal(page.rows.filter((row) => row.id === id).length, 1);
+      assert.equal(page.rows.find((row) => row.id === id)!.lastCallLogId, logIds[1]);
+      assert.equal((await history.getMultiTurnConversationById(id))!.lastCallLogId, logIds[1]);
       assert.equal(page.total, 1);
       assert.equal(
         (await history.listMultiTurnConversations({ limit: 1, offset: 1 })).rows.length,
-        1
+        0
       );
     });
   }

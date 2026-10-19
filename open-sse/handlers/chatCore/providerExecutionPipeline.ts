@@ -18,6 +18,13 @@ import {
 import { COOLDOWN_MS } from "../../config/errorConfig.ts";
 import { normalizeHeaders } from "../../utils/headers.ts";
 import { shouldSkipCredentialRefresh } from "./skipCredentialRefresh.ts";
+import {
+  CONNECTION_SCOPE_DENIED_CODE,
+  UNRESTRICTED_CONNECTION_SCOPE,
+  connectionScopeIds,
+  connectionScopePermits,
+  type ConnectionScope,
+} from "../../services/connectionScope.ts";
 
 export interface ChatCoreExecutorResult {
   response: Response;
@@ -65,6 +72,7 @@ export interface PipelineTargetContext {
 }
 
 export interface PipelineConnectionContext {
+  connectionScope?: ConnectionScope;
   initialConnectionId: string;
   getCurrentConnectionId: () => string | undefined;
   getCredentials: () => Record<string, unknown>;
@@ -332,6 +340,22 @@ export async function runProviderExecutionPipeline(
   input: ProviderExecutionPipelineInput
 ): Promise<ProviderExecutionOutcome> {
   const { policy, target, connection, wire, state, sendProviderAttempt } = input;
+  const scope = connection.connectionScope ?? UNRESTRICTED_CONNECTION_SCOPE;
+  const scopeRefusal = (): ProviderExecutionOutcome => ({
+    kind: "error",
+    result: createErrorResult(
+      403,
+      "No eligible connection matched the requested routing constraints",
+      null,
+      CONNECTION_SCOPE_DENIED_CODE,
+      "connection_scope_error"
+    ),
+    providerUsage: null,
+    model: wire.currentModel,
+    connectionId: currentConnectionId(connection),
+  });
+  if (scope.kind === "deny") return scopeRefusal();
+  const allowedConnections = connectionScopeIds(scope);
   const maxAttempts = maxAttemptsFor(target.provider);
   const excludedIds: string[] = [];
   let attempts = 0;
@@ -351,6 +375,7 @@ export async function runProviderExecutionPipeline(
     antigravityByopRotationPending = false;
     authRefreshPending = false;
     modelFallbackPending = false;
+    if (!connectionScopePermits(scope, currentConnectionId(connection))) return scopeRefusal();
     const before = assertLease(policy, connection, wire.currentModel);
     if (before) return before;
 
@@ -406,11 +431,16 @@ export async function runProviderExecutionPipeline(
         await state.onClearSessionAffinity?.({ failedConnectionId: failedId });
       }
       const nextCreds = await connection
-        .getProviderCredentials("codex", null, null, wire.currentModel, {
+        .getProviderCredentials("codex", null, allowedConnections, wire.currentModel, {
           excludeConnectionIds: [...excludedIds],
         })
         .catch(() => null);
-      if (nextCreds && !nextCreds.allRateLimited && nextCreds.connectionId) {
+      if (
+        nextCreds &&
+        !nextCreds.allRateLimited &&
+        nextCreds.connectionId &&
+        connectionScopePermits(scope, String(nextCreds.connectionId))
+      ) {
         await state.onAuditAccountRotation?.({
           action: "codex.account_rotation",
           failedConnectionId: failedId,
@@ -441,11 +471,16 @@ export async function runProviderExecutionPipeline(
           );
         }
         const nextCreds = await connection
-          .getProviderCredentials("antigravity", null, null, wire.currentModel, {
+          .getProviderCredentials("antigravity", null, allowedConnections, wire.currentModel, {
             excludeConnectionIds: [...excludedIds],
           })
           .catch(() => null);
-        if (nextCreds && !nextCreds.allRateLimited && nextCreds.connectionId) {
+        if (
+          nextCreds &&
+          !nextCreds.allRateLimited &&
+          nextCreds.connectionId &&
+          connectionScopePermits(scope, String(nextCreds.connectionId))
+        ) {
           connection.replaceCredentials(nextCreds as Record<string, unknown>);
           antigravityByopRotationPending = true;
           continue;

@@ -5,6 +5,7 @@
  */
 
 import { meteredBudgetCost } from "@/lib/usage/meteredBudgetPolicy";
+import { CONNECTION_SCOPE_DENIED_CODE } from "../../services/connectionScope.ts";
 import { getSelectedControlPlane } from "@/lib/db/controlPlaneContext";
 import { scheduleQuotaShareConsumptionAsync } from "./quotaShareConsumption.ts";
 import { getSelectedPersistenceIdentity } from "@/lib/db/controlPlaneContext";
@@ -93,6 +94,9 @@ export async function runNonStreamingResponse(deps: NonStreamingDeps) {
     claudePromptCacheLogMeta: _claudePromptCacheLogMeta,
     clientRawRequest,
     comboStrategy,
+    onConnectionScopeRefusal,
+    connectionScope,
+    forcedConnectionId,
     connectionId,
     copilotCompatibleReasoning,
     createErrorResult,
@@ -240,6 +244,7 @@ export async function runNonStreamingResponse(deps: NonStreamingDeps) {
           stream: false,
         },
         connection: {
+          connectionScope,
           initialConnectionId: String(getCurrentConnectionId() || connectionId || ""),
           getCurrentConnectionId: () => getCurrentConnectionId() || undefined,
           getCredentials: () => (credentials || {}) as Record<string, unknown>,
@@ -334,7 +339,8 @@ export async function runNonStreamingResponse(deps: NonStreamingDeps) {
       expectedConnectionId: managedLease
         ? String(getCurrentConnectionId() || connectionId || "") || undefined
         : undefined,
-      allowAccountRotation: !managedLease && comboStrategy !== "context-relay",
+      allowAccountRotation:
+        !managedLease && !forcedConnectionId && comboStrategy !== "context-relay",
       allowModelFallback: true,
       executeProviderRequest: (modelToCall, allowDedup) =>
         executeProviderRequest(modelToCall, allowDedup),
@@ -367,6 +373,23 @@ export async function runNonStreamingResponse(deps: NonStreamingDeps) {
 
     if (legResult.kind === "error") {
       const err = legResult.result;
+      if (err.errorCode === CONNECTION_SCOPE_DENIED_CODE) {
+        onConnectionScopeRefusal(err);
+        return {
+          response: err,
+          carry: {
+            translatedBody,
+            currentModel,
+            finalBody,
+            providerResponse,
+            providerHeaders,
+            effectiveServiceTier,
+            claudePromptCacheLogMeta,
+            reasoningReplayHistory,
+            pipelineRecovered,
+          },
+        };
+      }
       const errMessage =
         err?.rawMessage ||
         (err?.originalError instanceof Error ? err.originalError.message : err?.error) ||

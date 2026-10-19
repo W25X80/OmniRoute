@@ -15,6 +15,120 @@ test("runProviderExecutionPipeline is importable", async () => {
   assert.equal(typeof mod.runProviderExecutionPipeline, "function");
 });
 
+for (const provider of ["codex", "antigravity"]) {
+  for (const stream of [false, true]) {
+    test(`${provider} ${stream ? "stream" : "JSON"} retry retains the connection scope`, async () => {
+      const { runProviderExecutionPipeline } =
+        await import("../../open-sse/handlers/chatCore/providerExecutionPipeline.ts");
+      const sent: string[] = [];
+      const input = makeInput({
+        provider,
+        stream,
+        policy: { allowAccountRotation: true, allowModelFallback: false },
+        send: async () => {
+          const id = input.connection.getCurrentConnectionId()!;
+          sent.push(id);
+          return sent.length === 1
+            ? makeAttempt(
+                {
+                  error: {
+                    message: provider === "codex" ? "quota exhausted" : "gcp_project_required",
+                  },
+                },
+                provider === "codex" ? 429 : 422
+              )
+            : makeAttempt({ choices: [{ message: { content: "ok" } }] }, 200);
+        },
+        getProviderCredentials: (async (_provider, _exclude, allowed) => {
+          assert.deepEqual(
+            allowed,
+            ["conn-a", "conn-c"],
+            "the selector must never see an unrestricted retry"
+          );
+          return { connectionId: "conn-c", accessToken: "isolated" };
+        }) as PipelineConnectionContext["getProviderCredentials"],
+      });
+      input.connection.connectionScope = { kind: "connections", ids: ["conn-a", "conn-c"] };
+      const result = await runProviderExecutionPipeline(input);
+      assert.equal(result.kind, "response");
+      assert.deepEqual(sent, ["conn-a", "conn-c"]);
+    });
+  }
+}
+
+test("denied or mismatched connection scopes never reach selection or dispatch", async () => {
+  const { runProviderExecutionPipeline } =
+    await import("../../open-sse/handlers/chatCore/providerExecutionPipeline.ts");
+  for (const connectionScope of [
+    { kind: "deny" } as const,
+    { kind: "connections", ids: ["conn-b"] } as const,
+  ]) {
+    let sends = 0,
+      selections = 0;
+    const input = makeInput({
+      provider: "codex",
+      policy: { allowAccountRotation: true, allowModelFallback: true },
+      send: async () => {
+        sends++;
+        return makeAttempt({}, 200);
+      },
+      getProviderCredentials: (async () => {
+        selections++;
+        return null;
+      }) as PipelineConnectionContext["getProviderCredentials"],
+    });
+    input.connection.connectionScope = connectionScope;
+    assert.equal((await runProviderExecutionPipeline(input)).kind, "error");
+    assert.equal(sends, 0);
+    assert.equal(selections, 0);
+  }
+});
+
+for (const provider of ["codex", "antigravity"]) {
+  test(`${provider} cannot widen a resolved scope through a mutated selector argument`, async () => {
+    const { runProviderExecutionPipeline } =
+      await import("../../open-sse/handlers/chatCore/providerExecutionPipeline.ts");
+    const sent: string[] = [];
+    const audits: string[] = [];
+    const learned: string[] = [];
+    const input = makeInput({
+      provider,
+      policy: { allowAccountRotation: true, allowModelFallback: false },
+      state: {
+        recordRateLimitHeaders: (_provider, id) => {
+          learned.push(id!);
+        },
+        onAuditAccountRotation: async ({ newConnectionId }) => {
+          audits.push(newConnectionId);
+        },
+      },
+      getProviderCredentials: (async (_provider, _exclude, allowed) => {
+        assert.deepEqual(allowed, ["conn-a", "conn-c"]);
+        allowed!.splice(0, allowed!.length, "outside");
+        return { connectionId: "outside", accessToken: "never-send" };
+      }) as PipelineConnectionContext["getProviderCredentials"],
+      send: async () => {
+        sent.push(input.connection.getCurrentConnectionId()!);
+        return makeAttempt(
+          { error: { message: provider === "codex" ? "quota exhausted" : "gcp_project_required" } },
+          provider === "codex" ? 429 : 422
+        );
+      },
+    });
+    input.connection.connectionScope = { kind: "connections", ids: ["conn-a", "conn-c"] };
+    const outcome = await runProviderExecutionPipeline(input);
+    assert.equal(outcome.kind, "error");
+    assert.deepEqual(sent, ["conn-a"]);
+    assert.deepEqual(audits, []);
+    assert.deepEqual(input.connection.connectionScope.ids, ["conn-a", "conn-c"]);
+    assert.ok(learned.length > 0);
+    assert.ok(
+      learned.every((id) => id === "conn-a"),
+      "the genuine failure stays with its owner"
+    );
+  });
+}
+
 function jsonResponse(body: unknown, status: number, extraHeaders: Record<string, string> = {}) {
   return new Response(JSON.stringify(body), {
     status,

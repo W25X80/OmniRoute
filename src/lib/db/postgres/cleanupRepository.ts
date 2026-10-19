@@ -253,6 +253,8 @@ export function createPostgresCleanupRepository(database: PostgresDatabase) {
         }
         if (!(await exists(transaction, table))) return 0;
         const result = await transaction.query(`DELETE FROM ${qualified}`);
+        if (table === "conversation_turn_nodes")
+          await transaction.query("DELETE FROM omniroute.conversation_node_counts");
         return result.rowCount ?? 0;
       });
     },
@@ -286,12 +288,47 @@ export function createPostgresCleanupRepository(database: PostgresDatabase) {
             counts[target.resultKey] = 0;
             continue;
           }
+          const predicate = cutoff
+            ? target.cutoff === "iso"
+              ? `WHERE "${target.column}"::timestamptz < $1::timestamptz`
+              : `WHERE "${target.column}" < $1`
+            : "";
+          const values = cutoff ? [cutoffValue(target, cutoff)] : [];
+          if (target.table === "conversation_turn_nodes" && cutoff) {
+            const result = await transaction.query<{
+              deleted: string;
+              expected: string;
+              updated: string;
+            }>(
+              `WITH removed AS (DELETE FROM ${table} ${predicate} RETURNING conversation_id),
+               deltas AS MATERIALIZED (SELECT conversation_id,count(*) AS removed
+                 FROM removed GROUP BY conversation_id),
+               updated AS (UPDATE omniroute.conversation_node_counts c
+                 SET node_count=c.node_count-d.removed FROM deltas d
+                 WHERE c.conversation_id=d.conversation_id AND c.node_count>=d.removed
+                 RETURNING c.conversation_id)
+               SELECT (SELECT count(*)::text FROM removed) AS deleted,
+                 (SELECT count(*)::text FROM deltas) AS expected,
+                 (SELECT count(*)::text FROM updated) AS updated`,
+              values
+            );
+            const summary = result.rows[0];
+            if (!summary || summary.expected !== summary.updated)
+              throw new Error("Conversation node count integrity failure");
+            counts[target.resultKey] = Number(summary.deleted);
+            await transaction.query(
+              "DELETE FROM omniroute.conversation_node_counts WHERE node_count=0"
+            );
+            continue;
+          }
           const result = await transaction.query<{ artifact_relpath: string | null }>(
-            `DELETE FROM ${table} ${cutoff ? (target.cutoff === "iso" ? `WHERE "${target.column}"::timestamptz < $1::timestamptz` : `WHERE "${target.column}" < $1`) : ""}
+            `DELETE FROM ${table} ${predicate}
              ${target.table === "call_logs" ? "RETURNING artifact_relpath" : ""}`,
-            cutoff ? [cutoffValue(target, cutoff)] : []
+            values
           );
           counts[target.resultKey] = result.rowCount ?? 0;
+          if (target.table === "conversation_turn_nodes")
+            await transaction.query("DELETE FROM omniroute.conversation_node_counts");
           if (target.table === "call_logs") {
             for (const row of result.rows)
               if (row.artifact_relpath) artifacts.push(row.artifact_relpath);

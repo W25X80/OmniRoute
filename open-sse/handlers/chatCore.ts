@@ -231,6 +231,7 @@ import { handleBypassRequest } from "../utils/bypassHandler.ts";
 import { saveRequestUsage, trackPendingRequest, appendRequestLog } from "@/lib/usageDb";
 import {
   finalizePendingScope,
+  finalizePendingScopeById,
   initialPendingBody,
   updatePendingScope,
 } from "@/lib/usage/pendingRequestScope";
@@ -443,6 +444,7 @@ async function handleChatCoreInner({
   videoBridgeLog = undefined,
   fallbackAttempts = undefined,
   forcedConnectionId = null, // #14116: caller's pinned/requested connection, vs credentials.connectionId below
+  connectionScope = undefined,
   previousResponseResumed = undefined, // rehydrated-continuation flag from chat.ts; noted below, no semantics.
 }) {
   delete (body as Record<string, unknown>)._omniroutePreviousResponseResumed;
@@ -3713,9 +3715,20 @@ async function handleChatCoreInner({
     );
   };
 
+  const onConnectionScopeRefusal = (result: { status: number; errorCode?: string; error?: string }) => {
+    streamController.abort();
+    finalizePendingScopeById(pendingScope, {
+      status: result.status,
+      errorCode: result.errorCode,
+      error: result.error,
+    });
+  };
   let pipelineRecovered = false;
   if (stream) {
     const streamingOutcome = await runStreamingResponse({
+      onConnectionScopeRefusal,
+      connectionScope,
+      forcedConnectionId,
       reportSignatureFailure,
       apiKeyInfo,
       persistAttemptLogs,
@@ -3793,6 +3806,9 @@ async function handleChatCoreInner({
   // Non-streaming response
   if (!stream) {
     const nonStreamingOutcome = await runNonStreamingResponse({
+      onConnectionScopeRefusal,
+      connectionScope,
+      forcedConnectionId,
       reportSignatureFailure,
       apiKeyInfo,
       appendRequestLog,

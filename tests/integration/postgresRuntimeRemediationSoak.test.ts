@@ -1,3 +1,7 @@
+import {
+  insertConversationFixture,
+  deleteConversationFixture,
+} from "../helpers/persistence/conversationHistoryFixture.ts";
 import assert from "node:assert/strict";
 import { AsyncLocalStorage, AsyncResource } from "node:async_hooks";
 import { createHash, randomUUID, randomFillSync } from "node:crypto";
@@ -600,7 +604,8 @@ test(
         // Committed bounded setup statements; the timed phase never widens live transaction guards.
         for (let offset = 0; offset < historyRows; offset += 10000)
           await seeder.transaction((tx) =>
-            tx.query(
+            insertConversationFixture(
+              tx,
               `INSERT INTO omniroute.conversation_turn_nodes(id,conversation_id,parent_id,role,content_hash,first_seen_at,last_seen_at)
        SELECT $1||n,$2,NULL,'user',repeat('a',64),$3,$3 FROM generate_series($4::int,$5::int) n`,
               [
@@ -1021,9 +1026,11 @@ test(
           assert.ok(index.nodeIds.size >= 1088);
           assert.ok(nodes.every((node) => index.nodeIds.has(node.id)));
           await database.transaction((tx) =>
-            tx.query("DELETE FROM omniroute.conversation_turn_nodes WHERE id=ANY($1::text[])", [
-              nodes.map((node) => node.id),
-            ])
+            deleteConversationFixture(
+              tx,
+              "DELETE FROM omniroute.conversation_turn_nodes WHERE id=ANY($1::text[])",
+              [nodes.map((node) => node.id)]
+            )
           );
           for (const node of nodes) appendIds.delete(node.id);
         } else if (lane === "reads") {
@@ -1258,7 +1265,8 @@ test(
             const database = getSelectedPostgresDatabase()!;
             const cutoff = new Date(Date.now() - 30 * 86400000).toISOString();
             await database.transaction((tx) =>
-              tx.query(
+              insertConversationFixture(
+                tx,
                 `INSERT INTO omniroute.conversation_turn_nodes(id,conversation_id,role,content_hash,first_seen_at,last_seen_at)
              SELECT $1||n,$2,'user','expired',$3,$3 FROM generate_series(1,250) n`,
                 [
@@ -1364,9 +1372,11 @@ test(
         orphanFiles.clear();
         if (appendIds.size)
           await database.transaction((tx) =>
-            tx.query("DELETE FROM omniroute.conversation_turn_nodes WHERE id=ANY($1::text[])", [
-              [...appendIds],
-            ])
+            deleteConversationFixture(
+              tx,
+              "DELETE FROM omniroute.conversation_turn_nodes WHERE id=ANY($1::text[])",
+              [[...appendIds]]
+            )
           );
         appendIds.clear();
         for (const [id, reference] of publicationRefs) {
