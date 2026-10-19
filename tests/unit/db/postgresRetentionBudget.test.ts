@@ -11,6 +11,7 @@ const target = { table: "conversation_turn_nodes", column: "last_seen_at", cutof
 function fixture(onDelete: () => void = () => {}) {
   let batches = 0;
   let commits = 0;
+  let projectedNodeCount: number | null = 100_000;
   const database = {
     async transaction<T>(body: (tx: PostgresTransaction) => Promise<T>) {
       const result = await body({
@@ -35,6 +36,23 @@ function fixture(onDelete: () => void = () => {}) {
             rows = Array.from({ length: 1000 }, () => ({ conversation_id: "root" }));
             rowCount = 1000;
             command = "DELETE";
+          } else if (sql.startsWith("WITH locked AS MATERIALIZED")) {
+            assert.match(sql, /ORDER BY conversation_id COLLATE "C" FOR UPDATE/);
+            assert.match(sql, /c\.node_count>=d\.removed/);
+            assert.deepEqual(values, [["root"], [1000]]);
+            if (projectedNodeCount !== null && projectedNodeCount >= 1000) {
+              projectedNodeCount -= 1000;
+              rowCount = 1;
+              command = "UPDATE";
+            }
+          } else if (sql.startsWith("DELETE FROM omniroute.conversation_node_counts")) {
+            assert.match(sql, /node_count=0/);
+            assert.deepEqual(values, [["root"]]);
+            if (projectedNodeCount === 0) {
+              projectedNodeCount = null;
+              rowCount = 1;
+              command = "DELETE";
+            }
           } else if (sql.startsWith("UPDATE omniroute.agentic_conversations")) {
             assert.match(sql, /history_revision=history_revision\+1/);
             assert.deepEqual(values, [["root"]]);

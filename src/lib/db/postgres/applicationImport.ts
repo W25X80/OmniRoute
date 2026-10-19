@@ -866,7 +866,7 @@ async function* plannedRowBatches(
     for await (const rows of readApplicationHistory(table.rowCarrier, source))
       yield rows.map((row) =>
         [...row.values, { kind: "integer" as const, value: row.rowid }].map((cell, index) =>
-          checkedCell(cell, table.columns[index], table.name)
+          checkedCell(cell as ApplicationImportCell, table.columns[index], table.name)
         )
       );
     return;

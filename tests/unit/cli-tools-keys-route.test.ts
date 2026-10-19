@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { SignJWT } from "jose";
+import { createManagementSessionToken } from "../helpers/managementSession.ts";
 
 const keysRoute = await import("../../src/app/api/keys/route.ts");
 const cliToolsKeysRoute = await import("../../src/app/api/cli-tools/keys/route.ts");
@@ -10,13 +10,7 @@ const originalJwtSecret = process.env.JWT_SECRET;
 const originalApiKeySecret = process.env.API_KEY_SECRET;
 
 async function createAuthCookie() {
-  process.env.JWT_SECRET = "test-cli-tools-keys-secret";
-  const secret = new TextEncoder().encode(process.env.JWT_SECRET);
-  const token = await new SignJWT({ authenticated: true, sub: "test-user" })
-    .setProtectedHeader({ alg: "HS256" })
-    .setIssuedAt()
-    .setExpirationTime("1h")
-    .sign(secret);
+  const token = await createManagementSessionToken("test-cli-tools-keys-secret");
 
   return `auth_token=${token}`;
 }
@@ -28,7 +22,7 @@ test.afterEach(() => {
   else process.env.API_KEY_SECRET = originalApiKeySecret;
 });
 
-test("CLI tools key list can return unmasked keys for authenticated internal consumers", async () => {
+test("CLI tools key list can return unmasked keys for an authenticated dashboard session", async () => {
   process.env.API_KEY_SECRET = "test-api-key-secret";
   const created = await createApiKey("CLI Tools Test Key", "test-machine-cli-tools");
 
@@ -72,6 +66,7 @@ test("general keys route stays masked for non-CLI consumers", async () => {
     assert.ok(key, "created key should be present");
     assert.notEqual(key.key, created.key);
     assert.match(key.key, /^.{8}\*\*\*\*.*$/);
+    assert.equal(key.rawKey, undefined);
   } finally {
     await deleteApiKey(created.id);
   }

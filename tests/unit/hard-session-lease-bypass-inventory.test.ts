@@ -33,7 +33,7 @@ const EXPECTED: Record<InventoryKind, Record<string, number>> = {
     "open-sse/handlers/chatCore/emptyTurnRetryLoop.ts": 1,
     "open-sse/handlers/chatCore/providerExecutionPipeline.ts": 2,
     "open-sse/services/imageCombo.ts": 1,
-    "open-sse/services/speechCombo.ts": 2,
+    "open-sse/services/speechCombo.ts": 1,
     "open-sse/services/videoCombo.ts": 2,
     "src/app/api/compression/compare/verify/route.ts": 1,
     "src/app/api/internal/codex-responses-ws/route.ts": 1,
@@ -43,10 +43,10 @@ const EXPECTED: Record<InventoryKind, Record<string, number>> = {
     "src/app/api/search/providers/route.ts": 3,
     "src/app/api/v1/_shared/elevenLabsProxy.ts": 1,
     "src/app/api/v1/_shared/fishAudioProxy.ts": 1,
-    "src/app/api/v1/audio/speech/route.ts": 2,
+    "src/app/api/v1/audio/speech/route.ts": 1,
     "src/app/api/v1/_shared/videoModelResolution.ts": 1,
-    "src/app/api/v1/audio/transcriptions/route.ts": 3,
-    "src/app/api/v1/audio/translations/route.ts": 2,
+    "src/app/api/v1/audio/transcriptions/route.ts": 2,
+    "src/app/api/v1/audio/translations/route.ts": 1,
     "src/app/api/v1/classify/route.ts": 1,
     // v3.8.51 #11754: the second resolveImageRouteModel() call (a duplicate
     // of the retirement-check one hoisted before enforceApiKeyPolicy) was
@@ -89,6 +89,10 @@ const EXPECTED: Record<InventoryKind, Record<string, number>> = {
     "src/lib/search/executeWebSearch.ts": 2,
     "src/lib/skills/webFetchExecution.ts": 1,
     "src/sse/handlers/chat.ts": 2,
+    // The three audio routes and speechCombo delegate their former keyless
+    // probes here (four sites -> one). The scoped selector still awaits auth's
+    // exclusive-lease occupancy policy without a managed lease: class B.
+    "src/sse/services/audioTargetSelection.ts": 1,
     "src/sse/services/auth.ts": 4,
     "src/sse/services/imageCredentialRetry.ts": 1,
   },

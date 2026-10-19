@@ -228,6 +228,7 @@ const planCode = ownerProjection(
     "checkedCell",
     "columnOrder",
     "buildPlan",
+    "addManagementAuthPlan",
     "addArtifactPublicationPlan",
     "artifactPublicationValues",
   ],
@@ -236,6 +237,7 @@ const planCode = ownerProjection(
 import {applicationImportDigest as canonical} from "./applicationImportDigest.ts";
 import {APPLICATION_IMPORT_NATIVE_ONLY,APPLICATION_IMPORT_TABLES} from "./applicationImportManifest.ts";
 import {ApplicationImportError,applicationSnapshotDigest} from "./applicationSnapshot.ts";
+import {AUTH_GENERATION_SETTING,readAuthGeneration} from "../authSettingsSemantics";
 `
 );
 const checkpointCode = ownerProjection(

@@ -65,14 +65,23 @@ function scheduler() {
     pending.push({ resource, run: () => resource.runInAsyncScope(callback) });
     return {};
   });
+  async function flush() {
+    for (let count = 0; count < 20 && pending.length; count++) {
+      pending.shift()!.run();
+      await tick();
+    }
+  }
+  async function flushUntil(predicate: () => boolean, message: string) {
+    for (let count = 0; count < 50 && !predicate(); count++) {
+      await tick();
+      if (pending.length) await flush();
+    }
+    assert.ok(predicate(), message);
+  }
   return {
     pending,
-    async flush() {
-      for (let count = 0; count < 20 && pending.length; count++) {
-        pending.shift()!.run();
-        await tick();
-      }
-    },
+    flush,
+    flushUntil,
     close() {
       for (const resource of resources) resource.emitDestroy();
     },
@@ -232,8 +241,12 @@ test(
       advance();
       const gate = barrier();
       state.readBarrier = gate.promise;
+      const readsBeforeRefresh = state.reads;
       await runtime.runPersistenceRequest(() => route.GET(request()));
-      await clock.flush();
+      await clock.flushUntil(
+        () => state.reads > readsBeforeRefresh,
+        "the admitted refresh must enter its settings read before shutdown starts"
+      );
       const closing = runtime.closePersistenceRuntime();
       await tick();
       assert.equal(fixture.planeCloses, 0);

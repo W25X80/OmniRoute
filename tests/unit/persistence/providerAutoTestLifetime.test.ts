@@ -77,9 +77,33 @@ const fixtureUrl = new URL(
   "../../helpers/persistence/providerAutoTestLifetimeFixture.ts",
   import.meta.url
 ).href;
+const managementSessionUrl = new URL("../../helpers/managementSession.ts", import.meta.url).href;
+const dashboardSessionTokenUrl = new URL(
+  "../../../src/shared/utils/dashboardSessionToken.ts",
+  import.meta.url
+).href;
+const settingsUrl = new URL("../../../src/lib/db/settings.ts", import.meta.url).href;
+const managementAuthGeneration = "00000000-0000-4000-8000-000000000001";
+const authSettingsFixtureCode = [
+  `import { getSettings } from ${JSON.stringify(settingsUrl)};`,
+  `const generation = ${JSON.stringify(managementAuthGeneration)};`,
+  "export async function getAuthSettingsSnapshot() {",
+  "  const settings = { ...(await getSettings()), managementAuthGeneration: generation };",
+  "  return { settings, revision: 0, generation };",
+  "}",
+].join("\n");
+const authSettingsFixtureUrl = `data:text/javascript,${encodeURIComponent(authSettingsFixtureCode)}`;
+// Mint and verify against the actual settings repository, adding only a stable auth generation.
+// The local SQL fixture supports that repository's query but not the compact auth-only query.
 const hooks = registerHooks({
   resolve(specifier, context, next) {
     const parent = decodeURIComponent(context.parentURL || "");
+    // Keep the real dashboard verifier while making its auth-generation input deterministic.
+    if (
+      (parent === managementSessionUrl && specifier === "../../src/lib/db/authSettings.ts") ||
+      (parent === dashboardSessionTokenUrl && specifier === "@/lib/db/authSettings")
+    )
+      return { url: authSettingsFixtureUrl, shortCircuit: true };
     const replace =
       (parent.endsWith("/db/persistenceRuntime.ts") &&
         [

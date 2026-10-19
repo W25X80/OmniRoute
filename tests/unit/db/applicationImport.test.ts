@@ -2,6 +2,7 @@ import {
   APPLICATION_IMPORT_TABLES,
   APPLICATION_IMPORT_NATIVE_ONLY,
   APPLICATION_IMPORT_NATIVE_FILE_TABLES,
+  APPLICATION_IMPORT_DERIVED_TABLES,
 } from "../../../src/lib/db/postgres/applicationImportManifest.ts";
 import {
   captureNativeBlob,
@@ -89,7 +90,15 @@ function reorderedJson(value: unknown): unknown {
 
 function fixture(initial: Record<string, unknown>[] = []) {
   const calls: { text: string; values?: unknown[] }[] = [],
-    rows = [...initial];
+    managementGeneration = "4a5be1c0-7bd8-4e51-8db6-7c0a79d0a95b",
+    rows = [
+      {
+        namespace: "settings",
+        key: "managementAuthGeneration",
+        value: JSON.stringify(managementGeneration),
+      },
+      ...initial,
+    ];
   let epoch: Record<string, unknown> | undefined = {
     singleton: true,
     authority_id: "91ae17e6-f411-4c61-8a17-7538d11fb860",
@@ -103,6 +112,7 @@ function fixture(initial: Record<string, unknown>[] = []) {
       ...APPLICATION_IMPORT_TABLES,
       ...APPLICATION_IMPORT_NATIVE_ONLY,
       ...APPLICATION_IMPORT_NATIVE_FILE_TABLES,
+      ...APPLICATION_IMPORT_DERIVED_TABLES,
     ]),
   ].map((name) => ({
     name,
@@ -111,7 +121,9 @@ function fixture(initial: Record<string, unknown>[] = []) {
         ? ["namespace", "key", "value"]
         : name === "api_key_policy_epoch"
           ? ["singleton", "authority_id", "generation"]
-          : ["id"],
+          : name === "conversation_node_counts"
+            ? ["conversation_id", "node_count"]
+            : ["id"],
   }));
   const answer = (text: string, values?: unknown[]): PostgresResult => {
     let data: Record<string, unknown>[] = [];
@@ -128,7 +140,9 @@ function fixture(initial: Record<string, unknown>[] = []) {
                   : name === "generation"
                     ? "bigint"
                     : "uuid"
-                : "text",
+                : table.name === "conversation_node_counts" && name === "node_count"
+                  ? "bigint"
+                  : "text",
             nullable: false,
             defaultExpression: null,
             identity: "",
@@ -139,9 +153,25 @@ function fixture(initial: Record<string, unknown>[] = []) {
     else if (text.includes('AS "primary"'))
       data = columns.map((table) => ({
         table: table.name,
-        primary: table.name === "key_value" ? ["namespace", "key"] : table.columns,
+        primary:
+          table.name === "key_value"
+            ? ["namespace", "key"]
+            : table.name === "conversation_node_counts"
+              ? ["conversation_id"]
+              : table.columns,
         parents: [],
       }));
+    else if (text.includes("conversation_node_counts_nonnegative")) {
+      assert.match(text, /count\(\*\)=3 AND count\(DISTINCT a\.attcollation\)=1/);
+      assert.match(text, /convalidated/);
+      assert.match(text, /pg_get_expr\(conbin,conrelid\)='\(node_count >= 0\)'/);
+      data = [{ compatible: true }];
+    } else if (
+      text.startsWith(
+        "SELECT value FROM omniroute.key_value WHERE namespace='settings' AND key='managementAuthGeneration'"
+      )
+    )
+      data = [{ value: JSON.stringify(managementGeneration) }];
     else if (text.startsWith("WITH headers AS"))
       data = [{ maximum: 0, total: "0", invalid: invalidContent }];
     else if (text.startsWith("SELECT singleton,generation")) data = epoch ? [epoch] : [];
@@ -158,6 +188,7 @@ function fixture(initial: Record<string, unknown>[] = []) {
     else if (text.startsWith("SELECT source_digest"))
       data = receipt ? [{ source_digest: receipt.sourceDigest }] : [];
     else if (text.startsWith('SELECT * FROM omniroute."key_value"')) data = rows.slice(0, 7);
+    else if (text === 'DELETE FROM omniroute."key_value"') rows.length = 0;
     else if (text.startsWith('INSERT INTO omniroute."key_value"')) {
       for (let i = 0; i < values!.length; i += 3)
         rows.push({ namespace: values![i], key: values![i + 1], value: values![i + 2] });
@@ -204,6 +235,7 @@ function fixture(initial: Record<string, unknown>[] = []) {
     database,
     calls,
     rows,
+    managementGeneration,
     getReceipt: () => receipt,
     getEpoch: () => epoch,
     invalidateContent() {
@@ -289,14 +321,41 @@ test("native import is parameterized, verified before COMMIT and receipt reconci
   try {
     const first = await importApplicationSnapshot(f.database, snapshot());
     assert.equal(first.alreadyImported, false);
-    assert.equal(first.rowCount, 2);
+    assert.equal(first.rowCount, 3);
+    assert.deepEqual(first.tableCounts, { key_value: 3 });
+    const payloadRows = f.rows
+      .filter((row) => row.namespace === "settings" && (row.key === "a" || row.key === "z"))
+      .map((row) => [row.key, row.value])
+      .sort(([left], [right]) => String(left).localeCompare(String(right)));
+    assert.deepEqual(payloadRows, [
+      ["a", '"default"'],
+      ["z", "opaque-ciphertext"],
+    ]);
+    const generationRows = f.rows.filter(
+      (row) => row.namespace === "settings" && row.key === "managementAuthGeneration"
+    );
+    assert.equal(generationRows.length, 1);
+    assert.equal(generationRows[0].value, JSON.stringify(f.managementGeneration));
+    assert.deepEqual(first.transformations, [
+      {
+        table: "key_value",
+        row: 2,
+        column: "value",
+        source: null,
+        target: JSON.stringify(f.managementGeneration),
+      },
+    ]);
     const insert = f.calls.find((call) =>
       call.text.startsWith('INSERT INTO omniroute."key_value"')
     )!;
     assert.ok(!insert.text.includes("opaque-ciphertext"));
-    assert.equal(insert.values?.length, 6);
+    assert.equal(insert.values?.length, 9);
     const before = f.calls.filter((call) => call.text.startsWith("INSERT")).length;
-    assert.equal((await importApplicationSnapshot(f.database, snapshot())).alreadyImported, true);
+    const repeated = await importApplicationSnapshot(f.database, snapshot());
+    assert.equal(repeated.alreadyImported, true);
+    assert.equal(repeated.planDigest, first.planDigest);
+    assert.deepEqual(repeated.tableCounts, first.tableCounts);
+    assert.deepEqual(repeated.transformations, first.transformations);
     assert.equal(f.calls.filter((call) => call.text.startsWith("INSERT")).length, before);
     assert.equal(
       (await verifyApplicationImport(f.database, snapshot())).sourceDigest,

@@ -1,7 +1,7 @@
 /**
  * GET /api/cli-tools/keys must only hand plaintext API keys (`rawKey`) to the instance
- * operator (dashboard session, machine-bound local CLI credential, or an instance with
- * login disabled). Machine credentials — API keys of any scope and `oma_` access tokens,
+ * operator (dashboard session or machine-bound local CLI credential). Anonymous open-mode
+ * callers and machine credentials — API keys of any scope and `oma_` access tokens,
  * including read-scoped ones — still get the listing, but only with the masked `key`.
  * If the operator check itself fails, the route fails closed with a 503.
  */
@@ -106,12 +106,22 @@ test("the machine-bound local CLI credential still receives rawKey", async () =>
   assert.equal(entryFor(await res.json()).rawKey, victimKey.key);
 });
 
-test("an instance with login disabled still receives rawKey", async () => {
+test("anonymous open-mode listing stays masked while a signed-in operator receives rawKey", async () => {
   await updateSettings({ requireLogin: false });
   try {
     const res = await keysRoute.GET(new Request(URL_KEYS));
     assert.equal(res.status, 200);
-    assert.equal(entryFor(await res.json()).rawKey, victimKey.key);
+    const raw = await res.text();
+    assert.ok(!raw.includes(victimKey.key), "anonymous open mode must not reveal the admin key");
+    assert.ok(!raw.includes(manageKey.key), "anonymous open mode must not reveal machine keys");
+    const entry = entryFor(JSON.parse(raw));
+    assert.equal(entry.rawKey, undefined);
+    assert.notEqual(entry.key, victimKey.key);
+    assert.match(entry.key as string, /^.{8}\*\*\*\*.*$/);
+
+    const operator = await keysRoute.GET(await makeManagementSessionRequest(URL_KEYS));
+    assert.equal(operator.status, 200);
+    assert.equal(entryFor(await operator.json()).rawKey, victimKey.key);
   } finally {
     await updateSettings({ requireLogin: true });
   }
