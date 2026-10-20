@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/errorSanitization.ts";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 import { sanitizeErrorFramesFromLogChunks } from "@/lib/logPayloads";
-import { getCallLogById } from "@/lib/usageDb";
+import { getManagementCallLogById } from "@/lib/usage/callLogs";
 import { getCompletedDetails, getPendingById } from "@/lib/usage/usageHistory";
 import {
   extractPreviousResponseId,
@@ -138,7 +138,7 @@ export async function GET(
     }
 
     // Next, try persistent call log by id
-    let persistedRequest = await getCallLogById(id);
+    let persistedRequest = await getManagementCallLogById(id, req?.signal);
 
     // If persistent call log doesn't have payloads, try the in-memory completedDetails cache
     if (

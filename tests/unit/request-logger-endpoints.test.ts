@@ -251,7 +251,10 @@ test("GET /api/usage/call-logs/[id] route exists and uses auth", () => {
   const content = fs.readFileSync("src/app/api/usage/call-logs/[id]/route.ts", "utf8");
   assert.ok(content.includes("export async function GET"), "should export GET handler");
   assert.ok(content.includes("requireManagementAuth"), "should check auth");
-  assert.ok(content.includes("getCallLogById"), "should import getCallLogById");
+  assert.ok(
+    content.includes("getManagementCallLogById"),
+    "should use management detail capability"
+  );
 });
 
 test("GET /api/usage/call-logs includes completed in-memory fallback rows", async () => {

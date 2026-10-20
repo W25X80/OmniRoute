@@ -95,14 +95,29 @@ existing object and a random missing key under that role with ExpectedBucketOwne
 availability/access failure, never evidence of absence. A negative GET after an uncertain PUT
 does not prove that the PUT cannot complete later; its journal identity remains pending.
 
+The two authenticated management detail routes (`/api/logs/[id]` and
+`/api/usage/call-logs/[id]`) can read an intact retained encrypted staging payload while
+publication is pending. They recheck the original call incarnation, runtime identity and current
+key privacy policy after bounded worker-thread decryption and integrity validation. Responses
+identify `detailSource: "staging"` and `artifactPublicationState`; persisted `detailState` and
+the journal remain unchanged. This capability does not extend to exports or inference
+continuation. At most two staged reads are admitted per process, with a ten-second response
+deadline; cancelled work retains its slot until its actual SQL/CPU lifetime ends.
+
 The authenticated management health payload includes `artifactReconciliation` (pending/uncertain/
-legacy/foreign-scope counts, staged bytes, oldest pending timestamp and safe failure diagnostics)
+legacy/foreign-scope counts, publication/deletion counts, staged bytes, oldest pending timestamp,
+`oldestUncertainCreatedAt`, `reviewRequired` and safe failure diagnostics)
 and `persistenceBackground` counters for the declared LKGP/reconciliation owners. Anonymous
 liveness responses do not expose these details. PostgreSQL diagnostics separate advisory lock,
 query and COMMIT timing; slow successful operations are rate-limited by static operation name.
 `npm run check:persistence-background-owners` is an AST admission ratchet with a frozen legacy
 inventory. It does not prove transitive callback safety or the absence of all blocking code;
 scenario tests and native runtime qualification remain required.
+
+`reviewRequired` marks uncertain entries whose creation time is at least 30 minutes old; a safe
+count/timestamp warning is emitted at most once per 30 minutes while that condition persists.
+This measures the age of an unresolved entry, not the time since its last positive progress.
+Neither a negative GET nor a successful staging read completes publication or retirement.
 
 Before upgrading, drain the sole writer and capture a verified recoverable database backup plus
 the unchanged encryption/authentication secrets. Apply migration 9 offline and verify its history

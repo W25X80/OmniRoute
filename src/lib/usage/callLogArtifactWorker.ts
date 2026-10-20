@@ -1,6 +1,7 @@
 import { parentPort } from "node:worker_threads";
 import { serializeArtifactForStorage } from "./callLogArtifactSerialization.ts";
 import { MAX_CALL_LOG_DECODE_BYTES } from "./callLogArtifactProtocol.ts";
+import { decodeStagedCallLog } from "./stagedCallLogDecode.ts";
 import type { CallLogArtifact } from "./callLogArtifacts.ts";
 import type {
   CallLogArtifactEnvironment,
@@ -22,13 +23,15 @@ function applyWriteEnvironment(environment: CallLogArtifactEnvironment): void {
 
 parentPort?.on("message", async (request: CallLogArtifactWorkerRequest) => {
   let reply: CallLogArtifactWorkerReply =
-    request.kind === "deserialize"
-      ? { id: request.id, kind: "deserialize", result: null }
+    request.kind === "deserialize" || request.kind === "deserialize-staged"
+      ? { id: request.id, kind: request.kind, result: null }
       : request.kind === "serialize"
         ? { id: request.id, kind: "serialize", bytes: null }
         : { id: request.id, kind: "write", result: null };
   try {
-    if (request.kind === "deserialize") {
+    if (request.kind === "deserialize-staged") {
+      reply = { id: request.id, kind: request.kind, result: decodeStagedCallLog(request.staging) };
+    } else if (request.kind === "deserialize") {
       if (
         request.bytes instanceof Uint8Array &&
         request.bytes.byteLength <= MAX_CALL_LOG_DECODE_BYTES
@@ -77,8 +80,8 @@ parentPort?.on("message", async (request: CallLogArtifactWorkerRequest) => {
     parentPort?.postMessage(reply, transfer);
   } catch {
     parentPort?.postMessage(
-      request.kind === "deserialize"
-        ? { id: request.id, kind: "deserialize", result: null }
+      request.kind === "deserialize" || request.kind === "deserialize-staged"
+        ? { id: request.id, kind: request.kind, result: null }
         : request.kind === "serialize"
           ? { id: request.id, kind: "serialize", bytes: null }
           : { id: request.id, kind: "write", result: null }

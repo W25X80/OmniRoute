@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
-import { getCallLogById } from "@/lib/usageDb";
+import { getManagementCallLogById } from "@/lib/usage/callLogs";
 
 export async function GET(request, { params }) {
   try {
@@ -8,7 +8,7 @@ export async function GET(request, { params }) {
     if (authError) return authError;
 
     const { id } = await params;
-    const log = await getCallLogById(id);
+    const log = await getManagementCallLogById(id, request?.signal);
 
     if (!log) {
       return NextResponse.json({ error: "Log not found" }, { status: 404 });

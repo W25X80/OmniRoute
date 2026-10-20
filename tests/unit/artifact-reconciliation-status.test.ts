@@ -39,3 +39,61 @@ test("object integrity failure does not become a common transport failure", asyn
   assert.equal(isSharedArtifactFailure(new ArtifactStorageError("invalid_reference")), false);
   assert.equal(isSharedArtifactFailure(new ArtifactStorageError("unavailable")), true);
 });
+
+test("old uncertainty requires review without inventing last-progress evidence or flooding logs", (t) => {
+  let now = Date.parse("2026-10-20T02:00:00Z");
+  t.mock.method(Date, "now", () => now);
+  const warnings: unknown[][] = [];
+  t.mock.method(console, "warn", (...args: unknown[]) => {
+    warnings.push(args);
+  });
+  const counts = {
+    pending: 28,
+    uncertain: 28,
+    legacy: 0,
+    foreignScope: 0,
+    stagedBytes: 4484523,
+    publishing: 11,
+    deletePending: 17,
+    oldestPendingAt: "2026-10-19T00:00:00Z",
+    oldestUncertainCreatedAt: "2026-10-20T01:30:01Z",
+  };
+  recordArtifactReconciliationPass(counts);
+  assert.equal(getArtifactReconciliationStatus().reviewRequired, false);
+  now += 1000;
+  recordArtifactReconciliationPass(counts, { succeeded: new Set(["get"]) });
+  const status = getArtifactReconciliationStatus();
+  assert.equal(status.reviewRequired, true);
+  assert.equal(status.state, "pending");
+  assert.equal(status.publishing, 11);
+  assert.equal(status.deletePending, 17);
+  assert.equal(warnings.length, 1);
+  assert.ok(!Object.hasOwn(status, "reviewWarningAfter"));
+  recordArtifactReconciliationPass(counts, { succeeded: new Set(["get"]) });
+  assert.equal(warnings.length, 1);
+  now += 30 * 60000;
+  recordArtifactReconciliationPass(counts);
+  assert.equal(warnings.length, 2);
+  recordArtifactReconciliationPass({
+    ...counts,
+    pending: 0,
+    uncertain: 0,
+    publishing: 0,
+    deletePending: 0,
+    oldestUncertainCreatedAt: null,
+  });
+  assert.equal(getArtifactReconciliationStatus().reviewRequired, false);
+});
+
+test("pending age alone cannot establish old uncertainty", () => {
+  recordArtifactReconciliationPass({
+    pending: 1,
+    uncertain: 1,
+    legacy: 0,
+    foreignScope: 0,
+    stagedBytes: 0,
+    oldestPendingAt: "2000-01-01",
+    oldestUncertainCreatedAt: null,
+  });
+  assert.equal(getArtifactReconciliationStatus().reviewRequired, false);
+});

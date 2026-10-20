@@ -9,11 +9,15 @@ import type { ArtifactPutOptions } from "@/domain/persistence/artifactStore";
 import { getSelectedControlPlane } from "../db/controlPlaneContext";
 import { getPersistenceArtifactStore } from "../db/persistenceRuntime";
 import type { CallLogArtifact, CallLogArtifactWriteResult } from "./callLogArtifacts.ts";
-import { MAX_CALL_LOG_DECODE_BYTES } from "./callLogArtifactProtocol.ts";
+import {
+  MAX_CALL_LOG_DECODE_BYTES,
+  MAX_CALL_LOG_STAGED_CIPHER_CHARS,
+} from "./callLogArtifactProtocol.ts";
 import type {
   CallLogArtifactDecodeResult,
   CallLogArtifactEnvironment,
   CallLogArtifactWorkerReply,
+  StagedCallLogDecodeInput,
 } from "./callLogArtifactProtocol.ts";
 
 const MAX_QUEUED_JOBS = 128;
@@ -36,13 +40,14 @@ type QueueItem =
             reject: (error: Error) => void;
           }
       ))
-  | {
+  | ({
       id: number;
-      kind: "deserialize";
-      bytes: Uint8Array;
       resolve: (result: CallLogArtifactDecodeResult) => void;
       reject: (error: Error) => void;
-    };
+    } & (
+      | { kind: "deserialize"; bytes: Uint8Array }
+      | { kind: "deserialize-staged"; staging: StagedCallLogDecodeInput }
+    ));
 
 export class CallLogArtifactSerializationError extends Error {
   constructor() {
@@ -195,7 +200,7 @@ function failOpen(warn = false, detail?: unknown): void {
   const failed = active ? [active, ...queue] : [...queue];
   if (warn) {
     warnRateLimited(
-      failed.some((item) => item.kind === "deserialize")
+      failed.some((item) => item.kind === "deserialize" || item.kind === "deserialize-staged")
         ? "[callLogs] Call-log artifact decoder worker failed; detail unavailable."
         : failed.some((item) => item.kind === "serialize")
           ? "[callLogs] Call-log artifact serializer worker failed; detail unavailable."
@@ -206,7 +211,8 @@ function failOpen(warn = false, detail?: unknown): void {
   queue.length = 0;
   terminateWorker();
   for (const item of failed) {
-    if (item.kind === "deserialize") item.reject(new CallLogArtifactDeserializationError());
+    if (item.kind === "deserialize" || item.kind === "deserialize-staged")
+      item.reject(new CallLogArtifactDeserializationError());
     else if (item.kind === "serialize") item.reject(new CallLogArtifactSerializationError());
     else item.resolve(null);
   }
@@ -233,8 +239,8 @@ function attachWorker(created: Worker, native = false): Worker {
     if (!active || reply.id !== active.id) return;
     const completed = active;
     active = null;
-    if (completed.kind === "deserialize") {
-      if (reply.kind === "deserialize" && reply.result) completed.resolve(reply.result);
+    if (completed.kind === "deserialize" || completed.kind === "deserialize-staged") {
+      if (reply.kind === completed.kind && reply.result) completed.resolve(reply.result);
       else completed.reject(new CallLogArtifactDeserializationError());
     } else if (completed.kind === "serialize") {
       if (reply.kind === "serialize" && reply.bytes instanceof Uint8Array) {
@@ -299,7 +305,9 @@ function pump(): void {
     created.postMessage(
       next.kind === "deserialize"
         ? { id: next.id, kind: next.kind, bytes: next.bytes }
-        : { id: next.id, kind: next.kind, artifact: next.artifact, environment: next.environment }
+        : next.kind === "deserialize-staged"
+          ? { id: next.id, kind: next.kind, staging: next.staging }
+          : { id: next.id, kind: next.kind, artifact: next.artifact, environment: next.environment }
     );
   };
   try {
@@ -386,6 +394,28 @@ export function deserializeCallArtifactAsync(
   }
   return new Promise((resolve, reject) => {
     queue.push({ id: nextId++, kind: "deserialize", bytes, resolve, reject });
+    pump();
+  });
+}
+
+/** Admission is bounded again by the management reader before it loads ciphertext from SQL. */
+export function deserializeStagedCallArtifactAsync(
+  staging: StagedCallLogDecodeInput
+): Promise<CallLogArtifactDecodeResult> {
+  getPersistenceArtifactStore();
+  if (
+    closing ||
+    queue.length >= MAX_QUEUED_JOBS ||
+    (active?.kind === "deserialize-staged" ? 1 : 0) +
+      queue.filter((item) => item.kind === "deserialize-staged").length >=
+      2 ||
+    typeof staging.ciphertext !== "string" ||
+    staging.ciphertext.length > MAX_CALL_LOG_STAGED_CIPHER_CHARS ||
+    Date.now() >= staging.expiresAt
+  )
+    return Promise.reject(new CallLogArtifactDeserializationError());
+  return new Promise((resolve, reject) => {
+    queue.push({ id: nextId++, kind: "deserialize-staged", staging, resolve, reject });
     pump();
   });
 }

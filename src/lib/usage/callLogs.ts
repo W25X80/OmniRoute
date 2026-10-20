@@ -71,6 +71,7 @@ import {
   publishNativeArtifactIntent,
 } from "./nativeArtifactRecovery";
 import type { ArtifactRecoveryIntent } from "../db/postgres/artifactRecoveryRepository";
+import { captureStagedDetailAuthority, readNativeStagedCallDetail } from "./nativeStagedCallDetail";
 import {
   toNumber,
   toStringOrNull,
@@ -113,6 +114,7 @@ let callLogSavesClosing = false;
 
 type CallLogSummaryRow = {
   id: string;
+  insertion_order?: number;
   timestamp: string | null;
   method: string | null;
   path: string | null;
@@ -1178,8 +1180,18 @@ export async function getCallLogs(filter: any = {}) {
   return rows.map(mapSummaryRow);
 }
 
-export async function getCallLogById(id: string) {
+export function getCallLogById(id: string) {
+  return getCallLogDetail(id);
+}
+
+/** Management-only recovery capability; generic exports and continuation never opt in. */
+export function getManagementCallLogById(id: string, signal?: AbortSignal) {
+  return getCallLogDetail(id, { signal });
+}
+
+async function getCallLogDetail(id: string, management?: { signal?: AbortSignal }) {
   const postgres = getSelectedCallLogRepository();
+  const stagingAuthority = postgres && management ? captureStagedDetailAuthority() : null;
   const db = postgres ? undefined : getDbInstance();
   const row = postgres
     ? ((await postgres.byId(id)) as CallLogSummaryRow | undefined)
@@ -1226,6 +1238,33 @@ export async function getCallLogById(id: string) {
     } else {
       if (postgres) await postgres.setDetailState(id, "corrupt");
       else db!.prepare("UPDATE call_logs SET detail_state = ? WHERE id = ?").run("corrupt", id);
+    }
+  }
+
+  if (
+    stagingAuthority &&
+    !row.artifact_relpath &&
+    row.detail_state === "missing" &&
+    typeof row.insertion_order === "number"
+  ) {
+    const staged = await readNativeStagedCallDetail(
+      stagingAuthority,
+      id,
+      row.insertion_order,
+      management?.signal
+    );
+    if (staged) {
+      return {
+        ...entry,
+        detailSource: staged.detailSource,
+        artifactPublicationState: staged.artifactPublicationState,
+        requestBody: staged.artifact.requestBody ?? null,
+        responseBody: staged.artifact.responseBody ?? null,
+        error: staged.artifact.error ?? entry.error,
+        pipelinePayloads: staged.artifact.pipeline ?? null,
+        hasPipelineDetails: Boolean(staged.artifact.pipeline) || entry.hasPipelineDetails,
+        active: false,
+      };
     }
   }
 

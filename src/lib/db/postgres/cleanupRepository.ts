@@ -134,12 +134,18 @@ export function createPostgresCleanupRepository(database: PostgresDatabase) {
             foreign_scope: string;
             staged_bytes: string;
             oldest_pending_at: string | null;
+            publishing: string;
+            delete_pending: string;
+            oldest_uncertain_at: string | null;
           }>(
             `SELECT count(*) AS pending,
           count(*) FILTER(WHERE upload_state='uncertain') AS uncertain,
           count(*) FILTER(WHERE upload_state='legacy_unknown' OR store_scope IS NULL) AS legacy,
           count(*) FILTER(WHERE store_scope IS NOT NULL AND store_scope<>$1) AS foreign_scope,
-          COALESCE(sum(staged_bytes),0) AS staged_bytes,min(created_at)::text AS oldest_pending_at
+          COALESCE(sum(staged_bytes),0) AS staged_bytes,min(created_at)::text AS oldest_pending_at,
+          count(*) FILTER(WHERE publication_state='publishing') AS publishing,
+          count(*) FILTER(WHERE publication_state='delete_pending') AS delete_pending,
+          min(created_at) FILTER(WHERE upload_state='uncertain')::text AS oldest_uncertain_at
           FROM omniroute.artifact_deletion_queue WHERE publication_state<>'attached'`,
             [scope]
           )
@@ -151,6 +157,9 @@ export function createPostgresCleanupRepository(database: PostgresDatabase) {
           foreignScope: Number(row.foreign_scope),
           stagedBytes: Number(row.staged_bytes),
           oldestPendingAt: row.oldest_pending_at,
+          publishing: Number(row.publishing),
+          deletePending: Number(row.delete_pending),
+          oldestUncertainCreatedAt: row.oldest_uncertain_at,
         };
       });
     },

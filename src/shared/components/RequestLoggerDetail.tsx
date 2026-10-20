@@ -528,11 +528,13 @@ export default function RequestLoggerDetail({
     }
   };
   const detailIssue =
-    detail?.detailState === "missing"
-      ? t("payloadMissing")
-      : detail?.detailState === "corrupt"
-        ? t("payloadCorrupt")
-        : null;
+    detail?.detailSource === "staging"
+      ? t("payloadFromStaging")
+      : detail?.detailState === "missing"
+        ? t("payloadMissing")
+        : detail?.detailState === "corrupt"
+          ? t("payloadCorrupt")
+          : null;
   const tokenStats = {
     totalIn: detail?.tokens?.in ?? log.tokens?.in ?? null,
     totalOut: detail?.tokens?.out ?? log.tokens?.out ?? null,
