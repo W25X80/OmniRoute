@@ -112,7 +112,7 @@ test(
         ];
         await binding.settings.update({ requireLogin: true });
         let serial = 0;
-        async function seed(keyless = false, id = `${prefix}-${serial++}`) {
+        async function seed(keyless = false, id = `${prefix}-${serial++}`, withPipeline = true) {
           const keyId = keyless ? null : id + "-key";
           if (keyId)
             await database.transaction(async (tx) => {
@@ -128,7 +128,7 @@ test(
             requestBody: { private: id },
             responseBody: { retained: true },
             error: null,
-            pipeline: { clientRequest: { model: "fixture" } },
+            pipeline: withPipeline ? { clientRequest: { model: "fixture" } } : undefined,
           };
           const bytes = Buffer.from(JSON.stringify(artifact));
           const checksum = createHash("sha256").update(bytes).digest("hex");
@@ -258,6 +258,48 @@ test(
         });
 
         await t.test(
+          "staging preserves legacy pipeline detail and rechecks privacy after loading it",
+          async () => {
+            const item = await seed(false, undefined, false);
+            await database.transaction((tx) =>
+              tx.query(
+                "INSERT INTO omniroute.request_detail_logs(id,call_log_id,timestamp,client_request) VALUES($1,$2,$3,$4)",
+                [
+                  randomUUID(),
+                  item.id,
+                  new Date().toISOString(),
+                  JSON.stringify({ retainedLegacy: true }),
+                ]
+              )
+            );
+            const legacy = (await callLogs.getCallLogById(item.id))!.pipelinePayloads;
+            assert.ok(legacy);
+            assert.deepEqual(
+              (await callLogs.getManagementCallLogById(item.id))!.pipelinePayloads,
+              legacy
+            );
+            assert.equal(
+              await service.readNativeStagedCallDetail(
+                service.captureStagedDetailAuthority()!,
+                item.id,
+                item.callOrder,
+                undefined,
+                async () => {
+                  await database.transaction(async (tx) => {
+                    await acquirePostgresLock(tx, "keyPolicy");
+                    await tx.query("UPDATE omniroute.api_keys SET no_log=1 WHERE id=$1", [
+                      item.keyId,
+                    ]);
+                  });
+                  return legacy;
+                }
+              ),
+              null
+            );
+          }
+        );
+
+        await t.test(
           "each original owner operand is necessary at initial and final reads",
           async () => {
             const item = await seed();
@@ -303,6 +345,10 @@ test(
                   );
                 } else
                   await database.transaction(async (tx) => {
+                    await tx.query(
+                      "DELETE FROM omniroute.request_detail_logs WHERE call_log_id LIKE $1",
+                      [prefix + "%"]
+                    );
                     await acquirePostgresLock(tx, "keyPolicy");
                     await acquirePostgresLock(tx, "accounting");
                     if (action === "no_log")

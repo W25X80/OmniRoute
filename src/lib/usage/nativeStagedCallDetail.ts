@@ -24,7 +24,8 @@ export async function readNativeStagedCallDetail(
   authority: NonNullable<ReturnType<typeof captureStagedDetailAuthority>>,
   callId: string,
   callOrder: number,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  loadLegacyPipeline?: () => Promise<Record<string, unknown> | null>
 ) {
   if (signal?.aborted || admission.active >= MAX_READS) return null;
   admission.active++;
@@ -55,9 +56,17 @@ export async function readNativeStagedCallDetail(
     });
     if (result.state !== "ready" || !result.artifact || !current()) return null;
     const artifact = result.artifact;
+    // Preserve the ordinary detail reader's fallback before the final privacy fence.
+    const pipelinePayloads = artifact.pipeline ?? (await loadLegacyPipeline?.()) ?? null;
+    if (!current()) return null;
     const projected = await projectStagedArtifact(authority.database, snapshot, (uploadState) =>
       current()
-        ? { artifact, detailSource: "staging" as const, artifactPublicationState: uploadState }
+        ? {
+            artifact,
+            pipelinePayloads,
+            detailSource: "staging" as const,
+            artifactPublicationState: uploadState,
+          }
         : null
     );
     return current() ? projected : null;

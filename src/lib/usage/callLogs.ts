@@ -1251,7 +1251,8 @@ async function getCallLogDetail(id: string, management?: { signal?: AbortSignal 
       stagingAuthority,
       id,
       row.insertion_order,
-      management?.signal
+      management?.signal,
+      () => buildLegacyPipelinePayloadsAsync(id)
     );
     if (staged) {
       return {
@@ -1261,8 +1262,8 @@ async function getCallLogDetail(id: string, management?: { signal?: AbortSignal 
         requestBody: staged.artifact.requestBody ?? null,
         responseBody: staged.artifact.responseBody ?? null,
         error: staged.artifact.error ?? entry.error,
-        pipelinePayloads: staged.artifact.pipeline ?? null,
-        hasPipelineDetails: Boolean(staged.artifact.pipeline) || entry.hasPipelineDetails,
+        pipelinePayloads: staged.pipelinePayloads,
+        hasPipelineDetails: Boolean(staged.pipelinePayloads) || entry.hasPipelineDetails,
         active: false,
       };
     }
