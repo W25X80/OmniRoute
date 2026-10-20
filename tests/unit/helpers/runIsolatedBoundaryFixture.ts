@@ -44,6 +44,7 @@ export function runIsolatedBoundaryFixture({
           LC_ALL: "C.UTF-8",
           NODE_ENV: "test",
           OMNIROUTE_DISABLE_CREDENTIAL_HEALTH_CHECK: "true",
+          OMNIROUTE_DATABASE_BACKEND: "sqlite",
           OMNIROUTE_PLUGINS_DIR: pluginsDir,
           PATH: CHILD_PATH,
           TZ: "UTC",

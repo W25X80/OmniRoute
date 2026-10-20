@@ -152,6 +152,7 @@ test(
                   apiKeyId: keyId,
                   detailState: "missing",
                   detailReason: "publication_pending",
+                  videoContentRemoved: 0,
                 },
                 intent
               )
