@@ -92,6 +92,73 @@ describe("resource pressure cgroup parsers", () => {
 });
 
 describe("sampleResourceSignals", () => {
+  it("reads the finite ECS v1 hierarchy when the local limit is unlimited", async () => {
+    const root = "/sys/fs/cgroup/memory";
+    const fs = mapFs([
+      ["/proc/self/cgroup", "7:memory:/ecs/task/container\n"],
+      [
+        "/proc/self/mountinfo",
+        `42 30 0:40 /ecs/task/container ${root} rw - cgroup cgroup rw,memory\n`,
+      ],
+      [`${root}/memory.usage_in_bytes`, `${3500 * MiB}\n`],
+      [`${root}/memory.limit_in_bytes`, "9223372036854771712\n"],
+      [
+        `${root}/memory.stat`,
+        `cache ${100 * MiB}\ntotal_cache ${200 * MiB}\nhierarchical_memory_limit ${4 * GiB}\n`,
+      ],
+      [`${root}/memory.failcnt`, "3\n"],
+      [`${root}/memory.oom_control`, "oom_kill_disable 0\nunder_oom 0\noom_kill 2\n"],
+    ]);
+    const signals = await sampleResourceSignals({
+      fs,
+      memoryUsage,
+      heapStatistics: () => ({ heap_size_limit: 3 * GiB }),
+    });
+    assert.equal(signals.cgroup.currentBytes, 3500 * MiB);
+    assert.equal(signals.cgroup.maxBytes, 4 * GiB);
+    assert.equal(signals.cgroup.fileBytes, 200 * MiB);
+    assert.equal(signals.cgroup.highBytes, null, "v1 soft limit is not v2 memory.high");
+    assert.deepEqual(signals.cgroup.events, {
+      low: null,
+      high: null,
+      max: 3,
+      oom: null,
+      oom_kill: 2,
+    });
+  });
+
+  it("resolves a delegated v1 memory controller and selects its tighter hard limit", async () => {
+    const root = "/delegated/memory/service";
+    const fs = mapFs([
+      ["/proc/self/cgroup", "3:cpu,cpuacct:/unrelated\n7:memory:/tenant/service\n"],
+      [
+        "/proc/self/mountinfo",
+        "42 30 0:40 /tenant /delegated/memory rw - cgroup cgroup rw,memory\n",
+      ],
+      [`${root}/memory.usage_in_bytes`, `${500 * MiB}`],
+      [`${root}/memory.limit_in_bytes`, `${GiB}`],
+      [`${root}/memory.stat`, `cache 0\nhierarchical_memory_limit ${2 * GiB}\n`],
+      [`${root}/memory.soft_limit_in_bytes`, "1"],
+    ]);
+    const signals = await sampleResourceSignals({ fs });
+    assert.equal(signals.cgroup.maxBytes, GiB);
+    assert.equal(signals.cgroup.fileBytes, 0);
+    assert.equal(signals.cgroup.highBytes, null);
+    assert.equal(signals.cgroup.events, null);
+  });
+
+  it("does not escape the v1 mount or fabricate a finite sentinel limit", async () => {
+    const fs = mapFs([
+      ["/proc/self/cgroup", "7:memory:/tenant/../escape\n"],
+      ["/proc/self/mountinfo", "42 30 0:40 /tenant /safe/memory rw - cgroup cgroup rw,memory\n"],
+      ["/safe/escape/memory.usage_in_bytes", "1"],
+      ["/safe/escape/memory.limit_in_bytes", "42"],
+    ]);
+    const signals = await sampleResourceSignals({ fs });
+    assert.equal(signals.cgroup.currentBytes, null);
+    assert.equal(signals.cgroup.maxBytes, null);
+  });
+
   it("keeps an explicit zero file-cache reading distinct from unavailable", async () => {
     const fs = mapFs([
       ["/proc/self/cgroup", "0::/slice/service\n"],

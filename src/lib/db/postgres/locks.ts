@@ -10,7 +10,8 @@ import type { PostgresTransaction } from "./database";
  * schema -> applicationImport; routing -> catalogKeyValue -> keyPolicy -> sessions;
  * routing -> providers -> validation -> catalog -> catalogKeyValue -> keyPolicy;
  * settings/providers -> keyPolicy -> accounting/usage; providers -> validation;
- * keyPolicy -> quotaGroups; validation -> accounting.
+ * keyPolicy -> quotaGroups; validation -> accounting; sessions(shared) -> sessionAffinity.
+ * Affinity pins and history appends share sessions; cleanup and combo edits retain it exclusively.
  * These are dependency edges, not numeric ordering. Do not reverse an edge.
  * Accounting intentionally still covers receipts, artifacts, budgets and
  * quota-reset history until their cross-table invariants admit a narrower fence.
@@ -63,15 +64,21 @@ export async function acquirePostgresLock(
   );
 }
 
+const POSTGRES_ENTITY_LOCK_NAMESPACES = {
+  quotaCounter: 18766,
+  providerQuota: 18767,
+  sessionAffinity: 18768,
+} as const;
+
 /** Hash collisions conservatively serialize independent tuples; never mix rows. */
 export async function acquirePostgresEntityLock(
   transaction: PostgresTransaction,
-  owner: "quotaCounter" | "providerQuota",
+  owner: keyof typeof POSTGRES_ENTITY_LOCK_NAMESPACES,
   identity: readonly string[]
 ): Promise<void> {
   transaction.noteAdvisoryLock?.(owner, "exclusive");
   await transaction.query("SELECT pg_advisory_xact_lock($1,hashtext($2))", [
-    owner === "quotaCounter" ? 18766 : 18767,
+    POSTGRES_ENTITY_LOCK_NAMESPACES[owner],
     JSON.stringify(identity),
   ]);
 }

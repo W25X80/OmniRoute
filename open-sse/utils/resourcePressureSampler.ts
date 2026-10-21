@@ -151,6 +151,130 @@ export async function resolveCgroupDirectory(
   }
 }
 
+async function resolveCgroupV1Directory(
+  readText: ResourcePressureFs["readText"]
+): Promise<string | null> {
+  const [contents, mountInfo] = await Promise.all([
+    readText("/proc/self/cgroup"),
+    readText("/proc/self/mountinfo"),
+  ]);
+  const entry = contents
+    ?.split("\n")
+    .find((line) => line.split(":")[1]?.split(",").includes("memory"));
+  if (entry) {
+    const cgroupPath = entry.slice(entry.indexOf(":", entry.indexOf(":") + 1) + 1);
+    for (const line of mountInfo?.split("\n") ?? []) {
+      const separator = line.indexOf(" - ");
+      if (separator < 0) continue;
+      const left = line.slice(0, separator).trim().split(/\s+/);
+      const right = line
+        .slice(separator + 3)
+        .trim()
+        .split(/\s+/);
+      if (right[0] !== "cgroup" || !right[2]?.split(",").includes("memory") || left.length < 5)
+        continue;
+      const root = decodeMountInfoPath(left[3]);
+      const mountpoint = decodeMountInfoPath(left[4]);
+      if (!root?.startsWith("/") || !mountpoint?.startsWith("/") || !cgroupPath.startsWith("/"))
+        return null;
+      const candidate = resolveFromMount(cgroupPath, { root, mountpoint });
+      if (!candidate) return null;
+      if ((await readText(path.join(candidate, "memory.usage_in_bytes"))) != null) return candidate;
+    }
+  }
+  const fallback = path.join(DEFAULT_CGROUP_ROOT, "memory");
+  return (await readText(path.join(fallback, "memory.usage_in_bytes"))) != null ? fallback : null;
+}
+
+function statFields(text: string | null): Map<string, string> {
+  return new Map(
+    (text ?? "")
+      .trim()
+      .split("\n")
+      .map((line) => {
+        const [key, value] = line.trim().split(/\s+/, 2);
+        return [key, value ?? ""];
+      })
+  );
+}
+
+function finiteMinimum(...values: Array<number | null>): number | null {
+  const finite = values.filter((value): value is number => value !== null);
+  return finite.length ? Math.min(...finite) : null;
+}
+
+async function sampleCgroup(readText: ResourcePressureFs["readText"]): Promise<{
+  signals: ResourceSignals["cgroup"];
+  pressure: string | null;
+}> {
+  const directory = await resolveCgroupDirectory(readText);
+  if (directory) {
+    const [current, max, high, events, stat, pressure] = await Promise.all(
+      [
+        "memory.current",
+        "memory.max",
+        "memory.high",
+        "memory.events",
+        "memory.stat",
+        "memory.pressure",
+      ].map((file) => readText(path.join(directory, file)))
+    );
+    return {
+      signals: {
+        currentBytes: sanitizeMemoryBytes(current),
+        maxBytes: sanitizeMemoryBytes(max),
+        highBytes: sanitizeMemoryBytes(high),
+        fileBytes: parseMemoryStatFileBytes(stat),
+        events: parseMemoryEvents(events),
+      },
+      pressure,
+    };
+  }
+  const legacy = await resolveCgroupV1Directory(readText);
+  if (!legacy)
+    return {
+      signals: {
+        currentBytes: null,
+        maxBytes: null,
+        highBytes: null,
+        fileBytes: null,
+        events: null,
+      },
+      pressure: null,
+    };
+  const [current, limit, stat, failcnt, oom] = await Promise.all(
+    [
+      "memory.usage_in_bytes",
+      "memory.limit_in_bytes",
+      "memory.stat",
+      "memory.failcnt",
+      "memory.oom_control",
+    ].map((file) => readText(path.join(legacy, file)))
+  );
+  const fields = statFields(stat);
+  const cache = fields.get("total_cache") ?? fields.get("cache");
+  const failed = failcnt == null ? null : parseEventCounter(failcnt);
+  const killed = statFields(oom).get("oom_kill");
+  const oomKills = killed == null ? null : parseEventCounter(killed);
+  return {
+    signals: {
+      currentBytes: sanitizeMemoryBytes(current),
+      // ECS exposes an unlimited leaf with a finite task limit in the hierarchy.
+      maxBytes: finiteMinimum(
+        sanitizeMemoryBytes(limit),
+        sanitizeMemoryBytes(fields.get("hierarchical_memory_limit"))
+      ),
+      highBytes: null, // v1 soft_limit is not the v2 throttling mechanism.
+      fileBytes: cache === "0" ? 0 : sanitizeMemoryBytes(cache),
+      events:
+        failed == null && oomKills == null
+          ? null
+          : { low: null, high: null, max: failed, oom: null, oom_kill: oomKills },
+    },
+    pressure: null,
+  };
+}
+
 function parseEventCounter(value: string): number | null {
   const parsed = Number(value.trim());
   return Number.isFinite(parsed) && parsed >= 0 && parsed < Number.MAX_SAFE_INTEGER
@@ -234,7 +358,14 @@ function firstParseablePsi(
 export async function sampleResourceSignals(
   deps: SampleResourceSignalsDeps = {}
 ): Promise<ResourceSignals> {
-  const readText = deps.fs?.readText ?? defaultReadText;
+  const sourceRead = deps.fs?.readText ?? defaultReadText;
+  const readText: ResourcePressureFs["readText"] = async (filePath) => {
+    try {
+      return await sourceRead(filePath);
+    } catch {
+      return null;
+    }
+  };
   let memory: NodeJS.MemoryUsage;
   try {
     memory = (deps.memoryUsage ?? process.memoryUsage)();
@@ -254,35 +385,14 @@ export async function sampleResourceSignals(
     /* retain process heap sample */
   }
 
-  const cgroupDirectory = await resolveCgroupDirectory(readText);
-  const cgroupReads = cgroupDirectory
-    ? await Promise.all([
-        readText(path.join(cgroupDirectory, "memory.current")),
-        readText(path.join(cgroupDirectory, "memory.max")),
-        readText(path.join(cgroupDirectory, "memory.high")),
-        readText(path.join(cgroupDirectory, "memory.events")),
-        readText(path.join(cgroupDirectory, "memory.stat")),
-        readText(path.join(cgroupDirectory, "memory.pressure")),
-      ])
-    : null;
-  // Named bindings instead of positional indices: the read order above is
-  // easy to shuffle on edit, and a silent index shift would corrupt the
-  // current/max/high/stat mapping.
-  const cgroupFiles = {
-    current: cgroupReads?.[0] ?? null,
-    max: cgroupReads?.[1] ?? null,
-    high: cgroupReads?.[2] ?? null,
-    events: cgroupReads?.[3] ?? null,
-    stat: cgroupReads?.[4] ?? null,
-    pressure: cgroupReads?.[5] ?? null,
-  };
+  const cgroup = await sampleCgroup(readText);
   // /proc/pressure/memory is host-wide. Inside Docker/cgroup that stalls the
   // chat admission gate (503 resource_pressure) when the *machine* is swapping
   // even if this container is idle. Prefer this unit's cgroup PSI; fall back
   // to the host file only when the cgroup sample is missing or unparseable
   // (bare metal, cgroup v1, or a stub filesystem).
   const hostPsi = await readText("/proc/pressure/memory").catch(() => null);
-  const psiWinner = firstParseablePsi(cgroupFiles.pressure, hostPsi);
+  const psiWinner = firstParseablePsi(cgroup.pressure, hostPsi);
   const parsedPsi = psiWinner ? parsePsi(psiWinner.text) : null;
 
   return {
@@ -295,13 +405,7 @@ export async function sampleResourceSignals(
       availableBytes: safeNumber(deps.availableMemory ?? (() => process.availableMemory?.())),
       constrainedBytes: safeNumber(deps.constrainedMemory ?? (() => process.constrainedMemory?.())),
     },
-    cgroup: {
-      currentBytes: sanitizeMemoryBytes(cgroupFiles.current),
-      maxBytes: sanitizeMemoryBytes(cgroupFiles.max),
-      highBytes: sanitizeMemoryBytes(cgroupFiles.high),
-      fileBytes: parseMemoryStatFileBytes(cgroupFiles.stat),
-      events: parseMemoryEvents(cgroupFiles.events),
-    },
+    cgroup: cgroup.signals,
     psi: parsedPsi ? { ...parsedPsi, psiSource: psiWinner?.psiSource ?? null } : null,
   };
 }

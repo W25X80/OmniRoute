@@ -14,6 +14,11 @@ import {
   type PostgresControlPlaneBinding,
 } from "../../src/lib/db/controlPlaneContext.ts";
 import { migratePostgresSchema } from "../../src/lib/db/postgres/migrations.ts";
+import {
+  CONVERSATION_INDEX_MAX_ROWS,
+  readConversationIndex,
+} from "../../src/lib/db/postgres/conversationHistory.ts";
+import { addConversationNodeCount } from "../../src/lib/db/postgres/conversationNodeCounts.ts";
 import type { PostgresDatabase } from "../../src/lib/db/postgres/database.ts";
 import {
   createTestPostgresDatabase,
@@ -139,5 +144,33 @@ describe("native implicit conversation concurrency", { skip: !postgresTestsEnabl
     ]);
     assert.ok(results.every((result) => result.conversationId === header));
     await assertTranscript(header, [], 2);
+  });
+
+  it("refuses an oversized index without truncating or mutating the stored history", async () => {
+    const seed = await resolve("oversized-index", ["seed"]);
+    const id = seed.conversationId!;
+    await database.transaction(async (tx) => {
+      await tx.query(
+        `INSERT INTO omniroute.conversation_turn_nodes
+        (id,conversation_id,parent_id,role,content_hash,first_seen_at,last_seen_at)
+        SELECT $1||'-'||n,$1,NULL,'user','hash-'||n,$2,$2
+        FROM generate_series(1,$3::integer) AS n`,
+        [id, new Date().toISOString(), CONVERSATION_INDEX_MAX_ROWS]
+      );
+      await addConversationNodeCount(tx, id, CONVERSATION_INDEX_MAX_ROWS);
+    });
+    await assert.rejects(
+      database.transaction((tx) => readConversationIndex(tx, id)),
+      /Conversation history exceeds tracking capacity/
+    );
+    const { rows } = await database.transaction((tx) =>
+      tx.query<{ count: string; derived: string }>(
+        `SELECT (SELECT count(*)::text FROM omniroute.conversation_turn_nodes WHERE conversation_id=$1) AS count,
+       (SELECT node_count::text FROM omniroute.conversation_node_counts WHERE conversation_id=$1) AS derived`,
+        [id]
+      )
+    );
+    assert.equal(rows[0].count, String(CONVERSATION_INDEX_MAX_ROWS + 1));
+    assert.equal(rows[0].derived, rows[0].count);
   });
 });

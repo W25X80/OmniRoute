@@ -89,6 +89,26 @@ function installHook(context, gate = Promise.resolve()) {
     });
 }
 
+test("owned pressure refusal returns a safe 503 and restores body ownership", async () => {
+  const req = new FakeRequest();
+  const res = new FakeResponse();
+  const originalOn = req.on;
+  const error = new Error("private memory details must not escape");
+  Object.defineProperty(error, Symbol.for("omniroute.persistence.request-capacity"), {
+    value: true,
+  });
+  globalThis.__omniroutePersistenceRequest = async () => {
+    throw error;
+  };
+  await wrapRequestListenerWithPersistence(() => assert.fail("handler dispatched"))(req, res);
+  assert.equal(res.status, 503);
+  assert.equal(JSON.parse(res.body).error.code, "resource_pressure");
+  assert.ok(!res.body.includes("private memory"));
+  assert.equal(req.on, originalOn);
+  assert.equal(req.listenerCount("aborted"), 0);
+  assert.equal(res.listenerCount("close"), 0);
+});
+
 async function collectReply(requestOptions, bytes) {
   return new Promise((resolve, reject) => {
     const client = http.request(requestOptions, (response) => {

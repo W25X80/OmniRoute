@@ -16,8 +16,20 @@ export function shutdownPostgresApplication(): Promise<void> {
 async function stopPostgresApplication(): Promise<void> {
   const { phase } = getPersistenceRuntimeStatus();
   if (phase !== "ready" && phase !== "closing") {
-    // A failed factory never entered application startup or activated its producers.
-    await closePersistenceRuntime();
+    // Process maintenance starts before the database factory; it also needs rollback.
+    const settled = await Promise.allSettled([
+      closePersistenceRuntime(),
+      import("@/lib/monitoring/runtimeResources").then((module) =>
+        module.stopRuntimeResourceMonitor()
+      ),
+      import("@/lib/db/responsesContinuationStore").then((module) =>
+        module.stopPendingContinuationMaintenance()
+      ),
+    ]);
+    const failures = settled.flatMap((result) =>
+      result.status === "rejected" ? [result.reason] : []
+    );
+    if (failures.length) throw new AggregateError(failures, "PostgreSQL startup cleanup failed");
     return;
   }
   beginPersistenceAdmissionClose();
@@ -353,6 +365,15 @@ async function stopPostgresApplication(): Promise<void> {
     );
   } finally {
     await attempt(closePersistenceRuntime, "persistence-close");
+    await attempt(
+      async () => (await import("@/lib/monitoring/runtimeResources")).stopRuntimeResourceMonitor(),
+      "resource-monitor-close"
+    );
+    await attempt(
+      async () =>
+        (await import("@/lib/db/responsesContinuationStore")).stopPendingContinuationMaintenance(),
+      "pending-continuation-close"
+    );
   }
   if (failures.length)
     throw new AggregateError(failures, "PostgreSQL application shutdown did not finish cleanly");

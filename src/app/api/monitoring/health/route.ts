@@ -11,8 +11,11 @@ import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 import { getArtifactReconciliationStatus } from "@/lib/usage/artifactReconciliationStatus";
 import {
   getPersistenceBackgroundMetrics,
+  getPersistenceRuntimeStatus,
   runPersistenceBackgroundWork,
 } from "@/lib/db/persistenceRuntime";
+import { getPendingContinuationStats } from "@/lib/db/responsesContinuationStore";
+import { getCallLogArtifactQueueStats } from "@/lib/usage/callLogArtifactWriter";
 
 /**
  * GET /api/monitoring/health — System health overview
@@ -339,6 +342,7 @@ async function rebuildHealthPayload(generation: number): Promise<unknown> {
   // the DB — a monitoring read stays cheap. Additive key, nothing moves.
   const walMaintenance = readHealthValue("wal maintenance", () => getWalMaintenanceState(), null);
 
+  const { retainedBytes, byteRefusals } = getCallLogArtifactQueueStats();
   const payload = {
     ...buildHealthPayload({
       appVersion: APP_CONFIG.version,
@@ -372,6 +376,9 @@ async function rebuildHealthPayload(generation: number): Promise<unknown> {
     }),
     artifactReconciliation: getArtifactReconciliationStatus(),
     persistenceBackground: getPersistenceBackgroundMetrics(),
+    persistenceRuntime: getPersistenceRuntimeStatus(),
+    pendingContinuation: getPendingContinuationStats(),
+    artifactSerialization: { retainedBytes, byteRefusals },
   };
 
   if (generation === healthPayloadCacheGeneration) {

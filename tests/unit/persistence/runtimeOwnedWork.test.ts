@@ -102,6 +102,53 @@ test.after(() => {
   }
 });
 
+test("root admission refuses capacity before preparing another catalog", { timeout: 10000 }, () =>
+  scenario(async () => {
+    await runtime.ensurePersistenceReady();
+    const release = barrier();
+    const jobs = Array.from({ length: 64 }, () =>
+      runtime.runPersistenceRequest(() => release.promise)
+    );
+    while (runtime.getPersistenceRuntimeStatus().activeRequests !== 64)
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    const before = fixture.generation;
+    let entered = false;
+    try {
+      await assert.rejects(
+        runtime.runPersistenceRequest(() => {
+          entered = true;
+        }),
+        /request admission/
+      );
+      assert.equal(entered, false);
+      assert.equal(fixture.generation, before, "refusal must precede catalog allocation");
+    } finally {
+      release.resolve();
+      await Promise.allSettled(jobs);
+    }
+    await runtime.runPersistenceRequest(() => {});
+    assert.equal(fixture.generation, before + 1, "completed work returns its admission slot");
+  })
+);
+
+test("root pressure refusal does not allocate a catalog or dispatch a handler", () =>
+  scenario(async () => {
+    await runtime.ensurePersistenceReady();
+    const pressure = await import("../../../open-sse/utils/resourcePressure.ts");
+    pressure.reloadResourcePressureRuntime({ heapThresholdMb: 1, immediateHeapUsedMb: () => 2 });
+    const before = fixture.generation;
+    try {
+      await assert.rejects(
+        runtime.runPersistenceRequest(() => assert.fail("handler dispatched")),
+        /request admission/
+      );
+      assert.equal(fixture.generation, before);
+      assert.equal(runtime.getPersistenceRuntimeStatus().activeRequests, 0);
+    } finally {
+      pressure.reloadResourcePressureRuntime();
+    }
+  }));
+
 test("cold close latches admission before a same-turn first startup", { timeout: 10000 }, () =>
   scenario(async () => {
     assert.equal(runtime.getPersistenceRuntimeStatus().phase, "starting");

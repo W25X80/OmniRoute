@@ -20,6 +20,47 @@ const { getConversationTurnPage, getMultiTurnConversationById } =
 const { resetDbInstance } = await import("../../src/lib/db/core.ts");
 const { withPostgresControlPlane } = await import("../../src/lib/db/controlPlaneContext.ts");
 const { PostgresError } = await import("../../src/lib/db/postgres/database.ts");
+const { withConversationFingerprint } =
+  await import("../../open-sse/services/conversationTrackingFence.ts");
+const { computeFingerprintHash } = await import("../../open-sse/services/conversationTracker.ts");
+
+test("a cancelled fingerprint waiter never materializes canonical history", async () => {
+  const identity = {};
+  const owner = "waiting-preparation";
+  const fingerprint = computeFingerprintHash({
+    apiKeyId: owner,
+    model: "test-model",
+    toolNames: [],
+  });
+  const gate = Promise.withResolvers<void>();
+  const held = withConversationFingerprint(identity, fingerprint, () => gate.promise, {
+    deadline: Date.now() + 10000,
+  });
+  const controller = new AbortController();
+  let historyReads = 0;
+  const body = {
+    get messages() {
+      historyReads++;
+      return [{ role: "user", content: "large history" }];
+    },
+  };
+  const binding = {
+    databaseIdentity: identity,
+    assertReady() {},
+  } as unknown as PostgresControlPlaneBinding;
+  const waiting = withPostgresControlPlane(binding, () =>
+    resolveConversationId({ ...input(owner, []), body, signal: controller.signal })
+  );
+  const rejected = assert.rejects(waiting, /cancelled/);
+  try {
+    await setImmediate();
+    assert.equal(historyReads, 0);
+  } finally {
+    controller.abort();
+    gate.resolve();
+    await Promise.all([held, rejected]);
+  }
+});
 
 test.after(() => {
   resetDbInstance();

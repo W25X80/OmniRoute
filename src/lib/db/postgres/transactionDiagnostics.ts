@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { performance } from "node:perf_hooks";
 
 type Phase = "admission" | "connect" | "begin" | "body" | "query" | "commit" | "rollback";
@@ -6,6 +6,7 @@ type Phase = "admission" | "connect" | "begin" | "body" | "query" | "commit" | "
 /** Timings contain no SQL text, bound values, driver messages or caller payloads. */
 export class TransactionDiagnostics {
   readonly started = performance.now();
+  readonly transactionId = randomUUID();
   readonly operation: string;
   phase: Phase = "admission";
   failedPhase: Phase | undefined;
@@ -68,6 +69,7 @@ export class TransactionDiagnostics {
   snapshot(outcome: string, sqlState?: string) {
     return {
       module: "postgres",
+      transactionId: this.transactionId,
       operation: this.operation,
       phase: this.failedPhase ?? this.phase,
       outcome,

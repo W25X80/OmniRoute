@@ -127,6 +127,8 @@ test("shutdown waits early factory work and blocks selected startup and Ready", 
       false
     );
     assert.equal(count("pool:close"), 1);
+    assert.ok(count("maintenance:resources:stop") > 0);
+    assert.ok(count("maintenance:continuation:stop") > 0);
   } finally {
     gate.resolve();
     await Promise.allSettled([registering, closing]);

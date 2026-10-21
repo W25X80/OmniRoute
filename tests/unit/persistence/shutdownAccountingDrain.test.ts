@@ -206,6 +206,14 @@ test(
         );
         assert.equal(fixture.poolCloses, 1);
         assert.equal(runtime.getPersistenceRuntimeStatus().phase, "closed");
+        assert.ok(
+          shutdownFixture.events.indexOf("maintenance:continuation:stop") >
+            shutdownFixture.events.indexOf("tail:child-complete")
+        );
+        assert.ok(
+          shutdownFixture.events.indexOf("maintenance:resources:stop") >
+            shutdownFixture.events.indexOf("logs:close")
+        );
       } finally {
         external.emitDestroy();
       }

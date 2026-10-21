@@ -32,6 +32,7 @@
  */
 
 import { createHmac, randomUUID } from "node:crypto";
+import { setImmediate as yieldToEventLoop } from "node:timers/promises";
 import { getSelectedPersistenceIdentity } from "../../src/lib/db/controlPlaneContext.ts";
 import {
   commitConversationResolutionAsync,
@@ -269,7 +270,11 @@ export function computeFingerprintHash(input: {
 // artifact's full, untruncated request body and matching by contentHash.
 // Exported so that resolver can compute the same hash for a lookup key.
 export function hashTurnContent(turn: CanonicalTurn): string {
-  return hashHex(`${turn.role} ${turn.text}`);
+  return createHmac("sha256", "omniroute-conversation-fingerprint-v1")
+    .update(turn.role)
+    .update(" ")
+    .update(turn.text)
+    .digest("hex");
 }
 
 /**
@@ -296,17 +301,22 @@ interface NewTurnNode {
 }
 
 /** Build the new-node run for turns[fromIndex:], chained off `chainAnchor`. */
-function buildNewNodes(
+async function buildNewNodes(
   turns: CanonicalTurn[],
   fromIndex: number,
   chainAnchor: string,
   rootId: string,
-  turnHashes?: string[]
-): NewTurnNode[] {
+  turnHashes: string[],
+  lifetime: { signal?: AbortSignal; deadline: number }
+): Promise<NewTurnNode[]> {
   const nodes: NewTurnNode[] = [];
   let parent = chainAnchor;
   for (let i = fromIndex; i < turns.length; i++) {
-    const turnHash = turnHashes ? turnHashes[i] : hashTurnContent(turns[i]);
+    if ((i - fromIndex) % 32 === 0) {
+      assertConversationTrackingActive(lifetime.signal, lifetime.deadline);
+      await yieldToEventLoop();
+    }
+    const turnHash = turnHashes[i];
     const nodeId = chainNodeIdFromHash(parent, turnHash);
     nodes.push({
       id: nodeId,
@@ -403,6 +413,33 @@ export function findReconnectMatch(
   index: ConversationTurnIndex,
   options: FindReconnectMatchOptions = {}
 ): FindReconnectMatchResult {
+  const work = reconnectWalk(chainTurns, index, options);
+  let step = work.next();
+  while (!step.done) step = work.next();
+  return step.value;
+}
+
+/** Same election and step budget; long walks let SQL replies, streams and timers run. */
+export async function findReconnectMatchCooperatively(
+  chainTurns: CanonicalTurn[],
+  index: ConversationTurnIndex,
+  options: FindReconnectMatchOptions,
+  lifetime: { signal?: AbortSignal; deadline: number }
+): Promise<FindReconnectMatchResult> {
+  const work = reconnectWalk(chainTurns, index, options);
+  for (;;) {
+    assertConversationTrackingActive(lifetime.signal, lifetime.deadline);
+    const step = work.next();
+    if (step.done) return step.value;
+    await yieldToEventLoop();
+  }
+}
+
+function* reconnectWalk(
+  chainTurns: CanonicalTurn[],
+  index: ConversationTurnIndex,
+  options: FindReconnectMatchOptions
+): Generator<void, FindReconnectMatchResult> {
   const turnHashes = options.turnHashes ?? chainTurns.map(hashTurnContent);
   const budget: ReconnectWalkBudget = options.budget ?? {
     stepsLeft: options.maxSteps ?? DEFAULT_RECONNECT_MAX_STEPS,
@@ -413,6 +450,9 @@ export function findReconnectMatch(
 
   for (let s = 0; s < chainTurns.length; s++) {
     if (budget.stepsLeft <= 0) break;
+    // Scanning hashes without an anchor also consumes CPU, although it does not
+    // spend the match-proof budget. Keep the same election and charged step count.
+    if (s > 0 && s % 512 === 0) yield;
     const anchors = index.byContentHash.get(turnHashes[s]);
     if (!anchors) continue;
     for (const anchorNodeId of anchors) {
@@ -422,11 +462,13 @@ export function findReconnectMatch(
       // than an unverified one.
       budget.stepsLeft -= 1;
       budget.stepsUsed += 1;
+      if (budget.stepsUsed % 512 === 0) yield;
       let parent = anchorNodeId;
       let matchEndIndex = s + 1;
       while (matchEndIndex < chainTurns.length && budget.stepsLeft > 0) {
         budget.stepsLeft -= 1;
         budget.stepsUsed += 1;
+        if (budget.stepsUsed % 512 === 0) yield;
         const nodeId = chainNodeIdFromHash(parent, turnHashes[matchEndIndex]);
         if (!index.nodeIds.has(nodeId)) break;
         parent = nodeId;
@@ -493,7 +535,6 @@ export async function resolveConversationId(
     return { conversationId: id, isNewConversation: false };
   }
 
-  const turns = extractCanonicalTurns(input.body);
   const toolNames = extractToolNames(input.body);
   const fingerprintHash = computeFingerprintHash({
     apiKeyId: input.apiKeyId,
@@ -501,25 +542,23 @@ export async function resolveConversationId(
     toolNames,
   });
 
-  // The turn CHAIN excludes the system message entirely, same reasoning as
-  // extractFirstNonSystemText above: real coding-agent CLIs regenerate the
-  // system prompt (timestamp/cwd/git status...) on every single request, so
-  // treating it as an ordinary chained turn would make turn-0 (or wherever
-  // it sits) fail to match on every request — reintroducing the exact
-  // always-new-conversation bug this chain design exists to fix.
-  const chainTurns = turns.filter((t) => t.role !== "system");
-  // #7847-class stall fix: hash each turn's content exactly once per request
-  // and bound the reconnect walk across ALL candidates with one shared budget
-  // — previously every (start × anchor × walk-step) re-hashed the turn's full
-  // text twice, which on long duplicate-heavy coding-agent histories blocked
-  // the pre-routing request path for 10-130 s.
-  const turnHashes = chainTurns.map(hashTurnContent);
-
   const identity = getSelectedPersistenceIdentity() ?? sqliteIdentity;
   return withConversationFingerprint(
     identity,
     fingerprintHash,
     async () => {
+      assertConversationTrackingActive(input.signal, deadline);
+      // Waiters retain only the caller's input, not an additional canonical
+      // transcript and hash array. A cancelled waiter never prepares history.
+      const chainTurns = extractCanonicalTurns(input.body).filter((turn) => turn.role !== "system");
+      const turnHashes: string[] = [];
+      for (let i = 0; i < chainTurns.length; i++) {
+        if (i % 32 === 0) {
+          assertConversationTrackingActive(input.signal, deadline);
+          await yieldToEventLoop();
+        }
+        turnHashes.push(hashTurnContent(chainTurns[i]));
+      }
       const walkBudget: ReconnectWalkBudget = {
         stepsLeft: DEFAULT_RECONNECT_MAX_STEPS,
         stepsUsed: 0,
@@ -531,24 +570,29 @@ export async function resolveConversationId(
         let stale = false;
         for (const candidate of candidates) {
           assertConversationTrackingActive(input.signal, deadline);
+          // No remaining walk can prove a match; loading another full index cannot help.
+          if (walkBudget.stepsLeft <= 0) break;
           const snapshot = await getConversationHistorySnapshotAsync(candidate.id);
           if (!snapshot || snapshot.index.nodeIds.size === 0) continue;
-          const { match } = findReconnectMatch(chainTurns, snapshot.index, {
-            turnHashes,
-            budget: walkBudget,
-          });
+          const { match } = await findReconnectMatchCooperatively(
+            chainTurns,
+            snapshot.index,
+            { turnHashes, budget: walkBudget },
+            { signal: input.signal, deadline }
+          );
           if (!match) continue;
           // A different recorded child is a divergence: continue searching for its own straight chain.
           if (match.matchEndIndex !== chainTurns.length && match.anchorHasChild) continue;
           const nodes =
             match.matchEndIndex === chainTurns.length
               ? []
-              : buildNewNodes(
+              : await buildNewNodes(
                   chainTurns,
                   match.matchEndIndex,
                   match.anchorNodeId,
                   candidate.id,
-                  turnHashes
+                  turnHashes,
+                  { signal: input.signal, deadline }
                 );
           assertConversationTrackingActive(input.signal, deadline);
           const committed = await commitConversationResolutionAsync({
@@ -572,7 +616,10 @@ export async function resolveConversationId(
           apiKeyId: input.apiKeyId,
           fingerprintHash,
           correlationId: input.correlationId,
-          nodes: buildNewNodes(chainTurns, 0, id, id, turnHashes),
+          nodes: await buildNewNodes(chainTurns, 0, id, id, turnHashes, {
+            signal: input.signal,
+            deadline,
+          }),
         });
         return { conversationId: id, isNewConversation: true };
       }

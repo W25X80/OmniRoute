@@ -32,11 +32,13 @@
  */
 
 import { getDbInstance } from "./core";
-import { cloneLogPayload } from "../logPayloads";
 import { isExplicitNoLogApiKey } from "../compliance/noLog";
 import { withSelectedContinuationPrivacy } from "./postgres/continuationPrivacy";
 import { readCallArtifact, readCallArtifactAsync } from "../usage/callLogArtifacts";
 import { getSelectedPostgresDatabase, getSelectedPersistenceIdentity } from "./controlPlaneContext";
+import { PendingContinuationBridge } from "./pendingContinuationBridge";
+import type { PendingContinuationSeed } from "./pendingContinuationBridge";
+export type { PendingContinuationSeed } from "./pendingContinuationBridge";
 
 export type ResponsesContinuationState = {
   input: unknown[];
@@ -153,56 +155,27 @@ function extractContinuationState(
   return { input, output };
 }
 
-export interface PendingContinuationSeed {
-  readonly responseId: string;
-  readonly apiKeyId: string | null;
-  readonly persistenceAuthority: object | undefined;
-  readonly nonce: object;
-}
-
-type PendingContinuationEntry = {
-  nonce: object;
-  persistenceAuthority?: object;
-  apiKeyId: string | null;
-  state: ResponsesContinuationState;
-  expiresAt: number;
+// Next bundles share both authority isolation and one process-wide memory budget.
+const PENDING_CONTINUATIONS = Symbol.for("omniroute.pending-continuation-bridge.v2");
+const pendingGlobals = globalThis as typeof globalThis & {
+  [PENDING_CONTINUATIONS]?: PendingContinuationBridge;
 };
+const pendingContinuations = (pendingGlobals[PENDING_CONTINUATIONS] ??=
+  new PendingContinuationBridge());
 
-// Bounds how long a seeded entry can stand in for the durable row. Comfortably
-// longer than realistic artifact-write queue latency (single worker, see
-// MAX_QUEUED_JOBS in callLogArtifactWriter.ts) but short enough that a save
-// which never reaches "ready" (e.g. detailState becomes "missing") falls back
-// to the same permanent not-found the durable path already gives today.
-const PENDING_CONTINUATION_TTL_MS = 60_000;
-const sqlitePendingContinuationStates = new Map<string, PendingContinuationEntry>();
-const NATIVE_PENDING_CONTINUATIONS = Symbol.for("omniroute.postgres.pending-continuations.v1");
-type PendingStates = Map<string, PendingContinuationEntry>;
-type NativePendingOwners = WeakMap<object, PendingStates>;
-
-function nativePendingOwners(): NativePendingOwners {
-  const globals = globalThis as typeof globalThis & { [key: symbol]: unknown };
-  return (globals[NATIVE_PENDING_CONTINUATIONS] ??= new WeakMap<
-    object,
-    PendingStates
-  >()) as NativePendingOwners;
+/** Serving startup must call this outside request ALS, before opening request admission. */
+export function initializePendingContinuationMaintenance(): void {
+  pendingContinuations.initialize();
 }
 
-function selectedPendingStates(): PendingStates {
-  const identity = getSelectedPersistenceIdentity();
-  if (!identity) return sqlitePendingContinuationStates;
-  const owners = nativePendingOwners();
-  let states = owners.get(identity);
-  if (!states) {
-    states = new Map();
-    owners.set(identity, states);
-  }
-  return states;
+/** Serving shutdown calls this after accepted stream/accounting work has drained. */
+export function stopPendingContinuationMaintenance(): void {
+  pendingContinuations.stop();
 }
 
-function ownedPendingStates(seed: PendingContinuationSeed): PendingStates | undefined {
-  return seed.persistenceAuthority
-    ? nativePendingOwners().get(seed.persistenceAuthority)
-    : sqlitePendingContinuationStates;
+/** Aggregate counts and estimated retained bytes only; no response IDs, tenants or payloads. */
+export function getPendingContinuationStats() {
+  return pendingContinuations.stats();
 }
 
 /**
@@ -231,73 +204,33 @@ export function seedOwnedPendingContinuationState(
   if (!responseId) return undefined;
   const state = extractContinuationState(pipeline, videoContentRemoved);
   if (!state) return undefined;
-  const seed: PendingContinuationSeed = {
-    responseId,
-    persistenceAuthority: getSelectedPersistenceIdentity(),
-    apiKeyId,
-    nonce: {},
-  };
-  selectedPendingStates().set(responseId, {
-    nonce: seed.nonce,
-    persistenceAuthority: seed.persistenceAuthority,
-    apiKeyId,
-    state,
-    expiresAt: Date.now() + PENDING_CONTINUATION_TTL_MS,
-  });
-  return seed;
+  return pendingContinuations.admit(responseId, apiKeyId, getSelectedPersistenceIdentity(), state);
 }
 
 /** A delayed cancellation may remove only the exact seed it prepared. */
 export function clearOwnedPendingContinuationState(seed: PendingContinuationSeed): void {
-  const states = ownedPendingStates(seed);
-  const entry = states?.get(seed.responseId);
-  if (
-    entry?.nonce === seed.nonce &&
-    entry.apiKeyId === seed.apiKeyId &&
-    entry.persistenceAuthority === seed.persistenceAuthority
-  )
-    states!.delete(seed.responseId);
+  pendingContinuations.clearOwned(seed);
 }
 
 function selectedPendingSeed(
   responseId: string,
   apiKeyId: string
 ): PendingContinuationSeed | undefined {
-  const entry = selectedPendingStates().get(responseId);
-  if (
-    entry?.apiKeyId !== apiKeyId ||
-    entry.persistenceAuthority !== getSelectedPersistenceIdentity()
-  )
-    return undefined;
-  return {
-    responseId,
-    apiKeyId,
-    persistenceAuthority: entry.persistenceAuthority,
-    nonce: entry.nonce,
-  };
+  return pendingContinuations.seed(responseId, apiKeyId, getSelectedPersistenceIdentity());
 }
 
 /** Called from callLogs.ts once the durable row lands -- the DB is now
  * authoritative and the bridge entry would otherwise just idle until its TTL. */
 export function clearPendingContinuationState(responseId: string): void {
   if (!responseId) return;
-  selectedPendingStates().delete(responseId);
+  pendingContinuations.clear(responseId, getSelectedPersistenceIdentity());
 }
 
 function resolvePendingContinuationState(
   responseId: string,
   apiKeyId: string | null | undefined
 ): ResponsesContinuationState | null {
-  const entry = selectedPendingStates().get(responseId);
-  if (!entry || entry.persistenceAuthority !== getSelectedPersistenceIdentity()) return null;
-  if (Date.now() > entry.expiresAt) {
-    selectedPendingStates().delete(responseId);
-    return null;
-  }
-  // Same tenant-isolation rule as the durable lookup below: a response id is
-  // only ever handed back to the API key that created it.
-  if (!apiKeyId || entry.apiKeyId !== apiKeyId) return null;
-  return entry.state;
+  return pendingContinuations.read(responseId, apiKeyId, getSelectedPersistenceIdentity());
 }
 
 /**
@@ -607,7 +540,7 @@ export async function resolvePreviousResponseStateAsync(
     const currentSeed = selectedPendingSeed(responseId, apiKeyId);
     if (!pendingSeed || currentSeed?.nonce !== pendingSeed.nonce) return null;
     const pending = resolvePendingContinuationState(responseId, apiKeyId);
-    return pending ? cloneLogPayload(pending) : null;
+    return pending;
   });
   if (!authorized && pendingSeed) clearOwnedPendingContinuationState(pendingSeed);
   if (!authorized && !row && (initialPendingSeed || pendingSeed)) {

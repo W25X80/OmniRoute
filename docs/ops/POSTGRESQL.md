@@ -1,6 +1,6 @@
 ---
 title: "PostgreSQL operations"
-lastUpdated: 2026-10-13
+lastUpdated: 2026-10-21
 ---
 
 # PostgreSQL operations
@@ -53,6 +53,36 @@ admission wait. Connection/lock/statement/query/transaction/idle deadlines defau
 3/1/5/6/15/5 seconds. Tune only with the documented ordering constraints; pool limits apply per
 process. PostgreSQL 17+ is required by `transaction_timeout`.
 
+Native HTTP admission allows at most 64 active persistence requests. Resource-pressure
+admission runs before catalog preparation and body consumption, returning a sanitized 503
+with `Retry-After: 5` when capacity is unavailable. Accepted work retains its cleanup authority.
+The RSS fuse uses the smaller of its configured threshold and 90% of the finite container
+limit. The sampler supports cgroup v2 and cgroup v1, including a finite hierarchical limit
+when the task's leaf limit is unlimited. These bounds reduce amplification; they do not
+guarantee that one large accepted request cannot exhaust memory.
+
+Pending Responses continuations are a temporary bridge to durable call artifacts, not a second
+database. One process-wide bridge admits at most 256 entries, with estimated limits of 8 MiB
+per entry and 64 MiB total. It owns detached payloads and expires them after 60 seconds; a
+startup-owned one-second sweep releases expired entries even without another lookup. Over-budget
+entries are refused whole. Durable continuation lookup and current key privacy checks remain
+authoritative. Shutdown drains accepted work before releasing this bridge.
+
+The artifact worker queue reserves estimated input memory before cloning or worker transfer:
+32 MiB per raw artifact and 128 MiB across active/waiting inputs in all process bundles.
+Decode views are copied at their exact size under the existing 8 MiB limit; staged ciphertext
+keeps its existing size limit and consumes the shared budget. Caller mutation cannot enlarge
+an admitted graph. Refusal leaves PostgreSQL scalar call metadata with
+`detailReason: "preparation_failed"`; it does not create a publication intent or change usage
+accounting. Existing stored-payload truncation remains unchanged. Estimated input retention
+does not bound worker serialization temporaries or total process RSS.
+
+Every 30 seconds, the `runtime.resources` log records process/container memory, event-loop
+delay/utilization, persistence admission counts, pending-continuation counts/estimated bytes
+and process-wide artifact serialization retained-byte/refusal counters.
+These aggregate observations contain no request identities or payloads. They support diagnosis;
+they are not a heap-retention profile.
+
 Configure `AWS_REGION`, `OMNIROUTE_ARTIFACT_S3_BUCKET`, `OMNIROUTE_ARTIFACT_S3_PREFIX` and
 `OMNIROUTE_ARTIFACT_S3_EXPECTED_BUCKET_OWNER`. The expected owner is a 12-digit account ID.
 The task IAM role must permit object PUT/GET/DELETE in that private prefix. If
@@ -74,6 +104,22 @@ then append/count changes commit atomically if both the parent incarnation and r
 An acknowledged pre-write conflict can be reclassified twice; an unknown COMMIT is never replayed.
 The process-local fingerprint fence has bounded waiting and cancellation. This remains a
 single-writer deployment profile, not multi-replica qualification.
+
+Tracking reads at most 32,769 index rows and refuses histories above 32,768 nodes instead of
+passing a truncated graph to reconnection matching. Stored history is retained. Conversation
+canonicalization starts only after fingerprint admission; hashing and reconnect traversal yield
+between bounded work slices while preserving candidate order and matching semantics.
+
+Independent session-affinity pins use a shared sessions gate followed by a per-pin exclusive
+fence; model-history appends share the group gate. Cleanup and existing combo model edits keep
+their exclusive gate. A drained, single-writer replacement is required in either direction
+when deploying this lock-protocol change.
+
+Transaction diagnostics use one structured log record and a unique transaction identifier to
+separate concurrent operations. A server `FATAL 25P03` during COMMIT means the idle transaction
+was terminated before command execution and is classified as a known failure without replay.
+Connection loss, an acknowledgement lost after COMMIT, and other fatal errors remain unknown
+outcomes. No automatic retry is added.
 
 LKGP record and clear operations acquire background ownership before suspension, retain the
 existing 64-operation limit, and drain during shutdown. Related hints commit together. Delayed

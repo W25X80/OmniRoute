@@ -1,4 +1,8 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import {
+  checkResourcePressureGuard,
+  prepareResourcePressureObservation,
+} from "@omniroute/open-sse/utils/resourcePressure.ts";
 import type { NativeArtifactStore } from "@/domain/persistence/artifactStore";
 import {
   parseDatabaseBackend,
@@ -30,6 +34,7 @@ interface Runtime {
   applicationIdentity?: object;
   releaseApplication?: () => void;
   requests: Set<Work>;
+  requestRefusals: number;
   attempts: Set<Work>;
   attemptAdmissions: Set<Set<Work>>;
   attemptCancellation: AbortController;
@@ -75,6 +80,17 @@ export function isPersistenceStreamCapacityError(error: unknown): boolean {
 const BACKGROUND_LIMIT = 64;
 const TAIL_LIMIT = 64;
 const ATTEMPT_LIMIT = 64;
+const REQUEST_LIMIT = 64;
+
+export class PersistenceRequestCapacityError extends Error {
+  constructor() {
+    super("Persistence request admission is unavailable");
+    this.name = "PersistenceRequestCapacityError";
+    Object.defineProperty(this, Symbol.for("omniroute.persistence.request-capacity"), {
+      value: true,
+    });
+  }
+}
 
 export type PersistenceBackgroundOwner =
   | "lkgp.clear"
@@ -108,6 +124,7 @@ function runtime(): Runtime {
     backend,
     phase: "starting",
     requests: new Set(),
+    requestRefusals: 0,
     attempts: new Set(),
     attemptAdmissions: new Set(),
     attemptCancellation: new AbortController(),
@@ -119,17 +136,19 @@ function runtime(): Runtime {
 
 async function initializePostgres(state: Runtime): Promise<void> {
   readNativeScratchDataDir();
-  const [connectionModule, planeModule, artifactConfig, artifactFactory] = await Promise.all([
-    import("./postgres/environment"),
-    import("./postgres/controlPlane"),
-    import("../artifacts/s3ArtifactConfiguration"),
-    import("../artifacts/s3ArtifactStore"),
-  ]);
+  const [connectionModule, planeModule, artifactConfig, artifactFactory, logModule] =
+    await Promise.all([
+      import("./postgres/environment"),
+      import("./postgres/controlPlane"),
+      import("../artifacts/s3ArtifactConfiguration"),
+      import("../artifacts/s3ArtifactStore"),
+      import("@/shared/utils/logger"),
+    ]);
   const connection = await connectionModule.readPostgresEnvironment();
   const configuration = artifactConfig.readS3ArtifactConfiguration();
   const plane = await planeModule.initializePostgresControlPlane({
     connection,
-    logger: console,
+    logger: logModule.logger,
   });
   state.plane = plane;
   try {
@@ -188,8 +207,10 @@ export async function ensurePersistenceReady(): Promise<void> {
   if (state.phase !== "starting") throw new Error("Application persistence is unavailable");
   state.startup ??= (async () => {
     try {
-      if (state.backend === "postgres") await initializePostgres(state);
-      else await (await import("./core")).ensureDbInitialized();
+      if (state.backend === "postgres") {
+        await initializePostgres(state);
+        await prepareResourcePressureObservation();
+      } else await (await import("./core")).ensureDbInitialized();
       if (state.phase !== "starting") throw new Error("Application persistence is draining");
       state.phase = "ready";
     } catch (error) {
@@ -257,6 +278,12 @@ export async function runPersistenceRequest<T>(body: () => T | Promise<T>): Prom
   const state = runtime();
   await ensurePersistenceReady();
   if (state.phase !== "ready") throw new Error("Application persistence is draining");
+  // Admit before catalog preparation and body consumption. Accepted work retains its
+  // authority until the HTTP lifetime ends; pressure never revokes accounting cleanup.
+  if (state.requests.size >= REQUEST_LIMIT || checkResourcePressureGuard()) {
+    state.requestRefusals = Math.min(Number.MAX_SAFE_INTEGER, state.requestRefusals + 1);
+    throw new PersistenceRequestCapacityError();
+  }
   return tracked(state.requests, freshScope(state, body));
 }
 
@@ -510,6 +537,8 @@ export function getPersistenceRuntimeStatus(): {
   backend: DatabaseBackend;
   phase: Phase;
   activeRequests: number;
+  requestLimit: number;
+  requestRefusals: number;
   activeAttempts: number;
   attemptOperations: number;
   backgroundOperations: number;
@@ -520,6 +549,8 @@ export function getPersistenceRuntimeStatus(): {
     backend: state.backend,
     phase: state.phase,
     activeRequests: state.requests.size,
+    requestLimit: REQUEST_LIMIT,
+    requestRefusals: state.requestRefusals,
     activeAttempts: state.attemptAdmissions.size,
     attemptOperations: state.attempts.size,
     backgroundOperations: state.background.size,

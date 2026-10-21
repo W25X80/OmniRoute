@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { checkHeapPressureGuard, HEAP_PRESSURE_THRESHOLD_MB } from "./heapPressure.ts";
 import { buildErrorBody } from "./error.ts";
 import {
@@ -16,24 +17,61 @@ import {
 const MB = 1024 * 1024;
 const RETRY_AFTER_SECONDS = "5";
 const PRESSURE_MESSAGE = "Service temporarily unavailable due to resource pressure. Retry shortly.";
+// Instrumentation imports this module before application/request scopes. Preserve that
+// process owner across bundled copies and config reloads initiated by management requests.
+const MAINTENANCE_CONTEXT_KEY = Symbol.for("omniroute.resourcePressure.maintenance-context");
+const maintenanceGlobals = globalThis as typeof globalThis & {
+  [MAINTENANCE_CONTEXT_KEY]?: ReturnType<typeof AsyncLocalStorage.snapshot>;
+};
+const runMaintenance = (maintenanceGlobals[MAINTENANCE_CONTEXT_KEY] ??=
+  AsyncLocalStorage.snapshot());
 
 /**
  * Absolute RSS fuse for native/external memory that is invisible to V8 heapUsed.
  * OMNIROUTE_MEMORY_MB is the configured V8 heap budget; use 2x that value with
  * a 3 GiB floor unless OMNIROUTE_RSS_PRESSURE_MB explicitly overrides it.
+ * A finite container limit always leaves 10% for other processes and native allocations.
  */
 export function computeRssPressureThresholdMb(
   memoryBudgetRaw: string | number | undefined = process.env.OMNIROUTE_MEMORY_MB,
-  overrideRaw: string | number | undefined = process.env.OMNIROUTE_RSS_PRESSURE_MB
+  overrideRaw: string | number | undefined = process.env.OMNIROUTE_RSS_PRESSURE_MB,
+  constrainedBytes?: number
 ): number | null {
   const explicit = Number(overrideRaw);
-  if (Number.isFinite(explicit) && explicit > 0) return Math.floor(explicit);
   const memoryBudget = Number(memoryBudgetRaw);
-  if (!Number.isFinite(memoryBudget) || memoryBudget <= 0) return null;
-  return Math.max(3_072, Math.floor(memoryBudget * 2));
+  const configured =
+    Number.isFinite(explicit) && explicit > 0
+      ? Math.floor(explicit)
+      : Number.isFinite(memoryBudget) && memoryBudget > 0
+        ? Math.max(3_072, Math.floor(memoryBudget * 2))
+        : null;
+  const ceiling =
+    typeof constrainedBytes === "number" &&
+    Number.isFinite(constrainedBytes) &&
+    constrainedBytes > 0 &&
+    constrainedBytes < Number.MAX_SAFE_INTEGER
+      ? Math.max(1, Math.floor((constrainedBytes / MB) * 0.9))
+      : null;
+  return ceiling === null
+    ? configured
+    : configured === null
+      ? ceiling
+      : Math.min(configured, ceiling);
 }
 
-export const RSS_PRESSURE_THRESHOLD_MB = computeRssPressureThresholdMb();
+function constrainedMemoryBytes(): number | undefined {
+  try {
+    return process.constrainedMemory?.();
+  } catch {
+    return undefined;
+  }
+}
+
+export const RSS_PRESSURE_THRESHOLD_MB = computeRssPressureThresholdMb(
+  process.env.OMNIROUTE_MEMORY_MB,
+  process.env.OMNIROUTE_RSS_PRESSURE_MB,
+  constrainedMemoryBytes()
+);
 
 export type ResourcePressureGuardResult = {
   success: false;
@@ -367,7 +405,7 @@ export function createResourcePressureRuntime(
   const scheduleRefresh = (): void => {
     if (disposed || scheduled || inFlight) return;
     scheduled = true;
-    schedule(refresh);
+    runMaintenance(() => schedule(refresh));
   };
 
   // Both the self-restart circuit and recovery detection must not depend on
@@ -381,11 +419,13 @@ export function createResourcePressureRuntime(
 
   const ensureDriver = (): void => {
     if (disposed || backgroundDriver) return;
-    backgroundDriver = setInterval(() => {
-      if (disposed) return;
-      nextRefreshAtMs = Math.min(nextRefreshAtMs, nowMs());
-      scheduleRefresh();
-    }, driverIntervalMs);
+    backgroundDriver = runMaintenance(() =>
+      setInterval(() => {
+        if (disposed) return;
+        nextRefreshAtMs = Math.min(nextRefreshAtMs, nowMs());
+        scheduleRefresh();
+      }, driverIntervalMs)
+    );
     backgroundDriver.unref?.();
   };
 
@@ -415,7 +455,20 @@ export function createResourcePressureRuntime(
       } catch {
         rssUsedMb = 0;
       }
-      const immediateRss = immediateRssGuard(rssUsedMb, rssThresholdMb);
+      const limits = [lastSignals?.cgroup.maxBytes, lastSignals?.process.constrainedBytes].filter(
+        (value): value is number => value != null && value > 0
+      );
+      const effectiveRssThreshold =
+        options.rssThresholdMb === null
+          ? null
+          : limits.length
+            ? computeRssPressureThresholdMb(
+                undefined,
+                rssThresholdMb ?? undefined,
+                Math.min(...limits)
+              )
+            : rssThresholdMb;
+      const immediateRss = immediateRssGuard(rssUsedMb, effectiveRssThreshold);
       const immediate = immediateHeap ?? immediateRss;
       const immediateReason: PressureReason = immediateHeap ? "v8_heap_absolute" : "rss_absolute";
       const now = nowMs();
@@ -497,6 +550,13 @@ function activeRuntime(): ResourcePressureRuntime {
 
 export function checkResourcePressureGuard(): ResourcePressureGuardResult | null {
   return activeRuntime().check();
+}
+
+/** Resolve container limits before the native HTTP runtime opens admission. */
+export async function prepareResourcePressureObservation(): Promise<void> {
+  const runtime = activeRuntime();
+  runtime.check();
+  await runtime.whenRefreshSettled();
 }
 
 export function getResourcePressureObservation(): ResourcePressureObservation {

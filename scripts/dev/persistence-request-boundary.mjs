@@ -30,19 +30,22 @@ export function bindPersistenceRequestCallback(callback) {
   return bound;
 }
 
-function failUnavailable(res) {
+function failUnavailable(res, error) {
   if (res.destroyed || res.writableFinished || res.writableEnded) return;
   if (res.headersSent) {
     res.destroy();
     return;
   }
+  const pressure = error?.[Symbol.for("omniroute.persistence.request-capacity")] === true;
   res.writeHead(503, {
     "Content-Type": "application/json",
     "Cache-Control": "no-store",
-    "Retry-After": "1",
+    "Retry-After": pressure ? "5" : "1",
   });
   res.end(
-    '{"error":{"message":"Persistence is not ready","type":"server_error","code":"persistence_not_ready"}}'
+    pressure
+      ? '{"error":{"message":"Service temporarily unavailable due to resource pressure. Retry shortly.","type":"server_error","code":"resource_pressure"}}'
+      : '{"error":{"message":"Persistence is not ready","type":"server_error","code":"persistence_not_ready"}}'
   );
 }
 
@@ -176,17 +179,19 @@ export function wrapRequestListenerWithPersistence(listener, loadedNextConfigura
           file ? { req, res, ...file, onFailure: () => failUnavailable(res) } : undefined
         );
       } else owned = hook(run, lifetime.promise);
-    } catch {
+    } catch (error) {
       lifetime.dispose();
       bodyGate.restore();
-      failUnavailable(res);
-      console.error("[Persistence] Request boundary failed");
+      failUnavailable(res, error);
+      if (error?.[Symbol.for("omniroute.persistence.request-capacity")] !== true)
+        console.error("[Persistence] Request boundary failed");
       return;
     }
     return Promise.resolve(owned)
-      .catch(() => {
-        failUnavailable(res);
-        console.error("[Persistence] Request boundary failed");
+      .catch((error) => {
+        failUnavailable(res, error);
+        if (error?.[Symbol.for("omniroute.persistence.request-capacity")] !== true)
+          console.error("[Persistence] Request boundary failed");
       })
       .finally(() => {
         lifetime.dispose();

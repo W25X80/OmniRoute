@@ -201,3 +201,16 @@ export async function drainPersistenceAcceptedWork(): Promise<void> {
 export async function closeNativeNotionThreadSessions(): Promise<void> {
   record("notion:close");
 }
+
+export function initializePendingContinuationMaintenance(): void {
+  record("maintenance:continuation:start");
+}
+export function startRuntimeResourceMonitor(): void {
+  record("maintenance:resources:start");
+}
+export async function stopRuntimeResourceMonitor(): Promise<void> {
+  record("maintenance:resources:stop");
+}
+export function stopPendingContinuationMaintenance(): void {
+  record("maintenance:continuation:stop");
+}

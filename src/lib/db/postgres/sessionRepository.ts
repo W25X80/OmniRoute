@@ -10,7 +10,7 @@ import type {
 import { normalizeScope, type AccessScope } from "../../accessTokens/scopes";
 import type { PostgresDatabase, PostgresTransaction } from "./database";
 import { databaseTimestamp } from "./leaseRepository";
-import { acquirePostgresLock } from "./locks";
+import { acquirePostgresEntityLock, acquirePostgresLock } from "./locks";
 
 type Row = Record<string, unknown>;
 export interface SessionAffinityRecord {
@@ -100,10 +100,14 @@ function handoff(row: Row | undefined): HandoffPayload | null {
   };
 }
 export function createPostgresSessionRepository(database: PostgresDatabase) {
-  // Fences absent KV rows and compare/delete with concurrent replacement of the same pin.
-  function affinityTransaction<T>(body: (transaction: PostgresTransaction) => Promise<T>) {
+  // The shared gate excludes whole-domain cleanup; the entity fence covers even absent pins.
+  function affinityTransaction<T>(
+    affinityKey: string,
+    body: (transaction: PostgresTransaction) => Promise<T>
+  ) {
     return database.transaction(async (transaction) => {
-      await acquirePostgresLock(transaction, "sessions");
+      await acquirePostgresLock(transaction, "sessions", "shared");
+      await acquirePostgresEntityLock(transaction, "sessionAffinity", [affinityKey]);
       return body(transaction);
     });
   }
@@ -133,8 +137,8 @@ export function createPostgresSessionRepository(database: PostgresDatabase) {
   return {
     getSessionAccountAffinity(session: string, provider: string, ttl = 0, now?: number) {
       if (!session || !provider || !positiveTtl(ttl)) return Promise.resolve(null);
-      return affinityTransaction(async (transaction) => {
-        const affinityKey = key(session, provider);
+      const affinityKey = key(session, provider);
+      return affinityTransaction(affinityKey, async (transaction) => {
         const record = await affinityRow(transaction, affinityKey);
         if (!record) return null;
         if (Date.parse(record.expiresAt) <= (await nowMs(transaction, now))) {
@@ -155,8 +159,8 @@ export function createPostgresSessionRepository(database: PostgresDatabase) {
       ttl = 0
     ) {
       if (!session || !provider || !connectionId || !positiveTtl(ttl)) return Promise.resolve();
-      return affinityTransaction(async (transaction) => {
-        const affinityKey = key(session, provider);
+      const affinityKey = key(session, provider);
+      return affinityTransaction(affinityKey, async (transaction) => {
         const old = await affinityRow(transaction, affinityKey);
         await writeAffinity(
           transaction,
@@ -170,8 +174,8 @@ export function createPostgresSessionRepository(database: PostgresDatabase) {
     },
     touchSessionAccountAffinity(session: string, provider: string, now?: number, ttl = 0) {
       if (!positiveTtl(ttl) || !session || !provider) return Promise.resolve();
-      return affinityTransaction(async (transaction) => {
-        const affinityKey = key(session, provider);
+      const affinityKey = key(session, provider);
+      return affinityTransaction(affinityKey, async (transaction) => {
         const old = await affinityRow(transaction, affinityKey);
         const timestamp = await nowMs(transaction, now);
         if (old && Date.parse(old.expiresAt) > timestamp)
@@ -180,10 +184,11 @@ export function createPostgresSessionRepository(database: PostgresDatabase) {
     },
     deleteSessionAccountAffinity(session: string, provider: string) {
       if (!session || !provider) return Promise.resolve();
-      return affinityTransaction(async (transaction) => {
+      const affinityKey = key(session, provider);
+      return affinityTransaction(affinityKey, async (transaction) => {
         await transaction.query(
           `DELETE FROM omniroute.key_value WHERE namespace='session_account_affinity' AND key=$1`,
-          [key(session, provider)]
+          [affinityKey]
         );
       });
     },
@@ -193,8 +198,8 @@ export function createPostgresSessionRepository(database: PostgresDatabase) {
       connectionId: string
     ) {
       if (!session || !provider || !connectionId) return Promise.resolve(false);
-      return affinityTransaction(async (transaction) => {
-        const affinityKey = key(session, provider);
+      const affinityKey = key(session, provider);
+      return affinityTransaction(affinityKey, async (transaction) => {
         const old = await affinityRow(transaction, affinityKey);
         if (old?.connectionId !== connectionId) return false;
         await transaction.query(
@@ -205,7 +210,8 @@ export function createPostgresSessionRepository(database: PostgresDatabase) {
       });
     },
     cleanupStaleSessionAccountAffinities(_ttl?: number, now?: number) {
-      return affinityTransaction(async (transaction) => {
+      return database.transaction(async (transaction) => {
+        await acquirePostgresLock(transaction, "sessions");
         const timestamp = await nowMs(transaction, now);
         const rows = await transaction.query<{ key: string; value: string }>(
           `SELECT key,value FROM omniroute.key_value WHERE namespace='session_account_affinity'`
@@ -299,7 +305,7 @@ export function createPostgresSessionRepository(database: PostgresDatabase) {
       connection?: string
     ) {
       return database.transaction(async (transaction) => {
-        await acquirePostgresLock(transaction, "sessions");
+        await acquirePostgresLock(transaction, "sessions", "shared");
         await transaction.query(
           `INSERT INTO omniroute.session_model_history(session_id,combo_name,model_str,provider,connection_id,used_at) VALUES($1,$2,$3,$4,$5,$6)`,
           [

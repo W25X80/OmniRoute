@@ -568,13 +568,23 @@ declare global {
 }
 
 export async function registerNodejs(): Promise<void> {
-  if (parseDatabaseBackend() !== "postgres") return registerNodejsSelectedBackend(false);
-  if (process.env.NEXT_PHASE === "phase-production-build" || process.env.OMNIROUTE_BUILDING === "1")
+  const building =
+    process.env.NEXT_PHASE === "phase-production-build" || process.env.OMNIROUTE_BUILDING === "1";
+  const postgres = parseDatabaseBackend() === "postgres";
+  if (building) {
+    if (!postgres) await registerNodejsSelectedBackend(false);
     return;
-  if (globalThis.__omniroutePersistenceTransportInstalled !== true) {
+  }
+  if (postgres && globalThis.__omniroutePersistenceTransportInstalled !== true) {
     throw new Error("PostgreSQL requires the supported OmniRoute HTTP transport");
   }
   try {
+    // Startup owns these timers before entering any request/bootstrap ALS.
+    (
+      await import("@/lib/db/responsesContinuationStore")
+    ).initializePendingContinuationMaintenance();
+    (await import("@/lib/monitoring/runtimeResources")).startRuntimeResourceMonitor();
+    if (!postgres) return await registerNodejsSelectedBackend(false);
     await runPostgresBootstrap(async () => {
       globalThis.__omniroutePersistenceRequest = async (run, httpLifetime, fileTransport) => {
         await runPersistenceRequest(async () => {
@@ -607,12 +617,23 @@ export async function registerNodejs(): Promise<void> {
       await registerNodejsSelectedBackend(true);
     });
   } catch (error) {
-    globalThis.__omniroutePersistenceRequest = undefined;
-    globalThis.__omnirouteGetWebdavConfigurationAsync = undefined;
     try {
-      await (await import("@/lib/startup/postgresShutdown")).shutdownPostgresApplication();
+      if (postgres) {
+        globalThis.__omniroutePersistenceRequest = undefined;
+        globalThis.__omnirouteGetWebdavConfigurationAsync = undefined;
+        await (await import("@/lib/startup/postgresShutdown")).shutdownPostgresApplication();
+      }
     } catch {
       console.error("[STARTUP] PostgreSQL startup cleanup failed.");
+    } finally {
+      await Promise.allSettled([
+        import("@/lib/monitoring/runtimeResources").then((module) =>
+          module.stopRuntimeResourceMonitor()
+        ),
+        import("@/lib/db/responsesContinuationStore").then((module) =>
+          module.stopPendingContinuationMaintenance()
+        ),
+      ]);
     }
     throw normalizeBootError(error);
   }

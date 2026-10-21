@@ -11,6 +11,7 @@ export function lockConversationWrite(tx: PostgresTransaction): Promise<void> {
 
 export const CONVERSATION_INSERT_CHUNK_ROWS = 256;
 export const CONVERSATION_INSERT_CHUNK_BYTES = 256 * 1024;
+export const CONVERSATION_INDEX_MAX_ROWS = 32_768;
 
 export interface ConversationHistoryVersion {
   incarnation: string;
@@ -74,12 +75,17 @@ export function buildConversationIndex(
 }
 
 export async function readConversationIndex(tx: PostgresTransaction, id: string) {
-  return (
+  const rows = (
     await tx.query<ConversationIndexRow>(
-      "SELECT id,parent_id,content_hash FROM omniroute.conversation_turn_nodes WHERE conversation_id=$1 ORDER BY insertion_order",
-      [id]
+      "SELECT id,parent_id,content_hash FROM omniroute.conversation_turn_nodes WHERE conversation_id=$1 ORDER BY insertion_order LIMIT $2",
+      [id, CONVERSATION_INDEX_MAX_ROWS + 1]
     )
   ).rows;
+  // A partial graph invents leaves and can attach a divergent transcript to the
+  // wrong conversation. Tracking is best effort; refuse rather than truncate.
+  if (rows.length > CONVERSATION_INDEX_MAX_ROWS)
+    throw new RangeError("Conversation history exceeds tracking capacity");
+  return rows;
 }
 
 /** Mutators acquire parent rows before any node rows, in stable root order. */

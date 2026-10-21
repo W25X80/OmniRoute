@@ -82,6 +82,53 @@ function errorKind(kind: PostgresError["kind"]) {
   return (error: unknown) => error instanceof PostgresError && error.kind === kind;
 }
 
+test("idle-in-transaction FATAL at COMMIT proves rollback without authorizing replay", async () => {
+  let attempts = 0;
+  const f = fixture(async (text) => {
+    if (text === "COMMIT")
+      throw Object.assign(new Error("private server details"), {
+        code: "25P03",
+        severity: "FATAL",
+      });
+    return result(text);
+  });
+  try {
+    await assert.rejects(
+      f.database.transaction(async (tx) => {
+        attempts++;
+        await tx.query("WRITE");
+      }),
+      (error: unknown) =>
+        error instanceof PostgresError &&
+        error.kind === "transaction_failed" &&
+        error.sqlState === "25P03"
+    );
+    assert.equal(attempts, 1);
+    assert.deepEqual(f.calls, ["BEGIN", "WRITE", "COMMIT"]);
+    assert.deepEqual(f.releases, [true]);
+  } finally {
+    await f.database.close();
+  }
+});
+
+test("other FATAL errors at COMMIT remain uncertain", async () => {
+  for (const code of ["25P04", "08007", "57P01"]) {
+    const f = fixture(async (text) => {
+      if (text === "COMMIT")
+        throw Object.assign(new Error("private server details"), { code, severity: "FATAL" });
+      return result(text);
+    });
+    try {
+      await assert.rejects(
+        f.database.transaction(async () => 1),
+        errorKind("commit_unknown")
+      );
+    } finally {
+      await f.database.close();
+    }
+  }
+});
+
 test("commits once on the leased client and revokes the escaped scope", async () => {
   const f = fixture();
   let escaped!: PostgresTransaction;

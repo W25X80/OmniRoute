@@ -4,8 +4,10 @@ import { parseDatabaseBackend } from "../db/backendSelection";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { Worker } from "node:worker_threads";
+import { types } from "node:util";
 
 import type { ArtifactPutOptions } from "@/domain/persistence/artifactStore";
+import { retainedPlainDataBytes } from "@/shared/utils/retainedPlainData";
 import { getSelectedControlPlane } from "../db/controlPlaneContext";
 import { getPersistenceArtifactStore } from "../db/persistenceRuntime";
 import type { CallLogArtifact, CallLogArtifactWriteResult } from "./callLogArtifacts.ts";
@@ -24,9 +26,21 @@ const MAX_QUEUED_JOBS = 128;
 const IDLE_TIMEOUT_MS = 30_000;
 const CLOSE_TIMEOUT_MS = 2_000;
 const WARNING_INTERVAL_MS = 30_000;
+const DEFAULT_QUEUE_LIMITS = {
+  maxEntryBytes: 32 * 1024 * 1024,
+  maxRetainedBytes: 128 * 1024 * 1024,
+};
+const JOB_METADATA_BYTES = 512;
+const typedArrayByteLength = Object.getOwnPropertyDescriptor(
+  Object.getPrototypeOf(Uint8Array.prototype),
+  "byteLength"
+)!.get!;
+type ByteReservation = { bytes: number };
+type QueueLimits = typeof DEFAULT_QUEUE_LIMITS;
 
 type QueueBase = {
   id: number;
+  reservation: ByteReservation;
   artifact: CallLogArtifact;
   environment: CallLogArtifactEnvironment;
 };
@@ -42,6 +56,7 @@ type QueueItem =
       ))
   | ({
       id: number;
+      reservation: ByteReservation;
       resolve: (result: CallLogArtifactDecodeResult) => void;
       reject: (error: Error) => void;
     } & (
@@ -74,6 +89,69 @@ let idleTimer: NodeJS.Timeout | null = null;
 let closing = false;
 let closeWaiters: Array<() => void> = [];
 let lastWarningAt = 0;
+let queueLimits = { ...DEFAULT_QUEUE_LIMITS };
+const byteBudgetKey = Symbol.for("omniroute.call-log-artifact-byte-budget.v1");
+const byteBudgetGlobals = globalThis as typeof globalThis & {
+  [byteBudgetKey]?: { bytes: number; refusals: number };
+};
+const byteBudget = (byteBudgetGlobals[byteBudgetKey] ??= { bytes: 0, refusals: 0 });
+
+/** Worker counts are local; retained-byte counters include every bundled actor copy. */
+export function getCallLogArtifactQueueStats() {
+  return {
+    queued: queue.length,
+    active: active ? 1 : 0,
+    retainedBytes: byteBudget.bytes,
+    byteRefusals: byteBudget.refusals,
+  };
+}
+
+function availableBytes(): number {
+  return (
+    Math.min(queueLimits.maxRetainedBytes, DEFAULT_QUEUE_LIMITS.maxRetainedBytes) - byteBudget.bytes
+  );
+}
+
+function reserve(bytes: number): ByteReservation | null {
+  if (bytes > availableBytes()) return null;
+  byteBudget.bytes += bytes;
+  return { bytes };
+}
+
+function release(reservation: ByteReservation): void {
+  byteBudget.bytes -= reservation.bytes;
+  reservation.bytes = 0;
+}
+
+function refuseBytes(): null {
+  byteBudget.refusals = Math.min(Number.MAX_SAFE_INTEGER, byteBudget.refusals + 1);
+  return null;
+}
+
+/** Reserve the bounded descriptor scan before copying caller-owned plain graphs. */
+function admitPlain<T>(
+  value: T,
+  maximum: number
+): { value: T; reservation: ByteReservation } | null {
+  const bytes = retainedPlainDataBytes(
+    value,
+    Math.min(maximum, availableBytes()),
+    JOB_METADATA_BYTES
+  );
+  if (bytes === null) return refuseBytes();
+  const reservation = reserve(bytes);
+  if (!reservation) return refuseBytes();
+  try {
+    return { value: structuredClone(value), reservation };
+  } catch {
+    release(reservation);
+    return refuseBytes();
+  }
+}
+
+function admitArtifact(artifact: CallLogArtifact) {
+  return admitPlain({ artifact, environment: environmentSnapshot() }, queueLimits.maxEntryBytes);
+}
 
 function fileExistsAtRuntime(candidate: string): boolean {
   // The worker is copied explicitly by the standalone/npm packaging policies.
@@ -209,6 +287,7 @@ function failOpen(warn = false, detail?: unknown): void {
   }
   active = null;
   queue.length = 0;
+  for (const item of failed) release(item.reservation);
   terminateWorker();
   for (const item of failed) {
     if (item.kind === "deserialize" || item.kind === "deserialize-staged")
@@ -228,8 +307,19 @@ let workerFileOverride: { workerFile: string; execArgv: string[] } | null = null
  * worker script. Never called from production code paths.
  */
 export function __setCallLogWorkerOverrideForTests(
-  override: { workerFile: string; execArgv: string[] } | null
+  override: { workerFile: string; execArgv: string[]; queueLimits?: QueueLimits } | null
 ): void {
+  if (override?.queueLimits) {
+    if (active || queue.length || nativeWrites.size)
+      throw new Error("Cannot change artifact queue limits while work is admitted");
+    if (
+      Object.values(override.queueLimits).some(
+        (value) => !Number.isSafeInteger(value) || value <= 0
+      )
+    )
+      throw new RangeError("Artifact queue limits must be positive safe integers");
+    queueLimits = { ...override.queueLimits };
+  } else queueLimits = { ...DEFAULT_QUEUE_LIMITS };
   workerFileOverride = override;
 }
 
@@ -239,6 +329,7 @@ function attachWorker(created: Worker, native = false): Worker {
     if (!active || reply.id !== active.id) return;
     const completed = active;
     active = null;
+    release(completed.reservation);
     if (completed.kind === "deserialize" || completed.kind === "deserialize-staged") {
       if (reply.kind === completed.kind && reply.result) completed.resolve(reply.result);
       else completed.reject(new CallLogArtifactDeserializationError());
@@ -362,12 +453,15 @@ export function serializeCallArtifactAsync(artifact: CallLogArtifact): Promise<U
   getPersistenceArtifactStore();
   if (closing || queue.length >= MAX_QUEUED_JOBS)
     return Promise.reject(new CallLogArtifactSerializationError());
+  const admitted = admitArtifact(artifact);
+  if (!admitted) return Promise.reject(new CallLogArtifactSerializationError());
   return new Promise<Uint8Array>((resolve, reject) => {
     queue.push({
       id: nextId++,
       kind: "serialize",
-      artifact,
-      environment: environmentSnapshot(),
+      artifact: admitted.value.artifact,
+      environment: admitted.value.environment,
+      reservation: admitted.reservation,
       resolve,
       reject,
     });
@@ -384,16 +478,39 @@ export function deserializeCallArtifactAsync(
   } catch (error) {
     return Promise.reject(error);
   }
-  if (
-    closing ||
-    queue.length >= MAX_QUEUED_JOBS ||
-    !(bytes instanceof Uint8Array) ||
-    bytes.byteLength > MAX_CALL_LOG_DECODE_BYTES
-  ) {
+  if (closing || queue.length >= MAX_QUEUED_JOBS || !types.isUint8Array(bytes)) {
+    return Promise.reject(new CallLogArtifactDeserializationError());
+  }
+  // Read the intrinsic view length, ignoring caller getters and oversized backing buffers.
+  const byteLength = Reflect.apply(typedArrayByteLength, bytes, []) as number;
+  if (byteLength > MAX_CALL_LOG_DECODE_BYTES) {
+    refuseBytes();
+    return Promise.reject(new CallLogArtifactDeserializationError());
+  }
+  const reservation = reserve(JOB_METADATA_BYTES + byteLength);
+  if (!reservation) {
+    refuseBytes();
+    return Promise.reject(new CallLogArtifactDeserializationError());
+  }
+  let detached: Uint8Array;
+  try {
+    // Copy into the exact admitted length, excluding backing tails and raced shared-buffer growth.
+    detached = new Uint8Array(byteLength);
+    detached.set(bytes);
+  } catch {
+    release(reservation);
+    refuseBytes();
     return Promise.reject(new CallLogArtifactDeserializationError());
   }
   return new Promise((resolve, reject) => {
-    queue.push({ id: nextId++, kind: "deserialize", bytes, resolve, reject });
+    queue.push({
+      id: nextId++,
+      kind: "deserialize",
+      bytes: detached,
+      reservation,
+      resolve,
+      reject,
+    });
     pump();
   });
 }
@@ -403,19 +520,39 @@ export function deserializeStagedCallArtifactAsync(
   staging: StagedCallLogDecodeInput
 ): Promise<CallLogArtifactDecodeResult> {
   getPersistenceArtifactStore();
+  // Inspect descriptors before reading untrusted metadata; never call an accessor or proxy.
+  const ciphertext =
+    staging && !types.isProxy(staging)
+      ? Object.getOwnPropertyDescriptor(staging, "ciphertext")
+      : undefined;
+  const expiresAt =
+    staging && !types.isProxy(staging)
+      ? Object.getOwnPropertyDescriptor(staging, "expiresAt")
+      : undefined;
   if (
     closing ||
     queue.length >= MAX_QUEUED_JOBS ||
     (active?.kind === "deserialize-staged" ? 1 : 0) +
       queue.filter((item) => item.kind === "deserialize-staged").length >=
       2 ||
-    typeof staging.ciphertext !== "string" ||
-    staging.ciphertext.length > MAX_CALL_LOG_STAGED_CIPHER_CHARS ||
-    Date.now() >= staging.expiresAt
+    typeof ciphertext?.value !== "string" ||
+    ciphertext.value.length > MAX_CALL_LOG_STAGED_CIPHER_CHARS ||
+    typeof expiresAt?.value !== "number" ||
+    !Number.isFinite(expiresAt.value) ||
+    Date.now() >= expiresAt.value
   )
     return Promise.reject(new CallLogArtifactDeserializationError());
+  const admitted = admitPlain(staging, queueLimits.maxRetainedBytes);
+  if (!admitted) return Promise.reject(new CallLogArtifactDeserializationError());
   return new Promise((resolve, reject) => {
-    queue.push({ id: nextId++, kind: "deserialize-staged", staging, resolve, reject });
+    queue.push({
+      id: nextId++,
+      kind: "deserialize-staged",
+      staging: admitted.value,
+      reservation: admitted.reservation,
+      resolve,
+      reject,
+    });
     pump();
   });
 }
@@ -433,12 +570,18 @@ export function writeCallArtifactAsync(
     warnRateLimited("[callLogs] Call-log artifact queue unavailable; detail omitted.");
     return Promise.resolve(null);
   }
+  const admitted = admitArtifact(artifact);
+  if (!admitted) {
+    warnRateLimited("[callLogs] Call-log artifact queue unavailable; detail omitted.");
+    return Promise.resolve(null);
+  }
   return new Promise((resolve) => {
     queue.push({
       id: nextId++,
       kind: "write",
-      artifact,
-      environment: environmentSnapshot(),
+      artifact: admitted.value.artifact,
+      environment: admitted.value.environment,
+      reservation: admitted.reservation,
       resolve,
     });
     pump();

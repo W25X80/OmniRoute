@@ -172,6 +172,8 @@ async function cleanup(): Promise<void> {
       );
     }
     await closeCallLogSaves();
+    await (await import("@/lib/monitoring/runtimeResources")).stopRuntimeResourceMonitor();
+    (await import("@/lib/db/responsesContinuationStore")).stopPendingContinuationMaintenance();
     if (closeAuditDb()) {
       console.log("[Shutdown] MCP audit database checkpointed and closed.");
     }

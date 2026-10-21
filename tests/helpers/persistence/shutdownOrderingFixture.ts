@@ -164,3 +164,10 @@ export function beginNativeProxyLogClose(): void {
 export async function closeProxyLogSavesAsync(): Promise<void> {
   recordShutdownPhase("proxy:close");
 }
+
+export async function stopRuntimeResourceMonitor(): Promise<void> {
+  shutdownFixture.events.push("maintenance:resources:stop");
+}
+export function stopPendingContinuationMaintenance(): void {
+  shutdownFixture.events.push("maintenance:continuation:stop");
+}

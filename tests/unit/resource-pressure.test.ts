@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { describe, it } from "node:test";
 import {
   computeRssPressureThresholdMb,
@@ -9,6 +10,33 @@ import {
 } from "../../open-sse/utils/resourcePressure.ts";
 
 const MiB = 1024 ** 2;
+
+it("pressure refresh and recovery timers do not inherit a later request context", async () => {
+  const request = new AsyncLocalStorage<object>();
+  const observed: Array<object | undefined> = [];
+  const runtime = createResourcePressureRuntime({
+    heapThresholdMb: 100,
+    immediateHeapUsedMb: () => 101,
+    immediateRssUsedMb: () => 1,
+    selfRestart: { enabled: false },
+    thresholds: { sustainedSamplesCritical: 1 },
+    sample: async () => {
+      observed.push(request.getStore());
+      return signals(Date.now(), 950);
+    },
+  });
+  try {
+    request.run({ payload: "request graph" }, () => runtime.check());
+    await runtime.whenRefreshSettled();
+    assert.equal(observed[0], undefined, "a scheduled refresh must belong to startup");
+    await new Promise<void>((done) => setTimeout(done, 1_150));
+    await runtime.whenRefreshSettled();
+    assert.ok(observed.length >= 2, "the recovery driver must run without incoming traffic");
+    assert.ok(observed.every((store) => store === undefined));
+  } finally {
+    runtime.dispose();
+  }
+});
 
 function signals(observedAtMs: number, heapUsedMb: number): ResourceSignals {
   return {
@@ -27,6 +55,15 @@ function signals(observedAtMs: number, heapUsedMb: number): ResourceSignals {
 }
 
 describe("RSS pressure fuse", () => {
+  it("leaves native-memory headroom below a finite container hard limit", () => {
+    assert.equal(computeRssPressureThresholdMb(3072, undefined, 4096 * MiB), 3686);
+    assert.equal(computeRssPressureThresholdMb(3072, 7000, 4096 * MiB), 3686);
+    assert.equal(computeRssPressureThresholdMb(3072, 2500, 4096 * MiB), 2500);
+    assert.equal(computeRssPressureThresholdMb(undefined, undefined, 4096 * MiB), 3686);
+    assert.equal(computeRssPressureThresholdMb(3072, undefined, 0), 6144);
+    assert.equal(computeRssPressureThresholdMb(3072, undefined, Number.MAX_SAFE_INTEGER), 6144);
+  });
+
   it("derives a conservative RSS ceiling from OMNIROUTE_MEMORY_MB", () => {
     assert.equal(computeRssPressureThresholdMb(1024, undefined), 3072);
     assert.equal(computeRssPressureThresholdMb(4096, undefined), 8192);

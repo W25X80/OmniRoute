@@ -5,8 +5,12 @@ import { randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import test from "node:test";
 import { createPostgresDatabase } from "../../src/lib/db/postgres/connect.ts";
-import type { PostgresOptions } from "../../src/lib/db/postgres/config.ts";
-import { PostgresError } from "../../src/lib/db/postgres/database.ts";
+import {
+  parsePostgresConfiguration,
+  postgresPoolConfiguration,
+  type PostgresOptions,
+} from "../../src/lib/db/postgres/config.ts";
+import { PostgresDatabase, PostgresError } from "../../src/lib/db/postgres/database.ts";
 
 // scripts/test/postgres-runtime.mjs supplies an isolated, disposable loopback server.
 const port = Number(process.env.OMNIROUTE_TEST_POSTGRES_PORT);
@@ -318,3 +322,88 @@ integration(
     }
   }
 );
+
+integration("idle termination during a pending COMMIT proves rollback without replay", async () => {
+  const { Pool } = await import("pg");
+  const config = parsePostgresConfiguration({
+    host: "localhost",
+    port,
+    database: "omniroute_test",
+    user: "omniroute_test",
+    password: "omniroute_test",
+    idleInTransactionTimeoutMs: 100,
+    tls: { mode: "verify-full", ca: await readFile(caFile!, "utf8") },
+  });
+  const pool = new Pool(postgresPoolConfiguration(config));
+  let commitAttempts = 0;
+  let destroyed = false;
+  // Suppress only outbound COMMIT frames, after pg has installed its active query.
+  // The real TLS server is then idle in an open transaction and sends FATAL 25P03
+  // to that pending query. This is the dual of the lost-acknowledgement test above:
+  // a separate direct connection must observe no write, rather than a committed row.
+  const db = new PostgresDatabase(
+    {
+      on: (event, listener) => pool.on(event, listener),
+      end: () => pool.end(),
+      async connect() {
+        const client = await pool.connect();
+        const wire = (
+          client as unknown as {
+            connection: { _send: (buffer: Buffer) => boolean };
+          }
+        ).connection;
+        const send = wire._send;
+        let withholding = false;
+        wire._send = function (buffer) {
+          return withholding ? true : send.call(this, buffer);
+        };
+        return {
+          query(query) {
+            if (query.text === "COMMIT") {
+              withholding = true;
+              commitAttempts++;
+            }
+            return client.query(query);
+          },
+          on: (event, listener) => client.on(event, listener),
+          removeListener: (event, listener) => client.removeListener(event, listener),
+          release(destroy) {
+            destroyed ||= destroy === true;
+            wire._send = send;
+            client.release(destroy);
+          },
+        };
+      },
+    },
+    config,
+    logger
+  );
+  const direct = await database();
+  const table = tableName();
+  let callbacks = 0;
+  try {
+    await direct.transaction((tx) => tx.query(`CREATE TABLE ${table} (id integer)`));
+    await assert.rejects(
+      db.transaction(async (tx) => {
+        callbacks++;
+        assert.equal(
+          (await tx.query("SELECT ssl FROM pg_stat_ssl WHERE pid=pg_backend_pid()")).rows[0].ssl,
+          true
+        );
+        await tx.query(`INSERT INTO ${table} VALUES (1)`);
+      }),
+      (error: PostgresError) => error.kind === "transaction_failed" && error.sqlState === "25P03"
+    );
+    assert.equal(commitAttempts, 1);
+    assert.equal(callbacks, 1);
+    assert.equal(destroyed, true);
+    assert.deepEqual(
+      (await direct.transaction((tx) => tx.query(`SELECT id FROM ${table}`))).rows,
+      []
+    );
+  } finally {
+    await db.close();
+    await direct.transaction((tx) => tx.query(`DROP TABLE IF EXISTS ${table}`));
+    await direct.close();
+  }
+});

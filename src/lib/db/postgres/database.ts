@@ -385,12 +385,16 @@ export class PostgresDatabase {
         destroy = true;
         if (error instanceof PostgresError) throw error;
         const code = sqlState(error);
-        throw new PostgresError(
-          statementRejected(error) && code && rejectedCommitStates.has(code)
-            ? "transaction_failed"
-            : "commit_unknown",
-          code
-        );
+        // PostgreSQL processes the idle-in-transaction timeout before the next
+        // command and disables it while commands run (PostgresMain steps 4-7).
+        // Its FATAL can reach pg's active COMMIT promise after the idle timeout,
+        // but this transaction never committed. Other fatal/network failures
+        // still cannot establish rollback; none of these cases permits replay.
+        const idleTermination =
+          code === "25P03" && (error as { severity?: unknown }).severity === "FATAL";
+        const rejected =
+          idleTermination || (statementRejected(error) && code && rejectedCommitStates.has(code));
+        throw new PostgresError(rejected ? "transaction_failed" : "commit_unknown", code);
       }
       // pg's query_timeout rejects the caller without necessarily cancelling server work.
       // Never enqueue ROLLBACK behind uncertain I/O or return that connection for reuse.
