@@ -30,6 +30,7 @@ function runIsolatedFixture(testRoot: string): Promise<FixtureResult> {
     TZ: process.env.TZ ?? "UTC",
     TMPDIR: process.env.TMPDIR ?? os.tmpdir(),
     NODE_ENV: "test",
+    OMNIROUTE_DATABASE_BACKEND: "sqlite",
     APP_LOG_TO_FILE: "false",
     API_KEY_SECRET: "perplexity-stream-boundary-test-secret-00000000000000000000000000000000",
     DATA_DIR: dataDir,

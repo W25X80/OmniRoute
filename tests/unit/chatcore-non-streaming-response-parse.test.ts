@@ -3,18 +3,9 @@ import assert from "node:assert/strict";
 
 import { parseNonStreamingResponseBody } from "@omniroute/open-sse/handlers/chatCore/nonStreamingResponseParse.ts";
 
-// Minimal Response stub: only the surface parseNonStreamingResponseBody touches
-// (headers.get + text()). upstreamStream is passed false so readNonStreamingResponseBody
-// always takes the buffered response.text() path.
+// Real Response owns the readable body consumed by the bounded production reader.
 function makeResponse(body: string, contentType: string): Response {
-  return {
-    headers: {
-      get: (name: string) =>
-        name.toLowerCase() === "content-type" ? contentType : null,
-    },
-    text: async () => body,
-    body: null,
-  } as unknown as Response;
+  return new Response(body, { headers: { "content-type": contentType } });
 }
 
 const baseOpts = {

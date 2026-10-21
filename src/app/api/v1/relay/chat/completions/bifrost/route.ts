@@ -31,6 +31,12 @@
 import { z } from "zod";
 import { CORS_HEADERS, handleCorsOptions } from "@/shared/utils/cors";
 import { stripSensitiveResponseHeaders } from "@omniroute/open-sse/utils/upstreamResponseHeaders";
+import {
+  getRequestLifecycleSignal,
+  isIngressRequestDeadline,
+  promoteRequestToStreaming,
+  throwIfRequestCancelled,
+} from "@/lib/requestDeadline";
 import { createInjectionGuard } from "@/middleware/promptInjectionGuard";
 import {
   getRelayTokenByHashAsync,
@@ -84,6 +90,7 @@ export async function OPTIONS() {
 
 export async function POST(request: Request) {
   const startTime = Date.now();
+  const lifecycleSignal = getRequestLifecycleSignal(request.signal);
   const clientIp = getClientIp(request);
   const userAgent = sanitizeForensicHeader(request.headers.get("user-agent"));
 
@@ -259,7 +266,10 @@ export async function POST(request: Request) {
     }
 
     // 3. Decide streaming vs. unary
-    const wantsStream = Boolean((body as { stream?: boolean }).stream) && BIFROST_STREAMING_ENABLED;
+    const clientWantsStream = (body as { stream?: unknown }).stream === true;
+    const wantsStream = clientWantsStream && BIFROST_STREAMING_ENABLED;
+    throwIfRequestCancelled(lifecycleSignal);
+    if (wantsStream) promoteRequestToStreaming();
 
     // 4. Forward to bifrost
     const upstreamHeaders: Record<string, string> = {
@@ -280,17 +290,23 @@ export async function POST(request: Request) {
       timedOut = true;
       ac.abort();
     }, BIFROST_TIMEOUT_MS);
+    const upstreamSignal = lifecycleSignal
+      ? AbortSignal.any([lifecycleSignal, ac.signal])
+      : ac.signal;
 
     let upstream: Response;
     try {
+      throwIfRequestCancelled(lifecycleSignal);
       upstream = await fetch(`${BIFROST_BASE_URL}/v1/chat/completions`, {
         method: "POST",
         headers: upstreamHeaders,
         body: JSON.stringify(body),
-        signal: ac.signal,
+        signal: upstreamSignal,
       });
     } catch (error) {
       clearTimeout(tid);
+      if (lifecycleSignal?.aborted || isIngressRequestDeadline(error))
+        throw lifecycleSignal?.reason ?? error;
       throw error;
     }
 
@@ -362,6 +378,14 @@ export async function POST(request: Request) {
       headers: newHeaders,
     });
   } catch (err) {
+    if (isIngressRequestDeadline(err) || isIngressRequestDeadline(lifecycleSignal?.reason)) {
+      return new Response(
+        JSON.stringify(
+          buildErrorBody(504, "Gateway request exceeded its configured ingress deadline")
+        ),
+        { status: 504, headers: JSON_CORS_HEADERS }
+      );
+    }
     // Surface timeout/abort clearly so the caller can fall back to TS path.
     const isAbort = err instanceof Error && err.name === "AbortError";
     return new Response(

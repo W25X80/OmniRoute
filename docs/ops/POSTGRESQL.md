@@ -61,6 +61,19 @@ limit. The sampler supports cgroup v2 and cgroup v1, including a finite hierarch
 when the task's leaf limit is unlimited. These bounds reduce amplification; they do not
 guarantee that one large accepted request cannot exhaust memory.
 
+`OMNIROUTE_INGRESS_REQUEST_TIMEOUT_MS` optionally bounds native inference requests from HTTP
+acceptance, including persistence preparation, input, queues, retries and JSON response reads.
+The default `0` preserves deployments without an explicit ingress budget. For a verified
+60-second ingress idle allowance, `55000` reserves a delivery margin. Explicit client streaming
+hands off to the existing SSE lifecycle before its early keepalive starts. A local deadline is
+reported as `request_ingress_deadline_exceeded`, separately from upstream failures and actual
+client cancellation, and must not penalize an account or start another fallback attempt.
+This cannot successfully deliver a 70-second JSON generation through an unchanged 60-second
+ingress. Application timers also cannot guarantee delivery during arbitrary event-loop starvation.
+Non-streaming cancellation before finalization retains already observed upstream usage and
+chooses one failure outcome. Once durable finalization starts, a later timeout does not authorize
+a second charge or compensation: HTTP delivery and the database commit are not atomic.
+
 Pending Responses continuations are a temporary bridge to durable call artifacts, not a second
 database. One process-wide bridge admits at most 256 entries, with estimated limits of 8 MiB
 per entry and 64 MiB total. It owns detached payloads and expires them after 60 seconds; a
@@ -92,6 +105,15 @@ not test bucket access, IAM or KMS. Call artifacts have an 8 MiB limit; applicat
 have a separate 512 MiB logical content boundary. New files use transactional 8 MiB PostgreSQL
 chunks with a final size/SHA marker; callers retain the logical file API. This size limit does not
 guarantee completion within the configured SQL deadlines.
+
+Artifact PUT has separate bounded preparation and transport phases of up to five seconds each;
+durable ownership and client setup cannot consume the transport phase's allowance. Reads,
+deletion and client warmup retain a single five-second budget. One raw PUT is admitted per
+immutable reference; unknown outcomes are reconciled rather than replayed. Safe diagnostics
+include phase durations, bytes, transport code and socket/queue occupancy, without payloads or
+credential values. An SDK `TimeoutError` can also represent a connection reset, so its name
+alone does not prove that a configured timer expired. Storage shutdown allows 10.1 seconds to
+drain these bounded operations; an uncooperative transport can still exceed its public deadline.
 
 ### History concurrency and artifact recovery
 
@@ -140,6 +162,15 @@ with an explicit decision about exposing object names outside the call-log prefi
 existing object and a random missing key under that role with ExpectedBucketOwner. A 403 is an
 availability/access failure, never evidence of absence. A negative GET after an uncertain PUT
 does not prove that the PUT cannot complete later; its journal identity remains pending.
+
+After a negative reconciliation GET, an inactive uncertain upload can transfer its retained
+encrypted staging payload to a fresh immutable reference. The old reference becomes a deletion
+liability; it can never attach over the replacement. The next recovery pass, rather than the
+transfer transaction, dispatches the replacement. At most two journal identities are retained
+for one call incarnation, including acknowledged objects whose deletion is still pending.
+Only terminal cleanup frees that capacity. This bounds growth during repeated storage failures;
+it is not a lifetime retry limit or a guarantee that an unavailable object store will recover.
+The transfer uses schema 12 and does not require a migration.
 
 The two authenticated management detail routes (`/api/logs/[id]` and
 `/api/usage/call-logs/[id]`) can read an intact retained encrypted staging payload while

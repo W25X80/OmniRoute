@@ -1,6 +1,7 @@
+import * as requestDeadline from "../../../open-sse/utils/requestDeadline.ts";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
-import { createServer, get } from "node:http";
+import { createServer, get, request as httpRequest } from "node:http";
 import { registerHooks } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -67,6 +68,92 @@ async function eventually(predicate: () => boolean) {
   }
 }
 
+test("an owned JSON deadline retains native cleanup authority and rejects a late Next writer", async () => {
+  delete globalThis.__omniroutePersistenceRuntime;
+  fixture.reset();
+  const finish = barrier();
+  const entered = barrier();
+  const cleanupDone = barrier();
+  const previousTimeout = process.env.OMNIROUTE_INGRESS_REQUEST_TIMEOUT_MS;
+  const oldHook = globalThis.__omniroutePersistenceRequest;
+  process.env.OMNIROUTE_INGRESS_REQUEST_TIMEOUT_MS = "50";
+  globalThis.__omniroutePersistenceRequest = (run, lifetime) =>
+    runtime.runPersistenceRequest(async () => {
+      await run();
+      await lifetime;
+    });
+  let selected: object | undefined;
+  let cancellation: unknown;
+  const server = createServer(
+    wrapRequestListenerWithPersistence(
+      async (_req, res) => {
+        await runtime.runPersistenceAttempt(async () => {
+          const signal = requestDeadline.getRequestLifecycleSignal();
+          entered.resolve();
+          await finish.promise;
+          selected = getSelectedPersistenceIdentity();
+          cancellation = signal?.reason;
+          const late = new Response('{"late":true}', {
+            headers: { "content-type": "application/json" },
+          });
+          res.setHeader("content-type", "application/json");
+          await pipeToNodeResponse(late.body!, res);
+          cleanupDone.resolve();
+        });
+      },
+      { basePath: "", experimental: { caseSensitiveRoutes: false } }
+    )
+  );
+  try {
+    await runtime.ensurePersistenceReady();
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    assert.ok(address && typeof address === "object");
+    const response = new Promise<{ status: number; body: string }>((resolve, reject) => {
+      const client = httpRequest(
+        `http://127.0.0.1:${address.port}/v1/messages`,
+        { method: "POST" },
+        (res) => {
+          let body = "";
+          res.setEncoding("utf8");
+          res.on("data", (chunk) => {
+            body += chunk;
+          });
+          res.on("end", () => resolve({ status: res.statusCode ?? 0, body }));
+          res.on("error", reject);
+        }
+      );
+      client.on("error", reject);
+      client.end("{}");
+    });
+    await entered.promise;
+    const received = await response;
+    assert.equal(received.status, 504);
+    assert.equal(JSON.parse(received.body).error.code, "request_ingress_deadline_exceeded");
+    assert.equal(runtime.getPersistenceRuntimeStatus().activeAttempts, 1);
+    let drained = false;
+    const closing = runtime.closePersistenceRuntime().then(() => {
+      drained = true;
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(drained, false);
+    finish.resolve();
+    await cleanupDone.promise;
+    await closing;
+    assert.equal(selected, fixture.authority);
+    assert.equal(requestDeadline.isIngressRequestDeadline(cancellation), true);
+  } finally {
+    finish.resolve();
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await runtime.closePersistenceRuntime();
+    globalThis.__omniroutePersistenceRequest = oldHook;
+    if (previousTimeout === undefined) delete process.env.OMNIROUTE_INGRESS_REQUEST_TIMEOUT_MS;
+    else process.env.OMNIROUTE_INGRESS_REQUEST_TIMEOUT_MS = previousTimeout;
+    delete globalThis.__omniroutePersistenceRuntime;
+  }
+});
+
 test(
   "early keepalive cancellation retains chat preparation through the actual Next response pipe",
   { timeout: 10000 },
@@ -82,6 +169,7 @@ test(
       {},
       {
         chatAdmission,
+        ...requestDeadline,
         errorResponse,
         HTTP_STATUS,
         runPersistenceAttempt: runtime.runPersistenceAttempt,

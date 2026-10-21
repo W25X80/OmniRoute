@@ -1,3 +1,4 @@
+import { promoteRequestToStreaming } from "@/lib/requestDeadline";
 import { z } from "zod";
 import { CORS_HEADERS, handleCorsOptions } from "@/shared/utils/cors";
 import { callCloudWithMachineId } from "@/shared/utils/cloud";
@@ -12,7 +13,10 @@ import {
 } from "@omniroute/open-sse/services/selfHostedEntry.ts";
 import { initTranslators } from "@omniroute/open-sse/translator/index.ts";
 import { createInjectionGuard } from "@/middleware/promptInjectionGuard";
-import { acceptHeaderForcesStream } from "@omniroute/open-sse/utils/aiSdkCompat.ts";
+import {
+  acceptHeaderForcesStream,
+  resolveExplicitStreamAlias,
+} from "@omniroute/open-sse/utils/aiSdkCompat.ts";
 import {
   OPENAI_CHAT_ERROR_FRAME,
   OPENAI_KEEPALIVE_FRAME,
@@ -296,8 +300,15 @@ export async function POST(request) {
     const parsedBodyIsRecord = isRecord(parsedBody);
     const acceptHeader = request.headers.get("accept") || "";
     const acceptForcesStream =
-      parsedBodyIsRecord && acceptHeaderForcesStream(acceptHeader, parsedBody.stream);
-    const wantsStreaming = (parsedBodyIsRecord && parsedBody.stream === true) || acceptForcesStream;
+      parsedBodyIsRecord &&
+      acceptHeaderForcesStream(
+        acceptHeader,
+        resolveExplicitStreamAlias(parsedBody) ?? parsedBody.stream
+      );
+    const wantsStreaming =
+      (parsedBodyIsRecord &&
+        (resolveExplicitStreamAlias(parsedBody) ?? parsedBody.stream) === true) ||
+      acceptForcesStream;
 
     // #6422 — capture the compression request header once so we can echo it back
     // on the response when internal early-returns (idempotency cache, some combo
@@ -310,11 +321,10 @@ export async function POST(request) {
     );
 
     if (wantsStreaming) {
+      promoteRequestToStreaming();
       const reqId = callerCorrelationId ?? generateRequestId();
-      const {
-        signal: routeDeadlineSignal,
-        deadlineController: routeDeadlineController,
-      } = createStreamDeadlineSignal(request.signal);
+      const { signal: routeDeadlineSignal, deadlineController: routeDeadlineController } =
+        createStreamDeadlineSignal(request.signal);
       // Wrap the real handler response, not the synthetic early-keepalive response. If the
       // client cancels while handleChat is still pending, earlyStreamKeepalive will cancel the
       // eventual handler body; only that confirmed cleanup releases heavyweight capacity.

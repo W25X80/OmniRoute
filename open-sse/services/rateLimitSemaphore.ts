@@ -9,6 +9,8 @@
  * windows are typically short-lived).
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
+
 interface QueueItem {
   resolve: (release: () => void) => void;
   reject: (error: Error) => void;
@@ -20,6 +22,7 @@ interface ModelGate {
   max: number;
   queue: QueueItem[];
   rateLimitedUntil: number | null;
+  cooldownTimer: ReturnType<typeof setTimeout> | null;
 }
 
 interface AcquireOptions {
@@ -44,6 +47,16 @@ interface RateLimitStatsEntry {
 
 /** @type {Map<string, ModelGate>} */
 const gates = new Map<string, ModelGate>();
+const MAINTENANCE_CONTEXT_KEY = Symbol.for("omniroute.rateLimitSemaphore.maintenance-context");
+const maintenanceGlobals = globalThis as typeof globalThis & {
+  [MAINTENANCE_CONTEXT_KEY]?: ReturnType<typeof AsyncLocalStorage.snapshot>;
+};
+const MAX_TIMEOUT_MS = 2_147_483_647;
+
+/** Called by instrumentation before request/DB scopes; imports alone capture no caller. */
+export function prepareRateLimitSemaphoreMaintenance(): void {
+  maintenanceGlobals[MAINTENANCE_CONTEXT_KEY] ??= AsyncLocalStorage.snapshot();
+}
 
 /**
  * Get or create gate for a model
@@ -58,6 +71,7 @@ function getGate(modelStr: string, maxConcurrency = 3): ModelGate {
       max: maxConcurrency,
       queue: [],
       rateLimitedUntil: null,
+      cooldownTimer: null,
     });
   }
   const gate = gates.get(modelStr)!;
@@ -80,6 +94,38 @@ function isRateLimited(gate: ModelGate): boolean {
   return true;
 }
 
+function deleteIdleGate(modelStr: string, gate: ModelGate): void {
+  if (gates.get(modelStr) !== gate) return;
+  if (gate.running > 0 || gate.queue.length > 0 || isRateLimited(gate)) return;
+  if (gate.cooldownTimer) clearTimeout(gate.cooldownTimer);
+  gates.delete(modelStr);
+}
+
+function scheduleCooldownDrain(modelStr: string, gate: ModelGate): void {
+  if (gate.cooldownTimer) clearTimeout(gate.cooldownTimer);
+  const delay = Math.min(
+    MAX_TIMEOUT_MS,
+    Math.max(0, (gate.rateLimitedUntil ?? 0) - Date.now()) + 50
+  );
+  const schedule = () => {
+    const timer = setTimeout(() => {
+      if (gates.get(modelStr) !== gate || gate.cooldownTimer !== timer) return;
+      gate.cooldownTimer = null;
+      if (isRateLimited(gate)) {
+        scheduleCooldownDrain(modelStr, gate);
+      } else {
+        drainQueue(modelStr);
+      }
+    }, delay);
+    timer.unref?.();
+    return timer;
+  };
+  const runMaintenance = maintenanceGlobals[MAINTENANCE_CONTEXT_KEY];
+  // Standalone consumers without instrumentation keep the bounded timer's
+  // existing context behavior rather than saving the first request forever.
+  gate.cooldownTimer = runMaintenance ? runMaintenance(schedule) : schedule();
+}
+
 /**
  * Try to drain queued requests when slots become available
  * @param {string} modelStr
@@ -93,12 +139,10 @@ function drainQueue(modelStr: string): void {
     if (!next) break;
     clearTimeout(next.timer);
     gate.running++;
-    next.resolve(createReleaseFn(modelStr));
+    next.resolve(createReleaseFn(modelStr, gate));
   }
 
-  if (gate.running === 0 && gate.queue.length === 0) {
-    gates.delete(modelStr);
-  }
+  deleteIdleGate(modelStr, gate);
 }
 
 /**
@@ -106,18 +150,14 @@ function drainQueue(modelStr: string): void {
  * @param {string} modelStr
  * @returns {Function}
  */
-function createReleaseFn(modelStr: string): () => void {
+function createReleaseFn(modelStr: string, owner: ModelGate): () => void {
   let released = false;
   return () => {
     if (released) return;
     released = true;
     const gate = gates.get(modelStr);
-    if (gate && gate.running > 0) {
+    if (gate === owner && gate.running > 0) {
       gate.running--;
-      if (gate.running === 0 && gate.queue.length === 0) {
-        gates.delete(modelStr);
-        return;
-      }
       drainQueue(modelStr);
     }
   };
@@ -145,7 +185,7 @@ export function acquire(
   // Fast path: slot available and not rate-limited
   if (gate.running < gate.max && !isRateLimited(gate)) {
     gate.running++;
-    return Promise.resolve(createReleaseFn(modelStr));
+    return Promise.resolve(createReleaseFn(modelStr, gate));
   }
 
   // #3872: bounded queue — once the queue is full, fail fast so the round-robin combo
@@ -156,7 +196,7 @@ export function acquire(
     };
     err.code = "SEMAPHORE_QUEUE_FULL";
     // Drop a freshly-created idle gate so we don't leak an empty entry.
-    if (gate.running === 0 && gate.queue.length === 0) gates.delete(modelStr);
+    deleteIdleGate(modelStr, gate);
     return Promise.reject(err);
   }
 
@@ -166,6 +206,7 @@ export function acquire(
       // Remove from queue on timeout
       const idx = gate.queue.findIndex((item) => item.timer === timer);
       if (idx !== -1) gate.queue.splice(idx, 1);
+      deleteIdleGate(modelStr, gate);
       const err = new Error(`Semaphore timeout after ${timeoutMs}ms for ${modelStr}`) as Error & {
         code?: string;
       };
@@ -181,6 +222,7 @@ export function acquire(
  * Mark a model as rate-limited for a given duration.
  * Existing running requests continue, but new acquisitions are blocked
  * until the cooldown expires. After expiry, the queue drains automatically.
+ * Overlapping cooldowns keep the later expiry.
  *
  * @param {string} modelStr - The model identifier
  * @param {number} cooldownMs - How long to block (milliseconds)
@@ -190,15 +232,10 @@ export function markRateLimited(modelStr: string, cooldownMs: number): void {
   // gate.max, so the bare default here would reset a configured limit to 3 and the
   // post-cooldown drain would release that many queued requests at once.
   const gate = getGate(modelStr, gates.get(modelStr)?.max);
-  gate.rateLimitedUntil = Date.now() + cooldownMs;
-
-  // Schedule drain after cooldown expires
-  setTimeout(() => {
-    if (gate.rateLimitedUntil && Date.now() >= gate.rateLimitedUntil) {
-      gate.rateLimitedUntil = null;
-      drainQueue(modelStr);
-    }
-  }, cooldownMs + 50); // +50ms buffer
+  const until = Math.max(gate.rateLimitedUntil ?? 0, Date.now() + cooldownMs);
+  if (until === gate.rateLimitedUntil) return;
+  gate.rateLimitedUntil = until;
+  scheduleCooldownDrain(modelStr, gate);
 }
 
 /**
@@ -227,6 +264,7 @@ export function getStats(prefix?: string): Record<string, RateLimitStatsEntry> {
  */
 export function resetAll(): void {
   for (const [, gate] of gates) {
+    if (gate.cooldownTimer) clearTimeout(gate.cooldownTimer);
     for (const item of gate.queue) {
       clearTimeout(item.timer);
       item.reject(new Error("Semaphore reset"));

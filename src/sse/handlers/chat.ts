@@ -1,3 +1,10 @@
+import {
+  getRequestLifecycleSignal,
+  isIngressRequestDeadline,
+  throwIfRequestCancelled,
+  INGRESS_REQUEST_DEADLINE_CODE,
+  INGRESS_REQUEST_DEADLINE_TYPE,
+} from "@/lib/requestDeadline";
 import { resolveKeyConnectionScope } from "@/lib/api/keyConnectionScope";
 import {
   CONNECTION_SCOPE_DENIED_CODE,
@@ -160,7 +167,8 @@ import { resolveUseUpstream429BreakerHints } from "@/shared/utils/providerHints"
 import { isFeatureFlagEnabled, isRotationAttributionEnabled } from "@/shared/utils/featureFlags";
 import * as agyLease from "../services/antigravityLeaseLifecycle";
 import { shouldIsolateProbeFailures } from "@/shared/utils/probeOrigin";
-import { getCircuitBreaker, isLocalStreamLifecycleError } from "../../shared/utils/circuitBreaker";
+import { getCircuitBreaker } from "../../shared/utils/circuitBreaker";
+import { breakerCountsAsFailure, logBreakerStateChange } from "./providerBreakerCallbacks";
 import { maybeMarkChatAccountExhaustedFrom429 } from "../services/chatQuotaExhaustion";
 import { markQuotaHealthy } from "../../domain/quotaCache";
 import { resolveForcedConnectionForCredentialPool } from "../services/sessionAffinityPin.ts";
@@ -430,6 +438,8 @@ async function handleChatImplementation(
   admissionContext: chatAdmission.ChatAdmissionContext,
   signal: AbortSignal | null = request?.signal ?? null // #15010 deadline-aware lifecycle signal
 ) {
+  signal = getRequestLifecycleSignal(signal) ?? null;
+  throwIfRequestCancelled(signal);
   const peerRejection = rejectPeerRequest(request?.headers, log.warn, errorResponse);
   if (peerRejection) return peerRejection;
 
@@ -959,7 +969,7 @@ async function handleChatImplementation(
       apiKeyId: apiKeyInfo?.id ?? null,
       clientSessionIdHeader: clientConversationHeader,
       correlationId: reqId,
-      signal: request.signal,
+      signal,
     }));
   } catch (error) {
     // Best-effort tracking: a DB hiccup here must not turn an otherwise-working
@@ -1495,9 +1505,20 @@ export async function handleChat(
   ...args: Parameters<typeof handleChatWithAdmission>
 ): Promise<Response> {
   try {
+    args[4] = getRequestLifecycleSignal(args[4] ?? args[0]?.signal) ?? null;
+    throwIfRequestCancelled(args[4]);
     // Early keepalive can close HTTP before preparation or result accounting finishes.
-    return await runPersistenceAttempt(() => handleChatWithAdmission(...args));
+    const response = await runPersistenceAttempt(() => handleChatWithAdmission(...args));
+    throwIfRequestCancelled(args[4]);
+    return response;
   } catch (error) {
+    if (isIngressRequestDeadline(error)) {
+      return errorResponse(504, "Gateway request exceeded its configured ingress deadline", {
+        code: INGRESS_REQUEST_DEADLINE_CODE,
+        type: INGRESS_REQUEST_DEADLINE_TYPE,
+      });
+    }
+    if (args[4]?.aborted) return errorResponse(499, "Request aborted");
     if (!isPersistenceStreamCapacityError(error)) throw error;
     return errorResponse(
       HTTP_STATUS.SERVICE_UNAVAILABLE,
@@ -1737,9 +1758,8 @@ async function handleSingleModelChat(
     failureThreshold: providerProfile.failureThreshold,
     resetTimeout: providerProfile.resetTimeoutMs,
     // A local stream lifecycle error never reached the provider.
-    isFailure: (e) => !isLocalStreamLifecycleError(e),
-    onStateChange: (name: string, from: string, to: string) =>
-      log.info("CIRCUIT", `${name}: ${from} → ${to}`),
+    isFailure: breakerCountsAsFailure,
+    onStateChange: logBreakerStateChange,
     ...(useHints429
       ? {
           cooldownByKind: {
@@ -1762,7 +1782,8 @@ async function handleSingleModelChat(
       forceLiveComboTest ||
       runtimeOptions.emergencyFallbackTried === true
   );
-  const requestSignal = clientRawRequest?.signal ?? request?.signal ?? null;
+  const requestSignal =
+    getRequestLifecycleSignal(clientRawRequest?.signal ?? request?.signal) ?? null;
   // Cumulative cap across all waits for this request (#7360 follow-up) — mirrors
   // combo.ts's comboCooldownBudgetLeftMs. Declared outside requestAttemptLoop so
   // it persists (and only decreases) across `continue requestAttemptLoop` retries.
@@ -1799,6 +1820,7 @@ async function handleSingleModelChat(
   const agy = agyLease.startAntigravityLeaseRequest(provider, runtimeOptions.correlationId);
 
   requestAttemptLoop: while (true) {
+    throwIfRequestCancelled(requestSignal);
     const excludedConnectionIds = new Set<string>(agy.on ? agy.attempted : []);
     let lastError = requestRetryLastError;
     let lastStatus = requestRetryLastStatus;
@@ -1807,6 +1829,7 @@ async function handleSingleModelChat(
     initialPreselectedCredentials = null;
 
     while (true) {
+      throwIfRequestCancelled(requestSignal);
       const credentials =
         preselectedCredentials && excludedConnectionIds.size === 0 && !agy.on
           ? preselectedCredentials
@@ -1900,6 +1923,7 @@ async function handleSingleModelChat(
                 "COOLDOWN_RETRY",
                 `${provider}/${model} retry wait aborted by client disconnect`
               );
+              throwIfRequestCancelled(requestSignal);
               return errorResponse(499, "Request aborted");
             }
 
@@ -2184,6 +2208,13 @@ async function handleSingleModelChat(
         return execution.localResourcePressureResult.response;
       }
       const { result, tlsFingerprintUsed, wasProviderProbe } = execution;
+      try {
+        throwIfRequestCancelled(requestSignal);
+      } catch (error) {
+        releaseOAuthSession();
+        agyLease.release(leaseId);
+        throw error;
+      }
       if (!result.success) releaseOAuthSession();
       if (result.success && agyLease.isStreamingAntigravityResponse(result.response))
         result.response = inheritProviderProbeResponse(
@@ -2642,6 +2673,7 @@ async function handleSingleModelChat(
         const completed = await waitForCooldownAwareRetry(waitMs, requestSignal);
         if (!completed) {
           releaseOAuthSession();
+          throwIfRequestCancelled(requestSignal);
           return errorResponse(499, "Request aborted");
         }
         preselectedCredentials = credentials;

@@ -1,4 +1,5 @@
 import { AsyncResource } from "node:async_hooks";
+import { wrapRequestListenerWithDeadline } from "./request-deadline.mjs";
 
 export function isSqlitePersistenceRequested(env = process.env) {
   const backend = env.OMNIROUTE_DATABASE_BACKEND ?? "postgres";
@@ -144,7 +145,7 @@ function httpLifetime(req, res, onSettled) {
 }
 
 /** The hook owns handler Promise + HTTP lifetime; detached SSE tails need a separate permit. */
-export function wrapRequestListenerWithPersistence(listener, loadedNextConfiguration) {
+function wrapPersistenceListener(listener, loadedNextConfiguration) {
   const routing = isSqlitePersistenceRequested()
     ? undefined
     : captureNativeFileRouting(loadedNextConfiguration);
@@ -198,6 +199,13 @@ export function wrapRequestListenerWithPersistence(listener, loadedNextConfigura
         bodyGate.restore();
       });
   };
+}
+
+export function wrapRequestListenerWithPersistence(listener, loadedNextConfiguration) {
+  return wrapRequestListenerWithDeadline(
+    wrapPersistenceListener(listener, loadedNextConfiguration),
+    loadedNextConfiguration
+  );
 }
 
 /** Capture the already loaded Next config; never infer routing from a mutable env alias. */

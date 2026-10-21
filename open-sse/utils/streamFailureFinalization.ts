@@ -6,6 +6,11 @@ import {
 import { HTTP_STATUS } from "../config/constants.ts";
 import { buildErrorBody } from "./error.ts";
 import { sanitizeErrorMessage } from "./errorSanitization.ts";
+import {
+  isIngressRequestDeadline,
+  INGRESS_REQUEST_DEADLINE_CODE,
+  INGRESS_REQUEST_DEADLINE_TYPE,
+} from "./requestDeadline.ts";
 
 export type StreamCompletionPayload = {
   status: number;
@@ -282,16 +287,26 @@ export function createStreamFailureFinalizers({
     pipelineStreamFailureFinalized = true;
 
     const normalizedMessage = message || "Upstream stream error";
-    const clientClosed = isClientClosedPipelineError(normalizedMessage, statusCode);
-    const status = clientClosed
-      ? 499
-      : Number.isFinite(statusCode) && statusCode >= 400 && statusCode <= 599
-        ? statusCode
-        : HTTP_STATUS.BAD_GATEWAY;
-    const code = clientClosed
-      ? "client_disconnected"
-      : classifyPipelineStreamCode(normalizedMessage);
-    const type = clientClosed ? "client_disconnected" : "stream_error";
+    const ingressDeadline = isIngressRequestDeadline(error);
+    const clientClosed =
+      !ingressDeadline && isClientClosedPipelineError(normalizedMessage, statusCode);
+    const status = ingressDeadline
+      ? HTTP_STATUS.GATEWAY_TIMEOUT
+      : clientClosed
+        ? 499
+        : Number.isFinite(statusCode) && statusCode >= 400 && statusCode <= 599
+          ? statusCode
+          : HTTP_STATUS.BAD_GATEWAY;
+    const code = ingressDeadline
+      ? INGRESS_REQUEST_DEADLINE_CODE
+      : clientClosed
+        ? "client_disconnected"
+        : classifyPipelineStreamCode(normalizedMessage);
+    const type = ingressDeadline
+      ? INGRESS_REQUEST_DEADLINE_TYPE
+      : clientClosed
+        ? "client_disconnected"
+        : "stream_error";
 
     handleStreamFailure({
       status,

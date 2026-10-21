@@ -1,4 +1,5 @@
-import type { PreparedArtifact } from "@/domain/persistence/artifactStore";
+import { randomUUID } from "node:crypto";
+import { ArtifactStorageError, type PreparedArtifact } from "@/domain/persistence/artifactStore";
 import type { PostgresDatabase, PostgresTransaction } from "./database";
 import { acquirePostgresLock } from "./locks";
 import { lockArtifactPublication, readArtifactPublication } from "./artifactPublicationRepository";
@@ -22,6 +23,17 @@ export interface ArtifactRecoveryRow {
   staged_payload: string | null;
   dispatch_owner: string | null;
 }
+type ArtifactRecoveryOwner = Pick<
+  ArtifactRecoveryRow,
+  | "relpath"
+  | "publication_owner"
+  | "dispatch_owner"
+  | "call_log_id"
+  | "call_log_order"
+  | "store_scope"
+  | "expected_size_bytes"
+  | "expected_sha256"
+>;
 
 /** The caller holds keyPolicy(shared) then accounting, and has inserted metadata. */
 export async function stageArtifactRecovery(
@@ -102,6 +114,115 @@ async function revoke(tx: PostgresTransaction, row: ArtifactRecoveryRow) {
     `UPDATE omniroute.artifact_deletion_queue SET publication_state='delete_pending',
      staged_payload=NULL,staged_bytes=0,next_attempt_at=statement_timestamp() WHERE relpath=$1`,
     [row.relpath]
+  );
+}
+/** Transfer staging, never replay an uncertain PUT or discard its cleanup liability. */
+export async function replaceUncertainArtifactRecovery(
+  database: PostgresDatabase,
+  expected: ArtifactRecoveryOwner,
+  isLive: () => boolean
+): Promise<boolean> {
+  return database.transaction(
+    async (tx) => {
+      await acquirePostgresLock(tx, "keyPolicy", "shared");
+      // Attachment locks queue before call; exclude it before taking the trigger's
+      // call-before-queue order. No storage I/O runs in this short transfer.
+      await lockArtifactPublication(tx);
+      await tx.query(
+        "SELECT 1 FROM omniroute.call_logs WHERE id=$1 AND insertion_order=$2 FOR UPDATE",
+        [expected.call_log_id, expected.call_log_order]
+      );
+      const row = (await readArtifactPublication(tx, expected.relpath)) as
+        ArtifactRecoveryRow | undefined;
+      if (
+        !row ||
+        row.publication_state !== "publishing" ||
+        row.upload_state !== "uncertain" ||
+        row.publication_owner !== expected.publication_owner ||
+        row.dispatch_owner !== expected.dispatch_owner ||
+        row.call_log_id !== expected.call_log_id ||
+        row.call_log_order !== expected.call_log_order ||
+        row.store_scope !== expected.store_scope ||
+        row.expected_size_bytes !== expected.expected_size_bytes ||
+        row.expected_sha256 !== expected.expected_sha256
+      )
+        return false;
+      if (
+        !row.staged_payload ||
+        !/^[0-9a-f]{64}$/.test(row.expected_sha256) ||
+        !/^[0-9a-f]{64}$/.test(row.store_scope) ||
+        !row.relpath.endsWith(`_${row.expected_sha256}.json`)
+      )
+        throw new ArtifactStorageError("integrity");
+      if (!(await hasPrivateOwner(tx, row))) {
+        await revoke(tx, row);
+        return false;
+      }
+      if (isLive()) return false;
+      const retained = await tx.query<{ relpath: string }>(
+        `SELECT relpath FROM omniroute.artifact_deletion_queue
+       WHERE call_log_order=$1 AND call_log_id COLLATE "C"=$2 COLLATE "C" LIMIT 2`,
+        [row.call_log_order, row.call_log_id]
+      );
+      // An acknowledged GET does not free credit: DELETE may still be failing.
+      // Only terminal cleanup removing its row permits a later replacement.
+      if (retained.rows.length !== 1) {
+        await tx.query(
+          `UPDATE omniroute.artifact_deletion_queue SET
+         next_attempt_at=GREATEST(next_attempt_at,statement_timestamp()+interval '5 minutes')
+         WHERE relpath=$1 AND publication_state='publishing' AND upload_state='uncertain'`,
+          [row.relpath]
+        );
+        return false;
+      }
+      if (isLive()) return false;
+      const replacement = `s3/${randomUUID()}_${row.expected_sha256}.json`;
+      const inserted = await tx.query<{ relpath: string }>(
+        `WITH source AS MATERIALIZED (
+         SELECT * FROM omniroute.artifact_deletion_queue
+         WHERE relpath=$1 AND publication_owner=$4::uuid
+           AND dispatch_owner IS NOT DISTINCT FROM $5::uuid
+           AND call_log_id=$6 AND call_log_order=$7 AND store_scope=$8
+           AND expected_size_bytes=$9 AND expected_sha256=$10
+           AND publication_state='publishing' AND upload_state='uncertain'
+           AND staged_payload IS NOT NULL AND next_attempt_at<=statement_timestamp()
+       ), retired AS (
+         UPDATE omniroute.artifact_deletion_queue q
+         SET publication_state='delete_pending',staged_payload=NULL,staged_bytes=0,
+             next_attempt_at=statement_timestamp()+interval '5 minutes'
+         FROM source s WHERE q.relpath=s.relpath RETURNING q.relpath
+       )
+       INSERT INTO omniroute.artifact_deletion_queue
+         (relpath,publication_state,upload_state,publication_owner,store_scope,
+          expected_size_bytes,expected_sha256,call_log_id,call_log_order,
+          staged_payload,staged_bytes,dispatch_owner,next_attempt_at)
+       SELECT $2,'publishing','not_sent',$3::uuid,s.store_scope,
+         s.expected_size_bytes,s.expected_sha256,s.call_log_id,s.call_log_order,
+         s.staged_payload,s.staged_bytes,NULL,statement_timestamp()+interval '30 seconds'
+       FROM source s JOIN retired r ON r.relpath=s.relpath RETURNING relpath`,
+        [
+          row.relpath,
+          replacement,
+          randomUUID(),
+          row.publication_owner,
+          row.dispatch_owner,
+          row.call_log_id,
+          row.call_log_order,
+          row.store_scope,
+          row.expected_size_bytes,
+          row.expected_sha256,
+        ]
+      );
+      if (inserted.rowCount !== 1) return false;
+      const updated = await tx.query(
+        `UPDATE omniroute.call_logs SET detail_reason='publication_pending'
+       WHERE id=$1 AND insertion_order=$2 AND artifact_relpath IS NULL`,
+        [row.call_log_id, row.call_log_order]
+      );
+      if (updated.rowCount !== 1) throw new Error("Artifact replacement owner changed");
+      return true;
+    },
+    { operation: "artifact.replace" }
   );
 }
 /** Acknowledged CAS authorizes exactly one attempt. An unknown COMMIT authorizes none. */

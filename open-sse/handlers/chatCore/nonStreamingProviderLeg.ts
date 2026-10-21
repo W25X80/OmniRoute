@@ -37,6 +37,14 @@ import {
 import { isEmptyContentResponse } from "../../services/errorClassifier.ts";
 import { hasTrustedEmptyTurn } from "../../utils/emptyTurnPolicy.ts";
 import { FORMATS } from "../../translator/formats.ts";
+import {
+  getRequestLifecycleSignal,
+  isIngressRequestDeadline,
+  throwIfRequestCancelled,
+  INGRESS_REQUEST_DEADLINE_CODE,
+  INGRESS_REQUEST_DEADLINE_TYPE,
+} from "../../utils/requestDeadline.ts";
+import { readNonStreamingResponseBody } from "./nonStreamingResponseBody.ts";
 import { hasActiveClaudeThinking } from "../../utils/thinkingBudget.ts";
 
 /* -- exported types -------------------------------------------------------- */
@@ -58,6 +66,7 @@ export interface ProviderLegRotationPolicy {
 
 export interface ProviderLegInput {
   phase: "initial" | "follow-up";
+  signal?: AbortSignal | null;
   sourceBody: Record<string, unknown>;
   expectedConnectionId?: string;
   allowAccountRotation: boolean;
@@ -347,6 +356,93 @@ const DEFAULT_CLINEPASS_sleep = (ms: number) =>
 export async function runNonStreamingProviderLeg(
   input: ProviderLegInput
 ): Promise<NonStreamingProviderLegResult> {
+  const startMs = Date.now();
+  const signal = getRequestLifecycleSignal(input.signal);
+  const originalExecute = input.executeProviderRequest;
+  const guarded: ProviderLegInput = {
+    ...input,
+    signal,
+    executeProviderRequest: (...args) => {
+      throwIfRequestCancelled(signal);
+      return originalExecute(...args);
+    },
+  };
+  let observed: NonStreamingProviderLegResult | undefined;
+  let parsedUsage: ProviderLegUsage | null = null;
+  const parsedBodies = new WeakSet<object>();
+  const observeUsage = (body: Record<string, unknown>, provider: string) => {
+    if (parsedBodies.has(body)) return;
+    parsedBodies.add(body);
+    const unwrapped = unwrapClinepassEnvelope(body, provider).body;
+    const usage = extractUsage(isJsonRecord(unwrapped) ? unwrapped : body, provider);
+    if (!usage) return;
+    if (!parsedUsage) parsedUsage = { ...usage };
+    else
+      for (const key of Object.keys(usage) as Array<keyof ProviderLegUsage>) {
+        const value = usage[key];
+        if (typeof value === "number") parsedUsage[key] = (parsedUsage[key] ?? 0) + value;
+      }
+  };
+  try {
+    throwIfRequestCancelled(signal);
+    const result = await runNonStreamingProviderLegInner(guarded, observeUsage);
+    observed = result;
+    throwIfRequestCancelled(signal);
+    return result;
+  } catch (error) {
+    const cause = signal?.aborted ? signal.reason : error;
+    const localDeadline = isIngressRequestDeadline(cause);
+    const clientAbort =
+      !localDeadline && (signal?.aborted === true || isLocalStreamLifecycleError(cause));
+    const timeout =
+      error instanceof Error && ["TimeoutError", "BodyTimeoutError"].includes(error.name);
+    if (!localDeadline && !clientAbort && !timeout) throw error;
+    const status = clientAbort ? 499 : 504;
+    const code = localDeadline
+      ? INGRESS_REQUEST_DEADLINE_CODE
+      : clientAbort
+        ? "client_disconnected"
+        : "upstream_timeout";
+    const type = localDeadline
+      ? INGRESS_REQUEST_DEADLINE_TYPE
+      : clientAbort
+        ? "client_disconnected"
+        : "upstream_timeout";
+    const message = clientAbort
+      ? "Request aborted"
+      : localDeadline
+        ? "Gateway request exceeded its configured ingress deadline"
+        : "Upstream response timed out";
+    return {
+      kind: "error",
+      result: legError(status, message, cause, null, code, type),
+      receipt: buildReceipt(input, {
+        httpStatus: status,
+        errorType: type,
+        usage: parsedUsage ?? observed?.usage ?? null,
+        termination: "provider_error",
+        latencyMs: Date.now() - startMs,
+        startedAt: new Date(startMs).toISOString(),
+        endedAt: new Date().toISOString(),
+        connectionId: input.connectionId ?? "unknown",
+        model: input.effectiveModel ?? input.model ?? "unknown",
+      }),
+      usage: parsedUsage ?? observed?.usage ?? null,
+    };
+  }
+}
+
+async function runNonStreamingProviderLegInner(
+  input: ProviderLegInput,
+  observeUsage: (body: Record<string, unknown>, provider: string) => void
+): Promise<NonStreamingProviderLegResult> {
+  const parseObservedResponse = async (
+    opts: Parameters<typeof parseNonStreamingResponseBody>[0]
+  ) => {
+    const parsed = await parseNonStreamingResponseBody(opts);
+    if (parsed.kind === "ok") observeUsage(parsed.responseBody, input.provider ?? "unknown");
+    return parsed;
+  };
   const startedAt = new Date().toISOString();
   const startMs = Date.now();
   const effectiveModel = input.effectiveModel ?? input.model ?? "unknown";
@@ -488,6 +584,7 @@ export async function runNonStreamingProviderLeg(
     ) {
       throw error;
     }
+    if (input.signal?.aborted || isIngressRequestDeadline(error)) throw error;
     // `abort(reason)` can reject with a raw string that has no `name`/`status`, so
     // `error.name === "AbortError"` is too narrow — that shape fell through to the 502
     // provider-failure default (#7907). chatCore classified this through
@@ -508,7 +605,7 @@ export async function runNonStreamingProviderLeg(
         : "Provider request failed";
     const receipt = buildReceipt(input, {
       httpStatus: failureStatus,
-      errorType: null,
+      errorType: failureStatus === 504 ? "upstream_timeout" : null,
       usage: null,
       termination: "provider_error",
       latencyMs: Date.now() - startMs,
@@ -517,7 +614,14 @@ export async function runNonStreamingProviderLeg(
       connectionId,
       model: currentModel,
     });
-    const errorResult = legError(failureStatus, failureMessage, error);
+    const errorResult = legError(
+      failureStatus,
+      failureMessage,
+      error,
+      null,
+      failureStatus === 504 ? "upstream_timeout" : undefined,
+      failureStatus === 504 ? "upstream_timeout" : undefined
+    );
     return {
       kind: "error",
       result: errorResult as ChatCoreErrorResult,
@@ -571,9 +675,16 @@ export async function runNonStreamingProviderLeg(
     let parsedErrorBody: Record<string, unknown> = {};
 
     try {
-      const errorBodyText = await providerResponse.text();
+      const errorBodyText = await readNonStreamingResponseBody(
+        providerResponse,
+        "application/json",
+        false,
+        undefined,
+        { signal: input.signal }
+      );
       try {
         parsedErrorBody = JSON.parse(errorBodyText) as Record<string, unknown>;
+        if (isJsonRecord(parsedErrorBody)) observeUsage(parsedErrorBody, provider);
       } catch {
         // non-JSON error body
       }
@@ -585,7 +696,8 @@ export async function runNonStreamingProviderLeg(
         "Provider request failed";
       upstreamErrorCode = typeof errObj?.code === "string" ? errObj.code : undefined;
       upstreamErrorType = typeof errObj?.type === "string" ? errObj.type : undefined;
-    } catch {
+    } catch (error) {
+      if (input.signal?.aborted || isIngressRequestDeadline(error)) throw error;
       message = "Provider request failed";
     }
 
@@ -627,7 +739,8 @@ export async function runNonStreamingProviderLeg(
           if (mismatchAfter) return mismatchAfter;
 
           if (fallbackResult.response.ok) {
-            const fallbackParsed = await parseNonStreamingResponseBody({
+            const fallbackParsed = await parseObservedResponse({
+              signal: input.signal,
               providerResponse: fallbackResult.response,
               upstreamStream: false,
               providerHeaders: new Headers(fallbackResult.headers),
@@ -661,6 +774,7 @@ export async function runNonStreamingProviderLeg(
             }
           }
         } catch {
+          throwIfRequestCancelled(input.signal);
           // fallback also failed - fall through to standard error
         }
       }
@@ -706,7 +820,8 @@ export async function runNonStreamingProviderLeg(
           if (mismatchAfter) return mismatchAfter;
 
           if (fallbackResult.response.ok) {
-            const fallbackParsed = await parseNonStreamingResponseBody({
+            const fallbackParsed = await parseObservedResponse({
+              signal: input.signal,
               providerResponse: fallbackResult.response,
               upstreamStream: false,
               providerHeaders: new Headers(fallbackResult.headers),
@@ -740,6 +855,7 @@ export async function runNonStreamingProviderLeg(
             }
           }
         } catch {
+          throwIfRequestCancelled(input.signal);
           // fallback also failed - fall through to standard error
         }
       }
@@ -797,7 +913,8 @@ export async function runNonStreamingProviderLeg(
   }
 
   // -- Non-streaming response parsing (body read exactly once) ----------------
-  const parsed = await parseNonStreamingResponseBody({
+  const parsed = await parseObservedResponse({
+    signal: input.signal,
     providerResponse,
     upstreamStream: false,
     providerHeaders: new Headers(executorResult.headers),
@@ -898,7 +1015,8 @@ export async function runNonStreamingProviderLeg(
         if (mismatchAfter) return mismatchAfter;
 
         if (retryResult?.response?.ok) {
-          const retryParsed = await parseNonStreamingResponseBody({
+          const retryParsed = await parseObservedResponse({
+            signal: input.signal,
             providerResponse: retryResult.response,
             upstreamStream: undefined,
             providerHeaders: new Headers(retryResult.headers),
@@ -942,6 +1060,7 @@ export async function runNonStreamingProviderLeg(
           }
         }
       } catch {
+        throwIfRequestCancelled(input.signal);
         // retry failed, fall through
       }
     }
@@ -1023,7 +1142,8 @@ export async function runNonStreamingProviderLeg(
           if (mismatchAfter) return mismatchAfter;
 
           if (fallbackResult.response.ok) {
-            const fallbackParsed = await parseNonStreamingResponseBody({
+            const fallbackParsed = await parseObservedResponse({
+              signal: input.signal,
               providerResponse: fallbackResult.response,
               upstreamStream: false,
               providerHeaders: new Headers(fallbackResult.headers),
@@ -1107,6 +1227,7 @@ export async function runNonStreamingProviderLeg(
             };
           }
         } catch {
+          throwIfRequestCancelled(input.signal);
           const receipt = buildReceipt(input, {
             httpStatus: 502,
             errorType: "empty_content",

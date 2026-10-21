@@ -8,6 +8,12 @@
 
 import { CORS_HEADERS, handleCorsOptions } from "@/shared/utils/cors";
 import { stripSensitiveResponseHeaders } from "@omniroute/open-sse/utils/upstreamResponseHeaders";
+import {
+  getRequestLifecycleSignal,
+  isIngressRequestDeadline,
+  promoteRequestToStreaming,
+  throwIfRequestCancelled,
+} from "@/lib/requestDeadline";
 import { handleChat } from "@/sse/handlers/chat";
 import { withChatAdmission } from "@/shared/middleware/withChatAdmission";
 import { createInjectionGuard } from "@/middleware/promptInjectionGuard";
@@ -85,10 +91,13 @@ async function forwardToBifrost(
   backend: ReturnType<typeof resolveRelayRoutingBackend>,
   startTime: number,
   clientIp: string,
-  userAgent: string | null
+  userAgent: string | null,
+  lifecycleSignal: AbortSignal | undefined
 ): Promise<Response> {
-  const wantsStream =
-    Boolean((body as { stream?: boolean } | null)?.stream) && config.streamingEnabled;
+  const clientWantsStream = (body as { stream?: unknown } | null)?.stream === true;
+  const wantsStream = clientWantsStream && config.streamingEnabled;
+  throwIfRequestCancelled(lifecycleSignal);
+  if (wantsStream) promoteRequestToStreaming();
   const upstreamHeaders: Record<string, string> = {
     "Content-Type": "application/json",
     "x-relay-token-id": token.id,
@@ -107,13 +116,17 @@ async function forwardToBifrost(
     timedOut = true;
     ac.abort();
   }, config.timeoutMs);
+  const upstreamSignal = lifecycleSignal
+    ? AbortSignal.any([lifecycleSignal, ac.signal])
+    : ac.signal;
 
   try {
+    throwIfRequestCancelled(lifecycleSignal);
     const upstream = await fetch(`${config.baseUrl}/v1/chat/completions`, {
       method: "POST",
       headers: upstreamHeaders,
       body: JSON.stringify(body),
-      signal: ac.signal,
+      ...(lifecycleSignal ? { signal: upstreamSignal } : { signal: ac.signal }),
     });
 
     // Same strip as the bifrost sibling: an echoed upstream credential or
@@ -163,6 +176,7 @@ async function forwardToBifrost(
     if (wantsStream && upstream.body) {
       const stream = finalizeReadableStream(upstream.body, async (error) => {
         clearTimeout(tid);
+        if (lifecycleSignal?.aborted || isIngressRequestDeadline(error)) return;
         const statusCode = timedOut ? 504 : upstream.status;
         if (error && backend === "auto") {
           recordBifrostFailure(
@@ -207,6 +221,8 @@ async function forwardToBifrost(
     });
   } catch (error) {
     clearTimeout(tid);
+    if (lifecycleSignal?.aborted || isIngressRequestDeadline(error))
+      throw lifecycleSignal?.reason ?? error;
     const isAbort = error instanceof Error && error.name === "AbortError";
     throw new Error(
       isAbort
@@ -222,6 +238,7 @@ export async function OPTIONS() {
 
 async function postHandler(request: Request) {
   const startTime = Date.now();
+  const lifecycleSignal = getRequestLifecycleSignal(request.signal);
   const clientIp = getClientIp(request);
   const userAgent = sanitizeForensicHeader(request.headers.get("user-agent"));
 
@@ -375,6 +392,7 @@ async function postHandler(request: Request) {
         bifrostFallbackReason = `bifrost-cooldown; remaining=${cooldown.remainingMs}`;
       } else {
         try {
+          throwIfRequestCancelled(lifecycleSignal);
           const bifrostResponse = await forwardToBifrost(
             request,
             parsedBody,
@@ -383,11 +401,15 @@ async function postHandler(request: Request) {
             backend,
             startTime,
             clientIp,
-            userAgent
+            userAgent,
+            lifecycleSignal
           );
+          throwIfRequestCancelled(lifecycleSignal);
           clearBifrostFailure(bifrostConfig.baseUrl);
           return bifrostResponse;
         } catch (error) {
+          if (lifecycleSignal?.aborted || isIngressRequestDeadline(error))
+            throw lifecycleSignal?.reason ?? error;
           const message = error instanceof Error ? error.message : String(error);
           if (backend === "bifrost") {
             await recordUsage(token.id, request, startTime, clientIp, userAgent, "error", 502);
@@ -406,6 +428,7 @@ async function postHandler(request: Request) {
     }
 
     // 4. Proxy to internal handler
+    throwIfRequestCancelled(lifecycleSignal);
     const originalRequest = new Request(
       request.url.replace("/relay/chat/completions", "/chat/completions"),
       request
@@ -445,6 +468,14 @@ async function postHandler(request: Request) {
       headers: newHeaders,
     });
   } catch (error) {
+    if (isIngressRequestDeadline(error) || isIngressRequestDeadline(lifecycleSignal?.reason)) {
+      return new Response(
+        JSON.stringify(
+          buildErrorBody(504, "Gateway request exceeded its configured ingress deadline")
+        ),
+        { status: 504, headers: JSON_CORS_HEADERS }
+      );
+    }
     // buildErrorBody() routes through sanitizeErrorMessage(), which strips
     // stack traces and absolute file paths. Hard rule #12.
     const message = error instanceof Error ? error.message : "Unknown error";

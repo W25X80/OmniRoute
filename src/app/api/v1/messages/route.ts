@@ -1,3 +1,4 @@
+import { promoteRequestToStreaming } from "@/lib/requestDeadline";
 import { handleChat } from "@/sse/handlers/chat";
 import { generateRequestId } from "@/shared/utils/requestId";
 import { resolveIncomingCorrelationId } from "@/shared/utils/correlationPreserve.ts";
@@ -11,7 +12,10 @@ import {
 } from "@omniroute/open-sse/utils/earlyStreamKeepalive";
 import { createStreamDeadlineSignal } from "@omniroute/open-sse/utils/streamDeadlineSignal";
 import { resolveKeepaliveThreshold } from "@omniroute/open-sse/utils/keepaliveThreshold";
-import { resolveStreamFlag } from "@omniroute/open-sse/utils/aiSdkCompat";
+import {
+  resolveStreamFlag,
+  resolveExplicitStreamAlias,
+} from "@omniroute/open-sse/utils/aiSdkCompat";
 
 let initialized = false;
 
@@ -71,8 +75,13 @@ async function postHandler(request: any, context: any, preParsedBody: any = null
     }
   }
   const accept = String(request.headers?.get?.("accept") || "");
-  const wantsStreaming = resolveStreamFlag(body?.stream, accept, "claude");
+  const wantsStreaming = resolveStreamFlag(
+    resolveExplicitStreamAlias(body) ?? body?.stream,
+    accept,
+    "claude"
+  );
   if (wantsStreaming) {
+    promoteRequestToStreaming();
     // Single id for handler + keepalive bytes + deadline warn (matches the
     // chat/completions convention: caller id preserved, generated when absent).
     const correlationId =

@@ -107,3 +107,81 @@ test("rejects a non-SSE response whose declared Content-Length exceeds the cap (
     (err) => err instanceof NonStreamingResponseTooLargeError
   );
 });
+
+test("counts actual JSON bytes with missing or understated Content-Length", async () => {
+  for (const declared of [undefined, "1"]) {
+    let cancelled = 0;
+    const response = new Response(
+      new ReadableStream<Uint8Array>({
+        pull(controller) {
+          controller.enqueue(new Uint8Array(32));
+        },
+        cancel() {
+          cancelled++;
+        },
+      }),
+      { headers: declared ? { "content-length": declared } : {} }
+    );
+    await assert.rejects(
+      readNonStreamingResponseBody(response, "application/json", false, 16),
+      NonStreamingResponseTooLargeError
+    );
+    assert.equal(cancelled, 1);
+  }
+});
+
+test("JSON body timeout cancels a pending read without awaiting source cancellation", async () => {
+  let cancelled = 0;
+  const body = new ReadableStream<Uint8Array>({
+    cancel() {
+      cancelled++;
+      return new Promise(() => {});
+    },
+  });
+  const response = new Response(body);
+  await assert.rejects(
+    readNonStreamingResponseBody(response, "application/json", false, 1024, { timeoutMs: 20 }),
+    { name: "BodyTimeoutError" }
+  );
+  assert.equal(cancelled, 1);
+  assert.equal(body.locked, false);
+});
+
+test("preserves exact request cancellation reason and releases a JSON reader", async () => {
+  const abort = new AbortController();
+  const reason = new Error("typed request deadline");
+  let cancelled = 0;
+  const body = new ReadableStream<Uint8Array>({
+    cancel() {
+      cancelled++;
+    },
+  });
+  const pending = readNonStreamingResponseBody(
+    new Response(body),
+    "application/json",
+    false,
+    1024,
+    {
+      signal: abort.signal,
+    }
+  );
+  abort.abort(reason);
+  await assert.rejects(pending, (error) => error === reason);
+  assert.equal(cancelled, 1);
+  assert.equal(body.locked, false);
+});
+
+test("native JSON preserves SSE-looking strings and split UTF-8 at the exact byte cap", async () => {
+  const input = JSON.stringify({ text: "雪 data: [DONE]" });
+  const bytes = new TextEncoder().encode(input);
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (const byte of bytes) controller.enqueue(Uint8Array.of(byte));
+      controller.close();
+    },
+  });
+  assert.equal(
+    await readNonStreamingResponseBody(new Response(body), "application/json", false, bytes.length),
+    input
+  );
+});

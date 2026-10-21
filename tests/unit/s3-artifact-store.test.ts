@@ -7,6 +7,7 @@ import { DeleteObjectCommand, GetObjectCommand, PutObjectCommand } from "@aws-sd
 import { ArtifactStorageError } from "../../src/domain/persistence/artifactStore.ts";
 import {
   createS3ArtifactStore,
+  artifactStorageDiagnostic,
   MAX_ARTIFACT_BYTES,
   type S3ArtifactTransport,
 } from "../../src/lib/artifacts/s3ArtifactStore.ts";
@@ -397,4 +398,251 @@ test("a resolved response without positive acknowledgment cannot publish or ackn
   await assert.rejects(store.get(reference), storageError("unavailable"));
   assert.equal(response.Body.destroyed, true);
   await store.close();
+});
+
+test("durable preparation cannot consume the independent transport budget", async () => {
+  let sends = 0;
+  const store = createS3ArtifactStore(configuration, {
+    deadlineMs: 100,
+    loadClient: async () =>
+      fakeTransport(async () => {
+        sends++;
+        await delay(60);
+        return { $metadata: { httpStatusCode: 200 } };
+      }),
+  });
+  await store.warmup!();
+  try {
+    const stored = await store.put(bytes, {
+      async onPrepared() {
+        await delay(60);
+      },
+    });
+    assert.equal(stored.checksum, checksum);
+    assert.equal(sends, 1);
+  } finally {
+    await store.close();
+  }
+});
+
+test("expired preparation cannot dispatch before a delayed timer callback runs", async () => {
+  let sends = 0;
+  const store = createS3ArtifactStore(configuration, {
+    deadlineMs: 20,
+    loadClient: async () =>
+      fakeTransport(async () => {
+        sends++;
+        return { $metadata: { httpStatusCode: 200 } };
+      }),
+  });
+  await store.warmup!();
+  try {
+    await assert.rejects(
+      store.put(bytes, {
+        async onPrepared() {
+          const until = performance.now() + 30;
+          while (performance.now() < until) {
+            /* Hold the timer task behind this microtask. */
+          }
+        },
+      }),
+      (error) => {
+        assert.ok(error instanceof ArtifactStorageError);
+        assert.equal(error.kind, "deadline");
+        assert.equal(error.putStarted, false);
+        return true;
+      }
+    );
+    assert.equal(sends, 0);
+  } finally {
+    await store.close();
+  }
+});
+
+test("SDK timer provenance is a fixed safe enum without retaining raw messages", () => {
+  for (const [message, expected] of [
+    [
+      "@smithy/node-http-handler - the request socket did not establish a connection with the server within the configured timeout of 1000 ms.",
+      "connect",
+    ],
+    [
+      "@smithy/node-http-handler - [ERROR] a request has exceeded the configured 4000 ms requestTimeout.",
+      "request",
+    ],
+    [
+      "@smithy/node-http-handler - the request socket timed out after 4000 ms of inactivity (configured by client requestHandler).",
+      "socket",
+    ],
+    ["Bearer private credential https://private.invalid/object", "transport"],
+  ]) {
+    const error = Object.assign(new Error(message), {
+      name: "TimeoutError",
+      code: "ETIMEDOUT",
+      $metadata: { requestId: "safe-123" },
+    });
+    const diagnostic = artifactStorageDiagnostic(error);
+    assert.equal(diagnostic.timeoutSource, expected);
+    assert.equal(diagnostic.code, "ETIMEDOUT");
+    assert.equal(diagnostic.requestId, "safe-123");
+    assert.equal(JSON.stringify(diagnostic).includes(message), false);
+  }
+});
+
+test("unknown PUT retains one dispatch and exposes only content-free phase and pool gauges", async () => {
+  let sends = 0;
+  const transport = fakeTransport(async () => {
+    sends++;
+    throw Object.assign(
+      new Error(
+        "@smithy/node-http-handler - [ERROR] a request has exceeded the configured 4000 ms requestTimeout. secret=private"
+      ),
+      {
+        name: "TimeoutError",
+        code: "ETIMEDOUT",
+      }
+    );
+  });
+  const store = createS3ArtifactStore(configuration, {
+    loadClient: async () => ({
+      ...transport,
+      snapshot: () => ({ activeSockets: 3, queuedRequests: 2 }),
+    }),
+  });
+  await assert.rejects(store.put(bytes), (error) => {
+    assert.ok(error instanceof ArtifactStorageError);
+    assert.equal(error.kind, "put_unknown");
+    assert.equal(error.putStarted, true);
+    assert.equal(error.diagnostic?.timeoutSource, "request");
+    assert.equal(error.diagnostic?.operation, "put");
+    assert.equal(error.diagnostic?.phase, "transport");
+    assert.equal(error.diagnostic?.sizeBytes, bytes.byteLength);
+    assert.equal(error.diagnostic?.activeSockets, 3);
+    assert.equal(error.diagnostic?.queuedRequests, 2);
+    assert.equal(error.diagnostic?.activeOperations, 1);
+    assert.equal(Number.isSafeInteger(error.diagnostic?.elapsedMs), true);
+    assert.equal(JSON.stringify(error.diagnostic).includes("private"), false);
+    assert.equal(JSON.stringify(error.diagnostic).includes(configuration.bucket), false);
+    return true;
+  });
+  assert.equal(sends, 1);
+  await store.close();
+});
+
+for (const method of ["get", "delete"] as const) {
+  test(`${method} keeps its original single budget and rejects a response after a blocked loop`, async () => {
+    const response = objectBody();
+    const transport = fakeTransport(async () => {
+      const until = performance.now() + 30;
+      while (performance.now() < until) {
+        /* Delay the operation timer task. */
+      }
+      return response;
+    });
+    const store = createS3ArtifactStore(configuration, {
+      deadlineMs: 20,
+      loadClient: async () => transport,
+    });
+    await store.warmup!();
+    await assert.rejects(store[method](reference), (error) => {
+      assert.ok(error instanceof ArtifactStorageError);
+      assert.equal(error.kind, "deadline");
+      assert.equal(error.diagnostic?.operation, method);
+      assert.equal(error.diagnostic?.phase, "transport");
+      assert.ok((error.diagnostic?.transportMs ?? 0) >= 30);
+      return true;
+    });
+    if (method === "get") assert.equal(response.Body.destroyed, true);
+    await store.close();
+  });
+}
+
+test(
+  "reentrant close cannot succeed before the admitted PUT settles",
+  { timeout: 1000 },
+  async () => {
+    let sends = 0;
+    let closeSucceeded = false;
+    let closing: Promise<void> | undefined;
+    let preparedReference = "";
+    const store = createS3ArtifactStore(configuration, {
+      deadlineMs: 20,
+      loadClient: async () =>
+        fakeTransport(async () => {
+          sends++;
+          return { $metadata: { httpStatusCode: 200 } };
+        }),
+    });
+    const put = store.put(bytes, {
+      async onPrepared(prepared) {
+        preparedReference = prepared.reference;
+        closing = store.close();
+        void closing.then(
+          () => {
+            closeSucceeded = true;
+          },
+          () => {}
+        );
+        await closing;
+      },
+    });
+    await assert.rejects(put, (error) => {
+      assert.ok(error instanceof ArtifactStorageError);
+      assert.equal(error.kind, "deadline");
+      assert.equal(error.putStarted, false);
+      return true;
+    });
+    assert.equal(closeSucceeded, false);
+    assert.equal(
+      store.isPutActive!(preparedReference),
+      true,
+      "the public deadline does not release raw work"
+    );
+    await assert.rejects(closing!, storageError("deadline"));
+    await delay(0);
+    assert.equal(store.isPutActive!(preparedReference), false);
+    assert.equal(closeSucceeded, false);
+    assert.equal(sends, 0);
+    await assert.rejects(store.put(bytes), storageError("closed"));
+  }
+);
+
+test("reentrant preparation cannot exceed the eight-operation raw admission cap", async () => {
+  let preparations = 0;
+  let sends = 0;
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const nested: Array<Promise<unknown>> = [];
+  const store = createS3ArtifactStore(configuration, {
+    loadClient: async () =>
+      fakeTransport(async () => {
+        sends++;
+        return { $metadata: { httpStatusCode: 200 } };
+      }),
+  });
+  const onPrepared = async () => {
+    preparations++;
+    if (preparations <= 8) {
+      const child = store.put(bytes, { onPrepared });
+      void child.catch(() => {});
+      nested.push(child);
+    }
+    await gate;
+  };
+  const first = store.put(bytes, { onPrepared });
+  const completion = Promise.allSettled([first, ...nested]);
+  try {
+    assert.equal(preparations, 8);
+    await assert.rejects(nested[0], storageError("overloaded"));
+    assert.equal(sends, 0);
+  } finally {
+    release();
+    await completion;
+    await store.close();
+  }
+  const results = await completion;
+  assert.equal(results.filter((result) => result.status === "fulfilled").length, 8);
+  assert.equal(results.filter((result) => result.status === "rejected").length, 1);
+  assert.equal(sends, 8);
 });

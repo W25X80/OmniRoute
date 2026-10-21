@@ -14,6 +14,7 @@ import {
   type StoredArtifact,
   type ArtifactPutOptions,
   type PreparedArtifact,
+  type ArtifactStorageDiagnostic,
 } from "@/domain/persistence/artifactStore";
 import {
   parseS3ArtifactConfiguration,
@@ -34,6 +35,8 @@ type ArtifactOutput = PutObjectCommandOutput | GetObjectCommandOutput | DeleteOb
 export interface S3ArtifactTransport {
   send(command: ArtifactCommand, options: { abortSignal: AbortSignal }): Promise<ArtifactOutput>;
   destroy(): void;
+  /** Content-free shared HTTP pool occupancy, never its host/path keys. */
+  snapshot?(): Readonly<{ activeSockets: number; queuedRequests: number }>;
 }
 
 export interface S3ArtifactDependencies {
@@ -76,6 +79,14 @@ async function loadDefaultClient(
       const client = command instanceof PutObjectCommand ? writer : reader;
       return client.send(command, requestOptions) as Promise<ArtifactOutput>;
     },
+    snapshot() {
+      const count = (groups: Record<string, readonly unknown[]>) =>
+        Object.values(groups).reduce((total, items) => total + items.length, 0);
+      return {
+        activeSockets: count(agent.sockets),
+        queuedRequests: count(agent.requests),
+      };
+    },
     destroy() {
       writer.destroy();
       reader.destroy();
@@ -87,6 +98,8 @@ async function loadDefaultClient(
 export function artifactStorageDiagnostic(error: unknown) {
   const candidate = error as {
     name?: unknown;
+    code?: unknown;
+    message?: unknown;
     $metadata?: { httpStatusCode?: unknown; requestId?: unknown };
   } | null;
   const safe = (value: unknown, maximum: number) =>
@@ -94,6 +107,24 @@ export function artifactStorageDiagnostic(error: unknown) {
       ? value
       : undefined;
   const status = candidate?.$metadata?.httpStatusCode;
+  // Smithy uses the same error name for distinct timers. Retain only a fixed enum,
+  // never the source message (which may contain payloads, URLs or credentials).
+  const message = candidate?.message;
+  const timeoutSource: ArtifactStorageDiagnostic["timeoutSource"] =
+    candidate?.name !== "TimeoutError"
+      ? undefined
+      : typeof message === "string" &&
+          message.startsWith(
+            "@smithy/node-http-handler - the request socket did not establish a connection"
+          )
+        ? "connect"
+        : typeof message === "string" &&
+            message.startsWith("@smithy/node-http-handler - [ERROR] a request has exceeded")
+          ? "request"
+          : typeof message === "string" &&
+              message.startsWith("@smithy/node-http-handler - the request socket timed out after")
+            ? "socket"
+            : "transport";
   return Object.freeze({
     name: safe(candidate?.name, 80),
     status:
@@ -101,6 +132,8 @@ export function artifactStorageDiagnostic(error: unknown) {
         ? Number(status)
         : undefined,
     requestId: safe(candidate?.$metadata?.requestId, 200),
+    ...(safe(candidate?.code, 80) ? { code: safe(candidate?.code, 80) } : {}),
+    ...(timeoutSource ? { timeoutSource } : {}),
   });
 }
 
@@ -259,29 +292,134 @@ export function createS3ArtifactStore(
     });
   }
 
+  type OperationContext = {
+    signal: AbortSignal;
+    check(): void;
+    phase(value: NonNullable<ArtifactStorageDiagnostic["phase"]>): void;
+    beginTransport(): void;
+    transport(value: S3ArtifactTransport): void;
+    diagnostic(error?: unknown): Readonly<ArtifactStorageDiagnostic>;
+  };
+
   function operation<T>(
-    body: (signal: AbortSignal) => Promise<T>,
-    deadlineError = new ArtifactStorageError("deadline")
+    name: NonNullable<ArtifactStorageDiagnostic["operation"]>,
+    body: (context: OperationContext) => Promise<T>,
+    options: {
+      sizeBytes?: number;
+      deadlineError?(diagnostic: Readonly<ArtifactStorageDiagnostic>): ArtifactStorageError;
+    } = {}
   ): Promise<T> {
     if (closing) return Promise.reject(new ArtifactStorageError("closed"));
     if (active.size >= ARTIFACT_OPERATION_LIMIT)
       return Promise.reject(new ArtifactStorageError("overloaded"));
     const controller = new AbortController();
+    const startedAt = performance.now();
+    let phaseAt = startedAt;
+    let phase: NonNullable<ArtifactStorageDiagnostic["phase"]> = "prepare";
+    let expiresAt = startedAt + deadline;
+    let transportAt: number | undefined;
+    let transport: S3ArtifactTransport | undefined;
+    let timer: ReturnType<typeof setTimeout>;
+    let deadlineFailure: ArtifactStorageError | undefined;
     let rejectDeadline!: (error: ArtifactStorageError) => void;
     const expired = new Promise<never>((_, reject) => {
       rejectDeadline = reject;
     });
-    const timer = setTimeout(() => {
-      controller.abort();
-      rejectDeadline(deadlineError);
-    }, deadline);
-    const work = body(controller.signal);
-    active.add(work);
+    const diagnostic = (error?: unknown): Readonly<ArtifactStorageDiagnostic> => {
+      const now = performance.now();
+      const milliseconds = (value: number) => Math.max(0, Math.round(value));
+      let pool: ReturnType<NonNullable<S3ArtifactTransport["snapshot"]>> | undefined;
+      try {
+        pool = transport?.snapshot?.();
+      } catch {
+        // Diagnostics must not change a storage outcome.
+      }
+      const count = (value: unknown) =>
+        Number.isSafeInteger(value) && Number(value) >= 0 ? Number(value) : undefined;
+      return Object.freeze({
+        ...(error instanceof ArtifactStorageError
+          ? error.diagnostic
+          : artifactStorageDiagnostic(error)),
+        operation: name,
+        phase,
+        elapsedMs: milliseconds(now - startedAt),
+        phaseElapsedMs: milliseconds(now - phaseAt),
+        preparationMs: milliseconds((transportAt ?? now) - startedAt),
+        transportMs: transportAt === undefined ? 0 : milliseconds(now - transportAt),
+        deadlineOverrunMs: milliseconds(now - expiresAt),
+        ...(options.sizeBytes === undefined ? {} : { sizeBytes: options.sizeBytes }),
+        activeOperations: Math.max(1, active.size),
+        ...(count(pool?.activeSockets) === undefined
+          ? {}
+          : { activeSockets: count(pool?.activeSockets) }),
+        ...(count(pool?.queuedRequests) === undefined
+          ? {}
+          : { queuedRequests: count(pool?.queuedRequests) }),
+      });
+    };
+    const expire = () => {
+      if (!deadlineFailure) {
+        const detail = Object.freeze({ ...diagnostic(), timeoutSource: "operation" as const });
+        deadlineFailure =
+          options.deadlineError?.(detail) ??
+          new ArtifactStorageError("deadline", undefined, undefined, detail);
+        controller.abort();
+        rejectDeadline(deadlineFailure);
+      }
+      return deadlineFailure;
+    };
+    const check = () => {
+      // The timer task can be delayed by CPU work; elapsed time remains authoritative.
+      if (controller.signal.aborted || performance.now() >= expiresAt) throw expire();
+    };
+    const arm = () => {
+      timer = setTimeout(expire, Math.max(1, Math.ceil(expiresAt - performance.now())));
+    };
+    const context: OperationContext = {
+      signal: controller.signal,
+      check,
+      phase(value) {
+        check();
+        phase = value;
+        phaseAt = performance.now();
+        if (value === "transport") transportAt ??= phaseAt;
+      },
+      beginTransport() {
+        check();
+        if (transportAt !== undefined) throw new ArtifactStorageError("configuration");
+        transportAt = performance.now();
+        phase = "transport";
+        phaseAt = transportAt;
+        // Durable ownership/client preparation cannot borrow the transport's budget.
+        expiresAt = transportAt + deadline;
+        clearTimeout(timer);
+        arm();
+      },
+      transport(value) {
+        transport = value;
+      },
+      diagnostic,
+    };
+    // Callbacks can re-enter admission or close before the async body first yields.
+    // Reserve ownership first, without deferring the caller-byte snapshot in body.
+    let release!: () => void;
+    const lease = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    active.add(lease);
+    arm();
+    let work: Promise<T>;
+    try {
+      work = body(context);
+    } catch (error) {
+      work = Promise.reject(error);
+    }
     void work
       .catch(() => {})
       .finally(() => {
         clearTimeout(timer);
-        active.delete(work);
+        active.delete(lease);
+        release();
       });
     return Promise.race([work, expired]);
   }
@@ -290,17 +428,18 @@ export function createS3ArtifactStore(
     storageScope,
     prepare,
     warmup: () =>
-      operation(async (signal) => {
+      operation("warmup", async (context) => {
         try {
-          await client();
-          assertActive(signal);
+          context.phase("client");
+          context.transport(await client());
+          context.check();
         } catch (error) {
           if (error instanceof ArtifactStorageError) throw error;
           throw new ArtifactStorageError(
             "unavailable",
             undefined,
             false,
-            artifactStorageDiagnostic(error)
+            context.diagnostic(error)
           );
         }
       }),
@@ -317,81 +456,93 @@ export function createS3ArtifactStore(
         return Promise.reject(new ArtifactStorageError("configuration"));
       let reference: string | undefined;
       let putStarted = false;
-      const deadlineError = new ArtifactStorageError("deadline");
-      return operation(async (signal) => {
-        const immutableBytes = Buffer.from(bytes);
-        const checksum = digest(immutableBytes);
-        reference = allocated.reference;
-        if (
-          parseReference(reference) !== checksum ||
-          allocated.checksum !== checksum ||
-          allocated.sizeBytes !== immutableBytes.byteLength ||
-          allocated.storageScope !== storageScope ||
-          allocated.singleAttempt !== true
-        )
-          throw new ArtifactStorageError("integrity");
-        pendingPuts.set(reference, (pendingPuts.get(reference) ?? 0) + 1);
-        try {
-          // Caller SQL/checkpoint errors remain authoritative, not PUT errors.
-          await options.onPrepared?.(
-            Object.freeze({
-              reference,
-              sizeBytes: immutableBytes.byteLength,
-              checksum,
-              storageScope,
-              singleAttempt: true as const,
-            })
-          );
-          assertActive(signal);
+      return operation(
+        "put",
+        async (context) => {
+          const { signal } = context;
+          const immutableBytes = Buffer.from(bytes);
+          const checksum = digest(immutableBytes);
+          reference = allocated.reference;
+          if (
+            parseReference(reference) !== checksum ||
+            allocated.checksum !== checksum ||
+            allocated.sizeBytes !== immutableBytes.byteLength ||
+            allocated.storageScope !== storageScope ||
+            allocated.singleAttempt !== true
+          )
+            throw new ArtifactStorageError("integrity");
+          pendingPuts.set(reference, (pendingPuts.get(reference) ?? 0) + 1);
           try {
-            const sdk = await import("@aws-sdk/client-s3");
-            const transport = await client();
-            assertActive(signal);
-            putStarted = true;
-            const result = await transport.send(
-              new sdk.PutObjectCommand({
-                Bucket: configuration.bucket,
-                Key: configuration.prefix + reference,
-                ExpectedBucketOwner: configuration.expectedBucketOwner,
-                Body: immutableBytes,
-                ContentLength: immutableBytes.byteLength,
-                ContentType: "application/json",
-                ChecksumSHA256: Buffer.from(checksum, "hex").toString("base64"),
-                IfNoneMatch: "*",
-                ServerSideEncryption: configuration.kmsKeyId ? "aws:kms" : "AES256",
-                ...(configuration.kmsKeyId
-                  ? { SSEKMSKeyId: configuration.kmsKeyId, BucketKeyEnabled: true }
-                  : {}),
-              }),
-              { abortSignal: signal }
+            context.phase("claim");
+            // Caller SQL/checkpoint errors remain authoritative, not PUT errors.
+            await options.onPrepared?.(
+              Object.freeze({
+                reference,
+                sizeBytes: immutableBytes.byteLength,
+                checksum,
+                storageScope,
+                singleAttempt: true as const,
+              })
             );
-            assertActive(signal);
-            assertAcknowledged(result);
-            return { reference, sizeBytes: immutableBytes.byteLength, checksum };
-          } catch (error) {
-            throw new ArtifactStorageError(
-              putStarted ? "put_unknown" : "unavailable",
+            context.check();
+            try {
+              context.phase("client");
+              const sdk = await import("@aws-sdk/client-s3");
+              const transport = await client();
+              context.transport(transport);
+              context.beginTransport();
+              putStarted = true;
+              const result = await transport.send(
+                new sdk.PutObjectCommand({
+                  Bucket: configuration.bucket,
+                  Key: configuration.prefix + reference,
+                  ExpectedBucketOwner: configuration.expectedBucketOwner,
+                  Body: immutableBytes,
+                  ContentLength: immutableBytes.byteLength,
+                  ContentType: "application/json",
+                  ChecksumSHA256: Buffer.from(checksum, "hex").toString("base64"),
+                  IfNoneMatch: "*",
+                  ServerSideEncryption: configuration.kmsKeyId ? "aws:kms" : "AES256",
+                  ...(configuration.kmsKeyId
+                    ? { SSEKMSKeyId: configuration.kmsKeyId, BucketKeyEnabled: true }
+                    : {}),
+                }),
+                { abortSignal: signal }
+              );
+              context.check();
+              assertAcknowledged(result);
+              return { reference, sizeBytes: immutableBytes.byteLength, checksum };
+            } catch (error) {
+              if (
+                error instanceof ArtifactStorageError &&
+                error.diagnostic?.timeoutSource === "operation"
+              )
+                throw error;
+              throw new ArtifactStorageError(
+                putStarted ? "put_unknown" : "unavailable",
+                reference,
+                putStarted,
+                context.diagnostic(error)
+              );
+            }
+          } finally {
+            // A public deadline must not pretend the opaque transport has settled.
+            const remaining = (pendingPuts.get(reference) ?? 1) - 1;
+            if (remaining === 0) pendingPuts.delete(reference);
+            else pendingPuts.set(reference, remaining);
+          }
+        },
+        {
+          sizeBytes: bytes.byteLength,
+          deadlineError: (diagnostic) =>
+            new ArtifactStorageError(
+              putStarted ? "put_unknown" : "deadline",
               reference,
               putStarted,
-              artifactStorageDiagnostic(error)
-            );
-          }
-        } finally {
-          // A public deadline must not pretend the opaque transport has settled.
-          const remaining = (pendingPuts.get(reference) ?? 1) - 1;
-          if (remaining === 0) pendingPuts.delete(reference);
-          else pendingPuts.set(reference, remaining);
+              diagnostic
+            ),
         }
-      }, deadlineError).catch((error) => {
-        if (error === deadlineError) {
-          throw new ArtifactStorageError(
-            putStarted ? "put_unknown" : "deadline",
-            reference,
-            putStarted
-          );
-        }
-        throw error;
-      });
+      );
     },
     get(reference: string): Promise<Uint8Array | null> {
       let checksum: string;
@@ -400,13 +551,16 @@ export function createS3ArtifactStore(
       } catch (error) {
         return Promise.reject(error);
       }
-      return operation(async (signal) => {
+      return operation("get", async (context) => {
+        const { signal } = context;
         let body: unknown;
         let complete = false;
         try {
+          context.phase("client");
           const sdk = await import("@aws-sdk/client-s3");
           const transport = await client();
-          assertActive(signal);
+          context.transport(transport);
+          context.phase("transport");
           const response = (await transport.send(
             new sdk.GetObjectCommand({
               Bucket: configuration.bucket,
@@ -417,7 +571,7 @@ export function createS3ArtifactStore(
             { abortSignal: signal }
           )) as GetObjectCommandOutput;
           body = response.Body;
-          assertActive(signal);
+          context.check();
           assertAcknowledged(response);
           if (
             !Number.isSafeInteger(response.ContentLength) ||
@@ -425,7 +579,9 @@ export function createS3ArtifactStore(
             response.ContentLength! > MAX_ARTIFACT_BYTES
           )
             throw new ArtifactStorageError("integrity");
+          context.phase("body");
           const bytes = await collectBytes(body, response.ContentLength!, signal);
+          context.check();
           if (
             digest(bytes) !== checksum ||
             (response.ChecksumSHA256 !== undefined &&
@@ -433,6 +589,7 @@ export function createS3ArtifactStore(
           ) {
             throw new ArtifactStorageError("integrity");
           }
+          context.check();
           complete = true;
           return bytes;
         } catch (error) {
@@ -443,7 +600,7 @@ export function createS3ArtifactStore(
             "unavailable",
             undefined,
             undefined,
-            artifactStorageDiagnostic(error)
+            context.diagnostic(error)
           );
         } finally {
           if (!complete && body) {
@@ -462,11 +619,14 @@ export function createS3ArtifactStore(
       } catch (error) {
         return Promise.reject(error);
       }
-      return operation(async (signal) => {
+      return operation("delete", async (context) => {
+        const { signal } = context;
         try {
+          context.phase("client");
           const sdk = await import("@aws-sdk/client-s3");
           const transport = await client();
-          assertActive(signal);
+          context.transport(transport);
+          context.phase("transport");
           const result = await transport.send(
             new sdk.DeleteObjectCommand({
               Bucket: configuration.bucket,
@@ -475,7 +635,7 @@ export function createS3ArtifactStore(
             }),
             { abortSignal: signal }
           );
-          assertActive(signal);
+          context.check();
           assertAcknowledged(result);
           return true;
         } catch (error) {
@@ -486,7 +646,7 @@ export function createS3ArtifactStore(
             "unavailable",
             undefined,
             undefined,
-            artifactStorageDiagnostic(error)
+            context.diagnostic(error)
           );
         }
       });
@@ -503,7 +663,7 @@ export function createS3ArtifactStore(
             new Promise<never>((_, reject) => {
               timer = setTimeout(
                 () => reject(new ArtifactStorageError("deadline")),
-                deadline + 100
+                2 * deadline + 100
               );
             }),
           ]);

@@ -581,6 +581,9 @@ export async function registerNodejs(): Promise<void> {
   try {
     // Startup owns these timers before entering any request/bootstrap ALS.
     (
+      await import("@omniroute/open-sse/services/rateLimitSemaphore.ts")
+    ).prepareRateLimitSemaphoreMaintenance();
+    (
       await import("@/lib/db/responsesContinuationStore")
     ).initializePendingContinuationMaintenance();
     (await import("@/lib/monitoring/runtimeResources")).startRuntimeResourceMonitor();

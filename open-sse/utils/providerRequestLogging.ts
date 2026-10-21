@@ -26,8 +26,12 @@ type WarnLog = {
 type FetchInput = Parameters<typeof fetch>[0];
 type FetchInit = Parameters<typeof fetch>[1];
 
+// A socket can outlive dispatch and retain its ALS store. Detach the capture
+// there on settlement; the response owner can still read the Capture itself.
+type CaptureHolder = { capture: Capture | null };
+
 type CaptureState = {
-  context: AsyncLocalStorage<Capture>;
+  context: AsyncLocalStorage<CaptureHolder>;
   wrappedFetch: typeof fetch | null;
   wrappedInnerFetch: typeof fetch | null;
 };
@@ -41,7 +45,7 @@ function getCaptureState(): CaptureState {
 
   if (!scopedGlobal[CAPTURE_STATE_KEY]) {
     scopedGlobal[CAPTURE_STATE_KEY] = {
-      context: new AsyncLocalStorage<Capture>(),
+      context: new AsyncLocalStorage<CaptureHolder>(),
       wrappedFetch: null,
       wrappedInnerFetch: null,
     };
@@ -108,7 +112,7 @@ export function captureCurrentProviderRequest(
   log?: WarnLog | null
 ) {
   return capturePreparedRequest(
-    captureState.context.getStore(),
+    captureState.context.getStore()?.capture,
     url,
     headers,
     body,
@@ -160,11 +164,15 @@ export function onDispatchStart(listener: DispatchStartListener): void {
 export function runWithCapture<T>(requestCapture: Capture, fn: () => Promise<T>): Promise<T> {
   installFetchCapture();
   const dispatch = { settled: false };
-  return dispatchContext.run(dispatch, () => {
-    for (const listener of getDispatchStartListeners()) listener();
-    return captureState.context.run(requestCapture, fn).finally(() => {
+  const holder: CaptureHolder = { capture: requestCapture };
+  return dispatchContext.run(dispatch, async () => {
+    try {
+      for (const listener of getDispatchStartListeners()) listener();
+      return await captureState.context.run(holder, fn);
+    } finally {
       dispatch.settled = true;
-    });
+      holder.capture = null;
+    }
   });
 }
 
@@ -183,7 +191,7 @@ function installFetchCapture() {
 
   captureState.wrappedInnerFetch = globalThis.fetch.bind(globalThis);
   captureState.wrappedFetch = (async (input: FetchInput, init?: FetchInit) => {
-    const activeCapture = captureState.context.getStore();
+    const activeCapture = captureState.context.getStore()?.capture;
     if (activeCapture) {
       await captureFetchRequest(activeCapture, input, init);
     }
@@ -271,6 +279,8 @@ export function createPreparedRequestLogger(
   let latest: ProviderRequestPrepared | null = null;
   return {
     capture(request) {
+      // Late work from a completed dispatch must not overwrite a fresh retry.
+      if (dispatchContext.getStore()?.settled) return;
       latest = request;
       reqLogger.logTargetRequest(request.url, request.headers, request.body);
       updatePendingScope(scope, {

@@ -16,7 +16,13 @@ const { __setTlsFetchOverrideForTesting } =
   await import("../../open-sse/services/perplexityTlsClient.ts");
 const { handleChatCore } = await import("../../open-sse/handlers/chatCore.ts");
 
-type StreamFailure = { status: number; message: string; code?: string; type?: string };
+type StreamFailure = {
+  status: number;
+  message: string;
+  code?: string;
+  type?: string;
+  outputEmitted?: boolean;
+};
 
 function createPerplexityStream(
   events: Array<Record<string, unknown>>
@@ -275,6 +281,7 @@ test("thrown failures after content preserve the prefix and terminate as a safe 
   assert.ok(finalizedFailure);
   assert.equal(finalizedFailure.status, 502);
   assert.equal(finalizedFailure.message, "Perplexity upstream stream failed");
+  assert.equal(finalizedFailure.outputEmitted, true, "retain emitted-output state on failure");
 });
 
 test("partial content is preserved before a terminal error and the failed session is not stored", async () => {

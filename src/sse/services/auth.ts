@@ -1,3 +1,4 @@
+import { throwIfRequestCancelled } from "@/lib/requestDeadline";
 import type { CredentialSelectionOptions } from "./credentialSelectionOptions";
 export type { CredentialSelectionOptions } from "./credentialSelectionOptions";
 import { qoderSupportsCallerTools } from "@omniroute/open-sse/services/qoderCapabilities";
@@ -2610,6 +2611,7 @@ export async function markAccountUnavailable(
     structuredError?: { code?: string | null; type?: string | null } | null;
   } = {}
 ) {
+  throwIfRequestCancelled();
   const currentMutex = markMutexes.get(connectionId) || Promise.resolve();
   let resolveMutex: (() => void) | undefined;
   markMutexes.set(

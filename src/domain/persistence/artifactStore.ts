@@ -58,6 +58,25 @@ const MESSAGES: Record<ArtifactStorageFailure, string> = {
   put_unknown: "Artifact upload outcome is unknown",
 };
 
+export interface ArtifactStorageDiagnostic {
+  name?: string;
+  status?: number;
+  requestId?: string;
+  code?: string;
+  timeoutSource?: "connect" | "request" | "socket" | "transport" | "operation";
+  operation?: "put" | "get" | "delete" | "warmup";
+  phase?: "prepare" | "claim" | "client" | "transport" | "body";
+  elapsedMs?: number;
+  phaseElapsedMs?: number;
+  preparationMs?: number;
+  transportMs?: number;
+  deadlineOverrunMs?: number;
+  sizeBytes?: number;
+  activeOperations?: number;
+  activeSockets?: number;
+  queuedRequests?: number;
+}
+
 const ARTIFACT_ERROR = Symbol.for("omniroute.artifact.storage.error");
 
 export class ArtifactStorageError extends Error {
@@ -68,7 +87,7 @@ export class ArtifactStorageError extends Error {
     /** False proves dispatch never began; absence provides no such guarantee. */
     readonly putStarted?: boolean,
     /** Safe internal diagnostics only: never SDK messages, headers, credentials or paths. */
-    readonly diagnostic?: Readonly<{ name?: string; status?: number; requestId?: string }>
+    readonly diagnostic?: Readonly<ArtifactStorageDiagnostic>
   ) {
     super(MESSAGES[kind]);
     this.name = "ArtifactStorageError";

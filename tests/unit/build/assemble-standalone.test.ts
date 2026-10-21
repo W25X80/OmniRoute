@@ -56,6 +56,7 @@ function seedSidecarSources(root: string) {
     "scripts/dev/standalone-server-ws.mjs",
     "scripts/dev/peer-stamp.mjs",
     "scripts/dev/persistence-request-boundary.mjs",
+    "scripts/dev/request-deadline.mjs",
     "scripts/dev/webdav-native-handler.mjs",
     "scripts/dev/responses-ws-proxy.mjs",
     "scripts/build/runtime-env.mjs",
@@ -166,7 +167,11 @@ test("async and sync sidecar copy paths produce identical bundle trees", async (
     asyncTree,
     "sync (assembleStandalone) and async (sync*ToDir) must copy the same sidecar tree"
   );
-  for (const file of ["persistence-request-boundary.mjs", "webdav-native-handler.mjs"]) {
+  for (const file of [
+    "persistence-request-boundary.mjs",
+    "request-deadline.mjs",
+    "webdav-native-handler.mjs",
+  ]) {
     assert.ok(asyncTree.includes(file), `runtime sidecar copied by both paths: ${file}`);
   }
   // The TPROXY native addon must land at the cwd-relative path the runtime loader

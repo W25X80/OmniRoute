@@ -95,14 +95,9 @@ test("runProviderExecution is called once with policy; first send skips executeP
       assert.equal((translatedBody as { model?: string }).model, "gpt-4o");
       return {
         kind: "response",
-        response: {
-          ok: true,
-          status: 200,
-          statusText: "OK",
-          headers: new Headers({ "content-type": "application/json" }),
-          text: async () => JSON.stringify(okBody),
-          body: null,
-        } as unknown as Response,
+        response: new Response(JSON.stringify(okBody), {
+          headers: { "content-type": "application/json" },
+        }),
         url: "https://api.openai.com/v1/chat/completions",
         headers: {},
         transformedBody: okBody,
@@ -121,32 +116,27 @@ test("runProviderExecution is called once with policy; first send skips executeP
   }
 });
 
-test("response body is parsed exactly once", async () => {
-  let parseCount = 0;
-  const responseBody = {
+test("response body is consumed exactly once", async () => {
+  const payload = {
     id: "chatcmpl-test",
     choices: [{ message: { role: "assistant", content: "ok" }, finish_reason: "stop" }],
     usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
   };
-  const input = baseInput({
-    executeProviderRequest: async () => makeExecutorResult(responseBody),
+  const response = new Response(JSON.stringify(payload), {
+    headers: { "content-type": "application/json" },
   });
-  const orig = input.executeProviderRequest;
-  input.executeProviderRequest = async (...args) => {
-    const result = await orig(...args);
-    const origText = result.response.text.bind(result.response);
-    result.response = {
-      ...result.response,
-      text: async () => {
-        parseCount++;
-        return origText();
-      },
-    } as unknown as Response;
-    return result;
-  };
-  const result = await runNonStreamingProviderLeg(input);
+  const result = await runNonStreamingProviderLeg(
+    baseInput({
+      executeProviderRequest: async () => ({
+        ...makeExecutorResult(payload),
+        response,
+      }),
+    })
+  );
   assert.equal(result.kind, "ok");
-  assert.equal(parseCount, 1, "body should be parsed exactly once");
+  if (result.kind === "ok") assert.equal(result.response.choices[0].message.content, "ok");
+  assert.equal(response.bodyUsed, true);
+  await assert.rejects(response.text(), TypeError);
 });
 
 test("setRequestWireState is called before executor with current wire state", async () => {
@@ -164,14 +154,7 @@ test("buffered SSE response -> JSON body", async () => {
     'data: {"id":"c1","choices":[{"delta":{"content":"hello"},"index":0,"finish_reason":null}]}\n\n' +
     'data: {"id":"c1","choices":[{"delta":{},"index":0,"finish_reason":"stop"}]}\n\n' +
     "data: [DONE]\n\n";
-  const sseResponse = {
-    ok: true,
-    status: 200,
-    statusText: "OK",
-    headers: new Headers({ "content-type": "text/event-stream" }),
-    text: async () => sseBody,
-    body: null,
-  } as unknown as Response;
+  const sseResponse = new Response(sseBody, { headers: { "content-type": "text/event-stream" } });
   const input = baseInput({
     executeProviderRequest: async () => ({
       response: sseResponse,
@@ -973,14 +956,7 @@ test("invalid SSE payload returns errorCode invalid_sse_payload, not upstream_er
   const sseBody = 'data: {"error":{"message":"Devin CLI not found"}}\n\n';
   const input = baseInput({
     executeProviderRequest: async () => ({
-      response: {
-        ok: true,
-        status: 200,
-        statusText: "OK",
-        headers: new Headers({ "content-type": "text/event-stream" }),
-        text: async () => sseBody,
-        body: null,
-      } as unknown as Response,
+      response: new Response(sseBody, { headers: { "content-type": "text/event-stream" } }),
       url: "https://api.example.com/v1/chat/completions",
       headers: {},
       transformedBody: null,
@@ -998,14 +974,7 @@ test("invalid SSE payload returns errorCode invalid_sse_payload, not upstream_er
 test("invalid JSON payload returns errorCode invalid_json_payload, not upstream_error", async () => {
   const input = baseInput({
     executeProviderRequest: async () => ({
-      response: {
-        ok: true,
-        status: 200,
-        statusText: "OK",
-        headers: new Headers({ "content-type": "application/json" }),
-        text: async () => "not-json{{{",
-        body: null,
-      } as unknown as Response,
+      response: new Response("not-json{{{", { headers: { "content-type": "application/json" } }),
       url: "https://api.example.com/v1/chat/completions",
       headers: {},
       transformedBody: null,
@@ -1037,14 +1006,7 @@ test("empty-content fallback with invalid SSE body is 502, not 200 empty", async
         });
       }
       return {
-        response: {
-          ok: true,
-          status: 200,
-          statusText: "OK",
-          headers: new Headers({ "content-type": "text/event-stream" }),
-          text: async () => sseBody,
-          body: null,
-        } as unknown as Response,
+        response: new Response(sseBody, { headers: { "content-type": "text/event-stream" } }),
         url: "https://api.example.com/v1/chat/completions",
         headers: {},
         transformedBody: null,

@@ -17,6 +17,7 @@ import {
   claimArtifactRecoveryDispatch,
   deferArtifactRecovery,
   attachArtifactRecovery,
+  replaceUncertainArtifactRecovery,
   type ArtifactRecoveryIntent,
 } from "../db/postgres/artifactRecoveryRepository";
 import { confirmArtifactUpload } from "../db/postgres/artifactPublicationRepository";
@@ -107,7 +108,9 @@ export async function recoverNativeArtifact(
       options.onStorageSuccess?.(operation);
       operation = undefined;
       if (!bytes) {
-        await deferArtifactRecovery(database, reference);
+        // Missing is not proof the old PUT cannot commit later. Transfer staging
+        // to one fresh identity; the old key keeps its deletion-only liability.
+        await replaceUncertainArtifactRecovery(database, row, () => store.isPutActive!(reference));
         return false;
       }
       if (
@@ -148,7 +151,12 @@ export async function recoverNativeArtifact(
       (error.putStarted === false || error.kind === "overloaded" || error.kind === "closed");
     await deferArtifactRecovery(database, reference, dispatch, notSent);
     options.onFailure?.(error, operation);
-    console.warn("[callLogs] Artifact publication deferred", artifactFailureDiagnostic(error));
+    console.warn(
+      JSON.stringify({
+        event: "artifact.publication.deferred",
+        ...artifactFailureDiagnostic(error),
+      })
+    );
     return false;
   }
 }

@@ -1,3 +1,10 @@
+import { createErrorResult } from "../../utils/error.ts";
+import {
+  isIngressRequestDeadline,
+  throwIfRequestCancelled,
+  INGRESS_REQUEST_DEADLINE_CODE,
+  INGRESS_REQUEST_DEADLINE_TYPE,
+} from "../../utils/requestDeadline.ts";
 import { getSelectedControlPlane } from "@/lib/db/controlPlaneContext";
 /**
  * Request-level finalization for non-streaming chat.
@@ -107,6 +114,48 @@ export async function finalizeToolLoopError(input: {
 }): Promise<ChatCoreErrorResult> {
   const plan = buildNonStreamingFinalizationPlan(input.loop);
   const err = plan.kind === "failure" ? plan.error : missingError();
+  return finalizeNonStreamingFailure({ ...input, error: err, usage: plan.usage });
+}
+
+/** Resolve cancellation only before finalization; committed outcomes are never compensated. */
+export function resolveNonStreamingCancellation(
+  signal?: AbortSignal | null,
+  originalError?: unknown
+): ChatCoreErrorResult | null {
+  let reason = originalError;
+  try {
+    throwIfRequestCancelled(signal);
+  } catch (error) {
+    reason = error;
+  }
+  const localDeadline = isIngressRequestDeadline(reason);
+  if (!localDeadline && !signal?.aborted) return null;
+  const status = localDeadline ? 504 : 499;
+  const result = createErrorResult(
+    status,
+    localDeadline ? "Gateway request exceeded its configured ingress deadline" : "Request aborted",
+    null,
+    localDeadline ? INGRESS_REQUEST_DEADLINE_CODE : "client_disconnected",
+    localDeadline ? INGRESS_REQUEST_DEADLINE_TYPE : "client_disconnected"
+  ) as ChatCoreErrorResult;
+  result.originalError = reason;
+  return result;
+}
+
+export async function finalizeNonStreamingFailure(
+  input: Omit<Parameters<typeof finalizeToolLoopError>[0], "loop"> & {
+    error: ChatCoreErrorResult;
+    usage: ProviderLegUsage | null;
+  }
+): Promise<ChatCoreErrorResult> {
+  const err = input.error;
+  const plan: NonStreamingFinalizationPlan = {
+    kind: "failure",
+    error: err,
+    usage: input.usage,
+    totalCostUsd: 0,
+    receiptCount: 0,
+  };
   await finalizeNonStreamingRequest(plan, {
     writeUsage: () => {
       return input.persistFailureUsage(
@@ -120,6 +169,7 @@ export async function finalizeToolLoopError(input: {
     writeAttempt: () => {
       return input.persistAttemptLogs({
         status: err.status,
+        tokens: plan.usage,
         error: err.error || "Provider request failed",
         providerRequest: input.providerRequest,
         clientResponse: {

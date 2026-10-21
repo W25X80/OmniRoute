@@ -357,6 +357,11 @@ export const EXTRA_MODULE_ENTRIES = [
     dest: ["persistence-request-boundary.mjs"],
   },
   {
+    label: "inference request deadline owner",
+    src: ["scripts", "dev", "request-deadline.mjs"],
+    dest: ["request-deadline.mjs"],
+  },
+  {
     label: "peer-stamp helper (server-ws.mjs dependency)",
     src: ["scripts", "dev", "peer-stamp.mjs"],
     dest: ["peer-stamp.mjs"],

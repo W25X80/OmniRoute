@@ -129,6 +129,7 @@ import { THINKING_MARKER_HEADER } from "../utils/thinkCloseMarker.ts";
 import { resolveAgentGoalPolicy } from "../utils/agentGoalPolicy.ts";
 import { createStreamController } from "../utils/streamHandler.ts";
 import * as streamFailure from "../utils/streamFailureFinalization.ts";
+import { promoteRequestToStreaming, throwIfRequestCancelled } from "../utils/requestDeadline.ts";
 import { normalizeUsage } from "../utils/usageTracking.ts";
 import { refreshWithRetry, runWithOnPersist, runWithCasGuard } from "../services/tokenRefresh.ts";
 import { createRequestLogger } from "../utils/requestLogger.ts";
@@ -447,6 +448,7 @@ async function handleChatCoreInner({
   connectionScope = undefined,
   previousResponseResumed = undefined, // rehydrated-continuation flag from chat.ts; noted below, no semantics.
 }) {
+  throwIfRequestCancelled(clientRawRequest?.signal);
   delete (body as Record<string, unknown>)._omniroutePreviousResponseResumed;
   const {
     model: originModel,
@@ -1181,6 +1183,8 @@ async function handleChatCoreInner({
           userAgent: streamUserAgent,
           streamDefaultMode: apiKeyInfo?.streamDefaultMode,
         });
+  if (stream) promoteRequestToStreaming();
+  throwIfRequestCancelled(clientRawRequest?.signal);
 
   // `settings` is already consolidated once near the top of handleChatCore
   // (the "fetch once, reuse" const). A second `const settings` here was a
@@ -3158,7 +3162,10 @@ async function handleChatCoreInner({
   const executeProviderRequest = (
     modelToCall: string = effectiveModel,
     allowDedup: boolean = false
-  ) => executeProviderRequestLeaf(executeProviderRequestDeps, modelToCall, allowDedup);
+  ) => {
+    throwIfRequestCancelled(clientRawRequest?.signal);
+    return executeProviderRequestLeaf(executeProviderRequestDeps, modelToCall, allowDedup);
+  };
 
   const registeredProviderRequest =
     translatedBody && typeof translatedBody === "object" && !Array.isArray(translatedBody)
@@ -3371,6 +3378,7 @@ async function handleChatCoreInner({
     retryAfterMs?: number | null;
     targetModel: string;
   }) => {
+    throwIfRequestCancelled(clientRawRequest?.signal);
     let errorType = classifyProviderError(statusCode, message, provider);
     if (statusCode === 429 && isModelScope()) {
       const decision = classifyModelScope429(message, normalizeHeaders(headers));
@@ -3947,6 +3955,13 @@ async function handleChatCoreInner({
   }
 
   const streamingTailOutcome = await runStreamingTail({
+    registerStreamFinalizers: (
+      pipelineError: streamFailure.PipelineStreamErrorHandler,
+      clientDisconnect: (event: streamFailure.ClientDisconnectEvent) => boolean
+    ) => {
+      onPipelineStreamError = pipelineError;
+      onClientDisconnectFinalize = clientDisconnect;
+    },
     agentGoalPolicy,
     ...(nativeStreamingPersistence
       ? {

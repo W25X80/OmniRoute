@@ -63,6 +63,7 @@ export const APP_STAGING_ALLOWED_EXACT_PATHS: string[] = [
   "package.json",
   "peer-stamp.mjs",
   "persistence-request-boundary.mjs",
+  "request-deadline.mjs",
   // #13636/#14064: server-ws.mjs imports ./httpClientAbortGuard.mjs (process crash
   // guard); assembleStandalone copies it from src/shared/utils. Without this entry
   // the prepublish prune deletes it and every boot of the published package dies
@@ -235,6 +236,7 @@ export const PACK_ARTIFACT_REQUIRED_PATHS: string[] = [
   "dist/responses-ws-proxy.mjs",
   "dist/peer-stamp.mjs",
   "dist/persistence-request-boundary.mjs",
+  "dist/request-deadline.mjs",
   "dist/main-server-timeouts.mjs",
   // server-ws.mjs import (sd_notify helper) — enforced by the closure test.
   "dist/systemd-notify.mjs",

@@ -1,11 +1,11 @@
-import { isArtifactStorageErrorKind } from "@/domain/persistence/artifactStore";
+import {
+  isArtifactStorageErrorKind,
+  type ArtifactStorageDiagnostic,
+} from "@/domain/persistence/artifactStore";
 
-export function artifactFailureDiagnostic(error: unknown): {
-  kind: string;
-  name?: string;
-  status?: number;
-  requestId?: string;
-} {
+export function artifactFailureDiagnostic(
+  error: unknown
+): { kind: string } & Readonly<ArtifactStorageDiagnostic> {
   for (const kind of [
     "unavailable",
     "put_unknown",

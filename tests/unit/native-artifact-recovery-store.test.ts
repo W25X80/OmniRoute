@@ -52,11 +52,13 @@ test("preparation failure has explicit not-sent evidence and safe diagnostics; s
   await assert.rejects(store.put(Buffer.from("safe")), (error) => {
     assert.ok(isArtifactStorageErrorKind(error, "unavailable"));
     assert.equal(error.putStarted, false);
-    assert.deepEqual(error.diagnostic, {
-      name: "CredentialsProviderError",
-      status: 503,
-      requestId: "safe-123",
-    });
+    assert.equal(error.diagnostic?.name, "CredentialsProviderError");
+    assert.equal(error.diagnostic?.status, 503);
+    assert.equal(error.diagnostic?.requestId, "safe-123");
+    assert.equal(error.diagnostic?.operation, "put");
+    assert.equal(error.diagnostic?.phase, "client");
+    assert.equal(error.diagnostic?.transportMs, 0);
+    assert.equal(error.diagnostic?.sizeBytes, 4);
     assert.equal(JSON.stringify(error).includes("bearer"), false);
     return true;
   });

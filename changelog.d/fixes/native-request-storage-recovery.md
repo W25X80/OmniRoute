@@ -1,0 +1,2 @@
+- Bound optional JSON ingress deadlines without penalizing provider accounts, preserve stream cancellation ownership, and release completed request captures and semaphore timers.
+- Recover uncertain artifact publications through bounded fresh references while retaining encrypted staging and safe storage diagnostics.

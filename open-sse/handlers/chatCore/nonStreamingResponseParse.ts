@@ -64,12 +64,21 @@ export async function parseNonStreamingResponseBody(opts: {
   targetFormat: string;
   model: string;
   log?: LoggerLike;
+  signal?: AbortSignal | null;
 }): Promise<NonStreamingParseResult> {
   const { providerResponse, upstreamStream, providerHeaders, finalBody, targetFormat, model, log } =
     opts;
 
   const contentType = (providerResponse.headers.get("content-type") || "").toLowerCase();
-  const rawBody = await readNonStreamingResponseBody(providerResponse, contentType, upstreamStream);
+  const rawBody = await readNonStreamingResponseBody(
+    providerResponse,
+    contentType,
+    upstreamStream,
+    undefined,
+    {
+      signal: opts.signal,
+    }
+  );
   const normalizedProviderPayload = normalizePayloadForLog(rawBody);
   const looksLikeSSE =
     contentType.includes("text/event-stream") ||

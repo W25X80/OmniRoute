@@ -1,3 +1,4 @@
+import { promoteRequestToStreaming } from "@/lib/requestDeadline";
 import { z } from "zod";
 import { handleChat } from "@/sse/handlers/chat";
 import { logAdmissionRejection } from "@/sse/handlers/admissionRejectionLog";
@@ -16,7 +17,10 @@ import {
   resolveSessionId,
 } from "@/shared/middleware/chatBodyAdmission";
 import { SSE_HEARTBEAT_INTERVAL_MS } from "@omniroute/open-sse/config/constants";
-import { resolveStreamFlag } from "@omniroute/open-sse/utils/aiSdkCompat";
+import {
+  resolveStreamFlag,
+  resolveExplicitStreamAlias,
+} from "@omniroute/open-sse/utils/aiSdkCompat";
 import { errorResponse } from "@omniroute/open-sse/utils/error";
 import {
   withEarlyStreamKeepalive,
@@ -208,8 +212,13 @@ async function postHandler(request: any) {
       resolveIncomingCorrelationId(request.headers.get("x-correlation-id")) ??
       resolveIncomingCorrelationId(request.headers.get("x-request-id")) ??
       generateRequestId();
-    const wantsStreaming = resolveStreamFlag(resolvedBody?.stream, accept, "openai-responses");
+    const wantsStreaming = resolveStreamFlag(
+      resolveExplicitStreamAlias(resolvedBody) ?? resolvedBody?.stream,
+      accept,
+      "openai-responses"
+    );
     if (wantsStreaming) {
+      promoteRequestToStreaming();
       const thresholdMs = resolveKeepaliveThreshold(resolvedBody?.model);
       const { signal: streamSignal, deadlineController } = createStreamDeadlineSignal(
         request.signal

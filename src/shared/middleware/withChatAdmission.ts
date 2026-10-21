@@ -1,3 +1,4 @@
+import { getRequestLifecycleSignal } from "@/lib/requestDeadline";
 /**
  * Compose process-wide chat admission in front of a route handler.
  *
@@ -51,7 +52,7 @@ export function withChatAdmission(
       return await releaseChatAdmissionAfterHandler(
         Promise.resolve(handler(admission.request, ...args)),
         admission.lease,
-        { signal: request.signal }
+        { signal: getRequestLifecycleSignal(request.signal) }
       );
     } catch (error) {
       admission.lease?.release();

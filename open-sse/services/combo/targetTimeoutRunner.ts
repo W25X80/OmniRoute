@@ -1,3 +1,4 @@
+import { isIngressRequestDeadline, throwIfRequestCancelled } from "../../utils/requestDeadline.ts";
 /**
  * Wrap a single-model dispatch with a per-target timeout that aborts and falls back.
  *
@@ -23,7 +24,7 @@ import {
 } from "@/lib/db/persistenceRuntime";
 
 function attemptErrorResponse(error: unknown): Response {
-  if (isLocalCredentialSelectionFailure(error)) throw error;
+  if (isLocalCredentialSelectionFailure(error) || isIngressRequestDeadline(error)) throw error;
   if (isPersistenceStreamCapacityError(error))
     return errorResponse(503, "Gateway attempt capacity is unavailable. Please retry later.", {
       code: PERSISTENCE_STREAM_CAPACITY_CODE,
@@ -124,7 +125,9 @@ export function buildTargetTimeoutRunner(deps: {
     modelStr: string,
     target?: SingleModelTarget
   ): Promise<Response> => {
+    throwIfRequestCancelled();
     const resolvedTimeoutMs = await resolveTargetTimeoutMs?.(target);
+    throwIfRequestCancelled();
     const effectiveTimeoutMs =
       typeof resolvedTimeoutMs === "number" && Number.isFinite(resolvedTimeoutMs)
         ? resolvedTimeoutMs
@@ -221,7 +224,8 @@ export function buildTargetTimeoutRunner(deps: {
         }),
         timeoutPromise,
       ]).catch((raceErr) => {
-        if (isLocalCredentialSelectionFailure(raceErr)) throw raceErr;
+        if (isLocalCredentialSelectionFailure(raceErr) || isIngressRequestDeadline(raceErr))
+          throw raceErr;
         // Defensive: should never fire — both race branches always resolve.
         // Include the error message so the root cause is not masked.
         const detail = raceErr instanceof Error ? raceErr.message : String(raceErr);

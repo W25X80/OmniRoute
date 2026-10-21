@@ -337,6 +337,7 @@ test("findMissingArtifactPaths flags missing root runtime files in the tarball",
     "dist/open-sse/vendor/codex-chatgpt-web/responses/stateWorker.js",
     "dist/peer-stamp.mjs",
     "dist/persistence-request-boundary.mjs",
+    "dist/request-deadline.mjs",
     "dist/responses-ws-proxy.mjs",
     "dist/server-ws.mjs",
     "dist/src/lib/copilot/codegraphQueryWorker.cjs",
@@ -375,6 +376,7 @@ test("every shipped @omniroute workspace package is covered by an artifact prefi
 test("native persistence sidecars survive staging and fail loudly when absent", () => {
   for (const file of [
     "persistence-request-boundary.mjs",
+    "request-deadline.mjs",
     "webdav-native-handler.mjs",
     "src/lib/db/ompHostWorker.cjs",
   ]) {

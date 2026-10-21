@@ -16,17 +16,10 @@ export function makeResponse(
   headers: Record<string, string> = {}
 ): Response {
   const text = typeof body === "string" ? body : JSON.stringify(body);
-  return {
-    ok: status >= 200 && status < 300,
+  return new Response(text, {
     status,
-    statusText: status === 200 ? "OK" : "Error",
-    headers: new Headers({ "content-type": "application/json", ...headers }),
-    text: async () => text,
-    clone() {
-      return { ...this, text: async () => text } as unknown as Response;
-    },
-    body: null,
-  } as unknown as Response;
+    headers: { "content-type": "application/json", ...headers },
+  });
 }
 
 export function makeExecutorResult(

@@ -842,6 +842,9 @@ export async function runStreamingTail(deps: StreamingTailDeps) {
       }),
   });
 
+  // The pipeline can fail while the response hooks below are still pending.
+  deps.registerStreamFinalizers?.(onPipelineStreamError, onClientDisconnectFinalize);
+
   // For providers using Responses API format, translate stream back to openai (Chat Completions) format
   // UNLESS client is Droid CLI which expects openai-responses format back
   const needsResponsesTranslation =

@@ -1,3 +1,4 @@
+import { toFailureUsageAggregate } from "./failureUsage.ts";
 /**
  * Non-streaming response path, lifted out of handleChatCore.
  * The body matches the barrel. Closed-over request state arrives through
@@ -6,6 +7,7 @@
 
 import { meteredBudgetCost } from "@/lib/usage/meteredBudgetPolicy";
 import { CONNECTION_SCOPE_DENIED_CODE } from "../../services/connectionScope.ts";
+import { isIngressRequestDeadline, throwIfRequestCancelled } from "../../utils/requestDeadline.ts";
 import { getSelectedControlPlane } from "@/lib/db/controlPlaneContext";
 import { scheduleQuotaShareConsumptionAsync } from "./quotaShareConsumption.ts";
 import { getSelectedPersistenceIdentity } from "@/lib/db/controlPlaneContext";
@@ -55,8 +57,15 @@ import { buildNonStreamingResponseHeaders } from "../chatCore/nonStreamingRespon
 import { maybeWrapForcedNonStreamingResponsesJson } from "../chatCore/responsesJsonToSse.ts";
 import { runProviderExecutionPipeline } from "../chatCore/providerExecutionPipeline.ts";
 import { runNonStreamingProviderLeg } from "../chatCore/nonStreamingProviderLeg.ts";
-import type { NonStreamingProviderLegResult } from "@/lib/skills/toolLoopTypes.ts";
-import { finalizeToolLoopError } from "../chatCore/nonStreamingFinalization.ts";
+import type {
+  NonStreamingProviderLegResult,
+  ProviderLegUsage,
+} from "@/lib/skills/toolLoopTypes.ts";
+import {
+  finalizeToolLoopError,
+  finalizeNonStreamingFailure,
+  resolveNonStreamingCancellation,
+} from "../chatCore/nonStreamingFinalization.ts";
 import { markCodexScopeRateLimited } from "../chatCore/codexFailover.ts";
 import { deleteSessionAccountAffinityAsync } from "@/lib/db/sessionAccountAffinity";
 import { writeTerminalStatus } from "@/shared/utils/terminalStatus";
@@ -223,6 +232,14 @@ export async function runNonStreamingResponse(deps: NonStreamingDeps) {
   reasoningReplayHistory = _reasoningReplayHistory;
   translatedBody = _translatedBody;
   pipelineRecovered = false;
+  let observedUsage: ProviderLegUsage | null = null;
+  let terminalClaimed = false;
+  const claimFinalization = () => {
+    throwIfRequestCancelled(clientRawRequest?.signal);
+    // This claim precedes the first durable outcome. A later deadline cannot
+    // safely roll back an already committed usage row or replay its charge.
+    terminalClaimed = true;
+  };
 
   try {
     const runNonStreamingPipeline = async ({
@@ -335,6 +352,7 @@ export async function runNonStreamingResponse(deps: NonStreamingDeps) {
     let toolLoopUsage = null;
     let legResult = await runNonStreamingProviderLeg({
       phase: "initial",
+      signal: clientRawRequest?.signal,
       sourceBody: (body || {}) as Record<string, unknown>,
       expectedConnectionId: managedLease
         ? String(getCurrentConnectionId() || connectionId || "") || undefined
@@ -371,6 +389,7 @@ export async function runNonStreamingResponse(deps: NonStreamingDeps) {
       log,
     });
 
+    observedUsage = legResult.usage;
     if (legResult.kind === "error") {
       const err = legResult.result;
       if (err.errorCode === CONNECTION_SCOPE_DENIED_CODE) {
@@ -396,7 +415,7 @@ export async function runNonStreamingResponse(deps: NonStreamingDeps) {
         "";
       const errHeaders = err?.upstreamHeaders || err?.response?.headers;
       const errUpstreamBody = err?.upstreamErrorBody;
-      if (err) {
+      if (err && !isIngressRequestDeadline(err.originalError)) {
         await applyProviderFailureClassification({
           statusCode: err.status,
           message: errMessage,
@@ -406,6 +425,7 @@ export async function runNonStreamingResponse(deps: NonStreamingDeps) {
           targetModel: currentModel,
         });
       }
+      claimFinalization();
 
       const captured = providerRequestCapture.latest?.() ?? null;
       finalBody = captured?.body ?? finalBody ?? translatedBody;
@@ -457,7 +477,8 @@ export async function runNonStreamingResponse(deps: NonStreamingDeps) {
       if (getSelectedControlPlane()) await attemptLogPersistence;
       const failureUsagePersistence = persistFailureUsage(
         err.status,
-        err.errorCode || `upstream_${err.status}`
+        err.errorCode || `upstream_${err.status}`,
+        toFailureUsageAggregate(legResult.usage)
       );
       if (getSelectedControlPlane()) await failureUsagePersistence;
       trackPendingRequest(model, provider, pendingConnId, false, undefined, pendingRequestId);
@@ -564,6 +585,7 @@ export async function runNonStreamingResponse(deps: NonStreamingDeps) {
         return runNonStreamingProviderLeg(
           followUpLegInput(
             {
+              signal: clientRawRequest?.signal,
               executeProviderRequest: (modelToCall, allowDedup) =>
                 executeProviderRequest(modelToCall, allowDedup),
               runProviderExecution: runNonStreamingPipeline,
@@ -599,7 +621,10 @@ export async function runNonStreamingResponse(deps: NonStreamingDeps) {
       },
       logReceipt: (receipt) => reqLogger.logToolLoopReceipt(receipt),
     });
+    if (loopApply.kind !== "skip") observedUsage = loopApply.loop.cumulativeUsage;
+    throwIfRequestCancelled(clientRawRequest?.signal);
     if (loopApply.kind === "error") {
+      claimFinalization();
       return {
         response: await finalizeToolLoopError({
           loop: loopApply.loop,
@@ -679,16 +704,7 @@ export async function runNonStreamingResponse(deps: NonStreamingDeps) {
       looksLikeSSE ? { _streamed: true, _format: "sse-json", summary: responseBody } : responseBody
     );
     effectiveServiceTier = resolveReportedServiceTier(responseBody) ?? effectiveServiceTier;
-    if (onRequestSuccess) {
-      await onRequestSuccess();
-    }
     const successConnectionId = getCurrentConnectionId();
-    await maybeSyncClaudeExtraUsageState({
-      provider,
-      connectionId: successConnectionId,
-      providerSpecificData: credentials?.providerSpecificData,
-      log,
-    });
     const usage = toolLoopUsage ?? extractUsageFromResponse(responseBody, provider);
     const nativeQuotaCompletion = getSelectedControlPlane()
       ? {
@@ -707,70 +723,7 @@ export async function runNonStreamingResponse(deps: NonStreamingDeps) {
           log,
         }
       : undefined;
-    recordFinalInputCalibration(
-      body,
-      provider,
-      effectiveModel,
-      calibrationEstimatedInputTokens,
-      usage,
-      toolLoopUsage != null
-    );
     const cacheUsageLogMeta = buildCacheUsageLogMeta(usage);
-    if (usage && typeof usage === "object") {
-      attachCompressionUsageReceiptAfterAnalytics(usage as Record<string, unknown>, "provider");
-      if (provider === "gemini") {
-        const promptTokens =
-          typeof (usage as Record<string, unknown>).prompt_tokens === "number"
-            ? ((usage as Record<string, unknown>).prompt_tokens as number)
-            : 0;
-        if (promptTokens > 0) incrementTokenUsage(model, promptTokens);
-      }
-    }
-    recordContextEditingTelemetryHook({
-      contextEditingEnabled,
-      provider,
-      responseBody,
-      skillRequestId,
-      log,
-    });
-    appendRequestLog({
-      model,
-      provider,
-      connectionId: successConnectionId,
-      tokens: usage,
-      status: "200 OK",
-    }).catch(() => {});
-    await recordNonStreamingUsageStats(usage, {
-      traceEnabled,
-      provider,
-      connectionId: successConnectionId,
-      model,
-      startTime,
-      apiKeyInfo,
-      effectiveServiceTier,
-      isCombo,
-      comboStrategy,
-      endpoint: endpointPath,
-      cpaAuthIndex: readCpaAuthIndex(providerResponse),
-    });
-
-    // #12150 P1b surface 3 (fix round 1): a video-bridge-observed request's
-    // request- AND response-derived text both carry the full transcript (the
-    // flattened description on the request side, the model's own reply on
-    // the response side) — neither may populate durable Memory. See
-    // runMemoryExtractionGate for the shared gate + extraction wiring, unit
-    // tested directly in tests/unit/video-bridge-memory-suppression.test.ts.
-    runMemoryExtractionGate({
-      memoryOwnerId,
-      memorySettings,
-      videoBridgeObserved,
-      pipelineSessionId,
-      requestBody: body as Record<string, unknown>,
-      responseBody: memoryExtractionResponse as Record<string, unknown> | null,
-      extractFacts,
-      log,
-    });
-
     const customSkillExecutionEnabled =
       Boolean(memoryOwnerId) && memorySettings?.skillsEnabled === true;
     const builtinToolNames = [
@@ -823,7 +776,90 @@ export async function runNonStreamingResponse(deps: NonStreamingDeps) {
       : 0;
     const chatCostCtx = buildCostCtx(provider, model, usage, effectiveServiceTier, traceId);
 
+    const finalizeObservedUsage = async () => {
+      claimFinalization();
+      recordFinalInputCalibration(
+        body,
+        provider,
+        effectiveModel,
+        calibrationEstimatedInputTokens,
+        usage,
+        toolLoopUsage != null
+      );
+      if (usage && typeof usage === "object") {
+        attachCompressionUsageReceiptAfterAnalytics(usage as Record<string, unknown>, "provider");
+        if (provider === "gemini") {
+          const promptTokens =
+            typeof (usage as Record<string, unknown>).prompt_tokens === "number"
+              ? ((usage as Record<string, unknown>).prompt_tokens as number)
+              : 0;
+          if (promptTokens > 0) incrementTokenUsage(model, promptTokens);
+        }
+      }
+      recordContextEditingTelemetryHook({
+        contextEditingEnabled,
+        provider,
+        responseBody,
+        skillRequestId,
+        log,
+      });
+      appendRequestLog({
+        model,
+        provider,
+        connectionId: successConnectionId,
+        tokens: usage,
+        status: "200 OK",
+      }).catch(() => {});
+      await recordNonStreamingUsageStats(usage, {
+        traceEnabled,
+        provider,
+        connectionId: successConnectionId,
+        model,
+        startTime,
+        apiKeyInfo,
+        effectiveServiceTier,
+        isCombo,
+        comboStrategy,
+        endpoint: endpointPath,
+        cpaAuthIndex: readCpaAuthIndex(providerResponse),
+      });
+
+      // Usage has entered durable finalization. A cancellation in a success
+      // observer cannot discard that observed charge or start a second outcome.
+      if (!resolveNonStreamingCancellation(clientRawRequest?.signal)) {
+        try {
+          if (onRequestSuccess) await onRequestSuccess();
+          await maybeSyncClaudeExtraUsageState({
+            provider,
+            connectionId: successConnectionId,
+            providerSpecificData: credentials?.providerSpecificData,
+            log,
+          });
+        } catch (error) {
+          if (!resolveNonStreamingCancellation(clientRawRequest?.signal, error)) throw error;
+        }
+      }
+
+      // #12150 P1b surface 3 (fix round 1): a video-bridge-observed request's
+      // request- AND response-derived text both carry the full transcript (the
+      // flattened description on the request side, the model's own reply on
+      // the response side) — neither may populate durable Memory. See
+      // runMemoryExtractionGate for the shared gate + extraction wiring, unit
+      // tested directly in tests/unit/video-bridge-memory-suppression.test.ts.
+      runMemoryExtractionGate({
+        memoryOwnerId,
+        memorySettings,
+        videoBridgeObserved,
+        pipelineSessionId,
+        requestBody: body as Record<string, unknown>,
+        responseBody: memoryExtractionResponse as Record<string, unknown> | null,
+        extractFacts,
+        log,
+      });
+    };
+
     if (postCallGuardrails.blocked) {
+      await finalizeObservedUsage();
       const guardrailMessage = postCallGuardrails.message || "Response blocked by guardrail";
       const attemptLogPersistence = persistAttemptLogs({
         status: HTTP_STATUS.BAD_REQUEST,
@@ -892,6 +928,7 @@ export async function runNonStreamingResponse(deps: NonStreamingDeps) {
       hasTrustedEmptyTurn(providerResponse)
     );
     if (malformedTranslatedReason) {
+      await finalizeObservedUsage();
       const malformedDiagnostic = buildMalformedResponseDiagnostic(
         malformedTranslatedReason,
         responseBody,
@@ -997,6 +1034,8 @@ export async function runNonStreamingResponse(deps: NonStreamingDeps) {
         },
       };
     }
+
+    await finalizeObservedUsage();
 
     // ── Phase 9.1: Cache store (non-streaming, temp=0) ──
     await storeSemanticCacheResponseAsync({
@@ -1167,6 +1206,38 @@ export async function runNonStreamingResponse(deps: NonStreamingDeps) {
       },
     };
   } catch (error) {
+    const cancellation = terminalClaimed
+      ? null
+      : resolveNonStreamingCancellation(clientRawRequest?.signal, error);
+    if (cancellation) {
+      terminalClaimed = true;
+      const response = await finalizeNonStreamingFailure({
+        error: cancellation,
+        usage: observedUsage,
+        model,
+        provider,
+        connectionId: pendingConnId,
+        providerRequest: finalBody || translatedBody,
+        persistFailureUsage,
+        persistAttemptLogs,
+        trackPendingRequest,
+        pendingRequestId,
+      });
+      return {
+        response,
+        carry: {
+          translatedBody,
+          currentModel,
+          finalBody,
+          providerResponse,
+          providerHeaders,
+          effectiveServiceTier,
+          claudePromptCacheLogMeta,
+          reasoningReplayHistory,
+          pipelineRecovered,
+        },
+      };
+    }
     trackPendingRequest(model, provider, pendingConnId, false, undefined, pendingRequestId);
     const errorMetadata = getSafeErrorMetadata(error);
     const managedLeaseFenceCode = getManagedLeaseFenceErrorCode(errorMetadata.code);

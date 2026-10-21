@@ -54,6 +54,7 @@ import { resolveProviderId } from "../../shared/constants/providers";
 import { classifyProviderProbeResult } from "./providerProbeClassification";
 import { markProviderProbeResponse } from "../../shared/utils/providerProbeResult";
 import { inheritResponsePolicies } from "./chat/responsePolicies.ts";
+import { breakerCountsAsFailure, logBreakerStateChange } from "./providerBreakerCallbacks";
 import { isFeatureFlagEnabled } from "../../shared/utils/featureFlags";
 
 import { noteProxyOutcome } from "./proxyOutcomeMemory";
@@ -377,9 +378,8 @@ export async function checkPipelineGates(
     degradationThreshold: providerProfile.degradationThreshold,
     resetTimeout: providerProfile.resetTimeoutMs ?? providerProfile.circuitBreakerReset,
     // A local stream lifecycle error never reached the provider.
-    isFailure: (e) => !isLocalStreamLifecycleError(e),
-    onStateChange: (name: string, from: string, to: string) =>
-      log.info("CIRCUIT", `${name}: ${from} → ${to}`),
+    isFailure: breakerCountsAsFailure,
+    onStateChange: logBreakerStateChange,
     ...(useHints429
       ? {
           cooldownByKind: {

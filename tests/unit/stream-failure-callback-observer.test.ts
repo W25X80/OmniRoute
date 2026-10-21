@@ -8,6 +8,54 @@ import {
 
 const failure = { status: 502, message: "Upstream stream failed", code: "stream_pipeline_error" };
 
+test("an owned ingress deadline preserves local provenance rather than a provider failure", () => {
+  let completed = false;
+  const seen: StreamFailurePayload[] = [];
+  const finalizers = createStreamFailureFinalizers({
+    isStreamCompletionRecorded: () => completed,
+    isFailureCompletionRecorded: () => completed,
+    onStreamComplete: () => {
+      completed = true;
+    },
+    persistFailureUsage: () => {},
+    onStreamFailure: (value) => {
+      seen.push(value);
+    },
+  });
+  const error = new Error("Gateway request exceeded its configured ingress deadline");
+  error.name = "TimeoutError";
+  Object.defineProperty(error, Symbol.for("omniroute.request-ingress-deadline.v1"), {
+    value: true,
+  });
+  finalizers.onPipelineStreamError({ error, message: error.message, statusCode: 504 });
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].code, "request_ingress_deadline_exceeded");
+  assert.equal(seen[0].type, "request_deadline");
+  assert.equal(seen[0].status, 504);
+});
+
+test("a similarly named upstream timeout cannot claim trusted ingress provenance", () => {
+  let completed = false;
+  const seen: StreamFailurePayload[] = [];
+  const finalizers = createStreamFailureFinalizers({
+    isStreamCompletionRecorded: () => completed,
+    isFailureCompletionRecorded: () => completed,
+    onStreamComplete: () => {
+      completed = true;
+    },
+    persistFailureUsage: () => {},
+    onStreamFailure: (value) => {
+      seen.push(value);
+    },
+  });
+  const error = new Error("Gateway request exceeded its configured ingress deadline");
+  error.name = "TimeoutError";
+  finalizers.onPipelineStreamError({ error, message: error.message, statusCode: 504 });
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].code, "stream_pipeline_error");
+  assert.equal(seen[0].type, "stream_error");
+});
+
 test("undefined callback results retain order and exactly one dispatch", () => {
   const calls: string[] = [];
   let completed = false;

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { ArtifactStorageError } from "../../src/domain/persistence/artifactStore.ts";
 import {
+  artifactFailureDiagnostic,
   recordArtifactReconciliationPass,
   getArtifactReconciliationStatus,
 } from "../../src/lib/usage/artifactReconciliationStatus.ts";
@@ -96,4 +97,26 @@ test("pending age alone cannot establish old uncertainty", () => {
     oldestUncertainCreatedAt: null,
   });
   assert.equal(getArtifactReconciliationStatus().reviewRequired, false);
+});
+
+test("safe transport provenance and timings survive the management diagnostic projection", () => {
+  const diagnostic = Object.freeze({
+    name: "TimeoutError",
+    timeoutSource: "request" as const,
+    operation: "put" as const,
+    phase: "transport" as const,
+    elapsedMs: 4200,
+    preparationMs: 200,
+    transportMs: 4000,
+    sizeBytes: 1024,
+    activeOperations: 2,
+    activeSockets: 2,
+    queuedRequests: 0,
+  });
+  const failure = new ArtifactStorageError("put_unknown", "private-reference", true, diagnostic);
+  assert.deepEqual(artifactFailureDiagnostic(failure), { kind: "put_unknown", ...diagnostic });
+  assert.equal(
+    JSON.stringify(artifactFailureDiagnostic(failure)).includes("private-reference"),
+    false
+  );
 });

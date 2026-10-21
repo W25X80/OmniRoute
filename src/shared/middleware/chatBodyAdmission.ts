@@ -1,3 +1,8 @@
+import {
+  getRequestLifecycleSignal,
+  readRequestChunk,
+  throwIfRequestCancelled,
+} from "@/lib/requestDeadline";
 /**
  * Process-local bounded admission for POST /v1/chat/completions.
  *
@@ -1009,7 +1014,7 @@ function parseContentLength(header: string | null): number | null {
   return Number.isSafeInteger(parsed) ? parsed : null;
 }
 
-function rebuildRequest(request: Request, body: Uint8Array): Request {
+function rebuildRequest(request: Request, body: Uint8Array, signal = request.signal): Request {
   const headers = new Headers(request.headers);
   // The inbound value may be absent or dishonest. Let the runtime derive the correct value.
   headers.delete("content-length");
@@ -1017,7 +1022,7 @@ function rebuildRequest(request: Request, body: Uint8Array): Request {
     method: request.method,
     headers,
     body,
-    signal: request.signal,
+    signal,
     duplex: "half",
   } as RequestInit & { duplex: "half" });
 }
@@ -1034,6 +1039,8 @@ export async function admitChatRequest(
     heapPressureCheck?: () => boolean;
   } = {}
 ): Promise<ChatRequestAdmission> {
+  const signal = getRequestLifecycleSignal(request.signal);
+  throwIfRequestCancelled(signal);
   const sessionId = options.sessionId ?? resolveSessionId(request);
   const controller =
     options.controller ?? perConnectionAdmissionController.getController(sessionId);
@@ -1056,7 +1063,7 @@ export async function admitChatRequest(
     let totalBytes = 0;
     try {
       while (true) {
-        const { done, value } = await reader.read();
+        const { done, value } = await readRequestChunk(reader, signal);
         if (done) break;
         totalBytes += value.byteLength;
         if (totalBytes > hardMaxBytes) {
@@ -1076,7 +1083,7 @@ export async function admitChatRequest(
       body.set(chunk, offset);
       offset += chunk.byteLength;
     }
-    return { admit: true, request: rebuildRequest(request, body), lease: NULL_LEASE };
+    return { admit: true, request: rebuildRequest(request, body, signal), lease: NULL_LEASE };
   }
 
   // #503-fanout: shed before spending any bytes on ingestion when the process
@@ -1108,7 +1115,7 @@ export async function admitChatRequest(
     const countLease =
       controller.tryAcquireHeavy() ??
       (!heapPressureCheck() ? controller.tryAcquireHealthyHeadroom() : null) ??
-      (await controller.acquireHeavyWithin(queueMs, request.signal, bytes, sessionId));
+      (await controller.acquireHeavyWithin(queueMs, signal, bytes, sessionId));
     if (!countLease) return false;
 
     // Additive ingest byte-budget gate (#503-fanout), layered on top of the
@@ -1122,7 +1129,7 @@ export async function admitChatRequest(
     const budgetResult = await controller.acquireBudgetWithin(
       bytes,
       budgetWaitMs,
-      request.signal,
+      signal,
       sessionId
     );
     if (budgetResult.status !== "acquired") {
@@ -1155,7 +1162,7 @@ export async function admitChatRequest(
   let totalBytes = 0;
   try {
     while (true) {
-      const { done, value } = await reader.read();
+      const { done, value } = await readRequestChunk(reader, signal);
       if (done) break;
       totalBytes += value.byteLength;
       if (totalBytes > hardMaxBytes) {
@@ -1188,7 +1195,7 @@ export async function admitChatRequest(
     body.set(chunk, offset);
     offset += chunk.byteLength;
   }
-  return { admit: true, request: rebuildRequest(request, body), lease };
+  return { admit: true, request: rebuildRequest(request, body, signal), lease };
 }
 
 // Lease release binding lives in ./chatAdmissionRelease. Re-exported here so

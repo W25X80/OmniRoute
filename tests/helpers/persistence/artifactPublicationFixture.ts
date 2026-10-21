@@ -216,6 +216,54 @@ async function query<Row>(
     return result<Row>(fixture.keyExists ? [{ no_log: fixture.noLog ? 1 : 0 }] : []);
   if (sql.startsWith("SELECT * FROM omniroute.artifact_deletion_queue"))
     return result<Row>(fixture.intents.has(ref) ? [{ ...fixture.intents.get(ref) }] : []);
+  if (
+    sql.startsWith("SELECT relpath FROM omniroute.artifact_deletion_queue") &&
+    sql.includes("WHERE call_log_order=$1")
+  )
+    return result<Row>(
+      [...fixture.intents.values()]
+        .filter(
+          (row) => row.call_log_order === String(values[0]) && row.call_log_id === String(values[1])
+        )
+        .slice(0, 2)
+        .map((row) => ({ relpath: row.relpath }))
+    );
+  if (sql.startsWith("WITH source AS MATERIALIZED")) {
+    const row = fixture.intents.get(ref);
+    if (
+      !row ||
+      row.publication_state !== "publishing" ||
+      row.upload_state !== "uncertain" ||
+      row.nextDue > Date.now() ||
+      row.publication_owner !== values[3] ||
+      row.dispatch_owner !== values[4] ||
+      row.call_log_id !== values[5] ||
+      row.call_log_order !== values[6] ||
+      row.store_scope !== values[7] ||
+      row.expected_size_bytes !== values[8] ||
+      row.expected_sha256 !== values[9] ||
+      !row.staged_payload
+    )
+      return result<Row>([], 0);
+    if (fixture.intents.has(String(values[1]))) throw new Error("Duplicate artifact identity");
+    const successor = {
+      ...row,
+      relpath: String(values[1]),
+      publication_state: "publishing" as const,
+      upload_state: "not_sent" as const,
+      publication_owner: String(values[2]),
+      dispatch_owner: null,
+      nextDue: Date.now() + 30000,
+    };
+    Object.assign(row, {
+      publication_state: "delete_pending",
+      staged_payload: null,
+      staged_bytes: 0,
+      nextDue: Date.now() + 300000,
+    });
+    fixture.intents.set(successor.relpath, successor);
+    return result<Row>([{ relpath: successor.relpath }]);
+  }
   if (sql.startsWith("SELECT relpath FROM omniroute.artifact_deletion_queue"))
     return result<Row>(
       [...fixture.intents.values()]
@@ -292,6 +340,11 @@ async function query<Row>(
         artifact_size_bytes: values[3],
         artifact_sha256: values[4],
       });
+    } else if (sql.includes("SET detail_reason='publication_pending'")) {
+      const log = fixture.logs.get(ref);
+      if (!log || String(log.insertion_order) !== String(values[1]) || log.artifact_relpath)
+        return result<Row>([], 0);
+      log.detail_reason = "publication_pending";
     } else if (sql.includes("FROM omniroute.artifact_deletion_queue")) {
       const intent = fixture.intents.get(ref),
         log = intent?.call_log_id ? fixture.logs.get(intent.call_log_id) : undefined;
@@ -313,11 +366,13 @@ async function query<Row>(
     if (sql.includes("SET upload_state='uncertain'")) {
       row.upload_state = "uncertain";
       row.dispatch_owner = String(values[1]);
+      row.nextDue = Date.now() + 30000;
     } else if (sql.includes("upload_state=CASE WHEN $3")) {
       if (values[2] && row.dispatch_owner === values[1]) {
         row.upload_state = "not_sent";
         row.dispatch_owner = null;
       }
+      row.nextDue = Date.now() + 30000;
     } else if (sql.includes("publication_state=CASE")) {
       if (!values[1]) row.publication_state = "attached";
       row.nextDue = Date.now() + 300000;
