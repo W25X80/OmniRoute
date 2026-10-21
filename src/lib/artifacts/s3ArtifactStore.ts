@@ -80,8 +80,8 @@ async function loadDefaultClient(
       return client.send(command, requestOptions) as Promise<ArtifactOutput>;
     },
     snapshot() {
-      const count = (groups: Record<string, readonly unknown[]>) =>
-        Object.values(groups).reduce((total, items) => total + items.length, 0);
+      const count = (groups: Readonly<Record<string, readonly unknown[] | undefined>>) =>
+        Object.values(groups).reduce((total, items) => total + (items?.length ?? 0), 0);
       return {
         activeSockets: count(agent.sockets),
         queuedRequests: count(agent.requests),
