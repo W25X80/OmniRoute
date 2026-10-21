@@ -62,6 +62,45 @@ test("a cancelled fingerprint waiter never materializes canonical history", asyn
   }
 });
 
+for (const cause of ["cancelled", "deadline"] as const) {
+  test(`${cause} during new-node preparation cannot enter a durable create`, async (t) => {
+    const controller = new AbortController();
+    let now = Date.now();
+    if (cause === "deadline") t.mock.method(Date, "now", () => now);
+    let transactions = 0;
+    const database = {
+      async transaction(body: (tx: unknown) => Promise<unknown>) {
+        transactions++;
+        if (transactions > 1) throw new Error("Unexpected durable create after cancellation");
+        const result = await body({ query: async () => ({ rows: [], rowCount: 0 }) });
+        // Candidate read has completed. Abort in the next turn, inside the new-node
+        // builder's first yield, after the resolver's pre-preparation lifetime check.
+        void setImmediate().then(() => {
+          if (cause === "cancelled") controller.abort();
+          else now += 10_000;
+        });
+        return result;
+      },
+    } as unknown as PostgresDatabase;
+    const binding = {
+      database,
+      databaseIdentity: {},
+      assertReady() {},
+    } as unknown as PostgresControlPlaneBinding;
+    const result = await withPostgresControlPlane(binding, () =>
+      resolveConversationId({
+        ...input(`node-preparation-${cause}`, ["new turn"]),
+        signal: controller.signal,
+      })
+    ).then(
+      () => null,
+      (error: unknown) => error
+    );
+    assert.equal(transactions, 1, "no mutation transaction may start after cancellation");
+    assert.match(String(result), new RegExp(cause));
+  });
+}
+
 test.after(() => {
   resetDbInstance();
   rmSync(directory, { recursive: true, force: true });

@@ -315,6 +315,7 @@ async function buildNewNodes(
     if ((i - fromIndex) % 32 === 0) {
       assertConversationTrackingActive(lifetime.signal, lifetime.deadline);
       await yieldToEventLoop();
+      assertConversationTrackingActive(lifetime.signal, lifetime.deadline);
     }
     const turnHash = turnHashes[i];
     const nodeId = chainNodeIdFromHash(parent, turnHash);
@@ -610,16 +611,18 @@ export async function resolveConversationId(
         if (stale) continue;
         const id = `conv_${randomUUID()}`;
         assertConversationTrackingActive(input.signal, deadline);
+        const nodes = await buildNewNodes(chainTurns, 0, id, id, turnHashes, {
+          signal: input.signal,
+          deadline,
+        });
+        assertConversationTrackingActive(input.signal, deadline);
         await commitConversationResolutionAsync({
           kind: "create",
           id,
           apiKeyId: input.apiKeyId,
           fingerprintHash,
           correlationId: input.correlationId,
-          nodes: await buildNewNodes(chainTurns, 0, id, id, turnHashes, {
-            signal: input.signal,
-            deadline,
-          }),
+          nodes,
         });
         return { conversationId: id, isNewConversation: true };
       }
