@@ -9,6 +9,7 @@ export const nativeStartupFixture = {
   cloudBarrier: undefined as Promise<void> | undefined,
   memoryBarrier: undefined as Promise<void> | undefined,
   optionalImportBarrier: undefined as Promise<void> | undefined,
+  optionalImportEntered: undefined as (() => void) | undefined,
   persistencePhase: "starting" as "starting" | "ready" | "failed" | "closing" | "closed",
   serverPhase: "starting" as "starting" | "ready" | "stopping",
 };
@@ -204,6 +205,9 @@ export async function closeNativeNotionThreadSessions(): Promise<void> {
 
 export function initializePendingContinuationMaintenance(): void {
   record("maintenance:continuation:start");
+}
+export function prepareRateLimitSemaphoreMaintenance(): void {
+  record("maintenance:ratelimit:prepare");
 }
 export function startRuntimeResourceMonitor(): void {
   record("maintenance:resources:start");

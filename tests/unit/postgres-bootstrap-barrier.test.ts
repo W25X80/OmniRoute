@@ -19,6 +19,7 @@ const jobsUrl = new URL("../../src/lib/startup/postgresJobs.ts", import.meta.url
 const plainUrl = (url: string | undefined) => url?.split("?")[0];
 const ownerSymbol = Symbol.for("omniroute.postgresStartupOwner");
 const ownedGlobals = globalThis as typeof globalThis & { [ownerSymbol]?: unknown };
+let importGeneration = 0;
 const hooks = registerHooks({
   resolve(specifier, context, nextResolve) {
     const parent = plainUrl(context.parentURL);
@@ -37,7 +38,8 @@ const hooks = registerHooks({
       if (specifier === "@/lib/startup/postgresShutdown")
         return { url: shutdownUrl, shortCircuit: true };
       if (specifier === "@/lib/startup/postgresJobs") return { url: jobsUrl, shortCircuit: true };
-      if (specifier === "@/lib/modelsDevSync") return { url: optionalGateUrl, shortCircuit: true };
+      if (specifier === "@/lib/modelsDevSync")
+        return { url: `${optionalGateUrl}?generation=${importGeneration}`, shortCircuit: true };
       if (
         specifier !== "@/lib/db/backendSelection" &&
         specifier !== "@/lib/instrumentationBootError" &&
@@ -85,6 +87,8 @@ beforeEach(() => {
   nativeStartupFixture.cloudBarrier = undefined;
   nativeStartupFixture.memoryBarrier = undefined;
   nativeStartupFixture.optionalImportBarrier = undefined;
+  nativeStartupFixture.optionalImportEntered = undefined;
+  importGeneration++;
   nativeStartupFixture.persistencePhase = "starting";
   nativeStartupFixture.serverPhase = "starting";
   process.env.OMNIROUTE_DATABASE_BACKEND = "postgres";
@@ -163,7 +167,9 @@ test("shutdown drains an accepted producer before later jobs and pool close", as
 
 test("optional import completing after cancellation cannot activate its producer", async () => {
   const gate = deferred();
+  const entered = deferred();
   nativeStartupFixture.optionalImportBarrier = gate.promise;
+  nativeStartupFixture.optionalImportEntered = entered.resolve;
   const subsystem = instrumentation.OPTIONAL_BOOT_SUBSYSTEMS.find(
     (entry) => entry.name === "models-dev-sync"
   )!;
@@ -173,7 +179,7 @@ test("optional import completing after cancellation cannot activate its producer
     startupFixture.events.push("ready");
   });
   const rejection = assert.rejects(starting, /startup is stopping/);
-  await turn();
+  await entered.promise;
   const closing = boot.runPostgresShutdown(async () => {
     startupFixture.events.push("cleanup");
   });

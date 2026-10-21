@@ -25,6 +25,7 @@ const WRAPPER_SOURCE = path.join(ROOT, "scripts/dev/standalone-server-ws.mjs");
 const SIBLINGS: Array<[string, string]> = [
   ["scripts/dev/peer-stamp.mjs", "peer-stamp.mjs"],
   ["scripts/dev/persistence-request-boundary.mjs", "persistence-request-boundary.mjs"],
+  ["scripts/dev/request-deadline.mjs", "request-deadline.mjs"],
   ["scripts/dev/main-server-timeouts.mjs", "main-server-timeouts.mjs"],
   ["scripts/dev/systemd-notify.mjs", "systemd-notify.mjs"],
   ["scripts/dev/http-method-guard.cjs", "http-method-guard.cjs"],

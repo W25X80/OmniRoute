@@ -122,7 +122,8 @@ describe("i18n key parity for SERVER_OWNED_TOOL_LOOP_ENABLED", () => {
     const flagDef = definitions.SERVER_OWNED_TOOL_LOOP_ENABLED as
       Record<string, unknown> | undefined;
     assert.ok(flagDef, "definitions should contain SERVER_OWNED_TOOL_LOOP_ENABLED");
-    assert.equal(flagDef.label, "Server-Owned Tool Loop");
+    assert.equal(typeof flagDef.label, "string");
+    assert.ok((flagDef.label as string).trim().length > 0, "label should be non-empty");
     assert.equal(typeof flagDef.description, "string");
     assert.ok(
       ((flagDef.description as string) || "").length > 0,

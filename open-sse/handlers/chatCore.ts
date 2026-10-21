@@ -129,7 +129,12 @@ import { THINKING_MARKER_HEADER } from "../utils/thinkCloseMarker.ts";
 import { resolveAgentGoalPolicy } from "../utils/agentGoalPolicy.ts";
 import { createStreamController } from "../utils/streamHandler.ts";
 import * as streamFailure from "../utils/streamFailureFinalization.ts";
-import { promoteRequestToStreaming, throwIfRequestCancelled } from "../utils/requestDeadline.ts";
+import {
+  isIngressRequestDeadline,
+  promoteRequestToStreaming,
+  throwIfRequestCancelled,
+} from "../utils/requestDeadline.ts";
+import { resolveNonStreamingCancellation } from "./chatCore/nonStreamingFinalization.ts";
 import { normalizeUsage } from "../utils/usageTracking.ts";
 import { refreshWithRetry, runWithOnPersist, runWithCasGuard } from "../services/tokenRefresh.ts";
 import { createRequestLogger } from "../utils/requestLogger.ts";
@@ -392,14 +397,23 @@ export async function handleChatCore(args: Parameters<typeof handleChatCoreInner
       withResilienceActionsContext([args], (forwarded) => handleChatCoreInner(forwarded))
     );
   } catch (error) {
-    if (!isPersistenceStreamCapacityError(error)) throw error;
-    return createErrorResult(
-      HTTP_STATUS.SERVICE_UNAVAILABLE,
-      "Gateway attempt capacity is unavailable. Please retry later.",
-      null,
-      PERSISTENCE_STREAM_CAPACITY_CODE,
-      "local_queue_capacity"
-    );
+    if (isPersistenceStreamCapacityError(error)) {
+      return createErrorResult(
+        HTTP_STATUS.SERVICE_UNAVAILABLE,
+        "Gateway attempt capacity is unavailable. Please retry later.",
+        null,
+        PERSISTENCE_STREAM_CAPACITY_CODE,
+        "local_queue_capacity"
+      );
+    }
+    const signal = args.clientRawRequest?.signal;
+    // Preparation guards precede the inner response finalizer. Normalize only their
+    // owned reason; an independently failing SQL/upstream operation must still reject.
+    if (isIngressRequestDeadline(error) || (signal?.aborted && Object.is(error, signal.reason))) {
+      const cancellation = resolveNonStreamingCancellation(signal, error);
+      if (cancellation) return cancellation;
+    }
+    throw error;
   }
 }
 
@@ -1183,8 +1197,13 @@ async function handleChatCoreInner({
           userAgent: streamUserAgent,
           streamDefaultMode: apiKeyInfo?.streamDefaultMode,
         });
-  if (stream) promoteRequestToStreaming();
-  throwIfRequestCancelled(clientRawRequest?.signal);
+  try {
+    if (stream) promoteRequestToStreaming();
+    throwIfRequestCancelled(clientRawRequest?.signal);
+  } catch (error) {
+    trackPendingRequest(model, provider, pendingConnId, false, undefined, pendingRequestId);
+    throw error;
+  }
 
   // `settings` is already consolidated once near the top of handleChatCore
   // (the "fetch once, reuse" const). A second `const settings` here was a
