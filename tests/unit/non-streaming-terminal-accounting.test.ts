@@ -7,6 +7,8 @@ import { toFailureUsageAggregate } from "../../open-sse/handlers/chatCore/failur
 import { runNonStreamingProviderLeg } from "../../open-sse/handlers/chatCore/nonStreamingProviderLeg.ts";
 import { baseInput, makeExecutorResult } from "./_helpers/nonStreamingProviderLegFixtures.ts";
 import { controlledOwnerModule } from "../helpers/persistence/controlledOwnerModule.ts";
+import { aggregateProviderLegUsage } from "../../src/lib/skills/serverOwnedToolLoop.ts";
+import { followUpLegInput } from "../../open-sse/handlers/chatCore/serverOwnedToolLoopWire.ts";
 import type {
   NonStreamingProviderLegResult,
   ProviderLegUsage,
@@ -76,6 +78,79 @@ test("parsed ClinePass usage survives cancellation during retry delay", async ()
 const known: ProviderLegUsage = { prompt_tokens: 12, completion_tokens: 3, total_tokens: 15 };
 const cumulative: ProviderLegUsage = { prompt_tokens: 24, completion_tokens: 7, total_tokens: 31 };
 
+async function emptyTerminalLeg(provider = "openai") {
+  return runNonStreamingProviderLeg(
+    baseInput({
+      phase: "follow-up",
+      allowModelFallback: false,
+      provider,
+      sleep: async () => {},
+      executeProviderRequest: async () =>
+        makeExecutorResult(
+          provider === "clinepass"
+            ? { success: false, error: "empty content", usage: known }
+            : {
+                choices: [{ message: { role: "assistant", content: "" }, finish_reason: "stop" }],
+                usage: known,
+              }
+        ),
+    })
+  );
+}
+
+test("empty terminal return retains a separate cancellation ledger", async () => {
+  const leg = await emptyTerminalLeg();
+  assert.equal(leg.kind, "error");
+  assert.equal(leg.usage, null, "ordinary empty-response accounting is unchanged");
+  assert.equal(leg.receipt.usage, null);
+  const result = await scenario({ initialLeg: leg, cancelAtClassifierEntry: true });
+  assert.deepEqual(result.history, [{ status: 504, usage: toFailureUsageAggregate(known) }]);
+  assert.deepEqual(aggregateProviderLegUsage([leg.cancellationUsage ?? null]), known);
+  assert.deepEqual(result.attempts, [504]);
+});
+
+test("exhausted ClinePass return keeps both parsed attempts for a later deadline", async () => {
+  const leg = await emptyTerminalLeg("clinepass");
+  const expected = aggregateProviderLegUsage([known, known]);
+  assert.equal(leg.kind, "error");
+  assert.equal(leg.usage, null, "ordinary envelope-error accounting is unchanged");
+  const result = await scenario({ initialLeg: leg, cancelAtClassifierEntry: true });
+  assert.deepEqual(result.history, [{ status: 504, usage: toFailureUsageAggregate(expected) }]);
+  assert.deepEqual(aggregateProviderLegUsage([leg.cancellationUsage ?? null]), expected);
+  assert.deepEqual(result.attempts, [504]);
+});
+
+test("successful retry keeps prior parsed usage only for subsequent cancellation", async () => {
+  let sends = 0;
+  const leg = await runNonStreamingProviderLeg(
+    baseInput({
+      provider: "clinepass",
+      sleep: async () => {},
+      executeProviderRequest: async () =>
+        makeExecutorResult(
+          ++sends === 1
+            ? { success: false, error: "empty content", usage: known }
+            : {
+                choices: [{ message: { role: "assistant", content: "ok" }, finish_reason: "stop" }],
+                usage: cumulative,
+              }
+        ),
+    })
+  );
+  assert.equal(sends, 2);
+  assert.equal(leg.kind, "ok");
+  assert.deepEqual(
+    aggregateProviderLegUsage([leg.usage]),
+    cumulative,
+    "successful retry bills the winning response as before"
+  );
+  const expected = aggregateProviderLegUsage([known, cumulative]);
+  const result = await scenario({ initialLeg: leg, skipLoop: true, cancelInCost: true });
+  assert.deepEqual(result.history, [{ status: 504, usage: toFailureUsageAggregate(expected) }]);
+  assert.deepEqual(aggregateProviderLegUsage([leg.cancellationUsage ?? null]), expected);
+  assert.deepEqual(result.attempts, [504]);
+});
+
 async function scenario(
   options: {
     cancelInLoop?: boolean;
@@ -86,6 +161,9 @@ async function scenario(
     clientAbort?: boolean;
     errorLeg?: boolean;
     cancelAtClassifierEntry?: boolean;
+    initialLeg?: NonStreamingProviderLegResult;
+    followUpLeg?: NonStreamingProviderLegResult;
+    skipLoop?: boolean;
   } = {}
 ) {
   const abort = new AbortController();
@@ -126,14 +204,21 @@ async function scenario(
       clientVisible: true,
     },
   };
-  const leg: NonStreamingProviderLegResult = options.errorLeg
-    ? {
-        kind: "error",
-        result: errors.createErrorResult(429, "Rate limited"),
-        usage: known,
-        receipt: successfulLeg.receipt,
-      }
-    : successfulLeg;
+  const leg: NonStreamingProviderLegResult =
+    options.initialLeg ??
+    (options.errorLeg
+      ? {
+          kind: "error",
+          result: errors.createErrorResult(429, "Rate limited"),
+          usage: known,
+          receipt: successfulLeg.receipt,
+        }
+      : successfulLeg);
+  const followUpLeg: NonStreamingProviderLegResult = options.followUpLeg ?? {
+    ...successfulLeg,
+    usage: { prompt_tokens: 12, completion_tokens: 4, total_tokens: 16 },
+  };
+  let providerLegCalls = 0;
   const cancel = () =>
     abort.abort(
       options.clientAbort ? new DOMException("Client disconnected", "AbortError") : deadline()
@@ -155,10 +240,16 @@ async function scenario(
       ...deadlines,
       ...finalization,
       toFailureUsageAggregate,
+      aggregateProviderLegUsage,
+      followUpLegInput,
       getSelectedControlPlane: () => undefined,
       getSelectedPersistenceIdentity: () => undefined,
-      runNonStreamingProviderLeg: async () => leg,
-      applyServerOwnedToolLoopIfNeeded: async () => {
+      runNonStreamingProviderLeg: async () => (++providerLegCalls === 1 ? leg : followUpLeg),
+      applyServerOwnedToolLoopIfNeeded: async (input: {
+        followUpLeg(body: Record<string, unknown>): Promise<NonStreamingProviderLegResult>;
+      }) => {
+        if (options.skipLoop) return { kind: "skip" };
+        await input.followUpLeg({ messages: [] });
         if (options.cancelInLoop) cancel();
         return {
           kind: "ok",
@@ -216,9 +307,12 @@ async function scenario(
     webSearchFallbackPlan: {},
     providerRequestCapture: { latest: () => null, body: (value: unknown) => value },
     getCurrentConnectionId: () => "conn",
-    isServerOwnedToolLoopEnabled: () => false,
+    isServerOwnedToolLoopEnabled: () => !options.skipLoop,
     getSkillsModelIdForFormat: () => "model",
     syncExecuteTranslatedBody: noop,
+    translateRequest: async () => ({}),
+    getModelNormalizeToolCallId: () => false,
+    getModelPreserveOpenAIDeveloperRole: () => false,
     triedModels: new Set(),
     reqLogger: {
       logTargetRequest: noop,
@@ -299,6 +393,29 @@ test("deadline after a tool await finalizes known cumulative usage once as failu
   assert.deepEqual(result.attempts, [504]);
   assert.equal(result.pending, 1);
   assert.deepEqual(result.effects, []);
+});
+
+test("tool follow-up cancellation includes each leg's parsed ledger exactly once", async () => {
+  const ordinary = {
+    choices: [{ message: { role: "assistant", content: "ok" }, finish_reason: "stop" }],
+    usage: known,
+  };
+  const okLeg = await runNonStreamingProviderLeg(
+    baseInput({ executeProviderRequest: async () => makeExecutorResult(ordinary) })
+  );
+  assert.equal(okLeg.kind, "ok");
+  const first = aggregateProviderLegUsage([known, known]);
+  const next = aggregateProviderLegUsage([known, cumulative]);
+  const result = await scenario({
+    initialLeg: { ...okLeg, cancellationUsage: first },
+    followUpLeg: { ...okLeg, cancellationUsage: next },
+    cancelInLoop: true,
+  });
+  assert.deepEqual(result.history, [
+    { status: 504, usage: toFailureUsageAggregate(aggregateProviderLegUsage([first, next])) },
+  ]);
+  assert.deepEqual(result.attempts, [504]);
+  assert.equal(result.pending, 1);
 });
 
 test("successful multi-leg flow records cumulative usage once", async () => {

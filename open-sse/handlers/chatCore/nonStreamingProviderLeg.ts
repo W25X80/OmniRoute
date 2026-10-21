@@ -388,7 +388,7 @@ export async function runNonStreamingProviderLeg(
     const result = await runNonStreamingProviderLegInner(guarded, observeUsage);
     observed = result;
     throwIfRequestCancelled(signal);
-    return result;
+    return { ...result, cancellationUsage: parsedUsage ?? result.usage };
   } catch (error) {
     const cause = signal?.aborted ? signal.reason : error;
     const localDeadline = isIngressRequestDeadline(cause);

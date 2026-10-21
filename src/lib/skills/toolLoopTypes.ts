@@ -56,6 +56,8 @@ export type NonStreamingProviderLegResult =
       providerBody: Record<string, unknown>;
       providerRequest: Record<string, unknown>;
       usage: ProviderLegUsage | null;
+      /** Parsed attempts retained only for pre-finalization cancellation accounting. */
+      cancellationUsage?: ProviderLegUsage | null;
       responsePayloadFormat: string;
       looksLikeSSE: boolean;
       connectionId: string;
@@ -71,6 +73,8 @@ export type NonStreamingProviderLegResult =
       upstreamDiagnostic?: Record<string, unknown>;
       receipt: ProviderLegReceipt;
       usage: ProviderLegUsage | null;
+      /** Kept separate from ordinary error accounting and successful retry billing. */
+      cancellationUsage?: ProviderLegUsage | null;
     };
 
 // ─── §5.5 Tool Loop ────────────────────────────────────────────────────────

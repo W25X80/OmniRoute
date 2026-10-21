@@ -70,6 +70,7 @@ import { markCodexScopeRateLimited } from "../chatCore/codexFailover.ts";
 import { deleteSessionAccountAffinityAsync } from "@/lib/db/sessionAccountAffinity";
 import { writeTerminalStatus } from "@/shared/utils/terminalStatus";
 import { MEMORY_BUILTIN_TOOL_NAMES } from "@/lib/skills/memoryBuiltins";
+import { aggregateProviderLegUsage } from "@/lib/skills/serverOwnedToolLoop.ts";
 
 import { storeSemanticCacheResponseAsync } from "../chatCore/semanticCacheStore.ts";
 import {
@@ -233,6 +234,11 @@ export async function runNonStreamingResponse(deps: NonStreamingDeps) {
   translatedBody = _translatedBody;
   pipelineRecovered = false;
   let observedUsage: ProviderLegUsage | null = null;
+  const observeLeg = (leg: NonStreamingProviderLegResult) => {
+    const usage = leg.cancellationUsage ?? leg.usage;
+    if (usage) observedUsage = aggregateProviderLegUsage([observedUsage, usage]);
+    return leg;
+  };
   let terminalClaimed = false;
   const claimFinalization = () => {
     throwIfRequestCancelled(clientRawRequest?.signal);
@@ -389,7 +395,7 @@ export async function runNonStreamingResponse(deps: NonStreamingDeps) {
       log,
     });
 
-    observedUsage = legResult.usage;
+    observeLeg(legResult);
     if (legResult.kind === "error") {
       const err = legResult.result;
       if (err.errorCode === CONNECTION_SCOPE_DENIED_CODE) {
@@ -582,7 +588,7 @@ export async function runNonStreamingResponse(deps: NonStreamingDeps) {
           }
         );
         syncExecuteTranslatedBody(translatedBody);
-        return runNonStreamingProviderLeg(
+        const followUpResult = await runNonStreamingProviderLeg(
           followUpLegInput(
             {
               signal: clientRawRequest?.signal,
@@ -618,10 +624,10 @@ export async function runNonStreamingResponse(deps: NonStreamingDeps) {
             expectedConn
           )
         );
+        return observeLeg(followUpResult);
       },
       logReceipt: (receipt) => reqLogger.logToolLoopReceipt(receipt),
     });
-    if (loopApply.kind !== "skip") observedUsage = loopApply.loop.cumulativeUsage;
     throwIfRequestCancelled(clientRawRequest?.signal);
     if (loopApply.kind === "error") {
       claimFinalization();
