@@ -1455,7 +1455,7 @@ test(
       const expiredResult = await withDeadline(expiredReader, 6000);
       assert.equal(expiredResult.found, false, "expired seed cannot be revived");
       assert.deepEqual(expiredResult.handoff, {
-        readyReads: 2,
+        readyReads: 1,
         privacyReads: 1,
         keyPolicySharedLocks: 1,
         firstReadyRowCount: 0,

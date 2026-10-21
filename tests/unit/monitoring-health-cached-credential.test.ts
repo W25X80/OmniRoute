@@ -7,6 +7,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { createManagementSessionToken } from "../helpers/managementSession.ts";
 
 const TEST_DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "omniroute-health-cred-cache-"));
 process.env.DATA_DIR = TEST_DATA_DIR;
@@ -27,11 +28,7 @@ const {
 const { GET, __test_resetMonitoringHealthPayloadCache } =
   await import("../../src/app/api/monitoring/health/route.ts");
 
-const { SignJWT } = await import("jose");
-const AUTH_TOKEN = await new SignJWT({ authenticated: true })
-  .setProtectedHeader({ alg: "HS256" })
-  .setExpirationTime("30d")
-  .sign(new TextEncoder().encode(process.env.JWT_SECRET as string));
+const AUTH_TOKEN = await createManagementSessionToken();
 
 function authedRequest(): Request {
   return new Request("http://localhost/api/monitoring/health", {

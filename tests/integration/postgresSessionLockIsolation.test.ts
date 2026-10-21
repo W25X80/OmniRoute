@@ -229,7 +229,7 @@ test(
             comboName,
           ]);
         });
-        await combos.delete(comboId);
+        await combos.deleteById(comboId);
       } finally {
         await database.close();
       }

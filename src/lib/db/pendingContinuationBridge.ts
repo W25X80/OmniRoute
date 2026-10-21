@@ -68,7 +68,7 @@ export class PendingContinuationBridge {
     this.limits = { ...DEFAULT_LIMITS, ...options.limits };
     if (Object.values(this.limits).some((value) => !Number.isSafeInteger(value) || value <= 0))
       throw new RangeError("Pending continuation limits must be positive safe integers");
-    this.now = options.now ?? Date.now;
+    this.now = options.now ?? (() => Date.now());
     this.startSweep = options.startSweep ?? setInterval;
     this.stopSweep = options.stopSweep ?? clearInterval;
   }
