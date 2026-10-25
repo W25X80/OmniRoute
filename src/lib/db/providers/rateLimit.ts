@@ -269,7 +269,8 @@ export async function clearConnectionErrorIfUnchanged(
     testStatus: string | null | undefined;
     lastErrorAt: string | null | undefined;
     rateLimitedUntil: string | null | undefined;
-  }
+  },
+  options: { preserveScopedCooldowns?: boolean } = {}
 ): Promise<boolean> {
   const database = getSelectedPostgresDatabase();
   if (database) {
@@ -283,7 +284,11 @@ export async function clearConnectionErrorIfUnchanged(
       if (!rows[0]) return false;
       const row = rows[0];
       let providerData = row.provider_specific_data;
-      if (row.provider === "codex" && typeof providerData === "string") {
+      if (
+        !options.preserveScopedCooldowns &&
+        row.provider === "codex" &&
+        typeof providerData === "string"
+      ) {
         try {
           const parsed: unknown = JSON.parse(providerData);
           // json_remove has no matching object paths for scalars/arrays.
@@ -336,7 +341,7 @@ export async function clearConnectionErrorIfUnchanged(
       rate_limited_until = NULL,
       backoff_level = 0,
       provider_specific_data = CASE
-        WHEN provider = 'codex' AND json_valid(provider_specific_data)
+        WHEN ? = 0 AND provider = 'codex' AND json_valid(provider_specific_data)
           THEN json_remove(
             provider_specific_data,
             '$.codexScopeRateLimitedUntil',
@@ -352,6 +357,7 @@ export async function clearConnectionErrorIfUnchanged(
     `
     )
     .run(
+      options.preserveScopedCooldowns ? 1 : 0,
       new Date().toISOString(),
       id,
       expected.testStatus ?? "",
@@ -363,7 +369,7 @@ export async function clearConnectionErrorIfUnchanged(
     // Routing/health-only fields + codex-scope cooldown keys — none are read by
     // the /v1/models builder (it only reads providerSpecificData.excludedModels).
     invalidateDbCache("connections", id, { skipModelCatalog: true });
-    bumpProxyConfigGeneration();
+    await bumpProxyConfigGeneration();
   }
   return applied;
 }

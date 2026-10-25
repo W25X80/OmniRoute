@@ -208,6 +208,94 @@ test(
           assert.equal(await epoch(), beforeEpoch);
         }
       );
+      const { clearAccountError } = await plane.run(() => import("../../src/sse/services/auth.ts"));
+      for (const terminal of [false, true]) {
+        await t.test(
+          `late success preserves a newer native error; terminal=${terminal}`,
+          async () => {
+            const id = `oauth-late-success-${terminal}`;
+            await seed(id);
+            const oldTime = "2026-10-24T01:00:00.000Z";
+            await database.transaction((tx) =>
+              tx.query(
+                "UPDATE omniroute.provider_connections SET last_error='earlier failure',last_error_at=$1 WHERE id=$2",
+                [oldTime, id]
+              )
+            );
+            if (terminal) {
+              await plane!.run(() =>
+                expireProviderCredentialsIfUnchanged(
+                  id,
+                  credentialVersion(credentials),
+                  "invalid_grant"
+                )
+              );
+            } else {
+              await database.transaction((tx) =>
+                tx.query(
+                  "UPDATE omniroute.provider_connections SET last_error='newer failure',last_error_at='2026-10-25T02:00:00.000Z' WHERE id=$1",
+                  [id]
+                )
+              );
+            }
+            const before = await row(id);
+            await plane!.run(() =>
+              clearAccountError(id, {
+                testStatus: "active",
+                lastError: "earlier failure",
+                lastErrorAt: oldTime,
+                rateLimitedUntil: until,
+              })
+            );
+            assert.deepEqual(await row(id), before);
+            if (terminal) {
+              await plane!.run(() =>
+                clearAccountError(id, {
+                  testStatus: "expired",
+                  lastError: String(before.last_error),
+                  lastErrorAt: String(before.last_error_at),
+                  lastErrorType: String(before.last_error_type),
+                  rateLimitedUntil: until,
+                })
+              );
+              assert.deepEqual(await row(id), before);
+            }
+          }
+        );
+      }
+      await t.test(
+        "matched native recovery preserves manual disable and scoped quota state",
+        async () => {
+          const id = "oauth-matched-clear";
+          await seed(id, true);
+          const data = JSON.stringify({
+            operatorDisabledAt: "manual",
+            codexScopeRateLimitedUntil: { spark: until },
+            codexScopeRateLimitSource: { spark: "quota_reset" },
+            kept: true,
+          });
+          await database.transaction((tx) =>
+            tx.query(
+              "UPDATE omniroute.provider_connections SET last_error='earlier failure',last_error_at='old-time',provider_specific_data=$1 WHERE id=$2",
+              [data, id]
+            )
+          );
+          await plane!.run(() =>
+            clearAccountError(id, {
+              testStatus: "active",
+              lastError: "earlier failure",
+              lastErrorAt: "old-time",
+              rateLimitedUntil: until,
+            })
+          );
+          const after = await row(id);
+          assert.equal(after.is_active, 0);
+          assert.equal(after.last_error, null);
+          assert.equal(after.last_error_at, null);
+          assert.equal(after.rate_limited_until, null);
+          assert.equal(after.provider_specific_data, data);
+        }
+      );
       assert.equal(
         existsSync(join(directory, "storage.sqlite")),
         false,

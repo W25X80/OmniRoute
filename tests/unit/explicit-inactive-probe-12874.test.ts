@@ -256,14 +256,15 @@ test("W-7 chatHelpers onRequestSuccess calls maybeReactivateAfterExplicitProbe",
   assert.match(src, /clearAccountError/);
 });
 
-test("W-3 clearAccountError update payload has no isActive key", () => {
+test("W-3 clearAccountError uses conditional recovery without an isActive update", () => {
   const src = fs.readFileSync(new URL("../../src/sse/services/auth.ts", import.meta.url), "utf8");
   const start = src.indexOf("export async function clearAccountError");
   assert.ok(start >= 0, "clearAccountError must exist");
   const next = src.indexOf("\nexport ", start + 1);
   const body = next >= 0 ? src.slice(start, next) : src.slice(start);
-  const updateStart = body.indexOf("await updateProviderConnection(");
-  assert.ok(updateStart >= 0, "clearAccountError must call updateProviderConnection");
+  const updateStart = body.indexOf("await clearConnectionErrorIfUnchanged(");
+  assert.ok(updateStart >= 0, "clearAccountError must use conditional recovery");
+  assert.ok(body.includes("preserveScopedCooldowns: true"));
   const brace = body.indexOf("{", updateStart);
   assert.ok(brace >= 0);
   let depth = 0;

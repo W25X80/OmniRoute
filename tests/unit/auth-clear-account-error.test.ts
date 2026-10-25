@@ -110,13 +110,8 @@ test("clearRecoveredProviderState ignores empty payloads and clears recoverable 
     expiredStatus: "expired",
   });
   await auth.clearRecoveredProviderState({
+    ...(await providersDb.getProviderConnectionById(created.id)),
     connectionId: created.id,
-    testStatus: "unavailable",
-    lastError: "temporary failure",
-    lastErrorType: "transient",
-    lastErrorSource: "executor",
-    errorCode: 503,
-    rateLimitedUntil: new Date(Date.now() + 60_000).toISOString(),
   });
 
   const updated = await providersDb.getProviderConnectionById((created as any).id);

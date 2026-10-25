@@ -179,6 +179,7 @@ import {
 } from "./sessionAffinityPin";
 import {
   EXPLICIT_INACTIVE_PROBE_INTERVAL_MS,
+  EXPLICIT_PROBE_BLOCKLIST,
   lastExplicitProbeTime,
   noteExplicitProbe,
   selectExplicitInactiveProbe,
@@ -223,6 +224,7 @@ interface RecoverableConnectionState {
   connectionId: string;
   testStatus?: string | null;
   lastError?: string | null;
+  lastErrorAt?: string | null;
   rateLimitedUntil?: string | null;
   errorCode?: string | number | null;
   lastErrorType?: string | null;
@@ -995,6 +997,7 @@ async function materializeConnection(
     connectionId: connection.id,
     testStatus: connection.testStatus,
     lastError: connection.lastError,
+    lastErrorAt: connection.lastErrorAt,
     lastErrorType: connection.lastErrorType,
     lastErrorSource: connection.lastErrorSource,
     errorCode: connection.errorCode,
@@ -3422,6 +3425,12 @@ export async function clearAccountError(
   currentConnection: Partial<RecoverableConnectionState>
 ) {
   oauthAuthBackoff.resetStreak(connectionId);
+  const status = (currentConnection.testStatus || "").trim().toLowerCase();
+  const failure = (currentConnection.lastErrorType || "").trim().toLowerCase();
+  // Generic success (including search) cannot establish recovery of revoked
+  // credentials. Fresh re-authentication writes an active credential state.
+  if (status === "banned" || (status === "expired" && EXPLICIT_PROBE_BLOCKLIST.has(failure)))
+    return;
   // Only update if currently has error status
   const hasError =
     (currentConnection.testStatus && currentConnection.testStatus !== "active") ||
@@ -3433,16 +3442,18 @@ export async function clearAccountError(
 
   if (!hasError) return; // Skip if already clean
 
-  await updateProviderConnection(connectionId, {
-    testStatus: "active",
-    lastError: null,
-    lastErrorAt: null,
-    lastErrorType: null,
-    lastErrorSource: null,
-    errorCode: null,
-    rateLimitedUntil: null,
-    backoffLevel: 0,
-  });
+  // A success/recovery for an old snapshot cannot erase a newer authentication
+  // failure or cooldown. General success does not prove sibling model quotas reset.
+  const applied = await clearConnectionErrorIfUnchanged(
+    connectionId,
+    {
+      testStatus: currentConnection.testStatus,
+      lastErrorAt: currentConnection.lastErrorAt,
+      rateLimitedUntil: currentConnection.rateLimitedUntil,
+    },
+    { preserveScopedCooldowns: true }
+  );
+  if (!applied) return;
   log.info("AUTH", `Account ${connectionId.slice(0, 8)} error cleared`);
 }
 

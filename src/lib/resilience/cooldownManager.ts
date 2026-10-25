@@ -213,6 +213,7 @@ export async function clearConnectionCooldowns(
     await clearAccountError(id, {
       testStatus,
       lastError: text(row.lastError),
+      lastErrorAt: text(row.lastErrorAt),
       rateLimitedUntil: text(row.rateLimitedUntil),
       errorCode: row.errorCode as number | string | null,
       lastErrorType: text(row.lastErrorType),
