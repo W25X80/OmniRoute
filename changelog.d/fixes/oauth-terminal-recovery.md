@@ -1,0 +1,1 @@
+Keep rejected OAuth credentials expired with a safe failure reason until re-authentication or an explicit reset. Compare the failed credential version atomically before disabling a connection, so a late refresh failure cannot disable newer credentials; preserve manual disable intent and transient cooldown recovery on SQLite and PostgreSQL.

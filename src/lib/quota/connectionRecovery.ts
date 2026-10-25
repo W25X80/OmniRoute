@@ -46,6 +46,15 @@ export const RECOVERABLE_COOLDOWN_STATUS = "unavailable";
  */
 export const TERMINAL_CONNECTION_STATUSES = new Set<string>(["banned", "expired"]);
 
+/** Terminal authentication failures also excluded from explicit pinned-account probes. */
+export const EXPIRED_REPROBE_BLOCKLIST = new Set([
+  "account_deactivated",
+  "invalid_grant",
+  "unrecoverable_refresh_error",
+  "provider_deprecated",
+  "no_refresh_token",
+]);
+
 /**
  * Status that marks an account as out of metered credits. Unlike terminal
  * statuses, credits reset on a time window (daily RPD, monthly quota, etc.)
@@ -163,36 +172,6 @@ export function isRecoverableCooldownConnection(
  * Pure — `nowMs` and `reprobeMs` are injected so callers/tests control the clock.
  */
 
-export const EXPIRED_REPROBE_BLOCKLIST = new Set([
-  "account_deactivated",
-  "invalid_grant",
-  "unrecoverable_refresh_error",
-  "provider_deprecated",
-  "no_refresh_token",
-]);
-
-/**
- * Re-probe `expired` after the same window as credits_exhausted.
- * API-key 401s and OAuth races were persisted as expired and then never
- * retried (combo pre-skip + health-check skip). Do not reopen a real
- * deactivation / invalid_grant.
- */
-export function isExpiredReprobeCandidate(
-  connection: RecoverableConnectionInput | null | undefined,
-  nowMs: number,
-  reprobeMs: number = DEFAULT_CREDITS_REPROBE_MS
-): boolean {
-  if (!connection || typeof connection.id !== "string" || connection.id.length === 0) {
-    return false;
-  }
-  if (normalizeStatus(connection.testStatus) !== "expired") return false;
-  const err = (connection.lastErrorType || "").trim().toLowerCase();
-  if (EXPIRED_REPROBE_BLOCKLIST.has(err)) return false;
-  const sinceMs = cooldownUntilMs(connection.lastErrorAt || connection.rateLimitedUntil || "");
-  if (!Number.isFinite(sinceMs) || sinceMs <= 0) return true;
-  return nowMs - sinceMs >= reprobeMs;
-}
-
 export function isCreditsExhaustedReprobeCandidate(
   connection: RecoverableConnectionInput | null | undefined,
   nowMs: number,
@@ -223,8 +202,7 @@ export function selectRecoverableConnections<T extends RecoverableConnectionInpu
   return connections.filter(
     (connection) =>
       isRecoverableCooldownConnection(connection, nowMs) ||
-      isCreditsExhaustedReprobeCandidate(connection, nowMs) ||
-      isExpiredReprobeCandidate(connection, nowMs)
+      isCreditsExhaustedReprobeCandidate(connection, nowMs)
   );
 }
 
@@ -239,6 +217,7 @@ export interface ConnectionRecoveryTickResult {
  * Run one proactive-recovery pass: load active provider connections, select the
  * subset whose transient cooldown has elapsed, and clear their error state via
  * `clearAccountError` so they are eligible again before the next real request.
+ * Expired credentials are excluded: this pass does not authenticate them.
  *
  * Dependencies are injected (default to the real DB / auth modules) so the tick
  * can be unit-tested without a live database. Best-effort and never throws — a

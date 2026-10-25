@@ -543,6 +543,8 @@ export async function executeChatWithBreaker({
                 apiKey: newCreds.apiKey,
                 testStatus: newCreds.testStatus ?? "active",
                 isActive: newCreds.isActive,
+                expectedCredentialVersion: newCreds.expectedCredentialVersion,
+                errorCode: newCreds.errorCode,
               });
             },
             onRequestSuccess: async () => {

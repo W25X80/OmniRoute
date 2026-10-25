@@ -68,6 +68,7 @@ import { applyStatusRestatement } from "../../config/upstreamStatusRestatement.t
 
 import { updateProviderConnection, getProviderConnectionById } from "@/lib/db/providers";
 import { wasRefreshTokenRotated } from "@omniroute/open-sse/services/refreshSerializer.ts";
+import { credentialVersion } from "@/lib/providers/credentialFailure";
 
 import {
   createSafeAbortError,
@@ -656,6 +657,7 @@ export async function runStreamingResponse(deps: StreamingDeps) {
     // stale-token reuse that a concurrent/sibling refresh already rotated past.
     const attemptedRefreshToken =
       typeof credentials?.refreshToken === "string" ? credentials.refreshToken : null;
+    const attemptedCredentialVersion = credentialVersion(credentials);
     let persistFnRan = false;
     const persistFn = onCredentialsRefreshed
       ? async (refreshResult: Record<string, unknown>) => {
@@ -698,6 +700,7 @@ export async function runStreamingResponse(deps: StreamingDeps) {
     )) as null | {
       accessToken?: string;
       copilotToken?: string;
+      code?: string;
     };
 
     if (newCredentials?.accessToken || newCredentials?.copilotToken) {
@@ -821,7 +824,12 @@ export async function runStreamingResponse(deps: StreamingDeps) {
           }
         }
         if (!alreadyRotated) {
-          await onCredentialsRefreshed({ testStatus: "expired", isActive: false });
+          await onCredentialsRefreshed({
+            testStatus: "expired",
+            isActive: false,
+            expectedCredentialVersion: attemptedCredentialVersion,
+            errorCode: newCredentials.code,
+          });
         }
       }
     }

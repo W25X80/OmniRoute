@@ -167,6 +167,15 @@ export const getAllAccessTokens = (userInfo: any) => _getAllAccessTokens(userInf
 // Local-specific: Update credentials in localDb
 export async function updateProviderCredentials(connectionId: string, newCredentials: any) {
   try {
+    if (typeof newCredentials.expectedCredentialVersion === "string") {
+      const { expireProviderCredentialsIfUnchanged } =
+        await import("@/lib/db/providers/credentialFailure");
+      return await expireProviderCredentialsIfUnchanged(
+        connectionId,
+        newCredentials.expectedCredentialVersion,
+        newCredentials.errorCode
+      );
+    }
     const updates: Record<string, any> = {};
 
     if (newCredentials.accessToken) {
