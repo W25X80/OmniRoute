@@ -2297,6 +2297,11 @@ async function handleSingleModelChat(
         return result.response;
       }
 
+      // A per-key quota decision must not cool down the healthy shared account.
+      if (result.errorCode === "quota_share_blocked") {
+        return withSelectedConnectionHeader(result.response, credentials?.connectionId);
+      }
+
       // Missing Cloud Code project assignment is configuration, not a transient failure.
       // Preserve the typed fail-closed 422; marking it unavailable would trigger cooldown
       // redispatch and repeat bootstrap within the same logical request.

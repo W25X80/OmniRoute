@@ -130,12 +130,9 @@ test("CUSTOM: budget 0 disables Claude thinking", () => {
 });
 
 test("ADAPTIVE: Opus 4.7 budget capped within Anthropic-allowed range", () => {
-  // Capy sends `output_config.effort=max` (baseline 65536) on a long
-  // conversation (13 messages, 25 tools, recent tool_use). Multiplier
-  // stacks to 2.3× — raw budget would be ~150K, exceeding Anthropic's
-  // [1024, 128000] range for Opus 4.7 and triggering a 400.
-  // capThinkingBudget MUST cap at the model's thinkingBudgetCap.
-  setThinkingBudgetConfig({ mode: ThinkingMode.ADAPTIVE, effortLevel: "medium" });
+  // Automatic allocation must stay below the model cap even on a complex
+  // request. Explicit client effort is covered separately and is preserved.
+  setThinkingBudgetConfig({ mode: ThinkingMode.ADAPTIVE, effortLevel: "max" });
   const messages = Array.from({ length: 13 }, (_, i) => ({
     role: i % 2 === 0 ? "user" : "assistant",
     content:
@@ -148,7 +145,6 @@ test("ADAPTIVE: Opus 4.7 budget capped within Anthropic-allowed range", () => {
     model: "claude-opus-4-7",
     messages,
     tools,
-    output_config: { effort: "max" },
   };
   const result = applyThinkingBudget(body);
   assert.equal(result.thinking.type, "enabled");

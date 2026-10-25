@@ -1,3 +1,4 @@
+import { modelPatternMatches } from "@/lib/db/apiKeys/modelPermissions";
 import { isComboNameAllowedForKey, type ApiKeyMetadata } from "@/shared/utils/apiKeyPolicy";
 
 type CatalogKeyFilterDeps = {
@@ -22,7 +23,7 @@ type CatalogKeyFilterDeps = {
 export async function isCatalogModelAllowedForKey(
   apiKey: string,
   model: { id?: unknown; root?: unknown },
-  blockedModels: string[] | null | undefined,
+  keyMeta: Pick<ApiKeyMetadata, "allowedModels" | "blockedModels">,
   deps?: CatalogKeyFilterDeps
 ): Promise<boolean> {
   deps ??= await import("@/lib/db/apiKeys");
@@ -31,7 +32,14 @@ export async function isCatalogModelAllowedForKey(
 
   const root = typeof model.root === "string" ? model.root : "";
   if (!root || root === id || root.includes("/")) return false;
-  if (await deps.isModelBlockedByPatterns(blockedModels, id)) return false;
+  // A provider wildcard must not admit another provider through an unscoped root.
+  if (
+    !keyMeta.allowedModels?.some(
+      (pattern) => !pattern.includes("/") && modelPatternMatches(pattern, [root])
+    )
+  )
+    return false;
+  if (await deps.isModelBlockedByPatterns(keyMeta.blockedModels, id)) return false;
   return deps.isModelAllowedForKey(apiKey, root);
 }
 
@@ -41,7 +49,10 @@ export async function filterCatalogModelsForKey<
 >(
   apiKey: string,
   models: T[],
-  keyMeta: Pick<ApiKeyMetadata, "catalogScope" | "allowedCombos" | "blockedModels">,
+  keyMeta: Pick<
+    ApiKeyMetadata,
+    "catalogScope" | "allowedCombos" | "allowedModels" | "blockedModels"
+  >,
   deps: CatalogKeyFilterDeps,
   maybeYieldCatalogBuild: () => Promise<void>
 ): Promise<T[]> {
@@ -71,7 +82,7 @@ export async function filterCatalogModelsForKey<
       continue;
     }
     // m.id decides; a bare m.root also matches a bare allowlist entry (#781, #15409).
-    if (await isCatalogModelAllowedForKey(apiKey, m, keyMeta.blockedModels, deps)) {
+    if (await isCatalogModelAllowedForKey(apiKey, m, keyMeta, deps)) {
       filtered.push(m);
     }
   }

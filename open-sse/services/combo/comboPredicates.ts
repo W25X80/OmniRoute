@@ -297,6 +297,8 @@ const REQUEST_SCOPED_UPSTREAM_ERROR_CODES: Record<string, true> = {
   // connection health signal and must never feed lockout/cooldown/disable.
   resource_pressure: true,
   heap_pressure: true,
+  // Local per-key policy; the shared connection can still serve other keys.
+  quota_share_blocked: true,
 };
 
 /** Request/model-specific failures must not poison provider-wide resilience state. */

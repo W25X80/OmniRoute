@@ -13,7 +13,7 @@ import { getSelectedSemanticCacheAuthority } from "@/lib/db/semanticCache";
  */
 
 import crypto from "crypto";
-import { outputContractOf } from "@/lib/semanticCache";
+import { canonicalJson, outputContractOf, SEMANTIC_CACHE_KEY_SCHEMA } from "@/lib/semanticCache";
 import {
   type SemanticCacheConfig,
   type SemanticCacheType,
@@ -147,15 +147,20 @@ export function generateDirectHash(
   // request. Mirrors the #12307 fix already applied to the legacy signature path.
   outputContract?: unknown
 ): string {
-  const payload = JSON.stringify({
-    model: scoping?.cacheByModel !== false ? model : "*",
-    provider: scoping?.cacheByProvider ? scoping.provider || "*" : "*",
-    cacheKey: scoping?.cacheKey || undefined,
-    messages: normalizeMessagesForHash(conversation),
-    temperature,
-    top_p: topP,
-    outputContract: outputContract ?? undefined,
-  });
+  const payload = canonicalJson(
+    JSON.parse(
+      JSON.stringify({
+        schema: SEMANTIC_CACHE_KEY_SCHEMA,
+        model: scoping?.cacheByModel !== false ? model : "*",
+        provider: scoping?.cacheByProvider ? scoping.provider || "*" : "*",
+        cacheKey: scoping?.cacheKey || undefined,
+        messages: normalizeMessagesForHash(conversation),
+        temperature,
+        top_p: topP,
+        outputContract: outputContract ?? undefined,
+      })
+    )
+  );
 
   const digest = crypto.createHash("sha256").update(payload).digest("hex");
   return scoping?.apiKeyId ? `${scoping.apiKeyId}.${digest}` : digest;

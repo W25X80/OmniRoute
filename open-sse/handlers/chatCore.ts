@@ -2977,7 +2977,6 @@ async function handleChatCoreInner({
       });
 
       if (decision.kind === "block") {
-        const { buildErrorBody } = await import("../utils/error.ts");
         log?.warn?.(
           "QUOTA_SHARE",
           `[quotaShare] blocked apiKeyId=${apiKeyInfo.id} provider=${provider ?? "unknown"}: ${decision.reason}`
@@ -2987,14 +2986,16 @@ async function handleChatCoreInner({
         // pending detail lingers as an orphaned status-0 call-log row until the
         // reaper sweeps it (mirrors the other pre-upstream error returns).
         trackPendingRequest(model, provider, pendingConnId, false, undefined, pendingRequestId);
-        const headers: Record<string, string> = { "Content-Type": "application/json" };
+        const blocked = createErrorResult(
+          429,
+          decision.reason,
+          decision.retryAfterSeconds ? decision.retryAfterSeconds * 1000 : null,
+          "quota_share_blocked"
+        );
         if (decision.retryAfterSeconds) {
-          headers["Retry-After"] = String(decision.retryAfterSeconds);
+          blocked.response.headers.set("Retry-After", String(decision.retryAfterSeconds));
         }
-        return new Response(JSON.stringify(buildErrorBody(429, decision.reason)), {
-          status: 429,
-          headers,
-        });
+        return blocked;
       }
 
       if (decision.kind === "allow" && decision.deprioritize) {

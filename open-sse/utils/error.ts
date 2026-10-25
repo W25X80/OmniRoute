@@ -244,6 +244,7 @@ const SAFE_PUBLIC_ERROR_IDENTIFIERS = new Set([
   "proxy_unavailable",
   "proxy_unreachable",
   "quota_exhausted",
+  "quota_share_blocked",
   "quota_not_allocated",
   "quota_only",
   "rate_limit_error",

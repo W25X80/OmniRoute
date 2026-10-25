@@ -127,8 +127,15 @@ export function registerApiKeyRepositoryConformance(
     assert.equal(await h.keys.isModelAllowedForKey(created.key, "openai/model"), false);
     await h.keys.updateApiKeyPermissions(created.id, ["cx/*"]);
     assert.equal(await h.keys.isModelAllowedForKey(created.key, "codex/model"), true);
+    assert.equal(await h.keys.isModelAllowedForKey(created.key, "no-think/codex/model"), true);
+    assert.equal(await h.keys.isModelAllowedForKey(created.key, "no-think/"), false);
+    assert.equal(await h.keys.isModelAllowedForKey(created.key, "no-think/openai/model"), false);
     assert.equal(await h.keys.isModelAllowedForKey(created.key, "openai/model"), false);
     await h.keys.updateApiKeyPermissions(created.id, { blockedModels: ["codex/private*"] });
+    assert.equal(
+      await h.keys.isModelAllowedForKey(created.key, "no-think/codex/private-one"),
+      false
+    );
     assert.equal(
       await h.keys.isModelAllowedForKey(created.key, "cx/public", "codex/private-one"),
       false

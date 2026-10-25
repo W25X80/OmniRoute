@@ -1,5 +1,6 @@
 import { assertRegenerationScopes } from "@/domain/persistence/apiKeyRepository";
 import { createHash, randomUUID } from "node:crypto";
+import { stripNoThinkingAlias } from "@omniroute/open-sse/utils/noThinkingAlias.ts";
 import type {
   ApiKeyRepository,
   ApiKeyMetadata,
@@ -588,6 +589,8 @@ export function createPostgresApiKeyRepository(
     },
     async isModelAllowedForKey(key, modelId, resolvedModelId) {
       if (!key) return true;
+      if (!modelId) return false;
+      modelId = stripNoThinkingAlias(modelId);
       if (!modelId) return false;
       const synthetic = syntheticMetadata(key),
         current = synthetic ? null : await snapshot(key, true);
